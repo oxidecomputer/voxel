@@ -1,0 +1,14 @@
+*.sw*
+.falcon
+target
+debug.out
+cargo-bay.tgz
+.img
+.DS_Store
+core
+cargo-bay/
+*.vdev
+.sidecar-lite/
+voxel-image/out/
+voxel/rss-gen/Cargo.lock
+voxel.toml

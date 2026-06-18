@@ -1,0 +1,262 @@
+//! RSS bring-up progress (fridge-style): poll the RSS node's bootstrap-agent
+//! status API and render `[n/total]` step transitions. Also hosts `strip_ansi`,
+//! shared with serial-exec output parsing in [`crate::net`].
+
+use libfalcon::{NodeRef, Runner};
+use slog::{info, warn};
+use std::time::{Duration, Instant};
+
+/// Extract a `"key":"value"` string field from a flat JSON blob without a JSON
+/// dependency - robust to surrounding serial-console noise.
+fn json_str_field(s: &str, key: &str) -> String {
+    let pat = format!("\"{key}\":\"");
+    if let Some(i) = s.find(&pat) {
+        let rest = &s[i + pat.len()..];
+        if let Some(j) = rest.find('"') {
+            return rest[..j].to_string();
+        }
+    }
+    String::new()
+}
+
+/// RSS bring-up stages, in order, as omicron's `RssStep` serializes them
+/// (snake_case) paired with a human label. Used to render `[n/total]` progress.
+const RSS_STEPS: &[(&str, &str)] = &[
+    ("requested", "requested"),
+    ("starting", "starting"),
+    ("load_existing_plan", "loading existing plan"),
+    ("create_sled_plan", "creating sled plan"),
+    ("init_trust_quorum", "initializing trust quorum"),
+    ("initial_network_config_update", "initial network config"),
+    ("sled_init", "initializing sleds"),
+    ("final_network_config_update", "final network config"),
+    ("init_dns", "initializing internal DNS"),
+    ("configure_dns", "configuring DNS"),
+    ("init_ntp", "initializing NTP"),
+    ("wait_for_time_sync", "waiting for time sync"),
+    ("wait_for_database", "waiting for database"),
+    ("cluster_init", "initializing cluster"),
+    ("zones_init", "initializing zones"),
+    ("nexus_handoff", "handing off to Nexus"),
+];
+
+/// `RackOperationStatus::Initializing` nests the current `RssStep` as
+/// `"step":{"status":"<snake>"}`, so the step name is the first `status` after
+/// `"step"` - not a flat field.
+fn json_step(s: &str) -> String {
+    match s.find("\"step\"") {
+        Some(i) => json_str_field(&s[i..], "status"),
+        None => String::new(),
+    }
+}
+
+/// `(1-based index, human label)` for a snake_case step; index 0 if unknown.
+fn rss_step_display(step: &str) -> (usize, String) {
+    for (i, (name, label)) in RSS_STEPS.iter().enumerate() {
+        if *name == step {
+            return (i + 1, label.to_string());
+        }
+    }
+    (0, step.replace('_', " "))
+}
+
+/// Stream RSS bring-up: poll the RSS node's bootstrap-agent `/rack-initialize`
+/// endpoint and log each step transition until the rack initializes or fails.
+///
+/// We poll over SSH, NOT the serial console. The bootstrap-agent listens on the
+/// bootstrap net (the host can't reach it), so the curl runs *on* the RSS node -
+/// but driving it over the serial console is fatally fragile under RSS load: the
+/// single-user console gets contended during zone-init, and a stalled exec (or a
+/// timed-out/cancelled one) leaves a shell logged in on it that poisons every
+/// later poll. So we discover the node's host-LAN IP once, up front while the
+/// console is still quiet, then `ssh root@<ip> 'curl ...'` each poll - no console
+/// involvement, no wedge, no poisoning. (`setup_ssh` has enabled empty-password
+/// root login by the time launch completes.) Always returns within the cap so
+/// `cmd_launch` proceeds to re-point the host route at ce.
+pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, tag: &str) {
+    let curl = format!(
+        "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
+    );
+    const POLL_INTERVAL: Duration = Duration::from_secs(8);
+    const WATCH_CAP: Duration = Duration::from_secs(1800); // give up watching after 30m
+    const HEARTBEAT: Duration = Duration::from_secs(90); // re-affirm liveness this often
+
+    info!(d.log, "{tag}: watching RSS progress on the RSS node ...");
+
+    // The one and only serial read: find the RSS node's LAN IP up front (console
+    // still quiet here, before zone-init spam). Bounded so a wedged console can't
+    // hang us; if it fails we just stop watching - the rack keeps converging.
+    let rss_ip = match tokio::time::timeout(
+        Duration::from_secs(60),
+        crate::net::node_external_ip(d, rss, false),
+    )
+    .await
+    {
+        Ok(Ok(ip)) => ip,
+        Ok(Err(e)) => {
+            warn!(d.log, "{tag}: can't find the RSS node's IP to watch over SSH ({e}); \
+                bring-up continues - check `voxel status` / the console");
+            return;
+        }
+        Err(_) => {
+            warn!(d.log, "{tag}: timed out finding the RSS node's IP; bring-up \
+                continues - check `voxel status` / the console");
+            return;
+        }
+    };
+    info!(d.log, "{tag}: polling RSS status via ssh root@{rss_ip}");
+
+    let start = Instant::now();
+    let mut last = String::new();
+    let mut last_emit = Instant::now();
+    let mut step_start = Instant::now(); // when the CURRENT step began (for in-step timing)
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        if start.elapsed() > WATCH_CAP {
+            warn!(
+                d.log,
+                "{tag}: stopped watching after {}m - the rack may still be \
+                 converging; check the console or re-run `voxel status`. Not failing \
+                 the launch.",
+                WATCH_CAP.as_secs() / 60
+            );
+            break;
+        }
+        let out = match crate::net::ssh_capture(&rss_ip, &curl) {
+            Some(s) if !s.trim().is_empty() => s,
+            // ssh failed, or the agent isn't answering yet - retry. Heartbeat so a
+            // quiet stretch still shows the watcher is alive.
+            _ => {
+                if last_emit.elapsed() >= HEARTBEAT {
+                    // Can't know if the step advanced - report total watch time +
+                    // the last step we did see.
+                    let mins = start.elapsed().as_secs() / 60;
+                    let where_ = if last.is_empty() {
+                        "waiting for RSS to start".to_string()
+                    } else {
+                        format!("last seen: {}", rss_step_display(&last).1)
+                    };
+                    info!(d.log, "{tag}: still watching, {mins}m elapsed - {where_}");
+                    last_emit = Instant::now();
+                }
+                continue;
+            }
+        };
+        match json_str_field(&out, "status").as_str() {
+            "initializing" => {
+                let step = json_step(&out);
+                if !step.is_empty() && step != last {
+                    let (idx, label) = rss_step_display(&step);
+                    info!(d.log, "{tag} [{}/{}]: {}", idx, RSS_STEPS.len(), label);
+                    last = step;
+                    last_emit = Instant::now();
+                    step_start = Instant::now();
+                } else if !last.is_empty() && last_emit.elapsed() >= HEARTBEAT {
+                    // A genuinely slow step (e.g. waiting for the CockroachDB
+                    // cluster to form) must not look like a freeze. Report time in
+                    // THIS step, not total watch time.
+                    let (idx, label) = rss_step_display(&last);
+                    let mins = step_start.elapsed().as_secs() / 60;
+                    info!(
+                        d.log,
+                        "{tag} [{}/{}]: {} ... still working ({mins}m in this step)",
+                        idx,
+                        RSS_STEPS.len(),
+                        label
+                    );
+                    last_emit = Instant::now();
+                }
+            }
+            "initialized" => {
+                // A real init returns the rack's id; a null id means the
+                // bootstrap-agent is reporting a stale/leftover "initialized"
+                // ledger (e.g. emulated vdevs not wiped on relaunch) - not a real
+                // bring-up. Don't celebrate it.
+                let id = json_str_field(&out, "id");
+                if id.is_empty() {
+                    warn!(
+                        d.log,
+                        "{tag}: status=initialized but rack id is null - stale \
+                         sled state, NOT a real init. Destroy and relaunch from clean \
+                         storage (the emulated vdevs must be wiped)."
+                    );
+                } else {
+                    info!(d.log, "{tag}: complete - rack initialized (rack {id})");
+                }
+                break;
+            }
+            "initialization_failed" => {
+                warn!(d.log, "{tag} FAILED: {}", json_str_field(&out, "message"));
+                break;
+            }
+            _ => {} // not serving yet / other - keep waiting
+        }
+    }
+}
+
+/// Strip ANSI/VT escape sequences (CSI `ESC [ ... final-byte`) from serial-exec
+/// output - `ip(8)` colorizes on a tty, which corrupts parsed tokens.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break; // final byte ends the sequence
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_nested_rss_step() {
+        // RackOperationStatus::Initializing nests RssStep as {"status":...}.
+        let s = r#"{"status":"initializing","id":"abc-123","step":{"status":"create_sled_plan"}}"#;
+        assert_eq!(json_str_field(s, "status"), "initializing");
+        assert_eq!(json_step(s), "create_sled_plan");
+        let (idx, label) = rss_step_display("create_sled_plan");
+        assert_eq!(idx, 4);
+        assert_eq!(label, "creating sled plan");
+        assert_eq!(RSS_STEPS.len(), 16);
+    }
+
+    #[test]
+    fn initialized_has_no_step() {
+        let s = r#"{"status":"initialized","id":"abc-123"}"#;
+        assert_eq!(json_str_field(s, "status"), "initialized");
+        assert_eq!(json_step(s), "");
+    }
+
+    #[test]
+    fn unknown_step_humanizes() {
+        let (idx, label) = rss_step_display("some_new_step");
+        assert_eq!(idx, 0);
+        assert_eq!(label, "some new step");
+    }
+
+    #[test]
+    fn strip_ansi_yields_clean_ip() {
+        // ip(8) colorizes: ESC[36menp0s10ESC[0m ... ESC[35m192.168.68.171ESC[0m/22
+        let colored = "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
+        let clean = strip_ansi(colored);
+        let ip = clean
+            .split_whitespace()
+            .find(|t| t.contains('.') && t.contains('/'))
+            .and_then(|t| t.split('/').next())
+            .unwrap();
+        assert_eq!(ip, "192.168.68.171");
+    }
+}

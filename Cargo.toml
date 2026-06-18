@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "voxel-image/builder",
+    "voxel-config",
+    "voxel",
+    "voxel-init",
+]
+
+# rss-gen depends on omicron's own config types via a path to the IMAGE's omicron
+# source (box-specific, per-publish). Not built as part of this workspace.
+exclude = ["voxel/rss-gen"]
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+expectorate = "1.2.0"
+# Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
+# tokio features (they're additive), so we don't need "full".
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+libfalcon = { git = "https://github.com/oxidecomputer/falcon", branch = "main" }
+futures = "0.3"
+slog = "2.7"
+serde = "1"
+camino = { version = "1.2.2", features = ["serde1"] }
+toml_edit = "0.25"
+
+# sprockets/trust quorum related deps
+attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "06f05ee0fb26ed63f33dde79a7e0e7e766fd124c" }
+sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "d2b68e4f47e3c22bce0455aeb4cfb2e61ad229ba" }

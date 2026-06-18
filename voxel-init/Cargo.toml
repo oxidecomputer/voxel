@@ -1,0 +1,20 @@
+[package]
+name = "voxel-init"
+version = "0.1.0"
+edition = "2021"
+
+# The in-guest bring-up agent baked into voxel images. Deliberately depends on
+# NOTHING illumos-/falcon-specific so it cross-compiles to both guest OSes:
+# illumos (the voxel-cp gimlet) and x86_64-unknown-linux-musl (the voxel-frr
+# router). All OS interaction is shelling out to commands, so the same source
+# builds for both targets; only the role chosen at runtime differs.
+
+[[bin]]
+name = "voxel-init"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml_edit = { workspace = true }
+libc = "0.2"

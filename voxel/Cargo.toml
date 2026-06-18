@@ -1,0 +1,26 @@
+[package]
+name = "voxel"
+version = "0.1.0"
+edition = "2021"
+
+# The Voxel topology tool: launches an image-backed virtual rack and applies
+# on-the-fly generated config. libfalcon -> builds/runs on Helios only.
+
+[[bin]]
+name = "voxel"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+libfalcon.workspace = true
+anyhow.workspace = true
+slog.workspace = true
+futures.workspace = true
+clap.workspace = true
+camino.workspace = true
+voxel-config = { path = "../voxel-config" }
+
+# Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
+# pre-generated per-sled sprockets material that prep.sh used to rsync in).
+attest-mock.workspace = true
+sprockets-tls-test-utils.workspace = true

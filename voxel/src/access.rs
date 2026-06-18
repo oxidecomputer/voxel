@@ -1,0 +1,154 @@
+//! Node access: run commands, attach serial, and pilot-style SSH into sled
+//! global zones (`host`) and switch zones (`tp`).
+
+use anyhow::anyhow;
+use libfalcon::{cli::console, NodeRef};
+use voxel_config::{SledDesc, VoxelConfig};
+
+use crate::net::node_external_ip;
+use crate::topo::{build_topo, Topo};
+
+pub(crate) async fn cmd_exec(
+    cfg: &VoxelConfig,
+    name: &str,
+    node: &str,
+    command: &[String],
+) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    let n = topo.node_ref(node).ok_or_else(|| anyhow!("no such node: {node}"))?;
+    let out = topo.runner.exec(n, &command.join(" ")).await.map_err(|e| anyhow!("exec: {e}"))?;
+    print!("{out}");
+    Ok(())
+}
+
+pub(crate) async fn cmd_serial(cfg: &VoxelConfig, name: &str, node: &str) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    if topo.node_ref(node).is_none() {
+        return Err(anyhow!("no such node: {node}"));
+    }
+    let dir = topo.runner.get_falcon_dir();
+    console(node, camino::Utf8Path::new(&dir)).await.map_err(|e| anyhow!("serial: {e}"))
+}
+
+/// Hand the terminal to `ssh root@<ip>` (optionally running a remote command),
+/// replacing this process - the pilot/captain access pattern.
+fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut c = std::process::Command::new("ssh");
+    c.args(crate::net::EPHEMERAL_HOST_OPTS);
+    if remote.is_some() {
+        c.arg("-t"); // allocate a TTY for the remote interactive command
+    }
+    c.arg(format!("root@{ip}"));
+    if let Some(r) = remote {
+        c.arg(r);
+    }
+    // exec() only returns if it failed to launch ssh.
+    Err(anyhow!("could not exec ssh: {}", c.exec()))
+}
+
+pub(crate) async fn cmd_host_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    println!("{:<6}  {:<16}  {}", "NODE", "IP", "ROLE");
+    for (s, n) in &topo.sleds {
+        let ip = node_external_ip(&topo.runner, *n, false)
+            .await
+            .unwrap_or_else(|_| "(unknown)".into());
+        let role = if s.scrimlet { "scrimlet" } else { "gimlet" };
+        println!("{:<6}  {:<16}  {role}", s.name, ip);
+    }
+    Ok(())
+}
+
+pub(crate) async fn cmd_host_login(cfg: &VoxelConfig, name: &str, sled: &str) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    let (_, n) = topo
+        .sleds
+        .iter()
+        .find(|(s, _)| s.name == sled)
+        .ok_or_else(|| anyhow!("no such sled: {sled}"))?;
+    let ip = node_external_ip(&topo.runner, *n, false)
+        .await
+        .map_err(|e| anyhow!("{e} - is the rack up? (`voxel serial {sled}` for the console)"))?;
+    eprintln!("[voxel] ssh root@{ip}  ({sled} global zone)");
+    ssh_exec(&ip, None)
+}
+
+/// Resolve a switch argument to its scrimlet `(SledDesc, NodeRef)`. Accepts:
+/// a scrimlet **node name** (`g3`, always unambiguous); a **rack-qualified**
+/// switch `rackR/switchS` (R is 1-based, matching `tp ls` - the right form for a
+/// multi-rack deployment where each rack has its own switch0/switch1); or a bare
+/// **global** `switchN` (back-compat, the Nth scrimlet - fine for a single rack).
+fn resolve_switch<'a>(topo: &'a Topo, switch: &str) -> anyhow::Result<&'a (SledDesc, NodeRef)> {
+    let scrimlets: Vec<&(SledDesc, NodeRef)> =
+        topo.sleds.iter().filter(|(s, _)| s.scrimlet).collect();
+
+    // Node name - always unambiguous.
+    if let Some(hit) = scrimlets.iter().find(|(s, _)| s.name == switch) {
+        return Ok(hit);
+    }
+    // Rack-qualified `rackR/switchS` (R 1-based).
+    if let Some((r, sw)) = switch.split_once('/') {
+        if let (Some(rack), Some(slot)) = (
+            r.strip_prefix("rack").and_then(|x| x.parse::<usize>().ok()),
+            sw.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()),
+        ) {
+            let rack0 = rack.saturating_sub(1);
+            let hit = scrimlets
+                .iter()
+                .filter(|(s, _)| s.rack == rack0)
+                .nth(slot)
+                .ok_or_else(|| anyhow!("no rack{rack}/switch{slot} in topology"))?;
+            return Ok(hit);
+        }
+    }
+    // Bare `switchN` - global Nth scrimlet.
+    if let Some(n) = switch.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()) {
+        return scrimlets
+            .into_iter()
+            .nth(n)
+            .ok_or_else(|| anyhow!("no scrimlet for {switch}"));
+    }
+    Err(anyhow!("unknown switch '{switch}' (expected <scrimlet>|switchN|rackR/switchS)"))
+}
+
+pub(crate) async fn cmd_tp_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    // Each rack has its own switch0/switch1, so number the switch slot PER RACK
+    // and show which rack it's in (1-based, matching `voxel info`).
+    let multi = cfg.topology.racks() > 1;
+    if multi {
+        println!("{:<6}  {:<8}  {:<6}  {}", "RACK", "SWITCH", "NODE", "IP");
+    } else {
+        println!("{:<8}  {:<6}  {}", "SWITCH", "NODE", "IP");
+    }
+    let mut per_rack: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for (s, n) in topo.sleds.iter().filter(|(s, _)| s.scrimlet) {
+        let slot = per_rack.entry(s.rack).or_insert(0);
+        let ip = node_external_ip(&topo.runner, *n, false)
+            .await
+            .unwrap_or_else(|_| "(unknown)".into());
+        if multi {
+            println!(
+                "{:<6}  {:<8}  {:<6}  {ip}",
+                format!("rack{}", s.rack + 1),
+                format!("switch{slot}"),
+                s.name
+            );
+        } else {
+            println!("{:<8}  {:<6}  {ip}", format!("switch{slot}"), s.name);
+        }
+        *slot += 1;
+    }
+    Ok(())
+}
+
+pub(crate) async fn cmd_tp_login(cfg: &VoxelConfig, name: &str, switch: &str) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    let (s, n) = resolve_switch(&topo, switch)?;
+    let ip = node_external_ip(&topo.runner, *n, false)
+        .await
+        .map_err(|e| anyhow!("{e} - is the rack up? (`voxel serial {}` for the console)", s.name))?;
+    eprintln!("[voxel] ssh root@{ip} -> zlogin oxz_switch  ({} {switch})", s.name);
+    ssh_exec(&ip, Some("zlogin oxz_switch"))
+}
