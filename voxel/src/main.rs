@@ -39,9 +39,7 @@ struct Cli {
     #[arg(long, global = true, env = "VOXEL_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Project root that cargo-bay/ and .falcon/ live under - lets voxel run from
-    /// anywhere. Overrides voxel.toml `[falcon].workdir`; default is the
-    /// discovered voxel.toml's directory.
+    /// Project root that cargo-bay/ and .falcon/ live under 
     #[arg(long, global = true, env = "VOXEL_WORKDIR")]
     workdir: Option<PathBuf>,
 
