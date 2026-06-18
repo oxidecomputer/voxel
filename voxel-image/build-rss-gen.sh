@@ -18,7 +18,7 @@ set -euo pipefail
 OMICRON_SRC="${1:?usage: build-rss-gen.sh <omicron-src>}"
 HERE="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
 TESTBED="$(cd "${HERE}/.." >/dev/null 2>&1 && pwd -P)"
-RSS_GEN_DIR="${RSS_GEN_DIR:-/root/voxel-builds/rss-gen-$(basename "${OMICRON_SRC}")}"
+RSS_GEN_DIR="${RSS_GEN_DIR:-$(dirname "${OMICRON_SRC}")/rss-gen-$(basename "${OMICRON_SRC}")}"
 
 export PATH="${HOME}/.cargo/bin:/opt/ooce/bin:${PATH}"
 

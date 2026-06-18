@@ -29,7 +29,7 @@ HERE="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
 VOXEL="${VOXEL:-${HERE}/../target/debug/voxel}"
 
 OMICRON_REPO="${OMICRON_REPO:-https://github.com/oxidecomputer/omicron}"
-BUILD_ROOT="${BUILD_ROOT:-/root/voxel-builds}"
+BUILD_ROOT="${BUILD_ROOT:-${HOME}/voxel-builds}"
 OMICRON_SRC="${OMICRON_SRC:-${BUILD_ROOT}/omicron-${COMMIT}}"
 FALCON_DATASET="${FALCON_DATASET:-rpool/falcon}"
 CAPTURE_MODE="${CAPTURE_MODE:-zfs}"

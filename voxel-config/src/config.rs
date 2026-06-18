@@ -54,6 +54,11 @@ pub struct Falcon {
     /// `voxel` run from anywhere (e.g. installed in `/usr/bin`). `None` -> the
     /// directory containing this `voxel.toml`.
     pub workdir: Option<String>,
+    /// Build root for `voxel image create` (the omicron checkout + rss-gen
+    /// build dirs live here). Exported as `BUILD_ROOT`. `None` -> env, else
+    /// the build script's `$HOME/voxel-builds` default. Lets a non-root user
+    /// build images outside `/root`.
+    pub build_root: Option<String>,
 }
 
 impl VoxelConfig {

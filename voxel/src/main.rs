@@ -59,6 +59,11 @@ struct Cli {
     #[arg(long, global = true)]
     rss_gen: Option<PathBuf>,
 
+    /// Build root for `voxel image create` (overrides `[falcon].build_root` /
+    /// `$BUILD_ROOT`; default `$HOME/voxel-builds`).
+    #[arg(long, global = true)]
+    build_root: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -277,6 +282,15 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .or_else(|| std::env::var("VOXEL_RSS_GEN").ok());
     if let Some(r) = rss {
         std::env::set_var("VOXEL_RSS_GEN", r);
+    }
+    let build_root = cli
+        .build_root
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| cfg.and_then(|c| c.falcon.build_root.clone()))
+        .or_else(|| std::env::var("BUILD_ROOT").ok());
+    if let Some(b) = build_root {
+        std::env::set_var("BUILD_ROOT", b);
     }
 }
 
