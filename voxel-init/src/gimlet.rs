@@ -145,11 +145,20 @@ fn patch_sled_config(underlay: &[String]) -> Result<()> {
         text.parse().with_context(|| format!("parse {SLED_CFG}"))?;
     if let Some(first) = underlay.first() {
         doc["data_link"] = toml_edit::value(first.as_str());
-        let mut links = toml_edit::Array::new();
+        // Substitute the detected NICs into whatever data_links SHAPE the staged
+        // config has, so this agent works on any image: an inline table (omicron
+        // main's `{ kind = "virtual", devices = [...] }`) keeps its `kind` and
+        // only its `devices` are replaced; a bare array (pre-main) is rewritten.
+        let mut devices = toml_edit::Array::new();
         for u in underlay {
-            links.push(u.as_str());
+            devices.push(u.as_str());
         }
-        doc["data_links"] = toml_edit::value(links);
+        let dl = &mut doc["data_links"];
+        if let Some(table) = dl.as_inline_table_mut() {
+            table.insert("devices", toml_edit::Value::Array(devices));
+        } else {
+            *dl = toml_edit::value(devices);
+        }
     }
     fs::write(PATCHED_CFG, doc.to_string()).with_context(|| format!("write {PATCHED_CFG}"))?;
     // xtask virtual-hardware reads the workspace config (vdevs + sled_mode).

@@ -213,7 +213,8 @@ pub(crate) fn stage_config(cfg: &VoxelConfig) -> anyhow::Result<()> {
         fs::create_dir_all(&dir)?;
         fs::write(
             dir.join("sled-config.toml"),
-            s.sled_config(num_sleds_per_rack, num_fabric_routers).render(),
+            s.sled_config(num_sleds_per_rack, num_fabric_routers, cfg.image.data_links_schema)
+                .render(),
         )?;
     }
 

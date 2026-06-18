@@ -245,9 +245,11 @@ impl SledDesc {
         &self,
         num_sleds: usize,
         num_fabric_routers: usize,
+        data_links: SledDataLinksSchema,
     ) -> crate::sled::SledAgentConfig {
         crate::sled::SledAgentConfig::new(self.index, self.scrimlet)
             .with_topology(num_sleds, num_fabric_routers)
+            .with_data_links_schema(data_links)
     }
 }
 
@@ -259,12 +261,35 @@ pub struct Image {
     pub version: String,
     pub cp: Option<String>,
     pub frr: Option<String>,
+    /// Sled-agent `data_links` config shape, which differs by omicron era (the
+    /// image's control-plane version). See [`SledDataLinksSchema`].
+    pub data_links_schema: SledDataLinksSchema,
 }
 
 impl Default for Image {
     fn default() -> Self {
-        Self { version: "proto".into(), cp: None, frr: None }
+        Self {
+            version: "proto".into(),
+            cp: None,
+            frr: None,
+            data_links_schema: SledDataLinksSchema::default(),
+        }
     }
+}
+
+/// The shape of sled-agent's `data_links` config field, which changed across
+/// omicron versions. `voxel-init` (baked into each image) is shape-preserving:
+/// it substitutes the detected NIC names into whichever shape this selects, so
+/// one agent works on any image. Pick the variant matching the image's omicron.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SledDataLinksSchema {
+    /// Pre-main omicron (e.g. v20 / a3fee0ec): `data_links = ["vioif0", "vioif1"]`.
+    #[default]
+    List,
+    /// omicron main (the `DataLinks` enum):
+    /// `data_links = { kind = "virtual", devices = ["vioif0", "vioif1"] }`.
+    Tagged,
 }
 
 impl Image {

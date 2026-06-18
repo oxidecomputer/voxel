@@ -36,6 +36,8 @@ pub struct SledAgentConfig {
     /// Fabric (transit) routers - the scrimlet's uplink (front) port count
     /// (`softnpu_link` scrimlet->every fabric router).
     pub num_fabric_routers: usize,
+    /// Sled-agent `data_links` config shape (see [`crate::config::SledDataLinksSchema`]).
+    pub data_links: crate::config::SledDataLinksSchema,
 }
 
 impl SledAgentConfig {
@@ -49,6 +51,7 @@ impl SledAgentConfig {
             // calls `with_topology` for the live counts.
             num_sleds: 4,
             num_fabric_routers: 2,
+            data_links: crate::config::SledDataLinksSchema::default(),
         }
     }
 
@@ -57,6 +60,16 @@ impl SledAgentConfig {
     pub fn with_topology(mut self, num_sleds: usize, num_fabric_routers: usize) -> Self {
         self.num_sleds = num_sleds;
         self.num_fabric_routers = num_fabric_routers;
+        self
+    }
+
+    /// Select the sled-agent `data_links` config shape (see
+    /// [`crate::config::SledDataLinksSchema`]).
+    pub fn with_data_links_schema(
+        mut self,
+        schema: crate::config::SledDataLinksSchema,
+    ) -> Self {
+        self.data_links = schema;
         self
     }
 
@@ -120,8 +133,14 @@ impl SledAgentConfig {
         }
         writeln!(o).unwrap();
 
-        let data_links =
-            if self.scrimlet { "[\"vioif1\", \"vioif2\"]" } else { "[\"vioif0\", \"vioif1\"]" };
+        let devices =
+            if self.scrimlet { "\"vioif1\", \"vioif2\"" } else { "\"vioif0\", \"vioif1\"" };
+        let data_links = match self.data_links {
+            crate::config::SledDataLinksSchema::List => format!("[{devices}]"),
+            crate::config::SledDataLinksSchema::Tagged => {
+                format!("{{ kind = \"virtual\", devices = [{devices}] }}")
+            }
+        };
         writeln!(o, "data_links = {data_links}").unwrap();
         writeln!(o).unwrap();
 
@@ -213,5 +232,21 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("test-alias-1"));
+    }
+
+    #[test]
+    fn data_links_schema_shapes() {
+        use crate::config::SledDataLinksSchema;
+        // Default (List) renders the legacy array shape.
+        let list = parse(&SledAgentConfig::new(0, false).render());
+        assert!(list["data_links"].as_array().is_some(), "List => array");
+        // Tagged renders omicron main's DataLinks enum: { kind, devices }.
+        let tagged = parse(
+            &SledAgentConfig::new(0, false)
+                .with_data_links_schema(SledDataLinksSchema::Tagged)
+                .render(),
+        );
+        assert_eq!(tagged["data_links"]["kind"].as_str(), Some("virtual"));
+        assert_eq!(tagged["data_links"]["devices"].as_array().unwrap().len(), 2);
     }
 }
