@@ -30,14 +30,31 @@ See [`docs/voxel-roadmap.md`](docs/voxel-roadmap.md) for the engineering roadmap
 
 ## Building
 
-`voxel` and `voxel-image` link [falcon](https://github.com/oxidecomputer/falcon), which
-is illumos-only, so they build on a Helios host. `voxel-config` and `voxel-init` build
-on any platform:
 
 ```sh
-cargo build -p voxel-config -p voxel-init   # any platform
-cargo build -p voxel                        # Helios (libfalcon)
+cargo build
 ```
 
-`voxel/rss-gen` is built separately against the target image's omicron source - see
+`voxel/rss-gen` is built separately against the target image's omicron source. See
 [`voxel-image/build-rss-gen.sh`](voxel-image/build-rss-gen.sh).
+
+## Quickstart
+
+1. `cargo build` # build the CLI 
+2. `voxel image create 43bb5af` # builds omicron v21 (as of this writing), bakes voxel-cp-43bb5af, builds the commit-pinned voxel-rss-gen (~30-45 min)
+3. `bash voxel-image/build-frr.sh proto` # bakes voxel-frr-proto (omicron-independent; build once, reuse for any commit)
+4. Configure:
+
+```
+voxel config set image.cp voxel-cp-43bb5af
+voxel config set image.frr voxel-frr-proto
+voxel config set image.data_links_schema tagged # Only required for Omicron v21+ for now
+voxel config set falcon.rss_gen ~/voxel-builds/omicron-43bb5af/target/debug/voxel-rss-gen
+```
+
+5. pfexec voxel launch
+
+Notes: steps 2-4 default the build/dataset under $HOME/voxel-builds and rpool/falcon; if you use a non-default dataset, set
+falcon.dataset (and pass FALCON_DATASET= to build-frr.sh, which doesn't read the config). data_links_schema is the one knob that
+tracks the omicron version. Everything else is version-independent.
+
