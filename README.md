@@ -48,7 +48,7 @@ cargo build
 ```
 voxel config set image.cp voxel-cp-43bb5af
 voxel config set image.frr voxel-frr-proto
-voxel config set image.data_links_schema tagged # Only required for Omicron v21+ for now
+voxel config set image.data_links_schema tagged # Only required for Omicron v21+ for now, set to 'list' for v20.
 voxel config set falcon.rss_gen ~/voxel-builds/omicron-43bb5af/target/debug/voxel-rss-gen
 ```
 
