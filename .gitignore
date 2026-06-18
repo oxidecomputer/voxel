@@ -9,6 +9,7 @@ core
 cargo-bay/
 *.vdev
 .sidecar-lite/
+out/
 voxel-image/out/
 voxel/rss-gen/Cargo.lock
 voxel.toml

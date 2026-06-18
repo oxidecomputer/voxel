@@ -75,7 +75,9 @@ async fn main() -> Result<(), Error> {
     // share mechanism differs). Pick based on the base image.
     let is_linux = image.starts_with("debian")
         || image.starts_with("ubuntu")
-        || image.starts_with("linux");
+        || image.starts_with("linux")
+        || image.starts_with("junos")
+        || image.starts_with("voxel-frr");
     let mounted = if is_linux {
         d.mount_linux(&cargo_bay, "/opt/cargo-bay", vbuild)
     } else {

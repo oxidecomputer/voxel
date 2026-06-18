@@ -3768,6 +3768,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "voxel-container-router"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
 name = "voxel-image-builder"
 version = "0.1.0"
 dependencies = [

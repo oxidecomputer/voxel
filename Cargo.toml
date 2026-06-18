@@ -6,6 +6,7 @@ members = [
     "voxel-config",
     "voxel",
     "voxel-init",
+    "voxel-container-router",
 ]
 
 # rss-gen depends on omicron's own config types via a path to the IMAGE's omicron
