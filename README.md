@@ -52,19 +52,21 @@ voxel config set image.data_links_schema tagged # Only required for Omicron v21+
 voxel config set falcon.rss_gen ~/voxel-builds/omicron-43bb5af/target/debug/voxel-rss-gen
 ```
 
-5. pfexec voxel launch
+5. `pfexec voxel launch`
 
-Notes: steps 2-4 default the build/dataset under $HOME/voxel-builds and rpool/falcon; if you use a non-default dataset, set
-falcon.dataset (and pass FALCON_DATASET= to build-frr.sh, which doesn't read the config). data_links_schema is the one knob that
+Notes: steps 2-4 default the build/dataset under `$HOME/voxel-builds` and `rpool/falcon`; if you use a non-default dataset, set
+`falcon.dataset` (and pass `FALCON_DATASET=` to `build-frr.sh`, which doesn't read the config). `data_links_schema` is the one knob that
 tracks the omicron version. Everything else is version-independent.
 
-Additionally, BUILD_ROOT can be used to choose a different location for building omicron. Like other parameters, you can set it as a flag, voxel config, or environment variable.
+Additionally, `BUILD_ROOT` can be used to choose a different location for building omicron. Like other parameters, you can set it as a flag, voxel config, or environment variable.
 
+```
 voxel --build-root /data/builds image create 43bb5af   # flag
 voxel config set falcon.build_root /data/builds        # config ([falcon].build_root)
 BUILD_ROOT=/data/builds voxel image create 43bb5af     # env
+```
 
 So the two build-location knobs are:
-- FALCON_DATASET where images/topo zvols live (<ds>/img/...).
-- BUILD_ROOT where the omicron checkout + rss-gen build live.
+- `FALCON_DATASET` where images/topo zvols live (<ds>/img/...).
+- `BUILD_ROOT` where the omicron checkout + rss-gen build live.
 
