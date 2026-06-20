@@ -81,6 +81,11 @@ enum Cmd {
         /// `sp-sim`. Needs `[sp].emu_bin` + the hubris images in `[sp]`. Default: sp-sim.
         #[arg(long)]
         emu_sp: bool,
+        /// Additionally wire the RoT bridge (oxide-rot-1) onto the sidecar SP.
+        /// Implies --emu-sp. Needs [sp].rot_image. Runs the sidecar as two
+        /// emulated cores - keep OFF during initial bring-up (wedges handoff).
+        #[arg(long = "emu-rot")]
+        emu_rot: bool,
     },
     /// (Re)point the host route for the rack's external net at ce's current IP.
     Route {
@@ -394,8 +399,8 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route, emu_sp } => {
-            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route, *emu_sp)
+        Cmd::Launch { no_progress, no_route, emu_sp, emu_rot } => {
+            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route, *emu_sp || *emu_rot, *emu_rot)
                 .await
         }
         Cmd::Route { dry_run } => {

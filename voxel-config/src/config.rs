@@ -85,6 +85,12 @@ pub struct SpCfg {
     /// zone at `--emu` launch so `voxel sp ls/state/exec` can talk to the live SPs
     /// (the same client pilot uses). Optional; operator `sp` commands need it.
     pub faux_mgs: Option<String>,
+    /// RoT firmware image (`oxide-rot-1`, raw `.bin` or build archive) run as a
+    /// second emulated core alongside the **sidecar** SP — the sprot bridge — so
+    /// MGS/Nexus see a real Root of Trust (attestation, CMPA/CFPA, real boot
+    /// measurements) instead of the SP's canned fallback. Optional; when set,
+    /// `launch --emu` stages it and points the sidecar's `SP_EMU_ROT_FLASH` at it.
+    pub rot_image: Option<String>,
 }
 
 impl SpCfg {

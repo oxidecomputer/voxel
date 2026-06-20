@@ -198,7 +198,7 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
 }
 
 /// Generate + stage per-node config into the cargo-bay before launch.
-pub(crate) fn stage_config(cfg: &VoxelConfig, emu_sp: bool) -> anyhow::Result<()> {
+pub(crate) fn stage_config(cfg: &VoxelConfig, emu_sp: bool, emu_rot: bool) -> anyhow::Result<()> {
     let sleds = cfg.sleds();
     // Per-sled sled-agent config (replaces a4x2's config/gN-config.toml). Each
     // scrimlet's SoftNPU links only its OWN rack's sleds (rear ports) + every
@@ -271,7 +271,7 @@ pub(crate) fn stage_config(cfg: &VoxelConfig, emu_sp: bool) -> anyhow::Result<()
             if !emu_sp {
                 fs::write(dir.join("sp-sim-config.toml"), fleet.sp_sim_config())?;
             }
-            stage_sp_emu(cfg, &fleet, &dir)?;
+            stage_sp_emu(cfg, &fleet, &dir, emu_rot)?;
         }
     }
     Ok(())
@@ -287,6 +287,7 @@ fn stage_sp_emu(
     cfg: &VoxelConfig,
     fleet: &voxel_config::sp::SpFleet,
     dir: &Path,
+    emu_rot: bool,
 ) -> anyhow::Result<()> {
     let emu = fleet.emu_sps();
     if emu.is_empty() {
@@ -305,6 +306,17 @@ fn stage_sp_emu(
     if let Some(faux) = cfg.sp.faux_mgs.as_deref() {
         fs::copy(faux, out.join("faux-mgs"))
             .with_context(|| format!("stage faux-mgs from {faux}"))?;
+    }
+    // The sidecar SP runs oxide-rot-1 as a second emulated core (the sprot
+    // bridge) when --emu-rot is set, so MGS/Nexus see a real RoT. OFF by
+    // default: the two-core sidecar cannot answer MGS switch-id in time during
+    // RSS, which wedges the nexus handoff - attach the bridge after bring-up.
+    if emu_rot {
+        let rot = cfg.sp.rot_image.as_deref().ok_or_else(|| {
+            anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
+        })?;
+        fs::copy(rot, out.join("rot.flash"))
+            .with_context(|| format!("stage RoT image from {rot}"))?;
     }
     for sp in emu {
         let sel = sp.selector();
