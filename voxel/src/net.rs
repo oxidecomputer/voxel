@@ -84,6 +84,39 @@ pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// `scp <local> root@<ip>:<remote>` non-interactively (empty root password, same
+/// pattern as [`ssh_capture`]). Returns whether it succeeded. Used to deliver
+/// `faux-mgs` into a switch zone for the `sp` operator commands.
+pub(crate) fn scp_to(ip: &str, local: &str, remote: &str) -> bool {
+    let askpass = std::env::temp_dir().join("voxel-empty-askpass.sh");
+    if !askpass.exists() {
+        if std::fs::write(&askpass, "#!/bin/sh\necho\n").is_err() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    std::process::Command::new("scp")
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .stdin(std::process::Stdio::null())
+        .args(EPHEMERAL_HOST_OPTS)
+        .args([
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "NumberOfPasswordPrompts=1",
+            "-o", "ConnectTimeout=8",
+        ])
+        .arg(local)
+        .arg(format!("root@{ip}:{remote}"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Confirm a rack's external network is actually reachable end-to-end after the
 /// host route is set - a route in the table isn't the same as a converged
 /// transit. Probes the rack's external DNS (a `dig` SOA query, UDP/53) from the

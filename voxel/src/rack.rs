@@ -94,6 +94,7 @@ pub(crate) async fn cmd_launch(
     name: &str,
     no_progress: bool,
     no_route: bool,
+    emu_sp: bool,
 ) -> anyhow::Result<()> {
     // Floor (per rack - each is an independent RSS domain): omicron's control
     // plane can't form below 3 sleds (Crucible 3-way replication,
@@ -121,7 +122,7 @@ pub(crate) async fn cmd_launch(
     crate::image::ensure_image(&cfg.image.frr_image())?;
     memory_preflight(cfg)?;
     reset_node_cargo_bay(cfg)?;
-    stage_config(cfg)?;
+    stage_config(cfg, emu_sp)?;
     stage_sprockets(cfg)?;
     let mut topo = build_topo(cfg, name)?;
     // The all-VMs-at-once boot grabs ~all the guest RAM in one spike; under that

@@ -25,6 +25,7 @@ mod image;
 mod net;
 mod rack;
 mod rss;
+mod sp_cmd;
 mod topo;
 
 #[derive(Parser)]
@@ -76,6 +77,10 @@ enum Cmd {
         /// Don't set the host route to the rack's external network after launch.
         #[arg(long)]
         no_route: bool,
+        /// Run real-firmware SPs on the `sp-emu` emulator (whole fleet) instead of
+        /// `sp-sim`. Needs `[sp].emu_bin` + the hubris images in `[sp]`. Default: sp-sim.
+        #[arg(long)]
+        emu_sp: bool,
     },
     /// (Re)point the host route for the rack's external net at ce's current IP.
     Route {
@@ -106,6 +111,11 @@ enum Cmd {
     Image {
         #[command(subcommand)]
         cmd: ImageCmd,
+    },
+    /// Manage real-firmware SP-emulator (`sp-emu`) artifacts for `launch --emu`.
+    Sp {
+        #[command(subcommand)]
+        cmd: SpCmd,
     },
     /// Log into a sled's global zone.
     Host {
@@ -177,6 +187,70 @@ enum ImageCmd {
         /// Number of gimlet SPs to simulate (sp-sim).
         #[arg(long, default_value_t = 4)]
         gimlets: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpCmd {
+    /// List the live SPs over MGS (pilot `sp list`): type, serial, power, archive
+    /// id - via `faux-mgs` in the switch zone. Needs a running `--emu` rack.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Which switch zone to query (`switch0`|`switch1`|`<scrimlet>`).
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+    },
+    /// Ask one SP for its state (pilot `sp info`): serial, power, RoT, archive.
+    #[command(visible_alias = "state")]
+    Info {
+        /// Target SP: serial (e.g. BRM44220001), node (sidecar | g0 | g1 ...),
+        /// or sim addr ([::1]:33310 | 33310).
+        target: String,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+    },
+    /// Get an SP's power state (pilot `sp status`).
+    #[command(visible_alias = "st")]
+    Status {
+        /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
+        target: String,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+    },
+    /// Inject an NMI into the host via the SP (pilot `sp nmi`).
+    Nmi {
+        /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
+        target: String,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+    },
+    /// Pass a raw faux-mgs command to an SP (pilot `sp exec -e`), e.g.
+    /// `voxel sp exec g0 -e inventory`. Full surface: inventory,
+    /// component-details, read-sensor-value, dump, read-caboose, rot-boot-info, ...
+    Exec {
+        /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
+        target: String,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+        /// The faux-mgs command to run (pilot-style single command string).
+        #[arg(short = 'e', long = "exec")]
+        command: String,
+    },
+    /// Show the configured sp-emu build artifacts and whether `launch --emu` is
+    /// ready (pre-launch readiness check; no running rack needed).
+    Ready,
+    /// Flash a hubris image (`.zip`) into an sp-emu slot-A flash file.
+    Flash {
+        /// Hubris image archive (e.g. build-gimlet-c-image-default.zip).
+        image: PathBuf,
+        /// Output flash file.
+        out: PathBuf,
+    },
+    /// Build the gimlet-c + sidecar-c-emu v25 images from a hubris commit (via
+    /// build-sp.sh), then print the `[sp]` paths to set.
+    Build {
+        /// hubris git commit to build (v1 builds from the configured checkout).
+        commit: String,
     },
 }
 
@@ -320,8 +394,9 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route } => {
-            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route).await
+        Cmd::Launch { no_progress, no_route, emu_sp } => {
+            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route, *emu_sp)
+                .await
         }
         Cmd::Route { dry_run } => {
             rack::cmd_route(&load_config(&config_path)?, &cli.name, *dry_run).await
@@ -337,6 +412,7 @@ async fn main() -> Result<(), Error> {
         Cmd::Status => rack::cmd_status(&load_config(&config_path)?, &cli.name).await,
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => image::cmd_image(cmd),
+        Cmd::Sp { cmd } => sp_cmd::cmd_sp(&load_config(&config_path)?, &cli.name, cmd).await,
         Cmd::Host { cmd } => match cmd {
             HostCmd::Ls => access::cmd_host_ls(&load_config(&config_path)?, &cli.name).await,
             HostCmd::Login { sled } => {

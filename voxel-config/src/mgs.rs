@@ -147,6 +147,17 @@ fn switch0_config(fleet: &SpFleet, scrimlets: &[usize]) -> String {
     }
 
     write!(o, "{FOOTER}").unwrap();
+
+    // The emulator answers MGS far slower than sp-sim (RPCs take seconds), so when
+    // any SP is emulator-backed, widen MGS's per-attempt RPC timeout or discovery
+    // spuriously fails. The "SP online" gate (voxel-init) covers the long boot;
+    // this only needs to cover a single slow RPC. sp-sim keeps the tight default.
+    if fleet.has_emu() {
+        o = o.replace(
+            "per_attempt_timeout_millis = 2000",
+            "per_attempt_timeout_millis = 15000",
+        );
+    }
     o
 }
 
@@ -353,6 +364,18 @@ mode = "stderr-terminal"
         assert!(s1.contains("addr = \"[::1]:33311\""));
         assert!(!s1.contains(":33300\""));
         assert!(s1.contains("fake-interface = \"fake-sled0\""));
+    }
+
+    #[test]
+    fn emu_fleet_widens_mgs_timeout() {
+        // Any emulator-backed SP -> lenient per-attempt RPC timeout.
+        let f = SpFleet::sim_with_emu(&[0, 1, 2, 3], &["sidecar".into()]);
+        let s = switch_config(0, &f, &[0, 3]);
+        assert!(s.contains("per_attempt_timeout_millis = 15000"));
+        assert!(!s.contains("per_attempt_timeout_millis = 2000"));
+        // All-sim keeps the tight default (byte-exact reference unaffected).
+        let sim = switch_config(0, &SpFleet::sim(4), &[0, 3]);
+        assert!(sim.contains("per_attempt_timeout_millis = 2000"));
     }
 
     #[test]

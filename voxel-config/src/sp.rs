@@ -48,23 +48,23 @@ pub enum SpRole {
 pub enum SpBackend {
     /// omicron `sp-sim` on loopback in the switch zone (today's default).
     Sim,
-    /// Real Hubris firmware (Renode interim, or the native Rust emulator) reached
-    /// at a single shared `host` for every SP - e.g. a router's management
-    /// address while the SPs run centrally. (Per-sled distribution, where each SP
-    /// has its own address, is a future variant.)
-    ///
-    /// Not yet wired into a `voxel launch`: production always uses [`SpBackend::Sim`]
-    /// today. This variant is the seam the emulator track plugs into (see the
-    /// module docs); for now it's exercised only by the unit tests.
+    /// Real Hubris firmware on the native Rust SP emulator (`sp-emu`), running in
+    /// the switch zone on loopback exactly like `sp-sim` - so MGS reaches it at the
+    /// same `[::1]:333xx` unicast surface (the emulator's VLAN/trust/location logic
+    /// is internal to its bridge and never seen by MGS). Selectable per-SP, so a
+    /// fleet can run real firmware for the SPs under test and sim for the rest.
+    Emu,
+    /// Real Hubris firmware reached at an explicit remote `host` (SPs running on
+    /// another box). Future/out-of-zone variant; exercised only by unit tests.
     Central { host: String },
 }
 
 impl SpBackend {
-    /// The host portion MGS connects to. Sim binds loopback; an emulator binds a
-    /// real `host` (same for every SP today).
+    /// The host portion MGS connects to. In-zone backends (sim + emu) bind
+    /// loopback; a remote emulator binds an explicit `host`.
     fn mgs_host(&self) -> &str {
         match self {
-            SpBackend::Sim => "[::1]",
+            SpBackend::Sim | SpBackend::Emu => "[::1]",
             SpBackend::Central { host } => host,
         }
     }
@@ -91,6 +91,9 @@ pub struct Sp {
     pub fake_interface: String,
     /// MGS `[[switch.port]]` `ignition-target`.
     pub ignition_target: u8,
+    /// Which provider backs this SP (sp-sim / sp-emu / remote). Per-SP so a fleet
+    /// can mix emulated and simulated SPs.
+    pub backend: SpBackend,
 }
 
 impl Sp {
@@ -103,6 +106,25 @@ impl Sp {
             SpRole::Gimlet(i) => {
                 format!("{{ switch0 = [\"sled\", {i}], switch1 = [\"sled\", {i}] }}")
             }
+        }
+    }
+
+    /// Whether a `[sp].emu` selector names this SP: `"sidecar"`, or `"g{index}"`
+    /// (the global gimlet index).
+    pub fn matches_selector(&self, sel: &str) -> bool {
+        match self.role {
+            SpRole::Sidecar => sel == "sidecar",
+            SpRole::Gimlet(i) => {
+                sel.strip_prefix('g').and_then(|d| d.parse::<usize>().ok()) == Some(i)
+            }
+        }
+    }
+
+    /// This SP's `[sp].emu` selector form: `"sidecar"` or `"g{index}"`.
+    pub fn selector(&self) -> String {
+        match self.role {
+            SpRole::Sidecar => "sidecar".to_string(),
+            SpRole::Gimlet(i) => format!("g{i}"),
         }
     }
 }
@@ -151,6 +173,7 @@ impl SpFleet {
             mgs_host: backend.mgs_host().to_string(),
             fake_interface: "fake-switch0".to_string(),
             ignition_target: 1,
+            backend: backend.clone(),
         });
 
         // Gimlet SPs: one per sled. Port group base 33300 + 10*(i+1), keyed by the
@@ -170,6 +193,7 @@ impl SpFleet {
                 mgs_host: backend.mgs_host().to_string(),
                 fake_interface: format!("fake-sled{i}"),
                 ignition_target: ((pos + 2) % (n + 1)) as u8,
+                backend: backend.clone(),
             });
         }
 
@@ -185,6 +209,33 @@ impl SpFleet {
     /// one rack of a multi-rack deployment (see [`SpFleet::for_gimlets`]).
     pub fn sim_for_gimlets(gimlet_indices: &[usize]) -> Self {
         Self::for_gimlets(gimlet_indices, SpBackend::Sim)
+    }
+
+    /// A hybrid fleet for `gimlet_indices`: sp-sim by default, with the SPs named
+    /// in `emu` backed by `sp-emu` instead. Selectors are `"sidecar"` / `"g{index}"`
+    /// (e.g. `["sidecar", "g0"]`); unknown selectors are ignored. Both providers run
+    /// in-zone on loopback, so the MGS port surface is unchanged.
+    pub fn sim_with_emu(gimlet_indices: &[usize], emu: &[String]) -> Self {
+        let mut fleet = Self::for_gimlets(gimlet_indices, SpBackend::Sim);
+        for sp in &mut fleet.sps {
+            if emu.iter().any(|sel| sp.matches_selector(sel)) {
+                sp.backend = SpBackend::Emu;
+                sp.mgs_host = SpBackend::Emu.mgs_host().to_string();
+            }
+        }
+        fleet
+    }
+
+    /// Whether any SP is emulator-backed - drives MGS's RPC timeouts (the emulator
+    /// is slow; see [`crate::mgs`]) and the in-zone sp-emu process launch.
+    pub fn has_emu(&self) -> bool {
+        self.sps.iter().any(|sp| sp.backend == SpBackend::Emu)
+    }
+
+    /// The emulator-backed SPs in fleet order (sidecar first) - one in-zone sp-emu
+    /// process + flash file each.
+    pub fn emu_sps(&self) -> Vec<&Sp> {
+        self.sps.iter().filter(|sp| sp.backend == SpBackend::Emu).collect()
     }
 
     /// The sidecar SP (always present, first).
@@ -206,25 +257,31 @@ impl SpFleet {
         writeln!(o, "# SP simulator config - generated by voxel-config.").unwrap();
         writeln!(o, "#").unwrap();
 
-        // Sidecar SP: the switch.
+        // Sidecar SP: the switch. Emitted only when sp-sim backs it (an emulated
+        // sidecar is run by sp-emu, not sp-sim).
         let sidecar = self.sidecar();
-        writeln!(o, "\n[[simulated_sps.sidecar]]").unwrap();
-        writeln!(o, "serial_number = \"{}\"", sidecar.serial).unwrap();
-        writeln!(o, "manufacturing_root_cert_seed = \"{}\"", sidecar.root_cert_seed).unwrap();
-        writeln!(o, "device_id_cert_seed = \"{}\"", sidecar.device_id_seed).unwrap();
-        for inst in 0u16..2 {
-            writeln!(o, "\n[[simulated_sps.sidecar.network_config]]").unwrap();
-            writeln!(o, "[simulated_sps.sidecar.network_config.simulated]").unwrap();
-            writeln!(o, "bind_addr = \"[::]:{}\"", sidecar.base_port + inst).unwrap();
-        }
-        for inst in 0u16..2 {
-            writeln!(o, "\n[[simulated_sps.sidecar.ereport_network_config]]").unwrap();
-            writeln!(o, "[simulated_sps.sidecar.ereport_network_config.simulated]").unwrap();
-            writeln!(o, "bind_addr = \"[::1]:{}\"", sidecar.ereport_base + inst).unwrap();
+        if sidecar.backend == SpBackend::Sim {
+            writeln!(o, "\n[[simulated_sps.sidecar]]").unwrap();
+            writeln!(o, "serial_number = \"{}\"", sidecar.serial).unwrap();
+            writeln!(o, "manufacturing_root_cert_seed = \"{}\"", sidecar.root_cert_seed).unwrap();
+            writeln!(o, "device_id_cert_seed = \"{}\"", sidecar.device_id_seed).unwrap();
+            for inst in 0u16..2 {
+                writeln!(o, "\n[[simulated_sps.sidecar.network_config]]").unwrap();
+                writeln!(o, "[simulated_sps.sidecar.network_config.simulated]").unwrap();
+                writeln!(o, "bind_addr = \"[::]:{}\"", sidecar.base_port + inst).unwrap();
+            }
+            for inst in 0u16..2 {
+                writeln!(o, "\n[[simulated_sps.sidecar.ereport_network_config]]").unwrap();
+                writeln!(o, "[simulated_sps.sidecar.ereport_network_config.simulated]").unwrap();
+                writeln!(o, "bind_addr = \"[::1]:{}\"", sidecar.ereport_base + inst).unwrap();
+            }
         }
 
-        // Gimlet SPs: one per sled.
+        // Gimlet SPs: one per sled (sp-sim-backed only; emulated ones run on sp-emu).
         for sp in self.gimlets() {
+            if sp.backend != SpBackend::Sim {
+                continue;
+            }
             writeln!(o, "\n[[simulated_sps.gimlet]]").unwrap();
             if let Some(pn) = &sp.part_number {
                 writeln!(o, "part_number = \"{pn}\"").unwrap();
@@ -316,6 +373,34 @@ mod tests {
         let targets: Vec<u8> = g.iter().map(|s| s.ignition_target).collect();
         assert_eq!(targets, vec![2, 3, 0]);
         assert!(!targets.contains(&1));
+    }
+
+    #[test]
+    fn hybrid_emu_splits_providers() {
+        // sidecar + g0 on the emulator; g1..g3 stay on sp-sim.
+        let f = SpFleet::sim_with_emu(&[0, 1, 2, 3], &["sidecar".into(), "g0".into()]);
+        assert!(f.has_emu());
+        // emu set is sidecar + g0, in fleet order.
+        let emu: Vec<&str> = f.emu_sps().iter().map(|s| s.fake_interface.as_str()).collect();
+        assert_eq!(emu, vec!["fake-switch0", "fake-sled0"]);
+        // sp-sim config omits the emulated SPs: no sidecar block, gimlets g1..g3 only.
+        let v: toml::Value = toml::from_str(&f.sp_sim_config()).expect("valid TOML");
+        assert!(v["simulated_sps"].get("sidecar").is_none(), "emu sidecar not in sp-sim");
+        assert_eq!(v["simulated_sps"]["gimlet"].as_array().unwrap().len(), 3);
+        // Both providers are in-zone on loopback - MGS surface is unchanged.
+        assert_eq!(f.sidecar().mgs_host, "[::1]");
+        assert_eq!(f.gimlets()[0].mgs_host, "[::1]");
+    }
+
+    #[test]
+    fn all_sim_fleet_has_no_emu() {
+        let f = SpFleet::sim(4);
+        assert!(!f.has_emu());
+        assert!(f.emu_sps().is_empty());
+        // sp-sim still renders all 4 gimlets + sidecar (provider split is a no-op).
+        let v: toml::Value = toml::from_str(&f.sp_sim_config()).unwrap();
+        assert_eq!(v["simulated_sps"]["gimlet"].as_array().unwrap().len(), 4);
+        assert!(v["simulated_sps"].get("sidecar").is_some());
     }
 
     #[test]

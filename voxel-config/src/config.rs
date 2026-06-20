@@ -24,6 +24,7 @@ pub struct VoxelConfig {
     pub network: Network,
     pub recovery_silo: RecoverySiloCfg,
     pub falcon: Falcon,
+    pub sp: SpCfg,
 }
 
 impl Default for VoxelConfig {
@@ -34,6 +35,7 @@ impl Default for VoxelConfig {
             network: Network::default(),
             recovery_silo: RecoverySiloCfg::default(),
             falcon: Falcon::default(),
+            sp: SpCfg::default(),
         }
     }
 }
@@ -59,6 +61,41 @@ pub struct Falcon {
     /// the build script's `$HOME/voxel-builds` default. Lets a non-root user
     /// build images outside `/root`.
     pub build_root: Option<String>,
+}
+
+/// SP provider selection: which SPs (if any) run on the real-firmware emulator
+/// (`sp-emu`) instead of `sp-sim`. Empty (the default) = every SP on `sp-sim`,
+/// i.e. today's behavior. See [`crate::sp::SpFleet::sim_with_emu`].
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpCfg {
+    /// SPs to back with `sp-emu`. Selectors: `"sidecar"`, `"g{index}"` (global
+    /// gimlet index), e.g. `["sidecar", "g0"]`.
+    pub emu: Vec<String>,
+    /// Path to the `sp-emu` binary (illumos) staged into the switch zone.
+    /// Required when `emu` is non-empty.
+    pub emu_bin: Option<String>,
+    /// Hubris image (`.zip`) flashed for the **sidecar** SP (the `sidecar-c-emu`
+    /// build). Required when `"sidecar"` is in `emu`.
+    pub sidecar_image: Option<String>,
+    /// Hubris image (`.zip`) flashed for **gimlet** SPs (the `gimlet-c` build).
+    /// Required when any `"g{index}"` is in `emu`.
+    pub gimlet_image: Option<String>,
+    /// Path to the `faux-mgs` binary (the MGS-side client). Staged into the switch
+    /// zone at `--emu` launch so `voxel sp ls/state/exec` can talk to the live SPs
+    /// (the same client pilot uses). Optional; operator `sp` commands need it.
+    pub faux_mgs: Option<String>,
+}
+
+impl SpCfg {
+    /// The hubris image to flash for an SP selector (`"sidecar"` -> sidecar image,
+    /// else the gimlet image).
+    pub fn image_for(&self, selector: &str) -> Option<&str> {
+        match selector {
+            "sidecar" => self.sidecar_image.as_deref(),
+            _ => self.gimlet_image.as_deref(),
+        }
+    }
 }
 
 impl VoxelConfig {
@@ -773,6 +810,23 @@ mod tests {
         let s = cfg.sleds();
         assert!(s[1].scrimlet && s[2].scrimlet && !s[0].scrimlet && !s[3].scrimlet);
         assert_eq!(s.iter().filter(|x| x.rss).count(), 3);
+    }
+
+    #[test]
+    fn sp_section_parses_and_defaults_empty() {
+        // Default: no emu, no artifact paths (all-sim, zero-config).
+        let d = VoxelConfig::default();
+        assert!(d.sp.emu.is_empty());
+        assert!(d.sp.emu_bin.is_none() && d.sp.sidecar_image.is_none() && d.sp.gimlet_image.is_none());
+        // Populated [sp] parses, and image_for routes by selector.
+        let cfg = VoxelConfig::from_toml(
+            "[sp]\nemu = [\"sidecar\", \"g0\"]\nemu_bin = \"/x/sp-emu\"\nsidecar_image = \"/x/sc.zip\"\ngimlet_image = \"/x/g.zip\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sp.emu, vec!["sidecar".to_string(), "g0".to_string()]);
+        assert_eq!(cfg.sp.image_for("sidecar"), Some("/x/sc.zip"));
+        assert_eq!(cfg.sp.image_for("g0"), Some("/x/g.zip"));
+        assert_eq!(cfg.sp.emu_bin.as_deref(), Some("/x/sp-emu"));
     }
 
     #[test]

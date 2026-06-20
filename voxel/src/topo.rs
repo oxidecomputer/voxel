@@ -198,7 +198,7 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
 }
 
 /// Generate + stage per-node config into the cargo-bay before launch.
-pub(crate) fn stage_config(cfg: &VoxelConfig) -> anyhow::Result<()> {
+pub(crate) fn stage_config(cfg: &VoxelConfig, emu_sp: bool) -> anyhow::Result<()> {
     let sleds = cfg.sleds();
     // Per-sled sled-agent config (replaces a4x2's config/gN-config.toml). Each
     // scrimlet's SoftNPU links only its OWN rack's sleds (rear ports) + every
@@ -252,8 +252,13 @@ pub(crate) fn stage_config(cfg: &VoxelConfig) -> anyhow::Result<()> {
             rack_sleds.iter().filter(|s| s.scrimlet).map(|s| s.index).collect();
         // The SP fleet (sidecar + one SP per rack sled) is the shared MGS↔SP
         // contract; sim backend today, swappable to a real-firmware host.
-        let fleet = voxel_config::sp::SpFleet::sim_for_gimlets(&gimlet_indices);
-        let sp_sim = fleet.sp_sim_config();
+        // `--emu`: every SP is real-firmware on sp-emu (voxel-init disables sp-sim
+        // in-zone). Default: sp-sim for the whole fleet, no emu staging.
+        let fleet = if emu_sp {
+            voxel_config::sp::SpFleet::for_gimlets(&gimlet_indices, voxel_config::sp::SpBackend::Emu)
+        } else {
+            voxel_config::sp::SpFleet::sim_for_gimlets(&gimlet_indices)
+        };
         for (slot, s) in rack_sleds.iter().filter(|s| s.scrimlet).enumerate() {
             let dir = cargo_bay(&s.name);
             fs::create_dir_all(&dir)?;
@@ -261,7 +266,60 @@ pub(crate) fn stage_config(cfg: &VoxelConfig) -> anyhow::Result<()> {
                 dir.join(format!("mgs-config-switch{slot}.toml")),
                 voxel_config::mgs::switch_config(slot as u8, &fleet, &scrimlet_indices),
             )?;
-            fs::write(dir.join("sp-sim-config.toml"), &sp_sim)?;
+            // Stage sp-sim's config only in the default path; under --emu sp-sim is
+            // disabled, so don't stage one (and the enforcer leaves sp-sim alone).
+            if !emu_sp {
+                fs::write(dir.join("sp-sim-config.toml"), fleet.sp_sim_config())?;
+            }
+            stage_sp_emu(cfg, &fleet, &dir)?;
+        }
+    }
+    Ok(())
+}
+
+/// Stage the `sp-emu` binary + each emulated SP's flashed hubris image into a
+/// scrimlet's cargo-bay (`sp-emu/`), so `voxel-init` can run the real-firmware SPs
+/// in that switch zone. Each emu SP's image is flashed into `<base_port>.flash`
+/// (the filename carries the MGS port; voxel-init derives the board from it).
+/// No-op when no SP in the fleet is emulator-backed. Staged pre-launch, so it's
+/// present at boot (no 9p-visibility issue).
+fn stage_sp_emu(
+    cfg: &VoxelConfig,
+    fleet: &voxel_config::sp::SpFleet,
+    dir: &Path,
+) -> anyhow::Result<()> {
+    let emu = fleet.emu_sps();
+    if emu.is_empty() {
+        return Ok(());
+    }
+    let emu_bin = cfg.sp.emu_bin.as_deref().ok_or_else(|| {
+        anyhow!("[sp].emu is set but [sp].emu_bin (path to the sp-emu binary) is unset")
+    })?;
+    let out = dir.join("sp-emu");
+    fs::create_dir_all(&out)?;
+    fs::copy(emu_bin, out.join("sp-emu"))
+        .with_context(|| format!("stage sp-emu binary from {emu_bin}"))?;
+    // Stage `faux-mgs` (the MGS client) alongside it when configured, so
+    // `voxel sp ls/state/exec` can talk to the live SPs from inside the switch
+    // zone. Optional: the operator `sp` commands need it; launch itself doesn't.
+    if let Some(faux) = cfg.sp.faux_mgs.as_deref() {
+        fs::copy(faux, out.join("faux-mgs"))
+            .with_context(|| format!("stage faux-mgs from {faux}"))?;
+    }
+    for sp in emu {
+        let sel = sp.selector();
+        let image = cfg.sp.image_for(&sel).ok_or_else(|| {
+            let key = if sel == "sidecar" { "sidecar_image" } else { "gimlet_image" };
+            anyhow!("[sp].emu includes {sel} but [sp].{key} is unset")
+        })?;
+        let flash = out.join(format!("{}.flash", sp.base_port));
+        let status = std::process::Command::new(emu_bin)
+            .env("SP_EMU_FLASH", &flash)
+            .args(["flash", "a", image])
+            .status()
+            .with_context(|| format!("run {emu_bin} flash for {sel}"))?;
+        if !status.success() {
+            return Err(anyhow!("sp-emu flash failed for {sel} (image {image})"));
         }
     }
     Ok(())

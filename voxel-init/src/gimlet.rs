@@ -233,6 +233,13 @@ fn unplumb_softnpu_source() {
 const SWITCH_ZONE_MGS: &str = "/zone/oxz_switch/root/var/svc/manifest/site/mgs/config.toml";
 const SWITCH_ZONE_SP: &str = "/zone/oxz_switch/root/var/svc/manifest/site/sp-sim/config.toml";
 
+// sp-emu staging: `stage_config` drops the binary + a `<base_port>.flash` per
+// emulated SP into this scrimlet's cargo-bay; voxel-init copies them into the
+// switch zone and runs each as an SMF contract daemon.
+const SP_EMU_CARGO_DIR: &str = "/opt/cargo-bay/sp-emu";
+const SP_EMU_ZONE_DIR: &str = "/zone/oxz_switch/root/opt/oxide/sp-emu";
+const SP_EMU_MANIFEST: &str = "/zone/oxz_switch/root/var/svc/manifest/site/voxel-sp-emu.xml";
+
 /// Bake-once: the image bakes switch0 + sp-sim for a fixed gimlet count, but this
 /// launch may run a different count, and the 2nd scrimlet must present as switchN
 /// anyway. `stage_config` generates this scrimlet's slot MGS config + sp-sim
@@ -299,7 +306,11 @@ pub fn switch_enforcer(slot: u8) {
         }
         let mgs_ok = files_equal(SWITCH_ZONE_MGS, &mgs_staged);
         let sp_present = Path::new(SWITCH_ZONE_SP).exists();
-        let sp_ok = !sp_present || files_equal(SWITCH_ZONE_SP, &sp_staged);
+        // No staged sp-sim config (e.g. --emu, where setup_sp_emu disables sp-sim)
+        // -> nothing for the enforcer to reconcile.
+        let sp_ok = !Path::new(&sp_staged).exists()
+            || !sp_present
+            || files_equal(SWITCH_ZONE_SP, &sp_staged);
         if mgs_ok && sp_ok {
             note(format!("switch{slot} + sp-sim configs in place"));
             break;
@@ -319,10 +330,123 @@ pub fn switch_enforcer(slot: u8) {
         note(format!("forced switch{slot} / sp-sim configs"));
         std::thread::sleep(Duration::from_secs(1));
     }
+    // Stand up any staged emulated SPs as an SMF service in the switch zone (the
+    // zone is up by now). Idempotent + reboot-safe (startd owns them).
+    setup_sp_emu();
 }
 
 fn files_equal(a: &str, b: &str) -> bool {
     matches!((fs::read(a), fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Stand up the staged emulated SPs (`sp-emu`) as `svc:/oxide/voxel-sp-emu` in the
+/// switch zone, replacing sp-sim for their ports. `stage_config` flashed one
+/// `<base_port>.flash` per emu SP + staged the `sp-emu` binary into this
+/// scrimlet's cargo-bay; here we copy them into the zone and import a manifest
+/// with one contract-daemon instance per SP (startd supervises + restarts each,
+/// survives reboots). No-op when nothing's staged; idempotent once imported.
+fn setup_sp_emu() {
+    // Staged ports (filenames are `<base_port>.flash`).
+    let mut ports: Vec<u16> = match fs::read_dir(SP_EMU_CARGO_DIR) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".flash"))
+                    .and_then(|p| p.parse::<u16>().ok())
+            })
+            .collect(),
+        Err(_) => return, // no emu SPs staged on this scrimlet
+    };
+    if ports.is_empty() {
+        return;
+    }
+    ports.sort_unstable();
+    // Copy the binary + flash files into the zone (idempotent; safe to redo).
+    if let Err(e) = fs::create_dir_all(SP_EMU_ZONE_DIR) {
+        warn(format!("mkdir {SP_EMU_ZONE_DIR}: {e}"));
+        return;
+    }
+    let bin_to = format!("{SP_EMU_ZONE_DIR}/sp-emu");
+    if let Err(e) = fs::copy(format!("{SP_EMU_CARGO_DIR}/sp-emu"), &bin_to) {
+        warn(format!("copy sp-emu binary: {e}"));
+        return;
+    }
+    run("chmod", &["+x", &bin_to]);
+    for p in &ports {
+        if let Err(e) = fs::copy(
+            format!("{SP_EMU_CARGO_DIR}/{p}.flash"),
+            format!("{SP_EMU_ZONE_DIR}/{p}.flash"),
+        ) {
+            warn(format!("copy {p}.flash: {e}"));
+        }
+    }
+    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports)) {
+        warn(format!("write sp-emu manifest: {e}"));
+        return;
+    }
+    // Wait until oxz_switch is actually bootable (zlogin works) before any svc
+    // ops — early in bring-up the zone is still 'incomplete'.
+    let mut waited = 0;
+    while !run_quiet("zlogin", &["oxz_switch", "true"]) {
+        if waited >= 180 {
+            warn("sp-emu: oxz_switch never became ready; skipping");
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        waited += 2;
+    }
+    // Whole-fleet emu: every SP is emulated, so sp-sim isn't needed. Disable it
+    // (releasing the shared ports) before sp-emu binds them. Wait for sp-sim to be
+    // imported first, else the disable is a no-op and the baked sp-sim races us.
+    let mut waited = 0;
+    while !run_quiet("zlogin", &["oxz_switch", "svcs", "svc:/oxide/sp-sim:default"]) {
+        if waited >= 60 {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        waited += 2;
+    }
+    run("zlogin", &["oxz_switch", "svcadm", "disable", "-s", "svc:/oxide/sp-sim:default"]);
+    run("zlogin", &["oxz_switch", "svccfg", "import", "/var/svc/manifest/site/voxel-sp-emu.xml"]);
+    note(format!("sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled", ports.len()));
+}
+
+/// SMF manifest for `svc:/oxide/voxel-sp-emu`: one instance per emulated SP, each
+/// running the locked sp-emu launch line in the FOREGROUND (no `&`/nohup) so
+/// startd's contract owns it -> restart-on-crash + reboot-safety. Board/flash/
+/// bridge are passed via the method environment. Port 33300 is the sidecar; any
+/// other port is a gimlet.
+fn sp_emu_manifest(ports: &[u16]) -> String {
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\"?>\n");
+    s.push_str("<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n");
+    s.push_str("<service_bundle type=\"manifest\" name=\"voxel-sp-emu\">\n");
+    s.push_str("  <service name=\"oxide/voxel-sp-emu\" type=\"service\" version=\"1\">\n");
+    s.push_str("    <dependency name=\"multi_user\" grouping=\"require_all\" restart_on=\"none\" type=\"service\">\n");
+    s.push_str("      <service_fmri value=\"svc:/milestone/multi-user:default\"/>\n");
+    s.push_str("    </dependency>\n");
+    for &port in ports {
+        let board = if port == 33300 { "sidecar" } else { "gimlet" };
+        s.push_str(&format!("    <instance name=\"sp{port}\" enabled=\"true\">\n"));
+        s.push_str("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu gdb a 340000000\" timeout_seconds=\"0\">\n");
+        s.push_str("        <method_context>\n          <method_environment>\n");
+        s.push_str(&format!("            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"));
+        s.push_str(&format!("            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"));
+        s.push_str(&format!("            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"));
+        s.push_str("            <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n");
+        s.push_str("            <envvar name=\"SP_EMU_IDLE_MS\" value=\"20\"/>\n");
+        s.push_str("          </method_environment>\n        </method_context>\n");
+        s.push_str("      </exec_method>\n");
+        s.push_str("      <exec_method type=\"method\" name=\"stop\" exec=\":kill\" timeout_seconds=\"30\"/>\n");
+        s.push_str("      <property_group name=\"startd\" type=\"framework\">\n");
+        s.push_str("        <propval name=\"duration\" type=\"astring\" value=\"child\"/>\n");
+        s.push_str("      </property_group>\n");
+        s.push_str("    </instance>\n");
+    }
+    s.push_str("  </service>\n</service_bundle>\n");
+    s
 }
 
 /// SMF-service entry point - the baked `svc:/oxide/voxel-switch-enforcer`, run on

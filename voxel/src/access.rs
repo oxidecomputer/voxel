@@ -79,7 +79,10 @@ pub(crate) async fn cmd_host_login(cfg: &VoxelConfig, name: &str, sled: &str) ->
 /// switch `rackR/switchS` (R is 1-based, matching `tp ls` - the right form for a
 /// multi-rack deployment where each rack has its own switch0/switch1); or a bare
 /// **global** `switchN` (back-compat, the Nth scrimlet - fine for a single rack).
-fn resolve_switch<'a>(topo: &'a Topo, switch: &str) -> anyhow::Result<&'a (SledDesc, NodeRef)> {
+pub(crate) fn resolve_switch<'a>(
+    topo: &'a Topo,
+    switch: &str,
+) -> anyhow::Result<&'a (SledDesc, NodeRef)> {
     let scrimlets: Vec<&(SledDesc, NodeRef)> =
         topo.sleds.iter().filter(|(s, _)| s.scrimlet).collect();
 
