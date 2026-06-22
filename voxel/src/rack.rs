@@ -214,6 +214,38 @@ pub(crate) async fn cmd_launch(
             }
         }
     }
+
+    // --emu-rot: now that every rack has handed off (RSS done -> MGS `switch-id`
+    // is no longer on the critical path), attach the oxide-rot-1 RoT bridge to
+    // EVERY emulated SP (sidecar + all gimlets) in each scrimlet's switch zone.
+    // voxel-init staged rot.flash and brought every sp-emu instance up single-core;
+    // here we point each instance at it and restart so it runs the RoT as a second
+    // emulated core. Deferred to here (not boot) because a two-core sidecar can't
+    // answer `switch-id` in time during RSS and would wedge the handoff. Best
+    // effort: a failed attach leaves that SP on its canned RoT, so warn and carry on.
+    if emu_rot {
+        // `setenv -m start` writes the start method's environment (the same PG the
+        // manifest's <method_environment> populates), and the change only lands in
+        // the running snapshot after `svcadm refresh` - so refresh+restart EACH
+        // instance (a bare setenv/restart re-execs with the old, bridge-less env).
+        // zlogin re-joins its args through the zone shell (stripping any `sh -c`
+        // quoting), so the loop is passed directly, single-quoted, and the zone
+        // shell expands `$i` / `$(svcs ...)`. One restart per instance (not a
+        // whole-service bounce) so the SPs don't all drop at once.
+        let attach = "zlogin oxz_switch 'for i in $(svcs -H -o fmri svc:/oxide/voxel-sp-emu); do \
+             svccfg -s $i setenv -m start SP_EMU_ROT_FLASH /opt/oxide/sp-emu/rot.flash; \
+             svcadm refresh $i; svcadm restart $i; done'";
+        for rack in 0..racks {
+            for (s, n) in topo.sleds.iter().filter(|(s, _)| s.rack == rack && s.scrimlet) {
+                let label = rack_label(racks, rack, "rack");
+                info!(d.log, "{label}: attaching RoT bridge on all SPs in {}'s switch zone", s.name);
+                match d.exec(*n, attach).await {
+                    Ok(_) => info!(d.log, "{label}: RoT bridge attached on all SPs in {} (two-core)", s.name),
+                    Err(e) => warn!(d.log, "{label}: RoT bridge attach in {} failed: {e}", s.name),
+                }
+            }
+        }
+    }
     Ok(())
 }
 

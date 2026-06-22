@@ -232,16 +232,50 @@ async fn sp_ls(cfg: &VoxelConfig, name: &str, switch: &str) -> anyhow::Result<()
         "{:<8}  {:<5}  {:<8}  {:<12}  {:<6}  {}",
         "SP", "PORT", "TYPE", "SERIAL", "POWER", "ARCHIVE"
     );
+    // Probe every SP in ONE ssh: a single zlogin runs faux-mgs for each port
+    // in-zone, back to back. Doing 5 separate ssh+zlogin calls (sequential OR
+    // parallel) is the slow/variable path - zone login serializes, so concurrency
+    // just trades steady ~1.2s for frequent multi-second spikes. A warm SP answers
+    // each probe in ~20ms, so the whole table is one round trip (~0.3s). Outputs
+    // are split back out by the `@@SP <port>` markers, in `fleet.sps` order.
+    // One ssh+zlogin, but launch a faux-mgs per SP CONCURRENTLY in the zone (each
+    // to its own temp file), then wait and emit per-port. Probing the 5 SPs
+    // sequentially summed each probe's discovery to ~1.5s under box load; running
+    // them concurrently makes the table ~one probe deep (~0.4s). We pass the
+    // script directly to zlogin (NOT via `sh -c`, whose quoting zlogin strips),
+    // single-quoted so g0 hands it over as one arg; the zone shell parses it.
+    // faux-mgs's slog INFO goes to stderr - drop it so `field()` sees clean stdout.
+    let ports: Vec<u16> = fleet.sps.iter().map(|s| s.base_port).collect();
+    let plist: String = ports.iter().map(|p| format!(" {p}")).collect();
+    let probe = format!(
+        "for p in{plist}; do {FAUX_ZONE} --sp-sim-addr [::1]:$p --max-attempts 3 \
+         --per-attempt-timeout-millis 8000 state >/var/tmp/spls.$p 2>/dev/null & done; wait; \
+         for p in{plist}; do echo \"@@SP $p\"; cat /var/tmp/spls.$p; rm -f /var/tmp/spls.$p; done"
+    );
+    let combined =
+        ssh_capture(&ip, &format!("zlogin oxz_switch '{probe}'")).unwrap_or_default();
+    let outputs: Vec<String> = {
+        let mut v = vec![String::new(); ports.len()];
+        let mut idx: Option<usize> = None;
+        for line in combined.lines() {
+            if let Some(rest) = line.strip_prefix("@@SP ") {
+                idx = rest.trim().parse::<u16>().ok().and_then(|p| ports.iter().position(|&q| q == p));
+            } else if let Some(i) = idx {
+                v[i].push_str(line);
+                v[i].push('\n');
+            }
+        }
+        v
+    };
     let mut answered = false;
-    for sp in &fleet.sps {
+    for (sp, out) in fleet.sps.iter().zip(outputs) {
         let typ = match sp.role {
             SpRole::Sidecar => "sidecar",
             SpRole::Gimlet(_) => "gimlet",
         };
-        // Per-SP probe (3 tries: the emu's first-contact is ~2s cold). An SP that
-        // answered has a hubris archive / power even if its serial is blank (the
-        // emu gimlets carry no VPD serial yet) - key "answered" off that, not serial.
-        let out = faux_on(&ip, sp.base_port, &["state"], 3, 8000).unwrap_or_default();
+        // An SP that answered has a hubris archive / power even if its serial is
+        // blank (the emu gimlets carry no VPD serial yet) - key "answered" off
+        // that, not serial.
         let archive = field(&out, "hubris archive:");
         let power = field(&out, "power state:");
         let responded = !archive.is_empty() || !power.is_empty();

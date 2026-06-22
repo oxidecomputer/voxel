@@ -382,17 +382,20 @@ fn setup_sp_emu() {
             warn(format!("copy {p}.flash: {e}"));
         }
     }
-    // Copy the RoT image too, if staged: the sidecar SP runs it as a second
-    // emulated core (the sprot bridge) for a real Root of Trust. Its presence
-    // gates the SP_EMU_ROT_FLASH env on the sidecar instance below.
+    // Copy the RoT image too, if staged (--emu-rot): the sidecar SP can run it
+    // as a second emulated core (the sprot bridge) for a real Root of Trust. We
+    // stage it ready-to-go but DON'T wire it into the manifest here - the
+    // two-core sidecar can't answer MGS `switch-id` in time during RSS and would
+    // wedge the nexus handoff. The host (`cmd_launch`) attaches the bridge
+    // post-handoff, off the critical path, by setenv'ing SP_EMU_ROT_FLASH on the
+    // sp33300 instance + restarting it.
     let rot_src = format!("{SP_EMU_CARGO_DIR}/rot.flash");
-    let has_rot = std::path::Path::new(&rot_src).exists();
-    if has_rot {
+    if std::path::Path::new(&rot_src).exists() {
         if let Err(e) = fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash")) {
             warn(format!("copy rot.flash: {e}"));
         }
     }
-    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports, has_rot)) {
+    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports)) {
         warn(format!("write sp-emu manifest: {e}"));
         return;
     }
@@ -427,8 +430,11 @@ fn setup_sp_emu() {
 /// running the locked sp-emu launch line in the FOREGROUND (no `&`/nohup) so
 /// startd's contract owns it -> restart-on-crash + reboot-safety. Board/flash/
 /// bridge are passed via the method environment. Port 33300 is the sidecar; any
-/// other port is a gimlet.
-fn sp_emu_manifest(ports: &[u16], has_rot: bool) -> String {
+/// other port is a gimlet. The RoT bridge (SP_EMU_ROT_FLASH) is deliberately NOT
+/// set here: the sidecar must come up single-core for RSS (the two-core bridge
+/// starves MGS `switch-id` and wedges the handoff). The host attaches it
+/// post-handoff via `svccfg setenv` + restart - see `cmd_launch`.
+fn sp_emu_manifest(ports: &[u16]) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\"?>\n");
     s.push_str("<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n");
@@ -445,13 +451,10 @@ fn sp_emu_manifest(ports: &[u16], has_rot: bool) -> String {
         s.push_str(&format!("            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"));
         s.push_str(&format!("            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"));
         s.push_str(&format!("            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"));
-        // The sidecar SP runs the real RoT (oxide-rot-1) as a second emulated core
-        // over the sprot bridge when a rot.flash was staged. Gimlet SPs keep their
-        // canned-RoT firmware (no bridge), so only one instance pays the two-core
-        // cost — keeping bring-up light.
-        if has_rot && port == 33300 {
-            s.push_str("            <envvar name=\"SP_EMU_ROT_FLASH\" value=\"/opt/oxide/sp-emu/rot.flash\"/>\n");
-        }
+        // NOTE: SP_EMU_ROT_FLASH (the oxide-rot-1 RoT bridge) is intentionally
+        // omitted - every SP boots single-core so the sidecar can answer MGS
+        // `switch-id` during RSS. `cmd_launch` attaches the bridge to sp33300
+        // post-handoff (svccfg setenv + restart), keeping it off the critical path.
         s.push_str("            <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n");
         s.push_str("            <envvar name=\"SP_EMU_IDLE_MS\" value=\"20\"/>\n");
         s.push_str("          </method_environment>\n        </method_context>\n");
