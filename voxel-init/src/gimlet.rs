@@ -239,6 +239,10 @@ const SWITCH_ZONE_SP: &str = "/zone/oxz_switch/root/var/svc/manifest/site/sp-sim
 const SP_EMU_CARGO_DIR: &str = "/opt/cargo-bay/sp-emu";
 const SP_EMU_ZONE_DIR: &str = "/zone/oxz_switch/root/opt/oxide/sp-emu";
 const SP_EMU_MANIFEST: &str = "/zone/oxz_switch/root/var/svc/manifest/site/voxel-sp-emu.xml";
+// Each SP gets its OWN rot-serve (one RoT per SP — not shared). The rot-serve for
+// SP base-port `P` listens on the zone-local port `P - SP_EMU_ROT_PORT_OFFSET`
+// (e.g. 33300 -> 19300), clear of the SP base-port + ereport ranges.
+const SP_EMU_ROT_PORT_OFFSET: u16 = 14000;
 
 /// Bake-once: the image bakes switch0 + sp-sim for a fixed gimlet count, but this
 /// launch may run a different count, and the 2nd scrimlet must present as switchN
@@ -382,20 +386,21 @@ fn setup_sp_emu() {
             warn(format!("copy {p}.flash: {e}"));
         }
     }
-    // Copy the RoT image too, if staged (--emu-rot): the sidecar SP can run it
-    // as a second emulated core (the sprot bridge) for a real Root of Trust. We
-    // stage it ready-to-go but DON'T wire it into the manifest here - the
-    // two-core sidecar can't answer MGS `switch-id` in time during RSS and would
-    // wedge the nexus handoff. The host (`cmd_launch`) attaches the bridge
-    // post-handoff, off the critical path, by setenv'ing SP_EMU_ROT_FLASH on the
-    // sp33300 instance + restarting it.
+    // Copy the RoT image too, if staged (--emu-rot). Each SP gets its OWN
+    // out-of-process RoT: `sp_emu_manifest` emits one `voxel-rot-emu` rot-serve
+    // instance per SP (its own oxide-rot-1 on a dedicated zone-local port) and
+    // points each SP at it via SP_EMU_ROT_SERVICE. One sled/sidecar -> one SP ->
+    // one RoT (not shared, not in-process, not deferred). SPs stay single-core
+    // (RoT out-of-process), so they answer MGS `switch-id` during RSS and the RoT
+    // is live from boot -> MGS/Nexus pin the real RoT at rack-init.
     let rot_src = format!("{SP_EMU_CARGO_DIR}/rot.flash");
-    if std::path::Path::new(&rot_src).exists() {
+    let rot_enabled = std::path::Path::new(&rot_src).exists();
+    if rot_enabled {
         if let Err(e) = fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash")) {
             warn(format!("copy rot.flash: {e}"));
         }
     }
-    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports)) {
+    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports, rot_enabled)) {
         warn(format!("write sp-emu manifest: {e}"));
         return;
     }
@@ -426,23 +431,53 @@ fn setup_sp_emu() {
     note(format!("sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled", ports.len()));
 }
 
-/// SMF manifest for `svc:/oxide/voxel-sp-emu`: one instance per emulated SP, each
-/// running the locked sp-emu launch line in the FOREGROUND (no `&`/nohup) so
-/// startd's contract owns it -> restart-on-crash + reboot-safety. Board/flash/
-/// bridge are passed via the method environment. Port 33300 is the sidecar; any
-/// other port is a gimlet. The RoT bridge (SP_EMU_ROT_FLASH) is deliberately NOT
-/// set here: the sidecar must come up single-core for RSS (the two-core bridge
-/// starves MGS `switch-id` and wedges the handoff). The host attaches it
-/// post-handoff via `svccfg setenv` + restart - see `cmd_launch`.
-fn sp_emu_manifest(ports: &[u16]) -> String {
+/// SMF manifest for the emulated SP fleet, each instance running the locked
+/// sp-emu launch line in the FOREGROUND (no `&`/nohup) so startd's contract owns
+/// it -> restart-on-crash + reboot-safety. Board/flash/bridge are passed via the
+/// method environment. Port 33300 is the sidecar; any other port is a gimlet.
+///
+/// When `rot` is set (--emu-rot), the bundle also emits a `svc:/oxide/voxel-rot-emu`
+/// service with ONE rot-serve instance PER SP — each running its own oxide-rot-1
+/// on a dedicated zone-local port — and points each SP at ITS OWN RoT via
+/// SP_EMU_ROT_SERVICE (with a require_all dep so the RoTs start + prewarm first).
+/// One sled/sidecar -> one SP -> one RoT: separate process, own state — not
+/// shared, not in-process, not deferred. Each RoT runs out-of-process, so its SP
+/// stays single-core and answers MGS `switch-id` during RSS -> RoT live from boot,
+/// MGS/Nexus pin the real RoT at rack-init. When `rot` is false the SPs run with
+/// their canned RoT, as before.
+fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\"?>\n");
     s.push_str("<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n");
     s.push_str("<service_bundle type=\"manifest\" name=\"voxel-sp-emu\">\n");
+    // Per-SP RoT services: one oxide-rot-1 per SP, each on its own zone-local port.
+    if rot {
+        s.push_str("  <service name=\"oxide/voxel-rot-emu\" type=\"service\" version=\"1\">\n");
+        s.push_str("    <dependency name=\"multi_user\" grouping=\"require_all\" restart_on=\"none\" type=\"service\">\n");
+        s.push_str("      <service_fmri value=\"svc:/milestone/multi-user:default\"/>\n");
+        s.push_str("    </dependency>\n");
+        for &port in ports {
+            let rport = port - SP_EMU_ROT_PORT_OFFSET;
+            s.push_str(&format!("    <instance name=\"rot{port}\" enabled=\"true\">\n"));
+            s.push_str(&format!("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu rot-serve [::1]:{rport} /opt/oxide/sp-emu/rot.flash\" timeout_seconds=\"0\"/>\n"));
+            s.push_str("      <exec_method type=\"method\" name=\"stop\" exec=\":kill\" timeout_seconds=\"30\"/>\n");
+            s.push_str("      <property_group name=\"startd\" type=\"framework\">\n");
+            s.push_str("        <propval name=\"duration\" type=\"astring\" value=\"child\"/>\n");
+            s.push_str("      </property_group>\n");
+            s.push_str("    </instance>\n");
+        }
+        s.push_str("  </service>\n");
+    }
     s.push_str("  <service name=\"oxide/voxel-sp-emu\" type=\"service\" version=\"1\">\n");
     s.push_str("    <dependency name=\"multi_user\" grouping=\"require_all\" restart_on=\"none\" type=\"service\">\n");
     s.push_str("      <service_fmri value=\"svc:/milestone/multi-user:default\"/>\n");
     s.push_str("    </dependency>\n");
+    if rot {
+        // require_all on the whole RoT service: every per-SP rot-serve must be up.
+        s.push_str("    <dependency name=\"rot\" grouping=\"require_all\" restart_on=\"none\" type=\"service\">\n");
+        s.push_str("      <service_fmri value=\"svc:/oxide/voxel-rot-emu\"/>\n");
+        s.push_str("    </dependency>\n");
+    }
     for &port in ports {
         let board = if port == 33300 { "sidecar" } else { "gimlet" };
         s.push_str(&format!("    <instance name=\"sp{port}\" enabled=\"true\">\n"));
@@ -451,10 +486,12 @@ fn sp_emu_manifest(ports: &[u16]) -> String {
         s.push_str(&format!("            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"));
         s.push_str(&format!("            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"));
         s.push_str(&format!("            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"));
-        // NOTE: SP_EMU_ROT_FLASH (the oxide-rot-1 RoT bridge) is intentionally
-        // omitted - every SP boots single-core so the sidecar can answer MGS
-        // `switch-id` during RSS. `cmd_launch` attaches the bridge to sp33300
-        // post-handoff (svccfg setenv + restart), keeping it off the critical path.
+        // Point the SP at ITS OWN rot-serve (one RoT per SP): single-core SP +
+        // out-of-process RoT, live from boot through RSS - no two-core wedge.
+        if rot {
+            let rport = port - SP_EMU_ROT_PORT_OFFSET;
+            s.push_str(&format!("            <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"));
+        }
         s.push_str("            <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n");
         s.push_str("            <envvar name=\"SP_EMU_IDLE_MS\" value=\"20\"/>\n");
         s.push_str("          </method_environment>\n        </method_context>\n");
