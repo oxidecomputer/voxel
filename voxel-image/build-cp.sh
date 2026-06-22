@@ -65,6 +65,21 @@ git -C "${OMICRON_SRC}" fetch --all --tags -q || true
 git -C "${OMICRON_SRC}" checkout -q "${COMMIT}"
 cd "${OMICRON_SRC}"
 
+# --- 1b. voxel patch: report a Gimlet baseboard (de-a4x2 wicket fix) -----------
+# sled-hardware's parse_smbios_output returns a *Pc* baseboard for the a4x2/voxel
+# i86pc sleds, but wicketd's RACK SETUP correlates each sled's bootstrap address by
+# matching the SP's *Gimlet* baseboard (serial/model/revision from MGS). A Pc can
+# never equal a Gimlet, so every sled shows "bootstrap address UNKNOWN". Patch it
+# to return a Gimlet (revision 2, matching the emulated SP VPD `0XV2:...:002:`) so
+# the two baseboards correlate. `populate_smbios` (voxel topo.rs) bakes manufacturer
+# `a4x2` + serial `BRM4422000{i}` so this path is taken and the strings match the
+# SP. The checkout above resets the tree each build, so this re-applies every time.
+log "patching sled-hardware parse_smbios_output: Pc -> Gimlet baseboard"
+perl -pi -e 's/Some\(Baseboard::new_pc\(serial_number, product\)\)/Some(Baseboard::new_gimlet(serial_number, product, 2))/' \
+    sled-hardware/src/illumos/mod.rs
+grep -q 'new_gimlet(serial_number, product, 2)' sled-hardware/src/illumos/mod.rs \
+    || { log "FATAL: smbios baseboard patch did not apply"; exit 1; }
+
 # --- 2. prerequisites + softnpu machinery -------------------------------------
 log "install_builder_prerequisites.sh -y"
 ./tools/install_builder_prerequisites.sh -y

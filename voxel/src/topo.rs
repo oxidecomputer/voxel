@@ -44,15 +44,24 @@ fn ext_interface(d: &mut Runner, n: NodeRef) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SMBIOS type-1 for sled `index` - serial `2{index:07}`, model 913-0000019.
+/// SMBIOS type-1 for sled `index`. Manufacturer is `a4x2` — the ONLY string
+/// omicron's `sled-hardware` recognises to read identity from SMBIOS instead of
+/// falling back to the hostname. Serial `BRM4422000{index+1}` and revision `2`
+/// BYTE-MATCH the emulated SP's VPD (sp-emu builds `BRM4422000{(port-33300)/10}`,
+/// i.e. `index+1`, barcode rev `002`) and model `913-0000019`. Paired with the
+/// omicron `parse_smbios_output` Pc->Gimlet patch (applied in build-cp.sh),
+/// sled-agent then reports the SAME `Gimlet` baseboard the SP reports via MGS, so
+/// wicketd's RACK SETUP correlates each sled's bootstrap address instead of
+/// showing UNKNOWN. (Without the patch sled-agent returns a `Pc` baseboard, which
+/// can never equal the SP's `Gimlet` in wicketd's lookup.)
 fn populate_smbios(d: &mut Runner, x: NodeRef, index: usize) {
     d.set_smbios_type1(
         x,
         SmbiosType1Input {
-            manufacturer: "voxel".to_string(),
+            manufacturer: "a4x2".to_string(),
             product_name: "913-0000019".to_string(),
-            serial_number: format!("2{index:07}"),
-            version: 0,
+            serial_number: format!("BRM4422000{}", index + 1),
+            version: 2,
         },
     );
 }
