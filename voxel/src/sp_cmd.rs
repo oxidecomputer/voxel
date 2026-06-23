@@ -17,7 +17,7 @@ use voxel_config::sp::{Sp, SpBackend, SpFleet, SpRole};
 use voxel_config::VoxelConfig;
 
 use crate::access::resolve_switch;
-use crate::net::{node_external_ip, scp_to, ssh_capture};
+use crate::net::{node_external_ip, scp_to, ssh_capture, ssh_output};
 use crate::topo::{build_topo, Topo};
 use crate::SpCmd;
 
@@ -152,15 +152,23 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
 
 /// Run a faux-mgs command against one SP (by port) inside the switch zone over
 /// ssh, returning its combined output. The emulator can drop the first request
-/// under load, so retry (callers pick how hard).
+/// under load, so retry (callers pick how hard). Uses [`ssh_output`] (not
+/// `ssh_capture`) so a non-zero faux-mgs exit returns the SP's OWN error text
+/// (e.g. "the image caboose does not contain 'GITC'", "code: Unconfigured") - a
+/// bad arg or an empty slot is the SP answering, not the rack being down. Only a
+/// genuine ssh transport failure (None) maps to "is the switch zone reachable".
 fn faux_on(ip: &str, port: u16, args: &[&str], attempts: u32, timeout_ms: u32) -> anyhow::Result<String> {
     let remote = format!(
         "zlogin oxz_switch {FAUX_ZONE} --sp-sim-addr [::1]:{port} \
          --max-attempts {attempts} --per-attempt-timeout-millis {timeout_ms} {} 2>&1",
         args.join(" ")
     );
-    ssh_capture(ip, &remote)
-        .ok_or_else(|| anyhow!("faux-mgs over ssh failed (SP port {port}) - is the rack up?"))
+    ssh_output(ip, &remote)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!(
+            "couldn't reach faux-mgs in the switch zone (SP port {port}) - is the switch zone \
+             reachable? (`voxel status`)"
+        ))
 }
 
 /// The scrimlet host-LAN IP whose switch zone we drive faux-mgs in. Cached per

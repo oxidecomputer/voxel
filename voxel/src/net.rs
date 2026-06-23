@@ -53,6 +53,31 @@ pub(crate) const EPHEMERAL_HOST_OPTS: &[&str] = &[
 ];
 
 pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
+    let out = ssh_exec(ip, remote)?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Like [`ssh_capture`], but returns the remote command's combined output even
+/// when it exits non-zero - for callers (e.g. `sp exec`) that want the remote
+/// tool's OWN error text (faux-mgs prints `Error: ...`, which the caller folds
+/// into stdout via `2>&1`) instead of a generic "is the rack up?". Returns None
+/// only when ssh itself couldn't run or couldn't connect/authenticate (exit 255),
+/// i.e. the node really is unreachable - a non-255 exit means the command ran and
+/// its output (success or error) is meaningful.
+pub(crate) fn ssh_output(ip: &str, remote: &str) -> Option<String> {
+    let out = ssh_exec(ip, remote)?;
+    if out.status.code() == Some(255) {
+        return None; // ssh transport failure (connect/auth), not a remote error
+    }
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    Some(s)
+}
+
+/// Run a non-interactive ssh command (empty root password via a forced
+/// SSH_ASKPASS) and return its raw [`Output`]. Shared by [`ssh_capture`] (gates
+/// on exit status) and [`ssh_output`] (keeps output regardless of status).
+fn ssh_exec(ip: &str, remote: &str) -> Option<std::process::Output> {
     // ssh needs a non-interactive way to supply the (empty) password: point
     // SSH_ASKPASS at a script that prints an empty line, and force its use.
     let askpass = std::env::temp_dir().join("voxel-empty-askpass.sh");
@@ -64,7 +89,7 @@ pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
             std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o755)).ok()?;
         }
     }
-    let out = std::process::Command::new("ssh")
+    std::process::Command::new("ssh")
         .env("SSH_ASKPASS", &askpass)
         .env("SSH_ASKPASS_REQUIRE", "force")
         .stdin(std::process::Stdio::null())
@@ -80,8 +105,7 @@ pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
         .arg(format!("root@{ip}"))
         .arg(remote)
         .output()
-        .ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .ok()
 }
 
 /// `scp <local> root@<ip>:<remote>` non-interactively (empty root password, same
