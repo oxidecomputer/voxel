@@ -3046,7 +3046,6 @@ dependencies = [
 [[package]]
 name = "sprockets-tls-test-utils"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/sprockets.git?rev=d2b68e4f47e3c22bce0455aeb4cfb2e61ad229ba#d2b68e4f47e3c22bce0455aeb4cfb2e61ad229ba"
 dependencies = [
  "camino",
  "pki-playground",

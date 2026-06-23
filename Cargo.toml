@@ -10,7 +10,7 @@ members = [
 
 # rss-gen depends on omicron's own config types via a path to the IMAGE's omicron
 # source (box-specific, per-publish). Not built as part of this workspace.
-exclude = ["voxel/rss-gen"]
+exclude = ["voxel/rss-gen", "vendor/sprockets-tls-test-utils"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"
@@ -29,3 +29,8 @@ toml_edit = "0.25"
 # sprockets/trust quorum related deps
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "06f05ee0fb26ed63f33dde79a7e0e7e766fd124c" }
 sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "d2b68e4f47e3c22bce0455aeb4cfb2e61ad229ba" }
+
+# Use the vendored test-utils (BRM-serial platform-id) instead of the upstream
+# git crate, so sprockets/trust-quorum identities match the SP/SMBIOS baseboard.
+[patch."https://github.com/oxidecomputer/sprockets.git"]
+sprockets-tls-test-utils = { path = "vendor/sprockets-tls-test-utils" }
