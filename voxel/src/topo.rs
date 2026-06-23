@@ -263,6 +263,15 @@ pub(crate) fn stage_config(
         fs::write(dir.join("frr.conf"), router.render())?;
     }
 
+    // Static customer-edge address (if configured): voxel-init's router bring-up
+    // adds it as a SECONDARY IP on ce's uplink, giving the host route a stable
+    // nexthop. Staged only into ce's cargo-bay, so only ce picks it up.
+    if let Some(ip) = &cfg.topology.ce_external_ip {
+        let dir = cargo_bay("ce");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("ce-external-ip"), ip)?;
+    }
+
     // Bake-once, PER RACK: the image bakes switch0 + sp-sim for a FIXED gimlet
     // count, but a launch can run any count - and each rack has its OWN
     // switch0/switch1 pair, so the switch slot is rack-LOCAL (0 or 1). For each

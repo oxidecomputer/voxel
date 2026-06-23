@@ -125,6 +125,11 @@ impl VoxelConfig {
         let mut c = self.clone();
         c.topology.scrimlets = self.topology.scrimlet_names();
         c.topology.rss_sleds = self.topology.rss_count();
+        // Drop host-only fields the separately-built (commit-pinned) voxel-rss-gen
+        // doesn't know about - its voxel-config has `deny_unknown_fields`, so a key
+        // it predates would fail to parse. `ce_external_ip` is purely a voxel host
+        // routing detail, irrelevant to RSS config generation.
+        c.topology.ce_external_ip = None;
         c.to_toml()
     }
 
@@ -165,6 +170,15 @@ pub struct Topology {
     pub sled_memory_gb: u64,
     /// Per-router guest RAM, GiB (default 4).
     pub router_memory_gb: u64,
+    /// Static host-LAN address for the shared customer edge (`ce`), e.g.
+    /// `"192.168.68.170"`. Unset (`None`) -> `ce` DHCPs as before and voxel reads
+    /// the (volatile) lease over the serial console for the host route. Set it to
+    /// a fixed, free LAN address and voxel-init adds it as a SECONDARY address on
+    /// `ce`'s uplink (DHCP still provides egress/default) so the host route to each
+    /// rack's customer prefix has a STABLE nexthop that never churns across
+    /// launches - no serial lookup, no stale-route accumulation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ce_external_ip: Option<String>,
 }
 
 impl Default for Topology {
@@ -177,6 +191,7 @@ impl Default for Topology {
             routers: vec!["ce".into(), "cr1".into(), "cr2".into()],
             sled_memory_gb: 8,
             router_memory_gb: 4,
+            ce_external_ip: None,
         }
     }
 }

@@ -29,7 +29,8 @@ pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> a
     let racks = cfg.topology.racks();
     for rack in 0..racks {
         let prefix = cfg.network.for_rack(rack, racks).infra_prefix;
-        set_external_route(&topo.runner, ce, &prefix, !dry_run).await?;
+        set_external_route(&topo.runner, ce, &prefix, !dry_run, cfg.topology.ce_external_ip.as_deref())
+            .await?;
     }
     Ok(())
 }
@@ -236,7 +237,7 @@ pub(crate) async fn cmd_launch(
         for rack in 0..racks {
             let net = cfg.network.for_rack(rack, racks);
             let label = rack_label(racks, rack, "rack");
-            if let Err(e) = set_external_route(d, ce, &net.infra_prefix, !no_route).await {
+            if let Err(e) = set_external_route(d, ce, &net.infra_prefix, !no_route, cfg.topology.ce_external_ip.as_deref()).await {
                 warn!(d.log, "{label} external route: {e}");
                 continue;
             }

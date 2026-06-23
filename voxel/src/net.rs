@@ -198,24 +198,55 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
 /// it here keeps the external services reachable without a manual hunt. The
 /// route is keyed by `prefix`, so racks with distinct external prefixes don't
 /// collide. With `apply == false` it just prints the command.
+/// The gateways currently routing `dest` (an IPv4 network address like
+/// `198.51.100.0`), read from `netstat -rn -f inet`. Used to purge every stale
+/// route for a prefix - dead-ce gateways from prior launches pile up otherwise.
+fn route_gateways(dest: &str) -> Vec<String> {
+    let out = match std::process::Command::new("netstat").args(["-rn", "-f", "inet"]).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return Vec::new(),
+    };
+    out.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let d = it.next()?;
+            let gw = it.next()?;
+            (d == dest).then(|| gw.to_string())
+        })
+        .collect()
+}
+
 pub(crate) async fn set_external_route(
     d: &Runner,
     ce: NodeRef,
     prefix: &str,
     apply: bool,
+    static_ip: Option<&str>,
 ) -> anyhow::Result<()> {
-    let ip = node_external_ip(d, ce, true).await.map_err(|e| anyhow!("ce: {e}"))?;
+    // A configured static ce address (`[topology].ce_external_ip`) is a stable
+    // nexthop: use it directly and skip the slow, volatile serial-console lease
+    // lookup. Otherwise read ce's DHCP lease as before.
+    let ip = match static_ip {
+        Some(s) => s.to_string(),
+        None => node_external_ip(d, ce, true).await.map_err(|e| anyhow!("ce: {e}"))?,
+    };
 
     if !apply {
         info!(d.log, "external route (dry-run): route add {} {}", prefix, ip);
         return Ok(());
     }
     // Drop ALL stale routes for this prefix, then point it at the live ce.
-    // `route delete` removes one route at a time, and dead-ce gateways from prior
-    // launches accumulate - so loop until the prefix is gone from the table
-    // ("not in table"), bounded so a quirk can't spin forever. illumos `route`'s
-    // exit code is unreliable (non-zero even on a successful add), so we key off
-    // the printed output and confirm the final state by re-reading the table.
+    // Dead-ce gateways from prior launches accumulate, and a bare
+    // `route delete <prefix>` doesn't reliably clear multiple same-prefix routes -
+    // so first enumerate the live gateways for this prefix from the routing table
+    // and delete each explicitly, then a few unqualified deletes to catch any
+    // remainder. illumos `route`'s exit code is unreliable (non-zero even on a
+    // successful add), so we key off printed output and re-read the table to
+    // confirm the final state.
+    let dest = prefix.split('/').next().unwrap_or(prefix);
+    for gw in route_gateways(dest) {
+        let _ = std::process::Command::new("route").args(["delete", prefix, &gw]).output();
+    }
     for _ in 0..8 {
         let out = std::process::Command::new("route").args(["delete", prefix]).output();
         let gone = match out {

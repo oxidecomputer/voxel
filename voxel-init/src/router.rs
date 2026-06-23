@@ -23,10 +23,47 @@ pub fn bring_up() -> Result<()> {
     sysctl("net.ipv4.conf.default.rp_filter", "0");
 
     nat_rack_egress();
+    apply_static_edge_ip();
     apply_frr()?;
 
     note("router bring-up complete");
     Ok(())
+}
+
+/// If a static customer-edge address is staged (voxel `[topology].ce_external_ip`,
+/// written only into ce's cargo-bay), add it as a SECONDARY address on the uplink.
+/// DHCP keeps the primary address + default route (egress/NTP), so this is purely
+/// an extra fixed address that gives the host route to the rack a STABLE nexthop -
+/// no churn across launches, nothing to chase over the serial console. No-op on
+/// the cr* routers (only ce's cargo-bay carries the file). The prefix is taken
+/// from the uplink's current DHCP address so the secondary lands on the same LAN.
+fn apply_static_edge_ip() {
+    let ip = match fs::read_to_string("/opt/cargo-bay/ce-external-ip") {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return, // not configured / not the ce node
+    };
+    if ip.is_empty() {
+        return;
+    }
+    let Some(ifc) = uplink_iface() else {
+        warn("static edge IP: no uplink found");
+        return;
+    };
+    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
+    if cur.split_whitespace().any(|t| t == ip || t.starts_with(&format!("{ip}/"))) {
+        note(format!("static edge IP {ip} already on {ifc}"));
+        return;
+    }
+    // Prefix length from the uplink's DHCP address (token after "inet"), default /22.
+    let prefix = cur
+        .split_whitespace()
+        .skip_while(|t| *t != "inet")
+        .nth(1)
+        .and_then(|cidr| cidr.split('/').nth(1))
+        .unwrap_or("22");
+    let cidr = format!("{ip}/{prefix}");
+    run("ip", &["addr", "add", &cidr, "dev", &ifc]);
+    note(format!("static edge IP {cidr} added on {ifc}"));
 }
 
 fn sysctl(key: &str, val: &str) {
