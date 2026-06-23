@@ -27,6 +27,7 @@ mod rack;
 mod rss;
 mod sp_cmd;
 mod topo;
+mod wicket_setup;
 
 #[derive(Parser)]
 #[command(
@@ -86,6 +87,23 @@ enum Cmd {
         /// emulated cores - keep OFF during initial bring-up (wedges handoff).
         #[arg(long = "emu-rot")]
         emu_rot: bool,
+        /// Drive rack setup THROUGH wicketd (the real operator flow) instead of
+        /// the file-based sled-agent auto-init: suppresses the staged config-rss
+        /// so sled-agent waits, then uploads the config + a self-signed cert +
+        /// the recovery password to wicketd and POSTs to start RSS. Fully
+        /// populates wicket's RACK SETUP page. (Uses the progress path.)
+        #[arg(long = "wicket-setup")]
+        wicket_setup: bool,
+    },
+    /// (debug) Print the wicketd RSS config body that `--wicket-setup` would PUT,
+    /// reshaped from a generated config-rss.toml (validates the mapping offline).
+    #[command(hide = true)]
+    WicketDryrun {
+        /// Path to a generated config-rss.toml.
+        config_rss: PathBuf,
+        /// Per-rack sled count (the bootstrap slot set).
+        #[arg(default_value_t = 4)]
+        sleds: usize,
     },
     /// (Re)point the host route for the rack's external net at ce's current IP.
     Route {
@@ -399,10 +417,11 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route, emu_sp, emu_rot } => {
-            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route, *emu_sp || *emu_rot, *emu_rot)
+        Cmd::Launch { no_progress, no_route, emu_sp, emu_rot, wicket_setup } => {
+            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route, *emu_sp || *emu_rot, *emu_rot, *wicket_setup)
                 .await
         }
+        Cmd::WicketDryrun { config_rss, sleds } => wicket_setup::dryrun(config_rss, *sleds),
         Cmd::Route { dry_run } => {
             rack::cmd_route(&load_config(&config_path)?, &cli.name, *dry_run).await
         }

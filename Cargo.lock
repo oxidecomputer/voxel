@@ -3751,9 +3751,11 @@ dependencies = [
  "clap",
  "futures",
  "libfalcon",
+ "serde_json",
  "slog",
  "sprockets-tls-test-utils",
  "tokio",
+ "toml",
  "voxel-config",
 ]
 

@@ -96,6 +96,7 @@ pub(crate) async fn cmd_launch(
     no_route: bool,
     emu_sp: bool,
     emu_rot: bool,
+    wicket_setup: bool,
 ) -> anyhow::Result<()> {
     // Floor (per rack - each is an independent RSS domain): omicron's control
     // plane can't form below 3 sleds (Crucible 3-way replication,
@@ -123,7 +124,7 @@ pub(crate) async fn cmd_launch(
     crate::image::ensure_image(&cfg.image.frr_image())?;
     memory_preflight(cfg)?;
     reset_node_cargo_bay(cfg)?;
-    stage_config(cfg, emu_sp, emu_rot)?;
+    stage_config(cfg, emu_sp, emu_rot, wicket_setup)?;
     stage_sprockets(cfg)?;
     let mut topo = build_topo(cfg, name)?;
     // The all-VMs-at-once boot grabs ~all the guest RAM in one spike; under that
@@ -188,6 +189,22 @@ pub(crate) async fn cmd_launch(
             run_voxel_init(d, rack_sleds).await;
             if let Some((s, n)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
                 let tag = rack_label(racks, rack, "rack-init");
+                // --wicket-setup: nothing auto-inited (no staged config-rss), so
+                // drive RSS through wicketd (upload config + cert + recovery
+                // password, then POST to start). watch_rss then reports the
+                // wicketd-triggered bring-up exactly as for the file path.
+                if wicket_setup {
+                    let net = cfg.network.for_rack(rack, racks);
+                    let config_rss =
+                        std::path::Path::new("wicket-setup").join(format!("rack{rack}")).join("config-rss.toml");
+                    if let Err(e) = crate::wicket_setup::drive(
+                        d, *n, cfg.topology.sleds, &config_rss, &net.dns_zone, &tag,
+                    )
+                    .await
+                    {
+                        warn!(d.log, "{tag}: wicket-setup failed: {e}; rack will not initialize");
+                    }
+                }
                 watch_rss(d, *n, &s.bootstrap_addr(), &tag).await;
             }
         }

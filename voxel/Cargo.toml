@@ -19,6 +19,10 @@ futures.workspace = true
 clap.workspace = true
 camino.workspace = true
 voxel-config = { path = "../voxel-config" }
+# Reshape the generated config-rss.toml into wicketd's RSS config JSON for
+# `launch --wicket-setup` (drive setup through wicketd).
+toml = "0.9"
+serde_json = "1"
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).

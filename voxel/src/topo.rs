@@ -207,7 +207,12 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
 }
 
 /// Generate + stage per-node config into the cargo-bay before launch.
-pub(crate) fn stage_config(cfg: &VoxelConfig, emu_sp: bool, emu_rot: bool) -> anyhow::Result<()> {
+pub(crate) fn stage_config(
+    cfg: &VoxelConfig,
+    emu_sp: bool,
+    emu_rot: bool,
+    wicket_setup: bool,
+) -> anyhow::Result<()> {
     let sleds = cfg.sleds();
     // Per-sled sled-agent config (replaces a4x2's config/gN-config.toml). Each
     // scrimlet's SoftNPU links only its OWN rack's sleds (rear ports) + every
@@ -236,7 +241,19 @@ pub(crate) fn stage_config(cfg: &VoxelConfig, emu_sp: bool, emu_rot: bool) -> an
             .iter()
             .find(|s| s.rss && s.rack == rack)
             .ok_or_else(|| anyhow!("rack {rack} has no RSS sled"))?;
-        generate_rss_config(cfg, &cargo_bay(&rss_node.name), rack)?;
+        // For `--wicket-setup` we drive RSS through wicketd, so the config-rss
+        // must NOT be injected by voxel-init (sled-agent would otherwise auto-init
+        // from it). voxel-init only injects `<cargo-bay>/config-rss.toml`, so we
+        // simply generate it OUTSIDE the cargo-bay (in `wicket-setup/rackN/`) -
+        // `wicket_setup::drive` reads it from there to build the wicketd bodies.
+        let rss_dir = if wicket_setup {
+            let d = Path::new("wicket-setup").join(format!("rack{rack}"));
+            fs::create_dir_all(&d)?;
+            d
+        } else {
+            cargo_bay(&rss_node.name)
+        };
+        generate_rss_config(cfg, &rss_dir, rack)?;
     }
 
     // Per-router frr.conf.
