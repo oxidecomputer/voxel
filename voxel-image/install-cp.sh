@@ -132,6 +132,23 @@ else
     log "FATAL: voxel-init not staged at /opt/cargo-bay/voxel-init"; exit 1
 fi
 
+# Emulated SP/RoT fleet (sp-emu binary + faux-mgs + per-role firmware flashes).
+# Staged into the builder cargo-bay by build-cp.sh from the [sp] image paths, then
+# baked here so a launched rack runs the emulated SPs/RoTs WITHOUT the operator
+# needing the sp-emu sources or [sp] paths on the box. voxel-init's setup_sp_emu
+# copies these into oxz_switch at bring-up (a staged cargo-bay [sp].emu_bin still
+# wins, for dev iteration). Optional: absent on images built without [sp].emu_bin.
+if [[ -d /opt/cargo-bay/sp-emu ]]; then
+    log "baking sp-emu fleet from cargo-bay"
+    mkdir -p /opt/oxide/sp-emu
+    cp /opt/cargo-bay/sp-emu/* /opt/oxide/sp-emu/
+    chmod +x /opt/oxide/sp-emu/sp-emu 2>/dev/null || true
+    chmod +x /opt/oxide/sp-emu/faux-mgs 2>/dev/null || true
+    log "baked sp-emu: $(ls /opt/oxide/sp-emu | tr '\n' ' ')"
+else
+    log "no sp-emu staged in cargo-bay (image relies on launch-time [sp].emu_bin)"
+fi
+
 # Switch-slot enforcer as a baked SMF service. The 2nd scrimlet of each rack must
 # present as switch1, but the single image bakes switch0 for everyone; voxel-init
 # swaps the live config at bring-up. Doing that swap from a one-shot detached

@@ -350,8 +350,15 @@ fn files_equal(a: &str, b: &str) -> bool {
 /// with one contract-daemon instance per SP (startd supervises + restarts each,
 /// survives reboots). No-op when nothing's staged; idempotent once imported.
 fn setup_sp_emu() {
-    // Staged ports (filenames are `<base_port>.flash`).
-    let mut ports: Vec<u16> = match fs::read_dir(SP_EMU_CARGO_DIR) {
+    // The emu fleet's CONTENT (binary, per-SP flashes, rot.flash) is either STAGED
+    // in the cargo-bay (dev: [sp].emu_bin set -> topo flashes locally) or BAKED
+    // into the image at /opt/oxide/sp-emu (self-contained). Staged wins; baked is
+    // the fallback. The SP set + per-SP role + --emu-rot come from the `ports`
+    // manifest topo ALWAYS stages, so we know the fleet even on the baked path;
+    // for back-compat we also accept the legacy signal of staged `<port>.flash`
+    // filenames.
+    const BAKED: &str = "/opt/oxide/sp-emu";
+    let staged_flashes: Vec<u16> = match fs::read_dir(SP_EMU_CARGO_DIR) {
         Ok(rd) => rd
             .flatten()
             .filter_map(|e| {
@@ -361,10 +368,31 @@ fn setup_sp_emu() {
                     .and_then(|p| p.parse::<u16>().ok())
             })
             .collect(),
-        Err(_) => return, // no emu SPs staged on this scrimlet
+        Err(_) => Vec::new(),
+    };
+    // Manifest: a `rot <0|1>` line then `<port> <role>` lines.
+    let manifest = fs::read_to_string(format!("{SP_EMU_CARGO_DIR}/ports")).unwrap_or_default();
+    let mut roles: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+    let mut rot_from_manifest = false;
+    for line in manifest.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("rot"), Some(v)) => rot_from_manifest = v == "1",
+            (Some(p), Some(role)) => {
+                if let Ok(p) = p.parse::<u16>() {
+                    roles.insert(p, role.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ports: Vec<u16> = if !staged_flashes.is_empty() {
+        staged_flashes
+    } else {
+        roles.keys().copied().collect()
     };
     if ports.is_empty() {
-        return;
+        return; // no emu SPs on this scrimlet
     }
     ports.sort_unstable();
     // Copy the binary + flash files into the zone (idempotent; safe to redo).
@@ -373,31 +401,48 @@ fn setup_sp_emu() {
         return;
     }
     let bin_to = format!("{SP_EMU_ZONE_DIR}/sp-emu");
-    if let Err(e) = fs::copy(format!("{SP_EMU_CARGO_DIR}/sp-emu"), &bin_to) {
-        warn(format!("copy sp-emu binary: {e}"));
+    let bin_src = {
+        let staged = format!("{SP_EMU_CARGO_DIR}/sp-emu");
+        if std::path::Path::new(&staged).exists() { staged } else { format!("{BAKED}/sp-emu") }
+    };
+    if let Err(e) = fs::copy(&bin_src, &bin_to) {
+        warn(format!("copy sp-emu binary from {bin_src}: {e}"));
         return;
     }
     run("chmod", &["+x", &bin_to]);
     for p in &ports {
-        if let Err(e) = fs::copy(
-            format!("{SP_EMU_CARGO_DIR}/{p}.flash"),
-            format!("{SP_EMU_ZONE_DIR}/{p}.flash"),
-        ) {
-            warn(format!("copy {p}.flash: {e}"));
+        // Staged <port>.flash wins; else the baked per-role flash. Gimlet flashes
+        // are identical (the per-SP serial is set at runtime from SP_EMU_BRIDGE),
+        // so one baked gimlet.flash serves every gimlet port; 33300 -> sidecar.
+        let staged = format!("{SP_EMU_CARGO_DIR}/{p}.flash");
+        let src = if std::path::Path::new(&staged).exists() {
+            staged
+        } else {
+            let role = roles.get(p).map(String::as_str).unwrap_or("gimlet");
+            format!("{BAKED}/{role}.flash")
+        };
+        if let Err(e) = fs::copy(&src, format!("{SP_EMU_ZONE_DIR}/{p}.flash")) {
+            warn(format!("copy {p}.flash from {src}: {e}"));
         }
     }
-    // Copy the RoT image too, if staged (--emu-rot). Each SP gets its OWN
-    // out-of-process RoT: `sp_emu_manifest` emits one `voxel-rot-emu` rot-serve
-    // instance per SP (its own oxide-rot-1 on a dedicated zone-local port) and
-    // points each SP at it via SP_EMU_ROT_SERVICE. One sled/sidecar -> one SP ->
-    // one RoT (not shared, not in-process, not deferred). SPs stay single-core
-    // (RoT out-of-process), so they answer MGS `switch-id` during RSS and the RoT
-    // is live from boot -> MGS/Nexus pin the real RoT at rack-init.
-    let rot_src = format!("{SP_EMU_CARGO_DIR}/rot.flash");
-    let rot_enabled = std::path::Path::new(&rot_src).exists();
+    // Copy the RoT image too, if --emu-rot. Each SP gets its OWN out-of-process
+    // RoT: `sp_emu_manifest` emits one `voxel-rot-emu` rot-serve instance per SP
+    // (its own oxide-rot-1 on a dedicated zone-local port) and points each SP at
+    // it via SP_EMU_ROT_SERVICE. One sled/sidecar -> one SP -> one RoT (not
+    // shared, not in-process, not deferred). SPs stay single-core (RoT
+    // out-of-process), so they answer MGS `switch-id` during RSS and the RoT is
+    // live from boot -> MGS/Nexus pin the real RoT at rack-init. Enabled if a
+    // rot.flash is staged OR the manifest flags it (the baked path).
+    let staged_rot = format!("{SP_EMU_CARGO_DIR}/rot.flash");
+    let rot_enabled = std::path::Path::new(&staged_rot).exists() || rot_from_manifest;
     if rot_enabled {
+        let rot_src = if std::path::Path::new(&staged_rot).exists() {
+            staged_rot
+        } else {
+            format!("{BAKED}/rot.flash")
+        };
         if let Err(e) = fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash")) {
-            warn(format!("copy rot.flash: {e}"));
+            warn(format!("copy rot.flash from {rot_src}: {e}"));
         }
     }
     if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports, rot_enabled)) {

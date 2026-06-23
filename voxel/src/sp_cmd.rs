@@ -27,6 +27,9 @@ const FAUX_ZONE: &str = "/var/tmp/faux-mgs";
 const FAUX_GZ: &str = "/zone/oxz_switch/root/var/tmp/faux-mgs";
 /// Pre-boot cargo-bay copy (staged by `topo::stage_sp_emu` when `[sp].faux_mgs`).
 const FAUX_CARGO: &str = "/opt/cargo-bay/sp-emu/faux-mgs";
+/// Baked-into-the-image copy (install-cp.sh, the self-contained path - present
+/// even when neither `[sp].faux_mgs` nor `[sp].emu_bin` is configured at launch).
+const FAUX_BAKED: &str = "/opt/oxide/sp-emu/faux-mgs";
 
 pub(crate) async fn cmd_sp(cfg: &VoxelConfig, name: &str, cmd: &SpCmd) -> anyhow::Result<()> {
     match cmd {
@@ -122,10 +125,17 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    // Fallback: copy from the pre-staged cargo-bay binary (if 9p exposes it).
+    // Fallback: copy from a scrimlet-local binary - the baked image copy (the
+    // self-contained path) or the pre-staged cargo-bay copy (if 9p exposes it).
+    // Both live in the scrimlet GZ, so a single `cp` into the zone's /var/tmp
+    // (FAUX_GZ) works without re-scp from the box.
     let staged = ssh_capture(
         ip,
-        &format!("test -x {FAUX_CARGO} && cp {FAUX_CARGO} {FAUX_GZ} && chmod +x {FAUX_GZ} && echo staged"),
+        &format!(
+            "for s in {FAUX_BAKED} {FAUX_CARGO}; do \
+               if test -x $s; then cp $s {FAUX_GZ} && chmod +x {FAUX_GZ} && echo staged && break; fi; \
+             done"
+        ),
     )
     .map(|o| o.contains("staged"))
     .unwrap_or(false);

@@ -319,11 +319,24 @@ fn stage_sp_emu(
     if emu.is_empty() {
         return Ok(());
     }
-    let emu_bin = cfg.sp.emu_bin.as_deref().ok_or_else(|| {
-        anyhow!("[sp].emu is set but [sp].emu_bin (path to the sp-emu binary) is unset")
-    })?;
     let out = dir.join("sp-emu");
     fs::create_dir_all(&out)?;
+    // Always write the fleet manifest (`rot <0|1>` + `<port> <role>` lines) so
+    // voxel-init knows the SP set, each SP's role, and whether --emu-rot is on —
+    // even when it boots from the image's BAKED /opt/oxide/sp-emu artifacts
+    // (self-contained) rather than these staged copies. (The staged rot.flash was
+    // previously the only signal of --emu-rot; the baked path needs it explicit.)
+    let mut manifest = format!("rot {}\n", if emu_rot { 1 } else { 0 });
+    for sp in &emu {
+        let role = if sp.selector() == "sidecar" { "sidecar" } else { "gimlet" };
+        manifest.push_str(&format!("{} {}\n", sp.base_port, role));
+    }
+    fs::write(out.join("ports"), manifest)
+        .with_context(|| format!("write {}", out.join("ports").display()))?;
+    // Dev override: with [sp].emu_bin set, stage the binary + per-SP flashes from
+    // the local build for fast iteration (no rebake). Unset -> voxel-init uses the
+    // baked image artifacts (the per-SP flash from the baked per-role flash).
+    let Some(emu_bin) = cfg.sp.emu_bin.as_deref() else { return Ok(()) };
     fs::copy(emu_bin, out.join("sp-emu"))
         .with_context(|| format!("stage sp-emu binary from {emu_bin}"))?;
     // Stage `faux-mgs` (the MGS client) alongside it when configured, so
