@@ -197,15 +197,31 @@ pub(crate) async fn cmd_launch(
                     let net = cfg.network.for_rack(rack, racks);
                     let config_rss =
                         std::path::Path::new("wicket-setup").join(format!("rack{rack}")).join("config-rss.toml");
+                    // wicketd's bootstrap_sleds must be THIS rack's cubby slots =
+                    // its sleds' GLOBAL indices (rack 1 -> 3,4,5), matching what the
+                    // MGS sim reports (`location = ["sled", global_index]`); a flat
+                    // 0..n only correlates for rack 0.
+                    let slots: Vec<u16> = topo
+                        .sleds
+                        .iter()
+                        .filter(|(s, _)| s.rack == rack)
+                        .map(|(s, _)| s.index as u16)
+                        .collect();
                     if let Err(e) = crate::wicket_setup::drive(
-                        d, *n, cfg.topology.sleds, &config_rss, &net.dns_zone, &tag,
+                        d, *n, &slots, &config_rss, &net.dns_zone, &tag,
                     )
                     .await
                     {
                         warn!(d.log, "{tag}: wicket-setup failed: {e}; rack will not initialize");
                     }
                 }
-                watch_rss(d, *n, &s.bootstrap_addr(), &tag).await;
+                // Emulated SPs slow every MGS RPC, and multi-rack racks converge
+                // under each other's load - give those a 60m watch budget vs the
+                // 30m a single sp-sim rack needs.
+                let watch_cap = std::time::Duration::from_secs(
+                    if emu_sp || racks > 1 { 3600 } else { 1800 },
+                );
+                watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap).await;
             }
         }
         info!(d.log, "launch complete");
@@ -354,10 +370,13 @@ pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<
         return Err(anyhow!("no RSS sled in topology"));
     }
     let d = &topo.runner;
+    // Multi-rack racks converge under each other's load - watch longer (matches
+    // cmd_launch). Duration is Copy, so each watcher closure gets its own.
+    let watch_cap = std::time::Duration::from_secs(if racks > 1 { 3600 } else { 1800 });
     let watchers = rss_nodes.into_iter().map(|(s, n)| {
         let tag = rack_label(racks, s.rack, "rack-init");
         let addr = s.bootstrap_addr();
-        async move { watch_rss(d, *n, &addr, &tag).await }
+        async move { watch_rss(d, *n, &addr, &tag, watch_cap).await }
     });
     futures::future::join_all(watchers).await;
     Ok(())

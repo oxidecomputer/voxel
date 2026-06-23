@@ -73,12 +73,17 @@ fn rss_step_display(step: &str) -> (usize, String) {
 /// involvement, no wedge, no poisoning. (`setup_ssh` has enabled empty-password
 /// root login by the time launch completes.) Always returns within the cap so
 /// `cmd_launch` proceeds to re-point the host route at ce.
-pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, tag: &str) {
+/// `cap` bounds how long we watch one rack's RSS before giving up (the rack keeps
+/// converging regardless). The caller sizes it: a single sp-sim rack settles in
+/// ~12m, but emulated SPs slow every MGS RPC and a multi-rack launch runs the
+/// racks' bring-up under each other's load, so those need a bigger budget (see
+/// the callers in `rack.rs`).
+pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, tag: &str, cap: Duration) {
     let curl = format!(
         "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
     );
     const POLL_INTERVAL: Duration = Duration::from_secs(8);
-    const WATCH_CAP: Duration = Duration::from_secs(1800); // give up watching after 30m
+    let watch_cap = cap;
     const HEARTBEAT: Duration = Duration::from_secs(90); // re-affirm liveness this often
 
     info!(d.log, "{tag}: watching RSS progress on the RSS node ...");
@@ -112,13 +117,13 @@ pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, ta
     let mut step_start = Instant::now(); // when the CURRENT step began (for in-step timing)
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        if start.elapsed() > WATCH_CAP {
+        if start.elapsed() > watch_cap {
             warn!(
                 d.log,
                 "{tag}: stopped watching after {}m - the rack may still be \
                  converging; check the console or re-run `voxel status`. Not failing \
                  the launch.",
-                WATCH_CAP.as_secs() / 60
+                watch_cap.as_secs() / 60
             );
             break;
         }

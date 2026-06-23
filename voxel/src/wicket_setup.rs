@@ -34,16 +34,23 @@ const WICKETD: &str = "http://[::1]:12226";
 pub(crate) fn dryrun(config_rss_path: &Path, num_sleds: usize) -> Result<()> {
     let config_rss = std::fs::read_to_string(config_rss_path)
         .with_context(|| format!("read {}", config_rss_path.display()))?;
-    let (body, pw_hash) = build_bodies(&config_rss, num_sleds)?;
+    // Offline check assumes a single rack (slots 0..n); the live multi-rack slot
+    // set comes from the topology in `drive`.
+    let slots: Vec<u16> = (0..num_sleds as u16).collect();
+    let (body, pw_hash) = build_bodies(&config_rss, &slots)?;
     println!("{body}");
     eprintln!("[dryrun] recovery password hash present: {}", !pw_hash.is_empty());
     Ok(())
 }
 
 /// Reshape `config-rss.toml` into wicketd's `PutRssUserConfigInsensitive` JSON,
-/// and pull out the recovery-user password hash. `num_sleds` is the per-rack sled
-/// count -> the bootstrap slot set wicketd maps to SPs.
-fn build_bodies(config_rss: &str, num_sleds: usize) -> Result<(String, String)> {
+/// and pull out the recovery-user password hash. `bootstrap_slots` are the cubby
+/// slot numbers wicketd maps to discovered SPs - for rack R these are that rack's
+/// gimlet GLOBAL indices (rack 1's sleds sit in cubbies 3,4,5, not 0,1,2), since
+/// the MGS sim reports each gimlet at `location = ["sled", global_index]`. Passing
+/// a wrong/`0..n` set leaves wicketd unable to correlate rack 1's sleds and it
+/// never initializes.
+fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, String)> {
     let v: toml::Value = toml::from_str(config_rss).context("parse config-rss.toml")?;
     let arr = |k: &str| -> serde_json::Value {
         toml_to_json(v.get(k).cloned().unwrap_or(toml::Value::Array(vec![])))
@@ -86,7 +93,7 @@ fn build_bodies(config_rss: &str, num_sleds: usize) -> Result<(String, String)> 
         .unwrap_or_else(|| serde_json::json!({"allow": "any"}));
 
     let body = serde_json::json!({
-        "bootstrap_sleds": (0..num_sleds as u16).collect::<Vec<_>>(),
+        "bootstrap_sleds": bootstrap_slots,
         "ntp_servers": arr("ntp_servers"),
         "dns_servers": arr("dns_servers"),
         "internal_services_ip_pool_ranges": arr("internal_services_ip_pool_ranges"),
@@ -255,7 +262,7 @@ fn wait_wicketd_ready(ip: &str, num_sleds: usize, log: &slog::Logger) -> Result<
 pub(crate) async fn drive(
     d: &Runner,
     scrimlet: NodeRef,
-    num_sleds: usize,
+    bootstrap_slots: &[u16],
     config_rss_path: &Path,
     zone: &str,
     tag: &str,
@@ -264,17 +271,31 @@ pub(crate) async fn drive(
     let ip = node_external_ip(d, scrimlet, false)
         .await
         .map_err(|e| anyhow!("find switch-zone scrimlet IP: {e}"))?;
-    wait_wicketd_ready(&ip, num_sleds, &d.log)?;
+    wait_wicketd_ready(&ip, bootstrap_slots.len(), &d.log)?;
 
     let config_rss = std::fs::read_to_string(config_rss_path)
         .with_context(|| format!("read {}", config_rss_path.display()))?;
-    let (config_body, pw_hash) = build_bodies(&config_rss, num_sleds)?;
+    let (config_body, pw_hash) = build_bodies(&config_rss, bootstrap_slots)?;
     let (cert_pem, key_pem) = gen_cert(zone)?;
 
     // Upload the config, the cert/key pair, and the recovery password.
-    let put_config = wicketd_call(&ip, "PUT", "/rack-setup/config", &config_body, "wsetup-config.json")?;
+    // Right after wicketd reports the SPs discovered (`wait_wicketd_ready`) it can
+    // still transiently reject the config PUT with HTTP 400 for a few seconds while
+    // its internal SP inventory settles - observed on the SECOND rack of a
+    // multi-rack launch, which comes up under the first (already-initialized)
+    // rack's full load. The body is valid (a re-PUT moments later returns 204), so
+    // retry a handful of times before giving up.
+    let mut put_config = 0;
+    for attempt in 1..=10 {
+        put_config = wicketd_call(&ip, "PUT", "/rack-setup/config", &config_body, "wsetup-config.json")?;
+        if put_config == 204 {
+            break;
+        }
+        info!(d.log, "{tag}: PUT /rack-setup/config -> HTTP {put_config} (attempt {attempt}/10); wicketd still settling, retrying in 6s");
+        std::thread::sleep(Duration::from_secs(6));
+    }
     if put_config != 204 {
-        return Err(anyhow!("PUT /rack-setup/config -> HTTP {put_config}"));
+        return Err(anyhow!("PUT /rack-setup/config -> HTTP {put_config} after 10 attempts"));
     }
     let c = wicketd_call(&ip, "POST", "/rack-setup/config/cert", &json_string(&cert_pem), "wsetup-cert.json")?;
     let k = wicketd_call(&ip, "POST", "/rack-setup/config/key", &json_string(&key_pem), "wsetup-key.json")?;
