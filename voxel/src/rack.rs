@@ -28,7 +28,7 @@ pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> a
     // One host route per rack's external prefix - all racks egress via the shared ce.
     let racks = cfg.topology.racks();
     for rack in 0..racks {
-        let prefix = cfg.network.for_rack(rack, racks).infra_prefix;
+        let prefix = cfg.network.for_rack(rack).infra_prefix;
         set_external_route(&topo.runner, ce, &prefix, !dry_run, cfg.topology.ce_external_ip.as_deref())
             .await?;
     }
@@ -195,7 +195,7 @@ pub(crate) async fn cmd_launch(
                 // password, then POST to start). watch_rss then reports the
                 // wicketd-triggered bring-up exactly as for the file path.
                 if wicket_setup {
-                    let net = cfg.network.for_rack(rack, racks);
+                    let net = cfg.network.for_rack(rack);
                     let config_rss =
                         std::path::Path::new("wicket-setup").join(format!("rack{rack}")).join("config-rss.toml");
                     // wicketd's bootstrap_sleds must be THIS rack's cubby slots =
@@ -235,7 +235,7 @@ pub(crate) async fn cmd_launch(
     // rack's path as the second rack joins).
     if let Some(ce) = topo.node_ref("ce") {
         for rack in 0..racks {
-            let net = cfg.network.for_rack(rack, racks);
+            let net = cfg.network.for_rack(rack);
             let label = rack_label(racks, rack, "rack");
             if let Err(e) = set_external_route(d, ce, &net.infra_prefix, !no_route, cfg.topology.ce_external_ip.as_deref()).await {
                 warn!(d.log, "{label} external route: {e}");

@@ -111,7 +111,7 @@ fn uplink_port(u: &UplinkCfg) -> Result<PortConfig> {
 /// independent RSS domain, so the bootstrap set is filtered to that rack's sleds
 /// and the customer/service network is offset by `Network::for_rack`.
 fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeRequest> {
-    let n = &cfg.network.for_rack(rack, cfg.topology.racks());
+    let n = &cfg.network.for_rack(rack);
 
     let bootstrap_addrs: BTreeSet<Ipv6Addr> = cfg
         .sleds()

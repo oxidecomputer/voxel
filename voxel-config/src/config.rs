@@ -446,19 +446,17 @@ impl Network {
     /// peer with and route between each rack). The IP/ASN offsets are by rack
     /// index, so **rack 0 keeps the base addressing** (`198.51.100/24`).
     ///
-    /// In a **multi-rack** deployment each rack also gets its own external DNS
-    /// **zone** (`rack{N}.<dns_zone>`, **1-based** - so the racks read as rack1,
-    /// rack2, ...), making each rack's silo addressable by a distinct name
-    /// (`recovery.sys.rack1.oxide.test`). A single-rack deployment keeps the bare
-    /// `dns_zone` (`recovery.sys.oxide.test`). Upstream NTP/DNS + uplink ports
-    /// are left as-is.
-    pub fn for_rack(&self, rack: usize, racks: usize) -> Network {
+    /// Each rack gets its own external DNS **zone** (`rack{N}.<dns_zone>`,
+    /// **1-based** - so racks read as rack1, rack2, ...), making each rack's silo
+    /// addressable by a distinct name (`recovery.sys.rack1.oxide.test`). This
+    /// holds even for a **single-rack** deployment (rack 0 -> `rack1.oxide.test`):
+    /// the addressing is identical to rack 1 of a multi-rack deployment, so a
+    /// single rack can later grow a second rack with no renaming / DNS churn, and
+    /// one split-DNS / silo-URL convention covers every deployment size. Upstream
+    /// NTP/DNS + uplink ports are left as-is.
+    pub fn for_rack(&self, rack: usize) -> Network {
         let r8 = rack as u8;
-        let dns_zone = if racks > 1 {
-            format!("rack{}.{}", rack + 1, self.dns_zone)
-        } else {
-            self.dns_zone.clone()
-        };
+        let dns_zone = format!("rack{}.{}", rack + 1, self.dns_zone);
         Network {
             dns_zone,
             external_dns_ips: self.external_dns_ips.iter().map(|ip| offset_v4(ip, r8)).collect(),
@@ -901,21 +899,21 @@ mod tests {
         assert!(s.iter().all(|d| d.rss), "all 3 sleds per rack join RSS");
         // Per-rack addressing offset: rack 1 shifts the customer/service nets.
         let net = Network::default();
-        assert_eq!(net.for_rack(0, 2).infra_prefix, "198.51.100.0/24");
-        assert_eq!(net.for_rack(1, 2).infra_prefix, "198.51.101.0/24");
-        assert_eq!(net.for_rack(1, 2).service_pool_first, "198.51.101.20");
-        assert_eq!(net.for_rack(1, 2).external_dns_ips[0], "198.51.101.20");
-        assert_eq!(net.for_rack(1, 2).rack_subnet, "fd00:17:2:d00::/56");
-        assert_eq!(net.for_rack(1, 2).bgp_asn, 65001);
+        assert_eq!(net.for_rack(0).infra_prefix, "198.51.100.0/24");
+        assert_eq!(net.for_rack(1).infra_prefix, "198.51.101.0/24");
+        assert_eq!(net.for_rack(1).service_pool_first, "198.51.101.20");
+        assert_eq!(net.for_rack(1).external_dns_ips[0], "198.51.101.20");
+        assert_eq!(net.for_rack(1).rack_subnet, "fd00:17:2:d00::/56");
+        assert_eq!(net.for_rack(1).bgp_asn, 65001);
         // The uplink peer_asn tracks the rack's local ASN (rack 0 unchanged).
-        assert_eq!(net.for_rack(0, 2).uplinks[0].peer_asn, 65000);
-        assert_eq!(net.for_rack(1, 2).uplinks[0].peer_asn, 65001);
-        // Multi-rack: each rack gets its own 1-based external DNS zone, so silos
-        // are addressable per rack (recovery.sys.rack{N}.oxide.test).
-        assert_eq!(net.for_rack(0, 2).dns_zone, "rack1.oxide.test");
-        assert_eq!(net.for_rack(1, 2).dns_zone, "rack2.oxide.test");
-        // Single-rack keeps the bare zone (recovery.sys.oxide.test).
-        assert_eq!(net.for_rack(0, 1).dns_zone, "oxide.test");
+        assert_eq!(net.for_rack(0).uplinks[0].peer_asn, 65000);
+        assert_eq!(net.for_rack(1).uplinks[0].peer_asn, 65001);
+        // Every rack gets its own 1-based external DNS zone, so silos are
+        // addressable per rack (recovery.sys.rack{N}.oxide.test) - including a
+        // single-rack deploy, whose rack 0 is rack1 (matches rack 1 of a
+        // multi-rack deploy, so it can grow a 2nd rack with no DNS churn).
+        assert_eq!(net.for_rack(0).dns_zone, "rack1.oxide.test");
+        assert_eq!(net.for_rack(1).dns_zone, "rack2.oxide.test");
     }
 
     #[test]
