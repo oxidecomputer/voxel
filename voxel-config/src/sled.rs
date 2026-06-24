@@ -36,6 +36,10 @@ pub struct SledAgentConfig {
     /// Fabric (transit) routers - the scrimlet's uplink (front) port count
     /// (`softnpu_link` scrimlet->every fabric router).
     pub num_fabric_routers: usize,
+    /// Switch-to-switch interconnects this scrimlet is on - extra FRONT ports
+    /// (`softnpu_links` sidecar<->sidecar), wired after the fabric uplinks, so
+    /// the front-port budget must include them or the link lands off the ASIC.
+    pub num_interconnects: usize,
     /// Sled-agent `data_links` config shape (see [`crate::config::SledDataLinksSchema`]).
     pub data_links: crate::config::SledDataLinksSchema,
 }
@@ -51,6 +55,7 @@ impl SledAgentConfig {
             // calls `with_topology` for the live counts.
             num_sleds: 4,
             num_fabric_routers: 2,
+            num_interconnects: 0,
             data_links: crate::config::SledDataLinksSchema::default(),
         }
     }
@@ -60,6 +65,13 @@ impl SledAgentConfig {
     pub fn with_topology(mut self, num_sleds: usize, num_fabric_routers: usize) -> Self {
         self.num_sleds = num_sleds;
         self.num_fabric_routers = num_fabric_routers;
+        self
+    }
+
+    /// Add `n` switch-to-switch interconnect front ports (beyond the fabric
+    /// uplinks) to this scrimlet's SoftNPU budget.
+    pub fn with_interconnects(mut self, n: usize) -> Self {
+        self.num_interconnects = n;
         self
     }
 
@@ -88,7 +100,7 @@ impl SledAgentConfig {
         // (front) port per fabric router. dpd assigns the rear ports first, so
         // they line up with the topology's softnpu_link order (sleds, then fabric
         // routers). Gimlets have no switch zone, so the values are vestigial.
-        let front = if self.scrimlet { self.num_fabric_routers } else { 1 };
+        let front = if self.scrimlet { self.num_fabric_routers + self.num_interconnects } else { 1 };
         let rear = self.num_sleds;
         writeln!(
             o,
@@ -215,6 +227,19 @@ mod tests {
         let links = v["switch_zone_maghemite_links"].as_array().unwrap();
         assert_eq!(links.len(), 6);
         assert_eq!(links[5].as_str(), Some("tfportrear5_0"));
+    }
+
+    #[test]
+    fn interconnects_bump_scrimlet_front_ports() {
+        // A scrimlet on 1 interconnect: front = num_fabric_routers + 1 (the
+        // extra QSFP for the sidecar<->sidecar link). Rear unchanged.
+        let v = parse(&SledAgentConfig::new(0, true).with_topology(4, 2).with_interconnects(1).render());
+        let sp = &v["sidecar_revision"]["soft_propolis"];
+        assert_eq!(sp["front_port_count"].as_integer(), Some(3));
+        assert_eq!(sp["rear_port_count"].as_integer(), Some(4));
+        // Gimlets have no switch zone, so interconnects don't apply.
+        let g = parse(&SledAgentConfig::new(1, false).with_topology(4, 2).with_interconnects(1).render());
+        assert_eq!(g["sidecar_revision"]["soft_propolis"]["front_port_count"].as_integer(), Some(1));
     }
 
     #[test]

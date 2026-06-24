@@ -132,6 +132,19 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         ext_interface(&mut d, *n)?;
     }
 
+    // Switch-to-switch interconnects: a direct sidecar<->sidecar link per
+    // configured pair (`[topology].interconnects`). Wired AFTER the fabric
+    // uplinks so dpd assigns each the next front (qsfp) tfport. `softnpu_links`
+    // (plural) is the ASIC-to-ASIC form - both ends get a MAC, so neither
+    // scrimlet gains a viona NIC (which would shift the external vioif index and
+    // break the gimlets' hardcoded DHCP interface).
+    for (ai, bi) in cfg.topology.interconnect_pairs() {
+        let node = |idx: usize| sleds.iter().find(|(s, _)| s.index == idx).map(|(_, n)| *n);
+        if let (Some(a), Some(b)) = (node(ai), node(bi)) {
+            d.softnpu_links(a, b, Some(new_mac()), Some(new_mac()));
+        }
+    }
+
     // SMBIOS + cargo-bay mounts.
     for (s, n) in &sleds {
         populate_smbios(&mut d, *n, s.index);
@@ -228,6 +241,7 @@ pub(crate) fn stage_config(
         fs::write(
             dir.join("sled-config.toml"),
             s.sled_config(num_sleds_per_rack, num_fabric_routers, cfg.image.data_links_schema)
+                .with_interconnects(cfg.topology.interconnect_count_for(s.index))
                 .render(),
         )?;
     }

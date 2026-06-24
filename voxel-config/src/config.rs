@@ -130,6 +130,9 @@ impl VoxelConfig {
         // it predates would fail to parse. `ce_external_ip` is purely a voxel host
         // routing detail, irrelevant to RSS config generation.
         c.topology.ce_external_ip = None;
+        // Same: switch interconnects are a launch-time topology detail (falcon
+        // links + sled-agent front-port budget), invisible to RSS config.
+        c.topology.interconnects = Vec::new();
         c.to_toml()
     }
 
@@ -179,6 +182,17 @@ pub struct Topology {
     /// launches - no serial lookup, no stale-route accumulation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ce_external_ip: Option<String>,
+    /// Switch-to-switch ASIC interconnects: extra QSFP front ports linking two
+    /// scrimlet sidecars directly (falcon `softnpu_links`), carrying the underlay
+    /// (DDM) switch-to-switch - e.g. a cross-rack cable, or `switch0`<->`switch1`
+    /// within a rack (the DDM PoC). Each entry is a pair of switch selectors
+    /// (`switch0` | `switch1` | `switchN` | `rackR/switchS`). Empty -> none. Each
+    /// link adds one front port to BOTH endpoint scrimlets (wired after the
+    /// fabric-router uplinks, so it lands on the next `qsfp` tfport). The link
+    /// itself is plumbed at launch; DDM/routing over it is configured per
+    /// `voxel network`. Managed via `voxel network add-port` / `rm-port`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interconnects: Vec<(String, String)>,
 }
 
 impl Default for Topology {
@@ -192,6 +206,7 @@ impl Default for Topology {
             sled_memory_gb: 8,
             router_memory_gb: 4,
             ce_external_ip: None,
+            interconnects: Vec::new(),
         }
     }
 }
@@ -269,6 +284,48 @@ impl Topology {
             }
         }
         out
+    }
+
+    /// Resolve a switch selector to a scrimlet's GLOBAL sled index. Accepts a
+    /// node name (`g3`), a rack-qualified `rackR/switchS` (R 1-based, S the
+    /// 0-based slot within the rack), or a bare global `switchN` (the Nth
+    /// scrimlet across all racks). Config-time mirror of `access::resolve_switch`
+    /// (works off the descriptor list, no live topology).
+    pub fn resolve_switch_index(&self, sel: &str) -> Option<usize> {
+        let sleds = self.sleds();
+        let scrimlets: Vec<&SledDesc> = sleds.iter().filter(|s| s.scrimlet).collect();
+        if let Some(s) = scrimlets.iter().find(|s| s.name == sel) {
+            return Some(s.index);
+        }
+        if let Some((r, sw)) = sel.split_once('/') {
+            if let (Some(rack), Some(slot)) = (
+                r.strip_prefix("rack").and_then(|x| x.parse::<usize>().ok()),
+                sw.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()),
+            ) {
+                let rack0 = rack.saturating_sub(1);
+                return scrimlets.iter().filter(|s| s.rack == rack0).nth(slot).map(|s| s.index);
+            }
+        }
+        if let Some(n) = sel.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()) {
+            return scrimlets.get(n).map(|s| s.index);
+        }
+        None
+    }
+
+    /// Resolved interconnect endpoint index pairs (unresolvable / self pairs dropped).
+    pub fn interconnect_pairs(&self) -> Vec<(usize, usize)> {
+        self.interconnects
+            .iter()
+            .filter_map(|(a, b)| {
+                let (ai, bi) = (self.resolve_switch_index(a)?, self.resolve_switch_index(b)?);
+                (ai != bi).then_some((ai, bi))
+            })
+            .collect()
+    }
+
+    /// How many interconnects scrimlet `index` participates in (its front-port bump).
+    pub fn interconnect_count_for(&self, index: usize) -> usize {
+        self.interconnect_pairs().iter().filter(|(a, b)| *a == index || *b == index).count()
     }
 }
 
@@ -914,6 +971,25 @@ mod tests {
         // multi-rack deploy, so it can grow a 2nd rack with no DNS churn).
         assert_eq!(net.for_rack(0).dns_zone, "rack1.oxide.test");
         assert_eq!(net.for_rack(1).dns_zone, "rack2.oxide.test");
+    }
+
+    #[test]
+    fn interconnects_resolve_and_count() {
+        // Default single-rack 4-sled: scrimlets g0 (switch0) + g3 (switch1).
+        let mut t = Topology::default();
+        t.interconnects = vec![("switch0".into(), "switch1".into())];
+        assert_eq!(t.resolve_switch_index("switch0"), Some(0));
+        assert_eq!(t.resolve_switch_index("switch1"), Some(3));
+        assert_eq!(t.resolve_switch_index("g3"), Some(3));
+        assert_eq!(t.resolve_switch_index("rack1/switch1"), Some(3));
+        assert_eq!(t.resolve_switch_index("bogus"), None);
+        assert_eq!(t.interconnect_pairs(), vec![(0, 3)]);
+        assert_eq!(t.interconnect_count_for(0), 1);
+        assert_eq!(t.interconnect_count_for(3), 1);
+        assert_eq!(t.interconnect_count_for(1), 0); // a non-scrimlet sled
+        // A self / unresolvable pair is dropped from the resolved pairs.
+        t.interconnects = vec![("switch0".into(), "switch0".into()), ("switch0".into(), "nope".into())];
+        assert!(t.interconnect_pairs().is_empty());
     }
 
     #[test]
