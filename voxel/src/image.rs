@@ -196,6 +196,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd) -> anyhow::Result<()> {
             println!("removed {ds}");
             Ok(())
         }
+        // `image patch` needs the loaded config (for the default source image),
+        // so it's dispatched in `main` before delegating the rest here.
+        ImageCmd::Patch { .. } => Err(anyhow!("internal: `image patch` is dispatched in main")),
         ImageCmd::RenderSmf { omicron_root, gimlets } => {
             // Bake switch0 for `gimlets` sleds with scrimlets at the first + last
             // sled (the convention the default topology follows). The launch-time

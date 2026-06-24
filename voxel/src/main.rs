@@ -23,6 +23,7 @@ mod access;
 mod config_cmd;
 mod image;
 mod net;
+mod patch;
 mod rack;
 mod rss;
 mod sp_cmd;
@@ -135,6 +136,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImageCmd,
     },
+    /// Operate on a running rack (surgical component patching).
+    Rack {
+        #[command(subcommand)]
+        cmd: RackCmd,
+    },
     /// Manage real-firmware SP-emulator (`sp-emu`) artifacts for `launch --emu`.
     Sp {
         #[command(subcommand)]
@@ -201,6 +207,23 @@ enum ImageCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Fold a component patch into the image's @base so it persists across
+    /// relaunches (boot-modify-capture: boots the source image, places the
+    /// artifact in-guest, re-captures). Durable counterpart to `rack patch`;
+    /// slower (~minutes) but survives a clean relaunch. propolis + ddm-gz only
+    /// for now (switch-zone services need a switch.tar.gz repack).
+    Patch {
+        /// Component to patch (e.g. propolis, ddm-gz).
+        component: String,
+        /// Git ref (commit) to patch to.
+        reference: String,
+        /// Source image to patch (default: the configured image.cp).
+        #[arg(long)]
+        image: Option<String>,
+        /// New image name (default: <src>-<component>-<shortref>).
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// (build helper) Render the build-time smf configs (mgs-sim, sp-sim,
     /// sled-agent) into an omicron checkout. Used by build-cp.sh.
     #[command(hide = true)]
@@ -210,6 +233,28 @@ enum ImageCmd {
         /// Number of gimlet SPs to simulate (sp-sim).
         #[arg(long, default_value_t = 4)]
         gimlets: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum RackCmd {
+    /// Swap a single component on the running rack at a given ref (commit), then
+    /// restart its service. Fetches the prebuilt artifact from buildomat,
+    /// sha-verifies it, and places it on the relevant nodes. Live + ephemeral: a
+    /// clean relaunch reverts to the image (see `voxel image patch` to persist).
+    /// `voxel rack patch --list` shows the patchable components.
+    Patch {
+        /// Component to patch (e.g. propolis, mgd, dendrite, lldp). Omit with
+        /// `--list` to see them all.
+        component: Option<String>,
+        /// Git ref (commit) to patch to - the buildomat image revision.
+        reference: Option<String>,
+        /// List the patchable components and exit.
+        #[arg(long)]
+        list: bool,
+        /// Print the plan (component, ref, target nodes) without applying it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -435,7 +480,31 @@ async fn main() -> Result<(), Error> {
         Cmd::Info => rack::cmd_info(&load_config(&config_path)?, &cli.name),
         Cmd::Status => rack::cmd_status(&load_config(&config_path)?, &cli.name).await,
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
-        Cmd::Image { cmd } => image::cmd_image(cmd),
+        Cmd::Image { cmd } => match cmd {
+            ImageCmd::Patch { component, reference, image, out } => {
+                let cfg = load_config(&config_path)?;
+                let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
+                patch::cmd_image_patch(component, reference, &src, out.as_deref())
+            }
+            other => image::cmd_image(other),
+        },
+        Cmd::Rack { cmd } => match cmd {
+            RackCmd::Patch { component, reference, list, dry_run } => {
+                if *list {
+                    patch::list();
+                    Ok(())
+                } else {
+                    let component = component
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("missing component (try `voxel rack patch --list`)"))?;
+                    let reference = reference
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("missing ref (usage: voxel rack patch {component} <ref>)"))?;
+                    patch::cmd_rack_patch(&load_config(&config_path)?, &cli.name, component, reference, *dry_run)
+                        .await
+                }
+            }
+        },
         Cmd::Sp { cmd } => sp_cmd::cmd_sp(&load_config(&config_path)?, &cli.name, cmd).await,
         Cmd::Host { cmd } => match cmd {
             HostCmd::Ls => access::cmd_host_ls(&load_config(&config_path)?, &cli.name).await,
