@@ -22,7 +22,7 @@ set -euo pipefail
 : "${SRC_IMAGE:?set SRC_IMAGE}"; : "${OUT_IMAGE:?set OUT_IMAGE}"
 : "${ARTIFACT:?set ARTIFACT}"; : "${PKG:?set PKG}"; : "${PLACE_KIND:?set PLACE_KIND}"
 FALCON_DATASET="${FALCON_DATASET:-rpool/falcon}"
-COMPONENT="${COMPONENT:-$PKG}"; REF="${REF:-unknown}"
+COMPONENT="${COMPONENT:-$PKG}"; REF="${REF:-unknown}"; EXT="${EXT:-tar.gz}"
 HERE="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
 log() { echo "[patch-image] $*"; }
 
@@ -34,7 +34,14 @@ log() { echo "[patch-image] $*"; }
 # build-image.sh keys off CARGO_BAY (not VBUILD_CARGO_BAY, which it derives), so
 # we must pass CARGO_BAY for both the script copy AND the artifact to land here.
 STAGE="$(mktemp -d /var/tmp/voxel-patch-stage.XXXXXX)"
-cp "$ARTIFACT" "$STAGE/${PKG}.tar.gz"
+cp "$ARTIFACT" "$STAGE/${PKG}.${EXT}"
+
+# In-guest extraction of $TB, respecting the archive form (no gtar in the guest).
+case "$EXT" in
+  tar.gz) UNTAR_ROOT='gzcat "$TB" | tar xf - root'; UNTAR_ALL='gzcat "$TB" | tar xf -' ;;
+  tar)    UNTAR_ROOT='tar xf "$TB" root';           UNTAR_ALL='tar xf "$TB"' ;;
+  *)      echo "[patch-image] FATAL: unknown EXT=$EXT"; rm -rf "$STAGE"; exit 1 ;;
+esac
 
 # Generate the in-guest place script. build-image.sh requires INSTALL_SCRIPT to
 # live under HERE and runs it as `cd /opt/cargo-bay && bash ./<script>`. It then
@@ -49,7 +56,7 @@ PLACE="$HERE/.voxel-patch-place.sh"
   echo 'exec > /opt/cargo-bay/.place.log 2>&1'
   echo 'log() { echo "[patch-place] $*"; }'
   echo 'rm -f /var/voxel-image-ready'   # clear stale marker: no false success
-  echo "TB=/opt/cargo-bay/${PKG}.tar.gz"
+  echo "TB=/opt/cargo-bay/${PKG}.${EXT}"
   echo 'ls -la /opt/cargo-bay'
   echo '[[ -f "$TB" ]] || { log "FATAL: $TB missing"; exit 1; }'
   case "$PLACE_KIND" in
@@ -59,10 +66,16 @@ PLACE="$HERE/.voxel-patch-place.sh"
       echo "cp \"\$TB\" '${DEST}'"
       echo "digest -a sha256 '${DEST}' || true"
       ;;
+    dir-replace)
+      : "${DEST:?set DEST (install dir) for dir-replace}"
+      echo "log 'extracting ${PKG} into ${DEST}'"
+      echo "mkdir -p '${DEST}'"
+      echo "( cd '${DEST}' && ${UNTAR_ALL} )"
+      ;;
     gz-overlay)
       echo "log 'overlaying ${PKG} root/ onto /'"
       echo 'T=/var/tmp/voxel-patch-x; rm -rf "$T"; mkdir -p "$T"'
-      echo '( cd "$T" && gzcat "$TB" | tar xf - root )'
+      echo "( cd \"\$T\" && ${UNTAR_ROOT} )"
       echo '( cd "$T/root" && tar cf - . | ( cd / && tar xf - ) )'
       echo 'rm -rf "$T"'
       ;;
