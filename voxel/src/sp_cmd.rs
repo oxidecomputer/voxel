@@ -30,6 +30,13 @@ const FAUX_CARGO: &str = "/opt/cargo-bay/sp-emu/faux-mgs";
 /// Baked-into-the-image copy (install-cp.sh, the self-contained path - present
 /// even when neither `[sp].faux_mgs` nor `[sp].emu_bin` is configured at launch).
 const FAUX_BAKED: &str = "/opt/oxide/sp-emu/faux-mgs";
+/// The baked sp-emu fleet dir, in-zone and (from the sled GZ) GZ-visible. The
+/// per-SP flash files (`<port>.flash`), the shared RoT flash (`rot.flash`), and
+/// the `sp-emu` binary all live here; `voxel-init` starts one
+/// `svc:/oxide/voxel-sp-emu:sp<port>` (and `voxel-rot-emu:rot<port>`) per SP off
+/// these. `reflash` swaps a flash + restarts the matching service.
+const SP_EMU_ZONE: &str = "/opt/oxide/sp-emu";
+const SP_EMU_GZ: &str = "/zone/oxz_switch/root/opt/oxide/sp-emu";
 
 pub(crate) async fn cmd_sp(cfg: &VoxelConfig, name: &str, cmd: &SpCmd) -> anyhow::Result<()> {
     match cmd {
@@ -57,6 +64,8 @@ pub(crate) async fn cmd_sp(cfg: &VoxelConfig, name: &str, cmd: &SpCmd) -> anyhow
             print!("{}", sp_faux(cfg, name, switch, target, &parts).await?);
             Ok(())
         }
+        SpCmd::Reflash { target, image, switch } => sp_reflash(cfg, name, switch, target, image).await,
+        SpCmd::Debug { target, off, switch } => sp_debug(cfg, name, switch, target, *off).await,
     }
 }
 
@@ -235,6 +244,185 @@ async fn sp_faux(
         clear_cached_ip(&sw);
         e
     })
+}
+
+/// `voxel sp reflash <target> <image>` - re-flash a live SP (or the shared RoT)
+/// and restart its sp-emu service: the firmware counterpart to `voxel rack
+/// patch`. Flashes in-zone with the BAKED `sp-emu` (so it works on a
+/// self-contained image with no `[sp]` paths set), then verifies over MGS. Live
+/// + ephemeral - a clean relaunch reverts to the image; bake it via `build-cp.sh`
+/// to persist. `target == "rot"` swaps the shared raw `rot.flash` (every RoT
+/// bridge serves it) and restarts them all; otherwise it's a single SP.
+async fn sp_reflash(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+    target: &str,
+    image: &Path,
+) -> anyhow::Result<()> {
+    if !image.exists() {
+        return Err(anyhow!("image not found: {}", image.display()));
+    }
+    let local = image.to_str().ok_or_else(|| anyhow!("non-utf8 image path"))?;
+    let topo = build_topo(cfg, name)?;
+    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    // The baked sp-emu fleet must be present - reflash is meaningless on a
+    // sp-sim rack (there's no flash file / voxel-sp-emu service to swap).
+    let have = ssh_capture(&ip, &format!("test -x {SP_EMU_ZONE}/sp-emu && echo ok"))
+        .map(|o| o.contains("ok"))
+        .unwrap_or(false);
+    if !have {
+        clear_cached_ip(&sw);
+        return Err(anyhow!(
+            "no baked sp-emu in {sw}:{SP_EMU_ZONE} - reflash needs a running --emu / --emu-rot rack"
+        ));
+    }
+
+    if target == "rot" {
+        // rot.flash is a raw oxide-rot-1 image shared by every voxel-rot-emu
+        // instance (build-cp.sh copies `[sp].rot_image` -> rot.flash). Replace it
+        // and restart them all; the SPs reconnect to the bridge.
+        eprintln!("[voxel] reflashing shared RoT (rot.flash) on {sw} from {}", image.display());
+        if !scp_to(&ip, local, &format!("{SP_EMU_GZ}/rot.flash")) {
+            clear_cached_ip(&sw);
+            return Err(anyhow!("scp of RoT image into {sw} failed"));
+        }
+        // grep on one word ("voxel-rot-emu") is the nested-ssh-safe way to list
+        // the instances (alternation/brackets silently fail through ssh).
+        let restart = "n=0; for f in $(svcs -H -o fmri | grep voxel-rot-emu); do svcadm restart $f && n=$((n+1)); done; echo RESTARTED $n";
+        let out = ssh_output(&ip, &format!("zlogin oxz_switch '{restart}' 2>&1")).unwrap_or_default();
+        if !out.contains("RESTARTED") {
+            return Err(anyhow!("RoT image placed but restart failed on {sw}: {}", out.trim()));
+        }
+        eprintln!("[voxel] {}; verifying via rot-boot-info ...", out.trim());
+        match sp_faux(cfg, name, switch, "sidecar", &["rot-boot-info"]).await {
+            Ok(o) => print!("{o}"),
+            Err(e) => eprintln!("[voxel] RoT reflashed; rot-boot-info not yet available ({e})"),
+        }
+        return Ok(());
+    }
+
+    // SP reflash: flash the hubris zip into the target port's flash, swap, restart.
+    let port = resolve_port(&fleet, target)?;
+    let zip = image
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("bad image filename"))?;
+    eprintln!("[voxel] reflashing SP {target} (port {port}) on {sw} from {}", image.display());
+    let remote_zip_gz = format!("/zone/oxz_switch/root/var/tmp/{zip}");
+    if !scp_to(&ip, local, &remote_zip_gz) {
+        clear_cached_ip(&sw);
+        return Err(anyhow!("scp of hubris image into {sw} failed"));
+    }
+    // Flash in-zone into a temp file (the baked sp-emu does `flash a`), swap it
+    // atomically over the live <port>.flash, then restart just that SP's service.
+    let script = format!(
+        "set -e; SP_EMU_FLASH=/var/tmp/reflash.{port} {SP_EMU_ZONE}/sp-emu flash a /var/tmp/{zip}; \
+         mv /var/tmp/reflash.{port} {SP_EMU_ZONE}/{port}.flash; rm -f /var/tmp/{zip}; \
+         svcadm restart svc:/oxide/voxel-sp-emu:sp{port}; echo REFLASH_OK"
+    );
+    let out = ssh_output(&ip, &format!("zlogin oxz_switch '{script}' 2>&1")).unwrap_or_default();
+    if !out.contains("REFLASH_OK") {
+        return Err(anyhow!("SP reflash failed on {sw}: {}", out.trim()));
+    }
+    // The SP re-runs its ~340M-instruction preboot (~30s) before MGS answers;
+    // sp_faux retries generously, so this waits out the boot and returns fresh state.
+    eprintln!("[voxel] SP {target} reflashed + restarting; waiting for it to boot (~30s) ...");
+    match sp_faux(cfg, name, switch, target, &["state"]).await {
+        Ok(o) => print!("{o}"),
+        Err(e) => eprintln!(
+            "[voxel] reflashed, but SP {target} not responding yet ({e}); retry `voxel sp info {target}` shortly"
+        ),
+    }
+    Ok(())
+}
+
+/// `voxel sp debug <target> [--off]` - toggle the in-zone humility debug
+/// listeners for one SP by flipping `SP_EMU_NO_DEBUG` on its sp-emu service +
+/// restarting it. The SPs already run in `gdb` mode; that env var is the only
+/// thing suppressing the gdb/ocd listeners (`sp-emu` src/gdb.rs), so this is the
+/// on/off switch. On enable, prints the per-SP humility ports + attach command.
+/// Live + ephemeral (a clean relaunch reverts to baked production = debug off).
+///
+/// We edit the service's `start/environment` via an `svccfg -f` command file
+/// (scp'd into the zone) - preserving the rest of the env, toggling just the one
+/// var - then `svcadm refresh` + `restart`. Listeners bind after the SP's ~30s
+/// preboot.
+async fn sp_debug(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+    target: &str,
+    off: bool,
+) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let port = resolve_port(&fleet, target)?;
+    let fmri = format!("svc:/oxide/voxel-sp-emu:sp{port}");
+
+    // Read the current method environment so we only toggle SP_EMU_NO_DEBUG and
+    // keep everything else (board/flash/bridge/rot-service) intact.
+    let env = ssh_capture(&ip, &format!("zlogin oxz_switch svcprop -p start/environment {fmri}"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            clear_cached_ip(&sw);
+            anyhow!("couldn't read {fmri} env on {sw} - is this a running --emu / --emu-rot rack?")
+        })?;
+    let mut tokens: Vec<String> =
+        env.split_whitespace().filter(|t| !t.starts_with("SP_EMU_NO_DEBUG")).map(String::from).collect();
+    if off {
+        tokens.push("SP_EMU_NO_DEBUG=1".to_string());
+    }
+
+    // svccfg command file: re-set the whole (toggled) env list. Each token is
+    // double-quoted so values like `[::1]:33320` survive. Shipped as a FILE to
+    // dodge nested ssh/zlogin quoting of the parens + quotes.
+    let quoted: Vec<String> = tokens.iter().map(|t| format!("\"{t}\"")).collect();
+    let content = format!(
+        "select {fmri}\nsetprop start/environment = astring: ({})\n",
+        quoted.join(" ")
+    );
+    let local = std::env::temp_dir().join(format!("voxel-sp-env-{port}.scfg"));
+    std::fs::write(&local, &content).map_err(|e| anyhow!("write {}: {e}", local.display()))?;
+    let remote_gz = format!("/zone/oxz_switch/root/var/tmp/voxel-sp-env-{port}.scfg");
+    let remote = format!("/var/tmp/voxel-sp-env-{port}.scfg");
+    if !scp_to(&ip, local.to_str().unwrap_or_default(), &remote_gz) {
+        clear_cached_ip(&sw);
+        return Err(anyhow!("scp of the svccfg file into {sw} failed"));
+    }
+    let apply = format!(
+        "zlogin oxz_switch 'svccfg -f {remote} && svcadm refresh {fmri} && svcadm restart {fmri} && rm -f {remote} && echo APPLIED_OK'"
+    );
+    let out = ssh_output(&ip, &format!("{apply} 2>&1")).unwrap_or_default();
+    if !out.contains("APPLIED_OK") {
+        return Err(anyhow!("failed to apply debug toggle on {sw}: {}", out.trim()));
+    }
+
+    if off {
+        eprintln!("[voxel] {target} (port {port}) debug DISABLED on {sw}; sp-emu restarting (listeners off, production mode)");
+        return Ok(());
+    }
+    // Per-SP ports: offset by the bridge port (sp-emu src/gdb.rs). gdb=3333+off,
+    // ocd=6666+off, off = base_port - 33300. humility's transports (verified
+    // against this humility build): `-p ocdgdb` (read-only, GDB-RSP) honors
+    // HUMILITY_OCD_PORT -> works on ANY port; `-p ocd` (read+write, OpenOCD-Tcl)
+    // has a HARDCODED port 6666 -> only reaches the SP on bridge 33300.
+    let o = port.wrapping_sub(33300);
+    let (gdb, ocd) = (3333 + o, 6666 + o);
+    eprintln!("[voxel] {target} (port {port}) debug ENABLED on {sw}; sp-emu restarting (listeners ready in ~30s after preboot)");
+    println!("humility attach (listeners are 127.0.0.1 inside oxz_switch on {sw} - run humility there, or tunnel):");
+    println!("  reads (tasks/readmem/ringbuf/readvar) - GDB-RSP :{gdb}");
+    println!("    ssh -L {gdb}:127.0.0.1:{gdb} root@{ip}");
+    println!("    HUMILITY_OCD_PORT={gdb} humility -a <archive.zip> -p ocdgdb tasks");
+    if ocd == 6666 {
+        println!("  read+write (writemem/hiffy) - OpenOCD-Tcl :{ocd}");
+        println!("    ssh -L {ocd}:127.0.0.1:{ocd} root@{ip}");
+        println!("    humility -a <archive.zip> -p ocd <cmd>");
+    } else {
+        println!("  read+write (-p ocd) needs port 6666 (hardcoded in humility) - only the sidecar (33300); this SP's ocd is :{ocd}");
+    }
+    Ok(())
 }
 
 /// `voxel sp ls` - enumerate every SP via the switch zone, pilot-style table.

@@ -307,12 +307,41 @@ enum SpCmd {
     /// Show the configured sp-emu build artifacts and whether `launch --emu` is
     /// ready (pre-launch readiness check; no running rack needed).
     Ready,
-    /// Flash a hubris image (`.zip`) into an sp-emu slot-A flash file.
+    /// Flash a hubris image (`.zip`) into an sp-emu slot-A flash file (offline:
+    /// produces a flash file on disk; see `reflash` to swap one on a live rack).
     Flash {
         /// Hubris image archive (e.g. build-gimlet-c-image-default.zip).
         image: PathBuf,
         /// Output flash file.
         out: PathBuf,
+    },
+    /// Re-flash a live SP (or the shared RoT) on a running rack and restart its
+    /// sp-emu service - the firmware counterpart to `voxel rack patch`. SP
+    /// target: `sidecar` | `g0` | `g1` ... | a port; `rot` reflashes the shared
+    /// RoT image (restarts every RoT bridge). `<image>` is a hubris `.zip` for an
+    /// SP, or a raw oxide-rot-1 flash image for `rot`. Live + ephemeral (reverts
+    /// on a clean relaunch); to persist, bake it in via `build-cp.sh` + relaunch.
+    Reflash {
+        /// Target: `sidecar` | `gN` | a port | `rot`.
+        target: String,
+        /// Hubris `.zip` (SP) or raw oxide-rot-1 flash image (target `rot`).
+        image: PathBuf,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+    },
+    /// Enable (or `--off` to disable) the in-zone humility debug listeners
+    /// (gdb/ocd) for one SP - toggles `SP_EMU_NO_DEBUG` on its sp-emu service +
+    /// restarts it. On enable, prints the per-SP humility ports + attach command;
+    /// the SP reboots (~30s preboot) before the listeners are up. Live +
+    /// ephemeral (a clean relaunch reverts to debug-off).
+    Debug {
+        /// Target SP: `sidecar` | `gN` | a port.
+        target: String,
+        /// Disable debug (re-suppress the listeners) instead of enabling.
+        #[arg(long)]
+        off: bool,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
     },
     /// Build the gimlet-c + sidecar-c-emu v25 images from a hubris commit (via
     /// build-sp.sh), then print the `[sp]` paths to set.
