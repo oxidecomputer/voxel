@@ -23,6 +23,7 @@ mod access;
 mod config_cmd;
 mod image;
 mod net;
+mod network;
 mod patch;
 mod rack;
 mod rss;
@@ -141,6 +142,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RackCmd,
     },
+    /// Inspect, configure, and validate the rack network.
+    Network {
+        #[command(subcommand)]
+        cmd: NetworkCmd,
+    },
     /// Manage real-firmware SP-emulator (`sp-emu`) artifacts for `launch --emu`.
     Sp {
         #[command(subcommand)]
@@ -233,6 +239,49 @@ enum ImageCmd {
         /// Number of gimlet SPs to simulate (sp-sim).
         #[arg(long, default_value_t = 4)]
         gimlets: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    /// Show the per-rack network projection, switches, and switch interconnects.
+    Show,
+    /// Add a switch-to-switch interconnect (a direct sidecar<->sidecar QSFP link
+    /// carrying the underlay) between two switches; applied on the next launch.
+    /// Selectors: `switch0` | `switch1` | `switchN` | `rackR/switchS`.
+    AddPort { a: String, b: String },
+    /// Remove a switch interconnect (either order); applied on the next launch.
+    RmPort { a: String, b: String },
+    /// (debug/transient) Bring up a switch port's link on a RUNNING rack via
+    /// `swadm`: create (if needed) + enable the link in the switch zone, e.g.
+    /// `voxel network link-up switch0 qsfp2` for the interconnect. Run on both
+    /// ends - the link reaches Up once both are enabled. ⚠️ Nexus's reconciler
+    /// reaps manual swadm links in ~30s; persistent config must use the Oxide API.
+    LinkUp {
+        /// Switch: `switch0` | `switch1` | `switchN` | `rackR/switchS` | node `gN`.
+        switch: String,
+        /// Switch port (e.g. `qsfp2`); the link is created as `<port>/0`.
+        port: String,
+        /// Link speed (default 40G, matching the qsfp uplinks).
+        #[arg(long, default_value = "40G")]
+        speed: String,
+        /// Forward error correction (default none).
+        #[arg(long, default_value = "none")]
+        fec: String,
+    },
+    /// Take down a switch port's link (disable + delete) on a running rack,
+    /// e.g. `voxel network link-down switch0 qsfp2`.
+    LinkDown {
+        switch: String,
+        port: String,
+    },
+    /// Validate live networking on a running rack: per switch zone the link
+    /// states, BGP sessions, and programmed routes, plus the host routes.
+    Validate {
+        /// Show the full `swadm`/`mgadm` output (links, switch ports, bgp,
+        /// routes) in long form instead of summary counts.
+        #[arg(long)]
+        detail: bool,
     },
 }
 
@@ -516,6 +565,20 @@ async fn main() -> Result<(), Error> {
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
             }
             other => image::cmd_image(other),
+        },
+        Cmd::Network { cmd } => match cmd {
+            NetworkCmd::Show => network::show(&load_config(&config_path)?),
+            NetworkCmd::AddPort { a, b } => network::add_port(&config_path, a, b),
+            NetworkCmd::RmPort { a, b } => network::rm_port(&config_path, a, b),
+            NetworkCmd::LinkUp { switch, port, speed, fec } => {
+                network::link_up(&load_config(&config_path)?, &cli.name, switch, port, speed, fec).await
+            }
+            NetworkCmd::LinkDown { switch, port } => {
+                network::link_down(&load_config(&config_path)?, &cli.name, switch, port).await
+            }
+            NetworkCmd::Validate { detail } => {
+                network::validate(&load_config(&config_path)?, &cli.name, *detail).await
+            }
         },
         Cmd::Rack { cmd } => match cmd {
             RackCmd::Patch { component, reference, list, dry_run } => {
