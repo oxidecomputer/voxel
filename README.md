@@ -70,3 +70,51 @@ So the two build-location knobs are:
 - `FALCON_DATASET` where images/topo zvols live (<ds>/img/...).
 - `BUILD_ROOT` where the omicron checkout + rss-gen build live.
 
+## Emulated SPs and RoTs (sp-emu)
+
+By default voxel backs each SP with omicron's `sp-sim`. To run the real SP and RoT
+firmware instead, voxel uses [sp-emu](https://github.com/oxidecomputer/sp-emu),
+which boots unmodified Hubris on emulated STM32H7 and LPC55 cores. sp-emu is a
+separate binary that voxel runs inside the switch zone; it is not a Cargo
+dependency, so you build it and point voxel at it.
+
+1. Build sp-emu:
+
+   ```
+   git clone git@github.com:oxidecomputer/sp-emu.git
+   cd sp-emu && cargo build --release        # produces target/release/sp-emu
+   ```
+
+2. Point voxel at it in `voxel.toml`, along with the Hubris `-c-emu` images you
+   want to run:
+
+   ```toml
+   [sp]
+   emu = ["sidecar"]                  # which SPs run real firmware: "sidecar", "g0", ...
+   emu_bin = "/path/to/sp-emu/target/release/sp-emu"
+   sidecar_image = "/path/to/hubris/.../build-sidecar-c-emu-image-default.zip"
+   gimlet_image  = "/path/to/hubris/.../build-gimlet-c-emu-image-default.zip"
+   rot_image     = "/path/to/hubris/target/oxide-rot-1/dist/a/final.bin"
+   faux_mgs      = "/path/to/faux-mgs"   # optional, for `voxel sp` operator commands
+   ```
+
+3. Launch with the emulated fleet:
+
+   ```
+   voxel launch --emu-sp                  # real SP firmware behind MGS
+   voxel launch --emu-rot                 # also a real RoT (implies --emu-sp; needs rot_image)
+   voxel launch --emu-rot --wicket-setup  # drive rack setup through wicketd (real operator flow)
+   ```
+
+   `--wicket-setup` runs rack setup through wicketd the way an operator would,
+   instead of the file-based sled-agent auto-init: it uploads the config, a
+   self-signed cert, and the recovery password, starts RSS, and fully populates
+   wicket's RACK SETUP page. It needs the emulated SP/RoT fleet, so run it with
+   `--emu-rot`. Because it posts a cert, the console then comes up over https
+   rather than http.
+
+When you build a cp image, voxel bakes the sp-emu binary and per-role firmware into
+the image from `[sp]`, so a launched rack is self-contained and `emu_bin` can be
+left unset at launch. Setting `emu_bin` at launch stages it on the fly instead,
+which is useful for iterating on sp-emu without rebaking.
+
