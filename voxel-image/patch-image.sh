@@ -12,8 +12,9 @@
 #   OUT_IMAGE    new image name to capture into                  [required]
 #   ARTIFACT     path to the component <pkg>.tar.gz on the box    [required]
 #   PKG          artifact basename (e.g. propolis-server)         [required]
-#   PLACE_KIND   zone-image | gz-overlay                          [required]
-#   DEST         zone-image only: on-disk path to replace         [zone-image]
+#   PLACE_KIND   zone-image | gz-overlay | dir-replace            [required]
+#   DEST         on-disk file to replace (zone-image) or install  [zone-image,
+#                dir to extract into (dir-replace)                  dir-replace]
 #   COMPONENT    component label (for the version marker)         [default: PKG]
 #   REF          ref label (for the version marker)               [default: unknown]
 #   FALCON_DATASET, VBUILD_MEM_GB (default 6), VBUILD_CORES (default 4)

@@ -83,7 +83,6 @@ pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, ta
         "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
     );
     const POLL_INTERVAL: Duration = Duration::from_secs(8);
-    let watch_cap = cap;
     const HEARTBEAT: Duration = Duration::from_secs(90); // re-affirm liveness this often
 
     info!(d.log, "{tag}: watching RSS progress on the RSS node ...");
@@ -117,13 +116,13 @@ pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, ta
     let mut step_start = Instant::now(); // when the CURRENT step began (for in-step timing)
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
-        if start.elapsed() > watch_cap {
+        if start.elapsed() > cap {
             warn!(
                 d.log,
                 "{tag}: stopped watching after {}m - the rack may still be \
                  converging; check the console or re-run `voxel status`. Not failing \
                  the launch.",
-                watch_cap.as_secs() / 60
+                cap.as_secs() / 60
             );
             break;
         }
