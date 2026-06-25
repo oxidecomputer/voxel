@@ -19,6 +19,14 @@
 use crate::sp::SpFleet;
 use std::fmt::Write as _;
 
+/// MGS per-attempt UDP RPC timeout. The default (baked into [`HEAD`]) is tight for
+/// sp-sim; an emulator-backed fleet answers far slower, so [`switch0_config`]
+/// widens it to [`SP_RPC_TIMEOUT_EMU_MS`]. Both ends of that rewrite source these
+/// consts so the `replace` target can't drift from `HEAD`.
+const SP_RPC_TIMEOUT_DEFAULT_MS: u32 = 2000;
+/// Widened per-attempt RPC timeout for emulator-backed fleets; see [`SP_RPC_TIMEOUT_DEFAULT_MS`].
+const SP_RPC_TIMEOUT_EMU_MS: u32 = 15000;
+
 // Static comment/boilerplate blocks, verbatim from the known-good config. Only
 // the description/determination/port *data* between them is generated.
 const HEAD: &str = r#"#
@@ -154,8 +162,8 @@ fn switch0_config(fleet: &SpFleet, scrimlets: &[usize]) -> String {
     // this only needs to cover a single slow RPC. sp-sim keeps the tight default.
     if fleet.has_emu() {
         o = o.replace(
-            "per_attempt_timeout_millis = 2000",
-            "per_attempt_timeout_millis = 15000",
+            &format!("per_attempt_timeout_millis = {SP_RPC_TIMEOUT_DEFAULT_MS}"),
+            &format!("per_attempt_timeout_millis = {SP_RPC_TIMEOUT_EMU_MS}"),
         );
     }
     o

@@ -15,8 +15,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::frr::{FrrNeighbor, FrrRouter};
 
+/// Bootstrap-network IPv6 prefix (first three hextets); see
+/// [`SledDesc::bootstrap_addr`]. Each sled appends `:{2*index+1}::1`.
+const BOOTSTRAP_NET_PREFIX: &str = "fdb0:a840:2500";
+
+/// Default rack BGP ASN (the switch's local ASN + the uplink `peer_asn` it
+/// references). `for_rack` offsets it by rack index for multi-rack transit.
+const DEFAULT_RACK_ASN: u32 = 65000;
+
+/// FRR transit ASN base: `ce` is [`TRANSIT_ASN_BASE`]; customer router `cr{i}` is
+/// [`TRANSIT_ASN_BASE`]` + i` (i starts at 1). See [`VoxelConfig::to_frr`].
+const TRANSIT_ASN_BASE: u32 = 65100;
+
+/// First `enp0sN` index the fabric routers wire from (mirrors `build_topo`'s
+/// link-creation order). See [`VoxelConfig::to_frr`].
+const FRR_IFACE_BASE: usize = 8;
+
 /// Top-level Voxel configuration (`voxel.toml`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VoxelConfig {
     pub topology: Topology,
@@ -25,19 +41,6 @@ pub struct VoxelConfig {
     pub recovery_silo: RecoverySiloCfg,
     pub falcon: Falcon,
     pub sp: SpCfg,
-}
-
-impl Default for VoxelConfig {
-    fn default() -> Self {
-        Self {
-            topology: Topology::default(),
-            image: Image::default(),
-            network: Network::default(),
-            recovery_silo: RecoverySiloCfg::default(),
-            falcon: Falcon::default(),
-            sp: SpCfg::default(),
-        }
-    }
 }
 
 /// falcon/runtime settings: the zfs dataset falcon uses and the typed RSS
@@ -355,7 +358,7 @@ impl SledDesc {
     /// 0-4 (`2*index+1 < 10`); the old `{:x}` silently diverged at index 5,
     /// breaking bootstrap discovery for >4-sled racks.
     pub fn bootstrap_addr(&self) -> String {
-        format!("fdb0:a840:2500:{}::1", 2 * self.index + 1)
+        format!("{BOOTSTRAP_NET_PREFIX}:{}::1", 2 * self.index + 1)
     }
 
     /// This sled's generated sled-agent config (`sled-config.toml`). The rack's
@@ -451,7 +454,7 @@ impl Default for Network {
             rack_subnet: "fd00:17:01:d00::/56".into(),
             service_pool_first: "198.51.100.20".into(),
             service_pool_last: "198.51.100.29".into(),
-            bgp_asn: 65000,
+            bgp_asn: DEFAULT_RACK_ASN,
             infra_prefix: "198.51.100.0/24".into(),
             uplinks: vec![
                 UplinkCfg::default_for("switch0", "uplink0"),
@@ -461,38 +464,42 @@ impl Default for Network {
     }
 }
 
+/// Split an `addr/prefix` (or bare `addr`) into the address and its `/prefix`
+/// suffix, apply `f` to the address, and rejoin. If `f` returns `None` (the
+/// address didn't parse), the original input is returned unchanged.
+fn map_addr(s: &str, f: impl FnOnce(&str) -> Option<String>) -> String {
+    let (addr, suffix) = match s.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (s, String::new()),
+    };
+    match f(addr) {
+        Some(out) => format!("{out}{suffix}"),
+        None => s.to_string(),
+    }
+}
+
 /// Bump an IPv4 address's 3rd octet by `rack` (preserving any `/prefix`), so each
 /// rack gets a distinct customer/service network. Returns the input unchanged if
 /// it doesn't parse.
 fn offset_v4(s: &str, rack: u8) -> String {
-    let (addr, suffix) = match s.split_once('/') {
-        Some((a, p)) => (a, format!("/{p}")),
-        None => (s, String::new()),
-    };
-    match addr.parse::<std::net::Ipv4Addr>() {
-        Ok(ip) => {
+    map_addr(s, |addr| {
+        addr.parse::<std::net::Ipv4Addr>().ok().map(|ip| {
             let mut o = ip.octets();
             o[2] = o[2].wrapping_add(rack);
-            format!("{}{}", std::net::Ipv4Addr::from(o), suffix)
-        }
-        Err(_) => s.to_string(),
-    }
+            std::net::Ipv4Addr::from(o).to_string()
+        })
+    })
 }
 
 /// Bump an IPv6 prefix's 3rd hextet by `rack` (preserving any `/prefix`).
 fn offset_v6_prefix(s: &str, rack: u16) -> String {
-    let (addr, suffix) = match s.split_once('/') {
-        Some((a, p)) => (a, format!("/{p}")),
-        None => (s, String::new()),
-    };
-    match addr.parse::<std::net::Ipv6Addr>() {
-        Ok(ip) => {
+    map_addr(s, |addr| {
+        addr.parse::<std::net::Ipv6Addr>().ok().map(|ip| {
             let mut seg = ip.segments();
             seg[2] = seg[2].wrapping_add(rack);
-            format!("{}{}", std::net::Ipv6Addr::from(seg), suffix)
-        }
-        Err(_) => s.to_string(),
-    }
+            std::net::Ipv6Addr::from(seg).to_string()
+        })
+    })
 }
 
 impl Network {
@@ -555,7 +562,7 @@ impl UplinkCfg {
         Self {
             switch: switch.into(),
             port: "qsfp0".into(),
-            peer_asn: 65000,
+            peer_asn: DEFAULT_RACK_ASN,
             router_lifetime: 300,
             port_speed: "40G".into(),
             lldp_port_description: description.into(),
@@ -624,27 +631,28 @@ impl VoxelConfig {
                 let neighbors = fabric
                     .iter()
                     .enumerate()
-                    .map(|(k, r)| FrrNeighbor::new(format!("enp0s{}", 8 + k), format!("to {r}")))
+                    .map(|(k, r)| FrrNeighbor::new(format!("enp0s{}", FRR_IFACE_BASE + k), format!("to {r}")))
                     .collect();
                 FrrRouter {
                     hostname: "ce".into(),
-                    asn: 65100,
+                    asn: TRANSIT_ASN_BASE,
                     neighbors,
                     originate4: vec!["0.0.0.0/0".into()],
                     originate6: vec!["::/0".into()],
                 }
             } else {
                 cr_index += 1;
-                let mut neighbors = vec![FrrNeighbor::new("enp0s8", "to ce")];
+                let mut neighbors =
+                    vec![FrrNeighbor::new(format!("enp0s{FRR_IFACE_BASE}"), "to ce")];
                 for (k, (sname, rack, slot)) in scrimlets.iter().enumerate() {
                     neighbors.push(FrrNeighbor::new(
-                        format!("enp0s{}", 9 + k),
+                        format!("enp0s{}", FRR_IFACE_BASE + 1 + k),
                         format!("to {sname} (rack{rack} switch{slot})"),
                     ));
                 }
                 FrrRouter {
                     hostname: name.clone(),
-                    asn: 65100 + cr_index,
+                    asn: TRANSIT_ASN_BASE + cr_index,
                     neighbors,
                     originate4: vec![],
                     originate6: vec![],

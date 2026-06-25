@@ -127,13 +127,13 @@ ZVOL="/dev/zvol/rdsk/${NODE_DS}"
 [[ -e "${ZVOL}" ]] || { log "FATAL: node zvol not found at ${ZVOL}"; exit 1; }
 VOLSIZE="$(pfexec zfs get -Hp -o value volsize "${NODE_DS}")"
 BS=1048576
+IMG_DS="${FALCON_DATASET}/img/${IMAGE_NAME}"   # registered base image dataset (both modes)
 
 case "${CAPTURE_MODE}" in
 zfs)
     # Fast box-local path: a full (non-incremental) zfs send is self-contained,
     # so the resulting image has no dependency on the helios base it was cloned
     # from. Only allocated blocks move.
-    IMG_DS="${FALCON_DATASET}/img/${IMAGE_NAME}"
     log "capturing (zfs send/recv) ${NODE_DS} -> ${IMG_DS}@base"
     pfexec zfs destroy -r "${NODE_DS}@base" 2>/dev/null || true
     pfexec zfs destroy -r "${IMG_DS}" 2>/dev/null || true
@@ -153,7 +153,6 @@ raw)
     if [[ "${REGISTER:-0}" == "1" ]]; then
         # Stream-decompress back into a presized zvol. import-raw-img.sh can't
         # take .xz, and volsize must equal the uncompressed raw size.
-        IMG_DS="${FALCON_DATASET}/img/${IMAGE_NAME}"
         log "registering ${IMAGE_NAME} (streaming import into ${IMG_DS})"
         pfexec zfs destroy -r "${IMG_DS}" 2>/dev/null || true
         pfexec zfs create -p -V "${VOLSIZE}" -o volblocksize=4k -o compression=lz4 "${IMG_DS}"

@@ -216,12 +216,7 @@ pub(crate) async fn cmd_launch(
                         warn!(d.log, "{tag}: wicket-setup failed: {e}; rack will not initialize");
                     }
                 }
-                // Emulated SPs slow every MGS RPC, and multi-rack racks converge
-                // under each other's load - give those a 60m watch budget vs the
-                // 30m a single sp-sim rack needs.
-                let watch_cap = std::time::Duration::from_secs(
-                    if emu_sp || racks > 1 { 3600 } else { 1800 },
-                );
+                let watch_cap = rss_watch_cap(emu_sp, racks);
                 watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap).await;
             }
         }
@@ -363,6 +358,14 @@ pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// RSS watch budget: emulated SPs slow every MGS RPC and multi-rack racks
+/// converge under each other's load, so both get 60m vs the 30m a single sp-sim
+/// rack needs. (`cmd_status` watches a running rack with no emu_sp context, so it
+/// passes `false`.)
+fn rss_watch_cap(emu_sp: bool, racks: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(if emu_sp || racks > 1 { 3600 } else { 1800 })
+}
+
 pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let racks = cfg.topology.racks();
@@ -373,7 +376,7 @@ pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<
     let d = &topo.runner;
     // Multi-rack racks converge under each other's load - watch longer (matches
     // cmd_launch). Duration is Copy, so each watcher closure gets its own.
-    let watch_cap = std::time::Duration::from_secs(if racks > 1 { 3600 } else { 1800 });
+    let watch_cap = rss_watch_cap(false, racks);
     let watchers = rss_nodes.into_iter().map(|(s, n)| {
         let tag = rack_label(racks, s.rack, "rack-init");
         let addr = s.bootstrap_addr();

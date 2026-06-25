@@ -29,6 +29,7 @@ mod rack;
 mod rss;
 mod sp_cmd;
 mod topo;
+mod util;
 mod wicket_setup;
 
 #[derive(Parser)]

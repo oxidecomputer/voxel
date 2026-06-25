@@ -32,8 +32,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use voxel_config::VoxelConfig;
 
-use crate::net::{node_external_ip, scp_to, ssh_capture};
+use crate::net::{node_external_ip, scp_to, ssh_capture, zlogin, SWITCH_ZONE_ROOT};
 use crate::topo::{build_topo, Topo};
+use crate::util::{locate_script, shell_quote as q};
 
 const BUILDOMAT: &str = "https://buildomat.eng.oxide.computer/public/file/oxidecomputer";
 
@@ -49,7 +50,7 @@ enum Targets {
 /// The switch zone's root, as seen from the sled global zone. Every overlay
 /// component (the switch infra) lands here; the GZ ddm uses `DirReplace` instead,
 /// so there's no GZ-overlay case to generalize over.
-const SWITCH_ROOT: &str = "/zone/oxz_switch/root";
+const SWITCH_ROOT: &str = SWITCH_ZONE_ROOT;
 
 /// The buildomat artifact's on-disk form. omicron-package "zone" outputs are
 /// published gzipped (`<pkg>.tar.gz`) with an `oxide.json` + `root/` subtree;
@@ -178,8 +179,9 @@ fn registry() -> Vec<Component> {
 }
 
 fn lookup(name: &str) -> anyhow::Result<Component> {
-    registry().into_iter().find(|c| c.name == name).ok_or_else(|| {
-        let names: Vec<&str> = registry().iter().map(|c| c.name).collect();
+    let reg = registry();
+    let names: Vec<&str> = reg.iter().map(|c| c.name).collect();
+    reg.into_iter().find(|c| c.name == name).ok_or_else(|| {
         anyhow!("unknown component '{name}'. patchable components: {}", names.join(", "))
     })
 }
@@ -310,11 +312,6 @@ fn targets<'a>(topo: &'a Topo, comp: &Component) -> Vec<(String, NodeRef)> {
         .collect()
 }
 
-/// Single-quote for safe interpolation into a remote shell command.
-fn q(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Overlay an omicron "zone" tarball's `root/` subtree onto `root_dir` on the
 /// node, using only SVR4 `tar` + `gzcat` (the sleds/switch zone have no `gtar`):
 /// unpack the `root/` member into a temp dir, then stream its contents into place
@@ -345,7 +342,7 @@ fn dir_replace_cmd(comp: &Component, remote: &str, dir: &str) -> String {
 /// selects the switch zone vs the GZ. Returns the final state seen.
 fn wait_online(ip: &str, in_switch: bool, fmri: &str) -> String {
     let query = if in_switch {
-        format!("zlogin oxz_switch svcs -H -o state {fmri}")
+        zlogin(&format!("svcs -H -o state {fmri}"))
     } else {
         format!("svcs -H -o state {fmri}")
     };
@@ -366,7 +363,7 @@ fn wait_online(ip: &str, in_switch: bool, fmri: &str) -> String {
 /// `online`. Logs the outcome against `node`.
 fn restart_and_verify(d: &Runner, node: &str, ip: &str, pkg: &str, in_switch: bool, fmri: &str) {
     let restart = if in_switch {
-        format!("zlogin oxz_switch svcadm restart {fmri} && echo RESTART_OK")
+        zlogin(&format!("svcadm restart {fmri} && echo RESTART_OK"))
     } else {
         format!("svcadm restart {fmri} && echo RESTART_OK")
     };
@@ -482,22 +479,7 @@ pub(crate) async fn cmd_rack_patch(
 
 /// Locate `voxel-image/patch-image.sh` (mirrors `image::build_cp_script`).
 fn patch_image_script() -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::env::var("VOXEL_PATCH_IMAGE") {
-        return Ok(PathBuf::from(p));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("../../voxel-image/patch-image.sh");
-            if cand.exists() {
-                return Ok(cand);
-            }
-        }
-    }
-    let cwd = PathBuf::from("voxel-image/patch-image.sh");
-    if cwd.exists() {
-        return Ok(cwd);
-    }
-    Err(anyhow!("can't find patch-image.sh - set VOXEL_PATCH_IMAGE to its path"))
+    locate_script("VOXEL_PATCH_IMAGE", "patch-image.sh")
 }
 
 /// Fold a component patch into a NEW pinned `@base` (boot-modify-capture via

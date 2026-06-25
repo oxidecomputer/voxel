@@ -8,6 +8,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use voxel_config::{SledDesc, VoxelConfig};
 
+/// Gimlet board-serial prefix. The SMBIOS serial ([`populate_smbios`]) and the
+/// faux-mgs lookup serial (`sp_cmd::sp_serial`) both build `{prefix}{index+1}`
+/// from this, so they can't drift; it BYTE-MATCHES the emulated SP's VPD. Swapping
+/// to a mfg-allocated serial is a coordinated edit here + sp-emu `build_vpd_eeprom`
+/// + the vendored sprockets `platform_id` (see the de-a4x2 handoff notes).
+pub(crate) const GIMLET_SERIAL_PREFIX: &str = "BRM4422000";
+
 pub(crate) struct Topo {
     pub(crate) runner: Runner,
     pub(crate) sleds: Vec<(SledDesc, NodeRef)>,
@@ -60,7 +67,7 @@ fn populate_smbios(d: &mut Runner, x: NodeRef, index: usize) {
         SmbiosType1Input {
             manufacturer: "a4x2".to_string(),
             product_name: "913-0000019".to_string(),
-            serial_number: format!("BRM4422000{}", index + 1),
+            serial_number: format!("{GIMLET_SERIAL_PREFIX}{}", index + 1),
             version: 2,
         },
     );
@@ -148,19 +155,23 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
     // SMBIOS + cargo-bay mounts.
     for (s, n) in &sleds {
         populate_smbios(&mut d, *n, s.index);
-        d.mount(format!("./cargo-bay/{}", s.name), "/opt/cargo-bay", *n)
+        d.mount(format!("{CARGO_BAY}/{}", s.name), "/opt/cargo-bay", *n)
             .map_err(|e| anyhow!("mount {}: {e}", s.name))?;
     }
     for (r, n) in &routers {
-        d.mount_linux(format!("./cargo-bay/{r}"), "/opt/cargo-bay", *n)
+        d.mount_linux(format!("{CARGO_BAY}/{r}"), "/opt/cargo-bay", *n)
             .map_err(|e| anyhow!("mount_linux {r}: {e}"))?;
     }
 
     Ok(Topo { runner: d, sleds, routers })
 }
 
+/// Host-side cargo-bay root (per-node staging dirs live under `<CARGO_BAY>/<node>`,
+/// mounted into each guest at `/opt/cargo-bay`).
+const CARGO_BAY: &str = "./cargo-bay";
+
 fn cargo_bay(node: &str) -> PathBuf {
-    Path::new("./cargo-bay").join(node)
+    Path::new(CARGO_BAY).join(node)
 }
 
 /// Clear each node's cargo-bay before staging so it reflects ONLY the current
@@ -354,8 +365,9 @@ fn stage_sp_emu(
         let role = if sp.selector() == "sidecar" { "sidecar" } else { "gimlet" };
         manifest.push_str(&format!("{} {}\n", sp.base_port, role));
     }
-    fs::write(out.join("ports"), manifest)
-        .with_context(|| format!("write {}", out.join("ports").display()))?;
+    let ports_manifest = out.join("ports");
+    fs::write(&ports_manifest, manifest)
+        .with_context(|| format!("write {}", ports_manifest.display()))?;
     // Dev override: with [sp].emu_bin set, stage the binary + per-SP flashes from
     // the local build for fast iteration (no rebake). Unset -> voxel-init uses the
     // baked image artifacts (the per-SP flash from the baked per-role flash).
@@ -410,7 +422,7 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
     use sprockets_tls_test_utils as sprockets;
 
     let sleds = cfg.sleds();
-    let base = Utf8PathBuf::from("./cargo-bay");
+    let base = Utf8PathBuf::from(CARGO_BAY);
     let src = base.join("sprockets");
     fs::create_dir_all(&src).with_context(|| format!("{src}"))?;
 

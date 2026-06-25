@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context};
 use std::path::Path;
 use voxel_config::{config as vcfg, SledDesc, VoxelConfig};
 
-use crate::net::{node_external_ip, ssh_capture, ssh_output};
+use crate::net::{node_external_ip, ssh_capture, ssh_output, zlogin};
 use crate::topo::build_topo;
 
 const SWADM: &str = "/opt/oxide/dendrite/bin/swadm";
@@ -163,27 +163,27 @@ pub(crate) async fn link_up(
     let (sw, ip) = switch_ip(cfg, name, switch).await?;
     let link = format!("{port}/0");
     eprintln!("[voxel] {sw} ({ip}): bringing up link {link} ({speed}, fec {fec})");
-    let present = ssh_capture(&ip, &format!("zlogin oxz_switch {SWADM} link get {link} 2>&1"))
+    let present = ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1")))
         .map(|o| o.contains(port))
         .unwrap_or(false);
     if present {
         eprintln!("[voxel] {link} already exists; (re)enabling");
     } else {
         let create =
-            format!("zlogin oxz_switch {SWADM} link create -s {speed} --fec {fec} {port} 2>&1 && echo CREATE_OK");
+            zlogin(&format!("{SWADM} link create -s {speed} --fec {fec} {port} 2>&1 && echo CREATE_OK"));
         let out = ssh_output(&ip, &create).unwrap_or_default();
         if !out.contains("CREATE_OK") {
             return Err(anyhow!("link create {link} on {sw} failed: {}", out.trim()));
         }
     }
-    let en = ssh_output(&ip, &format!("zlogin oxz_switch {SWADM} link enable {link} 2>&1 && echo ENABLE_OK"))
+    let en = ssh_output(&ip, &zlogin(&format!("{SWADM} link enable {link} 2>&1 && echo ENABLE_OK")))
         .unwrap_or_default();
     if !en.contains("ENABLE_OK") {
         return Err(anyhow!("link enable {link} on {sw} failed: {}", en.trim()));
     }
     // Brief settle, then show the link state (Down until the peer end is up too).
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let st = ssh_capture(&ip, &format!("zlogin oxz_switch {SWADM} link get {link} 2>&1")).unwrap_or_default();
+    let st = ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1"))).unwrap_or_default();
     print!("{st}");
     eprintln!("[voxel] {sw}: {link} created + enabled (reaches Up once the peer switch's {port} is also up)");
     eprintln!("[voxel] ⚠️  transient: Nexus's reconciler will reap this manual link in ~30s - debug only; use the Oxide API to persist");
@@ -196,8 +196,8 @@ pub(crate) async fn link_down(cfg: &VoxelConfig, name: &str, switch: &str, port:
     let (sw, ip) = switch_ip(cfg, name, switch).await?;
     let link = format!("{port}/0");
     eprintln!("[voxel] {sw} ({ip}): taking down link {link}");
-    let _ = ssh_output(&ip, &format!("zlogin oxz_switch {SWADM} link disable {link} 2>&1"));
-    let out = ssh_output(&ip, &format!("zlogin oxz_switch {SWADM} link delete {link} 2>&1 && echo DELETE_OK"))
+    let _ = ssh_output(&ip, &zlogin(&format!("{SWADM} link disable {link} 2>&1")));
+    let out = ssh_output(&ip, &zlogin(&format!("{SWADM} link delete {link} 2>&1 && echo DELETE_OK")))
         .unwrap_or_default();
     if out.contains("DELETE_OK") {
         println!("{sw}: link {link} disabled + deleted");
@@ -242,7 +242,7 @@ pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> any
         };
         let asn = cfg.network.for_rack(s.rack).bgp_asn;
         println!("  switch {} ({ip}, rack{}):", s.name, s.rack + 1);
-        let zl = |c: String| ssh_capture(&ip, &format!("zlogin oxz_switch {c} 2>&1")).unwrap_or_default();
+        let zl = |c: String| ssh_capture(&ip, &format!("{} 2>&1", zlogin(&c))).unwrap_or_default();
         let links = zl(format!("{SWADM} link ls"));
         let ports = zl(format!("{SWADM} switch-port ls"));
         let bgp = zl(format!("{MGADM} bgp status neighbors {asn}"));

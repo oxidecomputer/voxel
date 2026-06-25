@@ -15,8 +15,30 @@ use std::time::Duration;
 
 const CARGO_BAY: &str = "/opt/cargo-bay";
 const OMICRON: &str = "/opt/oxide/omicron";
+// `<CARGO_BAY>/sled-config.toml` (kept literal: `concat!` can't expand a const).
 const SLED_CFG: &str = "/opt/cargo-bay/sled-config.toml";
 const PATCHED_CFG: &str = "/tmp/sled-config.toml";
+
+/// Pick the `staged` path if it exists on disk, else fall back to `baked` — the
+/// "dev cargo-bay wins, baked image otherwise" rule used to source every sp-emu
+/// artifact.
+fn pick(staged: String, baked: String) -> String {
+    if std::path::Path::new(&staged).exists() { staged } else { baked }
+}
+
+/// Poll `f` every 2s until it returns true or `max_s` seconds elapse; returns
+/// whether the condition was met (callers decide whether a timeout is fatal).
+fn wait_until(max_s: u32, mut f: impl FnMut() -> bool) -> bool {
+    let mut waited = 0;
+    while !f() {
+        if waited >= max_s {
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        waited += 2;
+    }
+    true
+}
 
 pub fn bring_up() -> Result<()> {
     setup_ssh();
@@ -244,6 +266,11 @@ const SP_EMU_MANIFEST: &str = "/zone/oxz_switch/root/var/svc/manifest/site/voxel
 // (e.g. 33300 -> 19300), clear of the SP base-port + ereport ranges.
 const SP_EMU_ROT_PORT_OFFSET: u16 = 14000;
 
+// The sidecar SP's MGS base port (voxel_config::sp::SP_PORT_BASE); every other
+// port in the fleet manifest is a gimlet. voxel-init is cross-compiled (musl) and
+// doesn't link voxel-config, so the value is mirrored here.
+const SIDECAR_SP_PORT: u16 = 33300;
+
 /// Bake-once: the image bakes switch0 + sp-sim for a fixed gimlet count, but this
 /// launch may run a different count, and the 2nd scrimlet must present as switchN
 /// anyway. `stage_config` generates this scrimlet's slot MGS config + sp-sim
@@ -401,10 +428,7 @@ fn setup_sp_emu() {
         return;
     }
     let bin_to = format!("{SP_EMU_ZONE_DIR}/sp-emu");
-    let bin_src = {
-        let staged = format!("{SP_EMU_CARGO_DIR}/sp-emu");
-        if std::path::Path::new(&staged).exists() { staged } else { format!("{BAKED}/sp-emu") }
-    };
+    let bin_src = pick(format!("{SP_EMU_CARGO_DIR}/sp-emu"), format!("{BAKED}/sp-emu"));
     if let Err(e) = fs::copy(&bin_src, &bin_to) {
         warn(format!("copy sp-emu binary from {bin_src}: {e}"));
         return;
@@ -414,13 +438,11 @@ fn setup_sp_emu() {
         // Staged <port>.flash wins; else the baked per-role flash. Gimlet flashes
         // are identical (the per-SP serial is set at runtime from SP_EMU_BRIDGE),
         // so one baked gimlet.flash serves every gimlet port; 33300 -> sidecar.
-        let staged = format!("{SP_EMU_CARGO_DIR}/{p}.flash");
-        let src = if std::path::Path::new(&staged).exists() {
-            staged
-        } else {
-            let role = roles.get(p).map(String::as_str).unwrap_or("gimlet");
-            format!("{BAKED}/{role}.flash")
-        };
+        let role = roles.get(p).map(String::as_str).unwrap_or("gimlet");
+        let src = pick(
+            format!("{SP_EMU_CARGO_DIR}/{p}.flash"),
+            format!("{BAKED}/{role}.flash"),
+        );
         if let Err(e) = fs::copy(&src, format!("{SP_EMU_ZONE_DIR}/{p}.flash")) {
             warn(format!("copy {p}.flash from {src}: {e}"));
         }
@@ -436,11 +458,7 @@ fn setup_sp_emu() {
     let staged_rot = format!("{SP_EMU_CARGO_DIR}/rot.flash");
     let rot_enabled = std::path::Path::new(&staged_rot).exists() || rot_from_manifest;
     if rot_enabled {
-        let rot_src = if std::path::Path::new(&staged_rot).exists() {
-            staged_rot
-        } else {
-            format!("{BAKED}/rot.flash")
-        };
+        let rot_src = pick(staged_rot, format!("{BAKED}/rot.flash"));
         if let Err(e) = fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash")) {
             warn(format!("copy rot.flash from {rot_src}: {e}"));
         }
@@ -451,26 +469,14 @@ fn setup_sp_emu() {
     }
     // Wait until oxz_switch is actually bootable (zlogin works) before any svc
     // ops — early in bring-up the zone is still 'incomplete'.
-    let mut waited = 0;
-    while !run_quiet("zlogin", &["oxz_switch", "true"]) {
-        if waited >= 180 {
-            warn("sp-emu: oxz_switch never became ready; skipping");
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(2));
-        waited += 2;
+    if !wait_until(180, || run_quiet("zlogin", &["oxz_switch", "true"])) {
+        warn("sp-emu: oxz_switch never became ready; skipping");
+        return;
     }
     // Whole-fleet emu: every SP is emulated, so sp-sim isn't needed. Disable it
     // (releasing the shared ports) before sp-emu binds them. Wait for sp-sim to be
     // imported first, else the disable is a no-op and the baked sp-sim races us.
-    let mut waited = 0;
-    while !run_quiet("zlogin", &["oxz_switch", "svcs", "svc:/oxide/sp-sim:default"]) {
-        if waited >= 60 {
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(2));
-        waited += 2;
-    }
+    let _ = wait_until(60, || run_quiet("zlogin", &["oxz_switch", "svcs", "svc:/oxide/sp-sim:default"]));
     run("zlogin", &["oxz_switch", "svcadm", "disable", "-s", "svc:/oxide/sp-sim:default"]);
     run("zlogin", &["oxz_switch", "svccfg", "import", "/var/svc/manifest/site/voxel-sp-emu.xml"]);
     note(format!("sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled", ports.len()));
@@ -524,7 +530,7 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         s.push_str("    </dependency>\n");
     }
     for &port in ports {
-        let board = if port == 33300 { "sidecar" } else { "gimlet" };
+        let board = if port == SIDECAR_SP_PORT { "sidecar" } else { "gimlet" };
         s.push_str(&format!("    <instance name=\"sp{port}\" enabled=\"true\">\n"));
         s.push_str("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu gdb a 340000000\" timeout_seconds=\"0\">\n");
         s.push_str("        <method_context>\n          <method_environment>\n");

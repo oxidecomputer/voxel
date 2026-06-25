@@ -18,7 +18,7 @@
 //! form -- the one fiddly bit is the flat-string serializations
 //! (`address = "addrconf"`, `addr = "unnumbered"`), validated against live wicketd.
 
-use crate::net::{node_external_ip, scp_to, ssh_capture};
+use crate::net::{node_external_ip, scp_to, ssh_capture, zlogin, SWITCH_ZONE_ROOT};
 use anyhow::{anyhow, Context, Result};
 use libfalcon::{NodeRef, Runner};
 use slog::info;
@@ -27,6 +27,10 @@ use std::time::{Duration, Instant};
 
 /// wicketd's dropshot address inside oxz_switch (loopback only).
 const WICKETD: &str = "http://[::1]:12226";
+
+/// How many times to re-PUT `/rack-setup/config` while wicketd's SP inventory
+/// settles (it can transiently 400 right after SP discovery; see `drive`).
+const CONFIG_PUT_ATTEMPTS: u32 = 10;
 
 /// Offline check (hidden `voxel wicket-dryrun`): parse a config-rss.toml and
 /// print the wicketd `PutRssUserConfigInsensitive` body it would PUT, so the
@@ -225,14 +229,14 @@ fn json_string(s: &str) -> String {
 fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> Result<u32> {
     let local = std::env::temp_dir().join(name);
     std::fs::write(&local, body).with_context(|| format!("write {name}"))?;
-    let zone_path = format!("/zone/oxz_switch/root/var/tmp/{name}");
+    let zone_path = format!("{SWITCH_ZONE_ROOT}/var/tmp/{name}");
     if !scp_to(ip, local.to_str().unwrap(), &zone_path) {
         return Err(anyhow!("scp {name} to {ip} switch zone failed"));
     }
-    let curl = format!(
-        "zlogin oxz_switch curl -s -o /dev/null -w '%{{http_code}}' -X {method} \
+    let curl = zlogin(&format!(
+        "curl -s -o /dev/null -w '%{{http_code}}' -X {method} \
          -H content-type:application/json --data @/var/tmp/{name} {WICKETD}{path}"
-    );
+    ));
     let code = ssh_capture(ip, &curl).ok_or_else(|| anyhow!("ssh curl {path} failed"))?;
     code.trim().parse::<u32>().map_err(|_| anyhow!("{path}: unexpected response {code:?}"))
 }
@@ -241,7 +245,7 @@ fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> R
 /// `bootstrap_sleds` is populated and a PUT will be accepted).
 fn wait_wicketd_ready(ip: &str, num_sleds: usize, log: &slog::Logger) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(300);
-    let curl = format!("zlogin oxz_switch curl -s {WICKETD}/bootstrap-sleds");
+    let curl = zlogin(&format!("curl -s {WICKETD}/bootstrap-sleds"));
     loop {
         if let Some(out) = ssh_capture(ip, &curl) {
             let found = out.matches("\"identifier\"").count();
@@ -286,16 +290,16 @@ pub(crate) async fn drive(
     // rack's full load. The body is valid (a re-PUT moments later returns 204), so
     // retry a handful of times before giving up.
     let mut put_config = 0;
-    for attempt in 1..=10 {
+    for attempt in 1..=CONFIG_PUT_ATTEMPTS {
         put_config = wicketd_call(&ip, "PUT", "/rack-setup/config", &config_body, "wsetup-config.json")?;
         if put_config == 204 {
             break;
         }
-        info!(d.log, "{tag}: PUT /rack-setup/config -> HTTP {put_config} (attempt {attempt}/10); wicketd still settling, retrying in 6s");
+        info!(d.log, "{tag}: PUT /rack-setup/config -> HTTP {put_config} (attempt {attempt}/{CONFIG_PUT_ATTEMPTS}); wicketd still settling, retrying in 6s");
         std::thread::sleep(Duration::from_secs(6));
     }
     if put_config != 204 {
-        return Err(anyhow!("PUT /rack-setup/config -> HTTP {put_config} after 10 attempts"));
+        return Err(anyhow!("PUT /rack-setup/config -> HTTP {put_config} after {CONFIG_PUT_ATTEMPTS} attempts"));
     }
     let c = wicketd_call(&ip, "POST", "/rack-setup/config/cert", &json_string(&cert_pem), "wsetup-cert.json")?;
     let k = wicketd_call(&ip, "POST", "/rack-setup/config/key", &json_string(&key_pem), "wsetup-key.json")?;

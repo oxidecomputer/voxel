@@ -22,6 +22,24 @@
 
 use std::fmt::Write as _;
 
+/// SP/RoT port scheme (see the module docs). The sidecar binds [`SP_PORT_BASE`] /
+/// [`EREPORT_BASE`]; gimlet `i` offsets both by [`PORT_STRIDE`]`*(i+1)`. The
+/// switch0/switch1 instances use `base + 0/1`. The host-cpu serial console sits at
+/// the SP's `base_port +` [`CONSOLE_PORT_OFFSET`]. `pub` so the `voxel` CLI derives
+/// its in-zone port math from this single source.
+pub const SP_PORT_BASE: u16 = 33300;
+/// Ereport port base; see [`SP_PORT_BASE`].
+pub const EREPORT_BASE: u16 = 44400;
+/// Per-gimlet port-group stride; see [`SP_PORT_BASE`].
+pub const PORT_STRIDE: u16 = 10;
+/// Host-cpu serial-console offset from an SP's `base_port`; see [`SP_PORT_BASE`].
+pub const CONSOLE_PORT_OFFSET: u16 = 2;
+
+/// The gimlet board part number reported by every sled SP.
+const GIMLET_PART_NUMBER: &str = "913-0000019";
+/// The (simulated) sidecar SP serial.
+const SIDECAR_SERIAL: &str = "SimSidecar0";
+
 /// Manufacturing root cert seed - a constant test value shared by every SP's RoT
 /// (matches a4x2's known-good config; attestation is verified against it).
 const ROOT_SEED: &str = "01de01de01de01de01de01de01de01de01de01de01de01de01de01de01de01de";
@@ -129,6 +147,31 @@ impl Sp {
     }
 }
 
+/// Render one `[[simulated_sps.<key>]]` block (identity + the two per-instance
+/// `network_config`/`ereport_network_config` tables) for `sp`. The sidecar and
+/// gimlet blocks are identical but for the table `key` (and the sidecar's absent
+/// `part_number`, which is `None` so emits nothing); the gimlet's extra host-cpu
+/// `components` block is emitted by the caller.
+fn render_sp_block(o: &mut String, key: &str, sp: &Sp) {
+    writeln!(o, "\n[[simulated_sps.{key}]]").unwrap();
+    if let Some(pn) = &sp.part_number {
+        writeln!(o, "part_number = \"{pn}\"").unwrap();
+    }
+    writeln!(o, "serial_number = \"{}\"", sp.serial).unwrap();
+    writeln!(o, "manufacturing_root_cert_seed = \"{}\"", sp.root_cert_seed).unwrap();
+    writeln!(o, "device_id_cert_seed = \"{}\"", sp.device_id_seed).unwrap();
+    for inst in 0u16..2 {
+        writeln!(o, "\n[[simulated_sps.{key}.network_config]]").unwrap();
+        writeln!(o, "[simulated_sps.{key}.network_config.simulated]").unwrap();
+        writeln!(o, "bind_addr = \"[::]:{}\"", sp.base_port + inst).unwrap();
+    }
+    for inst in 0u16..2 {
+        writeln!(o, "\n[[simulated_sps.{key}.ereport_network_config]]").unwrap();
+        writeln!(o, "[simulated_sps.{key}.ereport_network_config.simulated]").unwrap();
+        writeln!(o, "bind_addr = \"[::1]:{}\"", sp.ereport_base + inst).unwrap();
+    }
+}
+
 /// The rack's SP/RoT fleet: the sidecar SP + one gimlet SP per sled, built for a
 /// given [`SpBackend`]. The single source of truth `crate::mgs` and the SP
 /// provider both read from.
@@ -164,12 +207,12 @@ impl SpFleet {
         // Sidecar SP: base 33300 / ereport 44400, fake-switch0, ignition 1.
         sps.push(Sp {
             role: SpRole::Sidecar,
-            serial: "SimSidecar0".to_string(),
+            serial: SIDECAR_SERIAL.to_string(),
             part_number: None,
             root_cert_seed: ROOT_SEED.to_string(),
             device_id_seed: device_seed(0),
-            base_port: 33300,
-            ereport_base: 44400,
+            base_port: SP_PORT_BASE,
+            ereport_base: EREPORT_BASE,
             mgs_host: backend.mgs_host().to_string(),
             fake_interface: "fake-switch0".to_string(),
             ignition_target: 1,
@@ -185,11 +228,11 @@ impl SpFleet {
                 // Matches the SMBIOS serial `voxel` bakes (`2{index:07}`); for
                 // i < 10 this is byte-identical to the old `2000000{i}`.
                 serial: format!("2{i:07}"),
-                part_number: Some("913-0000019".to_string()),
+                part_number: Some(GIMLET_PART_NUMBER.to_string()),
                 root_cert_seed: ROOT_SEED.to_string(),
                 device_id_seed: device_seed(i + 1),
-                base_port: 33300 + 10 * (i as u16 + 1),
-                ereport_base: 44400 + 10 * (i as u16 + 1),
+                base_port: SP_PORT_BASE + PORT_STRIDE * (i as u16 + 1),
+                ereport_base: EREPORT_BASE + PORT_STRIDE * (i as u16 + 1),
                 mgs_host: backend.mgs_host().to_string(),
                 fake_interface: format!("fake-sled{i}"),
                 ignition_target: ((pos + 2) % (n + 1)) as u8,
@@ -261,20 +304,7 @@ impl SpFleet {
         // sidecar is run by sp-emu, not sp-sim).
         let sidecar = self.sidecar();
         if sidecar.backend == SpBackend::Sim {
-            writeln!(o, "\n[[simulated_sps.sidecar]]").unwrap();
-            writeln!(o, "serial_number = \"{}\"", sidecar.serial).unwrap();
-            writeln!(o, "manufacturing_root_cert_seed = \"{}\"", sidecar.root_cert_seed).unwrap();
-            writeln!(o, "device_id_cert_seed = \"{}\"", sidecar.device_id_seed).unwrap();
-            for inst in 0u16..2 {
-                writeln!(o, "\n[[simulated_sps.sidecar.network_config]]").unwrap();
-                writeln!(o, "[simulated_sps.sidecar.network_config.simulated]").unwrap();
-                writeln!(o, "bind_addr = \"[::]:{}\"", sidecar.base_port + inst).unwrap();
-            }
-            for inst in 0u16..2 {
-                writeln!(o, "\n[[simulated_sps.sidecar.ereport_network_config]]").unwrap();
-                writeln!(o, "[simulated_sps.sidecar.ereport_network_config.simulated]").unwrap();
-                writeln!(o, "bind_addr = \"[::1]:{}\"", sidecar.ereport_base + inst).unwrap();
-            }
+            render_sp_block(&mut o, "sidecar", sidecar);
         }
 
         // Gimlet SPs: one per sled (sp-sim-backed only; emulated ones run on sp-emu).
@@ -282,30 +312,15 @@ impl SpFleet {
             if sp.backend != SpBackend::Sim {
                 continue;
             }
-            writeln!(o, "\n[[simulated_sps.gimlet]]").unwrap();
-            if let Some(pn) = &sp.part_number {
-                writeln!(o, "part_number = \"{pn}\"").unwrap();
-            }
-            writeln!(o, "serial_number = \"{}\"", sp.serial).unwrap();
-            writeln!(o, "manufacturing_root_cert_seed = \"{}\"", sp.root_cert_seed).unwrap();
-            writeln!(o, "device_id_cert_seed = \"{}\"", sp.device_id_seed).unwrap();
-            for inst in 0u16..2 {
-                writeln!(o, "\n[[simulated_sps.gimlet.network_config]]").unwrap();
-                writeln!(o, "[simulated_sps.gimlet.network_config.simulated]").unwrap();
-                writeln!(o, "bind_addr = \"[::]:{}\"", sp.base_port + inst).unwrap();
-            }
-            for inst in 0u16..2 {
-                writeln!(o, "\n[[simulated_sps.gimlet.ereport_network_config]]").unwrap();
-                writeln!(o, "[simulated_sps.gimlet.ereport_network_config.simulated]").unwrap();
-                writeln!(o, "bind_addr = \"[::1]:{}\"", sp.ereport_base + inst).unwrap();
-            }
+            render_sp_block(&mut o, "gimlet", sp);
+            // The host-cpu component is gimlet-only (the sidecar has none).
             writeln!(o, "\n[[simulated_sps.gimlet.components]]").unwrap();
             writeln!(o, "id = \"sp3-host-cpu\"").unwrap();
             writeln!(o, "device = \"sp3-host-cpu\"").unwrap();
             writeln!(o, "description = \"FAKE host cpu\"").unwrap();
             writeln!(o, "capabilities = 0").unwrap();
             writeln!(o, "presence = \"Present\"").unwrap();
-            writeln!(o, "serial_console = \"[::1]:{}\"", sp.base_port + 2).unwrap();
+            writeln!(o, "serial_console = \"[::1]:{}\"", sp.base_port + CONSOLE_PORT_OFFSET).unwrap();
         }
 
         writeln!(o, "\n[log]").unwrap();

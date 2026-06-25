@@ -3,8 +3,9 @@
 
 use anyhow::{anyhow, Context};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use crate::util::{locate_script, shell_quote};
 use crate::ImageCmd;
 
 /// The resolved falcon dataset (set by `resolve_falcon_env`; else `rpool/falcon`).
@@ -32,32 +33,10 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Single-quote a path for safe interpolation into a `bash -c` pipeline.
-fn shell_quote(p: &Path) -> String {
-    format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
-}
-
 /// Locate `voxel-image/build-cp.sh`: `VOXEL_BUILD_CP` override, else relative to
-/// the running binary (`<exe>/../../voxel-image/build-cp.sh`), else CWD.
+/// the running binary, else CWD.
 fn build_cp_script() -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::env::var("VOXEL_BUILD_CP") {
-        return Ok(PathBuf::from(p));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("../../voxel-image/build-cp.sh");
-            if cand.exists() {
-                return Ok(cand);
-            }
-        }
-    }
-    let cwd = PathBuf::from("voxel-image/build-cp.sh");
-    if cwd.exists() {
-        return Ok(cwd);
-    }
-    Err(anyhow!(
-        "can't find build-cp.sh - set VOXEL_BUILD_CP to its path"
-    ))
+    locate_script("VOXEL_BUILD_CP", "build-cp.sh")
 }
 
 pub(crate) fn cmd_image(cmd: &ImageCmd) -> anyhow::Result<()> {
@@ -133,7 +112,7 @@ pub(crate) fn cmd_image(cmd: &ImageCmd) -> anyhow::Result<()> {
             eprintln!("[voxel] exporting {snap} -> {}", out.display());
             let status = std::process::Command::new("bash")
                 .arg("-c")
-                .arg(format!("{pipe} > {}", shell_quote(&out)))
+                .arg(format!("{pipe} > {}", shell_quote(&out.display().to_string())))
                 .status()
                 .map_err(|e| anyhow!("export: {e}"))?;
             if !status.success() {
@@ -150,7 +129,7 @@ pub(crate) fn cmd_image(cmd: &ImageCmd) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow!("bad file path"))?;
             // Derive image name + decompressor from the extension.
             let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst") {
-                (n.to_string(), format!("zstd -dc {}", shell_quote(file)))
+                (n.to_string(), format!("zstd -dc {}", shell_quote(&file.display().to_string())))
             } else if let Some(n) = fname.strip_suffix(".raw.xz") {
                 return Err(anyhow!(
                     "raw import for {n} not wired here yet - use build-image.sh's \

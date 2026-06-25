@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use libfalcon::{cli::console, NodeRef};
 use voxel_config::{SledDesc, VoxelConfig};
 
-use crate::net::node_external_ip;
+use crate::net::{node_external_ip, ZLOGIN};
 use crate::topo::{build_topo, Topo};
 
 pub(crate) async fn cmd_exec(
@@ -152,6 +152,6 @@ pub(crate) async fn cmd_tp_login(cfg: &VoxelConfig, name: &str, switch: &str) ->
     let ip = node_external_ip(&topo.runner, *n, false)
         .await
         .map_err(|e| anyhow!("{e} - is the rack up? (`voxel serial {}` for the console)", s.name))?;
-    eprintln!("[voxel] ssh root@{ip} -> zlogin oxz_switch  ({} {switch})", s.name);
-    ssh_exec(&ip, Some("zlogin oxz_switch"))
+    eprintln!("[voxel] ssh root@{ip} -> {ZLOGIN}  ({} {switch})", s.name);
+    ssh_exec(&ip, Some(ZLOGIN))
 }

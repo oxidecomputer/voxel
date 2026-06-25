@@ -13,18 +13,17 @@
 use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use voxel_config::sp::{Sp, SpBackend, SpFleet, SpRole};
+use voxel_config::sp::{Sp, SpBackend, SpFleet, SpRole, PORT_STRIDE, SP_PORT_BASE};
 use voxel_config::VoxelConfig;
 
 use crate::access::resolve_switch;
-use crate::net::{node_external_ip, scp_to, ssh_capture, ssh_output};
-use crate::topo::{build_topo, Topo};
+use crate::net::{node_external_ip, scp_to, ssh_capture, ssh_output, zlogin, SWITCH_ZONE_ROOT};
+use crate::topo::{build_topo, Topo, GIMLET_SERIAL_PREFIX};
 use crate::SpCmd;
 
-/// In-zone path we run faux-mgs from (also where we stage it on demand).
+/// In-zone path we run faux-mgs from (also where we stage it on demand). The
+/// GZ-visible view is `SWITCH_ZONE_ROOT + FAUX_ZONE` (see `ensure_faux`).
 const FAUX_ZONE: &str = "/var/tmp/faux-mgs";
-/// GZ-visible view of that path (the switch zone's root is mounted here).
-const FAUX_GZ: &str = "/zone/oxz_switch/root/var/tmp/faux-mgs";
 /// Pre-boot cargo-bay copy (staged by `topo::stage_sp_emu` when `[sp].faux_mgs`).
 const FAUX_CARGO: &str = "/opt/cargo-bay/sp-emu/faux-mgs";
 /// Baked-into-the-image copy (install-cp.sh, the self-contained path - present
@@ -36,7 +35,6 @@ const FAUX_BAKED: &str = "/opt/oxide/sp-emu/faux-mgs";
 /// `svc:/oxide/voxel-sp-emu:sp<port>` (and `voxel-rot-emu:rot<port>`) per SP off
 /// these. `reflash` swaps a flash + restarts the matching service.
 const SP_EMU_ZONE: &str = "/opt/oxide/sp-emu";
-const SP_EMU_GZ: &str = "/zone/oxz_switch/root/opt/oxide/sp-emu";
 
 pub(crate) async fn cmd_sp(cfg: &VoxelConfig, name: &str, cmd: &SpCmd) -> anyhow::Result<()> {
     match cmd {
@@ -107,7 +105,9 @@ fn resolve_port(fleet: &SpFleet, target: &str) -> anyhow::Result<u16> {
 fn sp_serial(sp: &Sp) -> String {
     match sp.role {
         SpRole::Sidecar => "BRM42220001".to_string(),
-        SpRole::Gimlet(_) => format!("BRM4422000{}", (sp.base_port - 33300) / 10),
+        SpRole::Gimlet(_) => {
+            format!("{GIMLET_SERIAL_PREFIX}{}", (sp.base_port - SP_PORT_BASE) / PORT_STRIDE)
+        }
     }
 }
 
@@ -116,7 +116,9 @@ fn sp_serial(sp: &Sp) -> String {
 /// zone over ssh, since `runner.exec` + `zlogin` doesn't terminate). Errors point
 /// at `[sp].faux_mgs` when it can't be found.
 fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
-    let present = ssh_capture(ip, &format!("test -x {FAUX_GZ} && echo present"))
+    // GZ-visible view of the in-zone faux-mgs path.
+    let faux_gz = format!("{SWITCH_ZONE_ROOT}{FAUX_ZONE}");
+    let present = ssh_capture(ip, &format!("test -x {faux_gz} && echo present"))
         .map(|o| o.contains("present"))
         .unwrap_or(false);
     if present {
@@ -126,8 +128,8 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
     // independent of in-zone 9p visibility of the cargo-bay copy.
     if let Some(faux) = host_faux {
         if Path::new(faux).exists()
-            && scp_to(ip, faux, FAUX_GZ)
-            && ssh_capture(ip, &format!("chmod +x {FAUX_GZ} && echo ok"))
+            && scp_to(ip, faux, &faux_gz)
+            && ssh_capture(ip, &format!("chmod +x {faux_gz} && echo ok"))
                 .map(|o| o.contains("ok"))
                 .unwrap_or(false)
         {
@@ -137,12 +139,12 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
     // Fallback: copy from a scrimlet-local binary - the baked image copy (the
     // self-contained path) or the pre-staged cargo-bay copy (if 9p exposes it).
     // Both live in the scrimlet GZ, so a single `cp` into the zone's /var/tmp
-    // (FAUX_GZ) works without re-scp from the box.
+    // (faux_gz) works without re-scp from the box.
     let staged = ssh_capture(
         ip,
         &format!(
             "for s in {FAUX_BAKED} {FAUX_CARGO}; do \
-               if test -x $s; then cp $s {FAUX_GZ} && chmod +x {FAUX_GZ} && echo staged && break; fi; \
+               if test -x $s; then cp $s {faux_gz} && chmod +x {faux_gz} && echo staged && break; fi; \
              done"
         ),
     )
@@ -167,11 +169,11 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
 /// bad arg or an empty slot is the SP answering, not the rack being down. Only a
 /// genuine ssh transport failure (None) maps to "is the switch zone reachable".
 fn faux_on(ip: &str, port: u16, args: &[&str], attempts: u32, timeout_ms: u32) -> anyhow::Result<String> {
-    let remote = format!(
-        "zlogin oxz_switch {FAUX_ZONE} --sp-sim-addr [::1]:{port} \
+    let remote = zlogin(&format!(
+        "{FAUX_ZONE} --sp-sim-addr [::1]:{port} \
          --max-attempts {attempts} --per-attempt-timeout-millis {timeout_ms} {} 2>&1",
         args.join(" ")
-    );
+    ));
     ssh_output(ip, &remote)
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow!(
@@ -283,14 +285,14 @@ async fn sp_reflash(
         // instance (build-cp.sh copies `[sp].rot_image` -> rot.flash). Replace it
         // and restart them all; the SPs reconnect to the bridge.
         eprintln!("[voxel] reflashing shared RoT (rot.flash) on {sw} from {}", image.display());
-        if !scp_to(&ip, local, &format!("{SP_EMU_GZ}/rot.flash")) {
+        if !scp_to(&ip, local, &format!("{SWITCH_ZONE_ROOT}{SP_EMU_ZONE}/rot.flash")) {
             clear_cached_ip(&sw);
             return Err(anyhow!("scp of RoT image into {sw} failed"));
         }
         // grep on one word ("voxel-rot-emu") is the nested-ssh-safe way to list
         // the instances (alternation/brackets silently fail through ssh).
         let restart = "n=0; for f in $(svcs -H -o fmri | grep voxel-rot-emu); do svcadm restart $f && n=$((n+1)); done; echo RESTARTED $n";
-        let out = ssh_output(&ip, &format!("zlogin oxz_switch '{restart}' 2>&1")).unwrap_or_default();
+        let out = ssh_output(&ip, &zlogin(&format!("'{restart}' 2>&1"))).unwrap_or_default();
         if !out.contains("RESTARTED") {
             return Err(anyhow!("RoT image placed but restart failed on {sw}: {}", out.trim()));
         }
@@ -309,7 +311,7 @@ async fn sp_reflash(
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("bad image filename"))?;
     eprintln!("[voxel] reflashing SP {target} (port {port}) on {sw} from {}", image.display());
-    let remote_zip_gz = format!("/zone/oxz_switch/root/var/tmp/{zip}");
+    let remote_zip_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/{zip}");
     if !scp_to(&ip, local, &remote_zip_gz) {
         clear_cached_ip(&sw);
         return Err(anyhow!("scp of hubris image into {sw} failed"));
@@ -321,7 +323,7 @@ async fn sp_reflash(
          mv /var/tmp/reflash.{port} {SP_EMU_ZONE}/{port}.flash; rm -f /var/tmp/{zip}; \
          svcadm restart svc:/oxide/voxel-sp-emu:sp{port}; echo REFLASH_OK"
     );
-    let out = ssh_output(&ip, &format!("zlogin oxz_switch '{script}' 2>&1")).unwrap_or_default();
+    let out = ssh_output(&ip, &zlogin(&format!("'{script}' 2>&1"))).unwrap_or_default();
     if !out.contains("REFLASH_OK") {
         return Err(anyhow!("SP reflash failed on {sw}: {}", out.trim()));
     }
@@ -362,7 +364,7 @@ async fn sp_debug(
 
     // Read the current method environment so we only toggle SP_EMU_NO_DEBUG and
     // keep everything else (board/flash/bridge/rot-service) intact.
-    let env = ssh_capture(&ip, &format!("zlogin oxz_switch svcprop -p start/environment {fmri}"))
+    let env = ssh_capture(&ip, &zlogin(&format!("svcprop -p start/environment {fmri}")))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
@@ -385,15 +387,15 @@ async fn sp_debug(
     );
     let local = std::env::temp_dir().join(format!("voxel-sp-env-{port}.scfg"));
     std::fs::write(&local, &content).map_err(|e| anyhow!("write {}: {e}", local.display()))?;
-    let remote_gz = format!("/zone/oxz_switch/root/var/tmp/voxel-sp-env-{port}.scfg");
+    let remote_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-env-{port}.scfg");
     let remote = format!("/var/tmp/voxel-sp-env-{port}.scfg");
     if !scp_to(&ip, local.to_str().unwrap_or_default(), &remote_gz) {
         clear_cached_ip(&sw);
         return Err(anyhow!("scp of the svccfg file into {sw} failed"));
     }
-    let apply = format!(
-        "zlogin oxz_switch 'svccfg -f {remote} && svcadm refresh {fmri} && svcadm restart {fmri} && rm -f {remote} && echo APPLIED_OK'"
-    );
+    let apply = zlogin(&format!(
+        "'svccfg -f {remote} && svcadm refresh {fmri} && svcadm restart {fmri} && rm -f {remote} && echo APPLIED_OK'"
+    ));
     let out = ssh_output(&ip, &format!("{apply} 2>&1")).unwrap_or_default();
     if !out.contains("APPLIED_OK") {
         return Err(anyhow!("failed to apply debug toggle on {sw}: {}", out.trim()));
@@ -408,7 +410,7 @@ async fn sp_debug(
     // against this humility build): `-p ocdgdb` (read-only, GDB-RSP) honors
     // HUMILITY_OCD_PORT -> works on ANY port; `-p ocd` (read+write, OpenOCD-Tcl)
     // has a HARDCODED port 6666 -> only reaches the SP on bridge 33300.
-    let o = port.wrapping_sub(33300);
+    let o = port.wrapping_sub(SP_PORT_BASE);
     let (gdb, ocd) = (3333 + o, 6666 + o);
     eprintln!("[voxel] {target} (port {port}) debug ENABLED on {sw}; sp-emu restarting (listeners ready in ~30s after preboot)");
     println!("humility attach (listeners are 127.0.0.1 inside oxz_switch on {sw} - run humility there, or tunnel):");
@@ -459,7 +461,7 @@ async fn sp_ls(cfg: &VoxelConfig, name: &str, switch: &str) -> anyhow::Result<()
          for p in{plist}; do echo \"@@SP $p\"; cat /var/tmp/spls.$p; rm -f /var/tmp/spls.$p; done"
     );
     let combined =
-        ssh_capture(&ip, &format!("zlogin oxz_switch '{probe}'")).unwrap_or_default();
+        ssh_capture(&ip, &zlogin(&format!("'{probe}'"))).unwrap_or_default();
     let outputs: Vec<String> = {
         let mut v = vec![String::new(); ports.len()];
         let mut idx: Option<usize> = None;
@@ -588,20 +590,5 @@ fn build(commit: &str) -> anyhow::Result<()> {
 
 /// Locate `voxel-image/build-sp.sh` (mirrors `image::build_cp_script`).
 fn build_sp_script() -> anyhow::Result<PathBuf> {
-    if let Ok(p) = std::env::var("VOXEL_BUILD_SP") {
-        return Ok(PathBuf::from(p));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("../../voxel-image/build-sp.sh");
-            if cand.exists() {
-                return Ok(cand);
-            }
-        }
-    }
-    let cwd = PathBuf::from("voxel-image/build-sp.sh");
-    if cwd.exists() {
-        return Ok(cwd);
-    }
-    Err(anyhow!("can't find build-sp.sh - set VOXEL_BUILD_SP to its path"))
+    crate::util::locate_script("VOXEL_BUILD_SP", "build-sp.sh")
 }
