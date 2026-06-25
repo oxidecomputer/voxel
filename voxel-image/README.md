@@ -12,7 +12,7 @@ one image serves every topology. Two image kinds, same machinery:
   baked. Arista cEOS routers are bring-your-own (proprietary; not built here).
 
 > Status: prototype. The build itself must run on a **Helios host** with
-> bhyve/propolis/falcon + zfs. It cannot run on macOS.
+> bhyve/propolis/falcon + zfs.
 
 ## What's baked vs. applied at launch
 
@@ -92,16 +92,6 @@ FALCON_DATASET=testbed/falcon CAPTURE_MODE=zfs VBUILD_DISK_GB=20 \
 # -> falcon base image img/voxel-frr-proto@base (node image "voxel-frr-proto")
 ```
 
-## Validated end-to-end (2026-06-14)
-
-Ran on the Helios box: builder installed the full 16-zone control plane (and
-**confirmed `omicron-package unpack` works without `virtual-hardware create`**),
-captured the image, and a single node booted from `voxel-cp-proto` with all 16
-zones intact in `/opt/oxide`. Note a single node can only validate that the
-image boots - a live Nexus needs the full multi-sled voxel topology (RSS +
-trust-quorum + a scrimlet/switch zone), since validated end-to-end (see
-`../docs/voxel-roadmap.md`).
-
 ## Notes / gotchas
 
 - **`FALCON_DATASET` per box.** falcon honors it (`lib/src/lib.rs:1818`, default
@@ -117,13 +107,3 @@ trust-quorum + a scrimlet/switch zone), since validated end-to-end (see
   (`source` -> `dest`) would make it usable. We capture via zfs send/recv (mode
   `zfs`) or `dd|xz` + streaming re-import (mode `raw`). `import-raw-img.sh` is
   NOT used (it can't decompress `.xz`).
-
-## Next steps
-
-- **DONE** - the multi-sled voxel topology boots `voxel-cp`, generates
-  RSS/sprockets/SMBIOS/sp-sim/mgs/router configs on the fly, and runs RSS -> live
-  Nexus; `voxel image create <commit>` builds `voxel-cp` from a fresh omicron clone
-  (build-from-source, since TUF lacks the i86pc global-zone software - see
-  `../docs/voxel-roadmap.md`). De-a4x2 is complete (a4x2 removed from the workspace).
-- Phase 2: move artifact production to the declarative helios `image-builder`
-  path for the open-source repo + buildomat CI that tracks omicron releases/main.
