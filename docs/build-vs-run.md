@@ -10,8 +10,8 @@ particular rack is baked in.
   BUILD TIME (once per omicron commit)        RUN TIME (every launch)
   ────────────────────────────────────        ───────────────────────────
   voxel image create <commit>                  voxel launch
-    -> build-cp.sh   (host)                       -> voxel (Rust)   (host)
-    -> install-cp.sh (builder VM)                 -> gimlet-launch.sh (in guest)
+    -> build-cp.sh   (host)                       -> voxel (Rust)        (host)
+    -> install-cp.sh (builder VM)                 -> voxel-init <role>   (in guest)
   produces: voxel-cp-<commit>@base             produces: a live, RSS-initialized rack
 ```
 
@@ -70,27 +70,32 @@ identity, the emulated U.2/M.2 vdevs, the sidecar program load, and the
 Turns the static image into a live, topology-specific rack. All config is
 generated from `VoxelConfig` (`voxel.toml`); none of it is in the image.
 
-**`voxel launch` - Rust, on the host:**
+**`voxel launch` - Rust, on the host (`rack::cmd_launch`):**
 | Phase | What | Source |
 |-------|------|--------|
-| `stage_launch_scripts` | static launch scripts (`gimlet-launch.sh`, `router-launch.sh`, `setup_ssh`) into each node's `cargo-bay/` - embedded in the binary, topology-driven (was the separate `prep.sh`) | `include_str!` |
-| `stage_config` | per-sled `sled-config.toml`, `config-rss.toml` (RSS node), per-router `frr.conf`, 2nd scrimlet's switch1 MGS config | `voxel-config::{sled,rss->voxel-rss-gen,frr,mgs}` |
+| preflight | guard the topology (≥3 sleds + exactly 2 scrimlets per rack), confirm the cp/frr images exist, check host RAM, reset each node's `cargo-bay/` | `voxel` |
+| `stage_config` | per-sled `sled-config.toml`, `config-rss.toml` (RSS node; suppressed under `--wicket-setup`), per-router `frr.conf`, 2nd scrimlet's switch1 MGS config; under `--emu-sp`/`--emu-rot` also stages the `sp-emu` binary + a `<port>.flash` per emulated SP | `voxel-config::{sled,rss->voxel-rss-gen,frr,mgs}` |
 | `stage_sprockets` | per-sled trust-quorum test keys | `sprockets-tls-test-utils` |
 | `build_topo` | falcon nodes (boot `voxel-cp`/`voxel-frr`), SoftNPU fabric, SMBIOS, mount `cargo-bay/<node>` -> `/opt/cargo-bay` | `libfalcon` |
-| launch | run each node's `gimlet-launch.sh`/`router-launch.sh` concurrently | `falcon exec` |
-| watch | stream the 16-stage RSS bring-up; set the external host route | bootstrap-agent status API |
+| boot | boot every VM (auto-retries the whole topology up to 3x - the all-at-once RAM spike can flake a cargo-bay mount) | `libfalcon` |
+| bring-up | run `/opt/oxide/voxel-init router` then `voxel-init gimlet` in each guest; multi-rack staggers rack-by-rack (concurrent zone-init thrashes the box) | `falcon exec` |
+| watch | stream the RSS bring-up (or, under `--wicket-setup`, drive RSS through wicketd first); then set + verify the external host route per rack | bootstrap-agent status API / wicketd |
 
-**In-guest - `gimlet-launch.sh` (per sled, via `falcon exec`):**
-- detect the jumbo underlay NIC(s), patch this sled's `sled-config` data links
-- `xtask virtual-hardware create` - ephemeral emulated U.2/M.2 (kept out of the image)
-- inject `config-rss.toml` (RSS node) + the patched `sled-config.toml` into `/opt/oxide/sled-agent/pkg/`
-- scrimlet: `scadm propolis load-program` the SoftNPU sidecar
-- 2nd scrimlet: swap the switch1 MGS config into `/zone/oxz_switch/root/...` and bounce MGS (so RSS inventories both switches)
+**In-guest - `voxel-init gimlet` (per sled, baked at `/opt/oxide/voxel-init`, run via `falcon exec`):**
+- detect the jumbo underlay NIC(s), patch this sled's `sled-config` data links (via `toml_edit`)
+- `xtask virtual-hardware create` - ephemeral emulated U.2/M.2 (kept out of the image; wipes any stale vdevs from a prior launch first)
+- inject `config-rss.toml` (RSS node) + the patched `sled-config.toml` as the runtime sled-agent configs
+- scrimlet: `scadm propolis load-program` the SoftNPU sidecar (gimlets have no softnpu device, so this is gated on sled mode)
+- 2nd scrimlet: swap the switch1 MGS config into the switch zone and bounce MGS (so RSS inventories both switches)
 - `omicron-package activate` -> sled-agent starts -> RSS bootstraps the rack
 
+(`voxel-init router` is the Debian/FRR counterpart; SSH setup, formerly the sourced
+`setup_ssh`, is now a function inside `voxel-init`.)
+
 **Mechanism in one line:** falcon mounts each node's `cargo-bay/` at
-`/opt/cargo-bay`; the in-guest scripts run via `falcon exec`, inject the generated
-config into the baked control plane, and let sled-agent + RSS take over.
+`/opt/cargo-bay`; the baked `voxel-init` agent runs in-guest via `falcon exec`,
+injects the generated config into the baked control plane, and lets sled-agent +
+RSS take over.
 
 ---
 

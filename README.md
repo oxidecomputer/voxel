@@ -13,7 +13,9 @@ hand-maintained per-node config files).
 
 ## Layout
 
-- **`voxel/`** - the `voxel` CLI (clap-based): `image`, `config`, `launch`/`destroy`,
+- **`voxel/`** - the `voxel` CLI (clap-based): `image`, `config`, `launch`/`destroy`
+  (incl. `--emu-sp`/`--emu-rot` real-firmware SPs and `--wicket-setup`), `rack` and
+  `network` (surgical patching + link/port ops), `sp-emu` (emulator artifacts),
   `exec`/`serial`/`status`, and pilot-style access (`tp login`, `host login`). Uses
   falcon as a library rather than wrapping it.
   - **`voxel/rss-gen/`** - typed, release-pinned `config-rss.toml` generator, built
