@@ -12,3 +12,4 @@ cargo-bay/
 voxel-image/out/
 voxel/rss-gen/Cargo.lock
 voxel.toml
+*.log

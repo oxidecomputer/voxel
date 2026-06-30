@@ -54,6 +54,19 @@ log() { echo "[build-cp] $*"; }
 [[ "$(uname -s)" == "SunOS" ]] || { log "FATAL: run on the Helios box"; exit 1; }
 [[ -x "${VOXEL}" ]] || { log "FATAL: voxel binary not found at ${VOXEL} (set VOXEL=)"; exit 1; }
 
+# --- sp-emu config gate (fail early, before the ~11-min build) ----------------
+# If the emulated SP/RoT fleet is configured ([sp].emu_bin), faux_mgs is REQUIRED:
+# build-cp.sh bakes it into the image, and without it the rack has no MGS-readiness
+# gate or `voxel sp` operator commands, making the image useless. Fail now rather
+# than 11 minutes in (or baking a broken image).
+if [[ -n "$("${VOXEL}" config get sp.emu_bin 2>/dev/null)" \
+   && -z "$("${VOXEL}" config get sp.faux_mgs 2>/dev/null)" ]]; then
+    log "FATAL: using sp-emu ([sp].emu_bin set) but [sp].faux_mgs is not set."
+    log "         Set it first:  voxel config set sp.faux_mgs <path-to-faux-mgs>"
+    log "         (required for the MGS-readiness gate and 'voxel sp' operator commands)"
+    exit 1
+fi
+
 # --- 1. clone + checkout ------------------------------------------------------
 if [[ ! -d "${OMICRON_SRC}/.git" ]]; then
     mkdir -p "${BUILD_ROOT}"
@@ -135,7 +148,7 @@ chmod +x "${CARGO_BAY}/voxel-init"
 # dev [sp].emu_bin override needs no rebake). The gimlet flashes are identical (the
 # per-SP serial is set at runtime from the base port), so one baked gimlet.flash
 # serves every gimlet SP; 33300 -> sidecar.flash.
-cfgval() { "${VOXEL}" config get "$1" 2>/dev/null | sed 's/^"//; s/"$//'; }
+cfgval() { "${VOXEL}" config get "$1" 2>/dev/null | sed 's/^"//; s/"$//' || true; }
 SP_EMU_BIN="$(cfgval sp.emu_bin)"
 if [[ -n "${SP_EMU_BIN}" && -x "${SP_EMU_BIN}" ]]; then
     SP_OUT="${CARGO_BAY}/sp-emu"
