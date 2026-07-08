@@ -31,6 +31,14 @@ cp -r "${TESTBED}/voxel/rss-gen" "${RSS_GEN_DIR}"
 sed -i "s#/opt/omicron#${OMICRON_SRC}#g" "${RSS_GEN_DIR}/Cargo.toml"
 sed -i "s#path = \"../../voxel-config\"#path = \"${TESTBED}/voxel-config\"#" "${RSS_GEN_DIR}/Cargo.toml"
 
+# Seed the lockfile from the image's omicron so shared deps (notably the
+# git-pinned `tufaceous-artifact`, which floats on branch=main) resolve to the
+# EXACT revs this omicron was built against. Without this, rss-gen's fresh
+# resolution pulls a newer tufaceous than omicron-common@<commit> was written
+# for, and omicron-common fails to compile (ArtifactKind/Artifact field errors).
+# Plain `cargo build` (not --locked) keeps these pins and adds rss-gen's extras.
+cp "${OMICRON_SRC}/Cargo.lock" "${RSS_GEN_DIR}/Cargo.lock"
+
 echo "[build-rss-gen] building against ${OMICRON_SRC}/target"
 build_log="$(mktemp)"
 set +e

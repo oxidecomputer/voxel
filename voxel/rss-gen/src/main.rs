@@ -24,7 +24,7 @@ use omicron_common::api::external::AllowedSourceIps;
 use sled_agent_types::early_networking::{
     BgpConfig, BgpPeerConfig, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
     MaxPathConfig, PortConfig, RackNetworkConfig, RouterLifetimeConfig, RouterPeerType,
-    SwitchSlot, UplinkAddress, UplinkAddressConfig,
+    SwitchSlot, UplinkAddress, UplinkAddressConfig, UplinkPorts,
 };
 use voxel_config::{UplinkCfg, VoxelConfig};
 
@@ -132,7 +132,9 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
         rack_subnet: n.rack_subnet.parse().context("rack_subnet")?,
         infra_ip_first: "::".parse::<IpAddr>()?,
         infra_ip_last: "::".parse::<IpAddr>()?,
-        ports,
+        // omicron wrapped the uplink port list in a non-empty newtype.
+        ports: UplinkPorts::new(ports)
+            .map_err(|_| anyhow::anyhow!("rack network config needs at least one uplink port"))?,
         bgp: vec![BgpConfig {
             asn: n.bgp_asn,
             originate: vec![n.infra_prefix.parse().context("infra_prefix")?],
