@@ -57,8 +57,9 @@ struct Cli {
     #[arg(long, global = true)]
     dataset: Option<String>,
 
-    /// Path to the commit-pinned `voxel-rss-gen` (overrides `[falcon].rss_gen` /
-    /// env).
+    /// Path to the commit-pinned `voxel-rss-gen`. Normally derived from the image's
+    /// omicron commit (`<build_root>/omicron-<commit>/...`); this + `$VOXEL_RSS_GEN`
+    /// override it for one-offs.
     #[arg(long, global = true)]
     rss_gen: Option<PathBuf>,
 
@@ -493,23 +494,35 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     if let Some(d) = dataset {
         std::env::set_var("FALCON_DATASET", d);
     }
-    let rss = cli
-        .rss_gen
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or_else(|| cfg.and_then(|c| c.falcon.rss_gen.clone()))
-        .or_else(|| std::env::var("VOXEL_RSS_GEN").ok());
-    if let Some(r) = rss {
-        std::env::set_var("VOXEL_RSS_GEN", r);
-    }
+    // Resolve the build root first (cli > config > env), since the rss-gen path is
+    // derived from it below. Export it as-is; apply the default only for our derive.
     let build_root = cli
         .build_root
         .as_ref()
         .map(|p| p.display().to_string())
         .or_else(|| cfg.and_then(|c| c.falcon.build_root.clone()))
         .or_else(|| std::env::var("BUILD_ROOT").ok());
-    if let Some(b) = build_root {
+    if let Some(b) = &build_root {
         std::env::set_var("BUILD_ROOT", b);
+    }
+    let build_root_eff = build_root.unwrap_or_else(|| {
+        format!("{}/voxel-builds", std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+    });
+    // voxel-rss-gen: `--rss-gen` flag or `$VOXEL_RSS_GEN` still override, but by
+    // default DERIVE the path from the image's omicron commit so it can never drift
+    // from `image.cp` (no `[falcon].rss_gen` knob to mismatch).
+    let rss = cli
+        .rss_gen
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| std::env::var("VOXEL_RSS_GEN").ok())
+        .or_else(|| {
+            cfg.and_then(|c| c.image.cp_commit()).map(|commit| {
+                format!("{build_root_eff}/omicron-{commit}/target/debug/voxel-rss-gen")
+            })
+        });
+    if let Some(r) = rss {
+        std::env::set_var("VOXEL_RSS_GEN", r);
     }
 }
 

@@ -43,18 +43,17 @@ pub struct VoxelConfig {
     pub sp: SpCfg,
 }
 
-/// falcon/runtime settings: the zfs dataset falcon uses and the typed RSS
-/// renderer path. Both optional - resolved at runtime as
-/// **flag > `voxel.toml` > env > built-in default**, so a populated `voxel.toml`
-/// is the source of truth and CLI flags override per invocation. Replaces the
-/// env-only `FALCON_DATASET` / `VOXEL_RSS_GEN` footguns.
+/// falcon/runtime settings (zfs dataset, project workdir, image build root).
+/// Each optional - resolved at runtime as **flag > `voxel.toml` > env > built-in
+/// default**. The `voxel-rss-gen` path is NOT configured here: it's derived from
+/// the image's omicron commit (`image.cp` -> `<build_root>/omicron-<commit>/...`)
+/// so the renderer can't drift from the image it renders for. See
+/// `resolve_falcon_env`; `--rss-gen` / `$VOXEL_RSS_GEN` still override.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Falcon {
     /// zfs dataset (falcon's `FALCON_DATASET`). `None` -> env, else `rpool/falcon`.
     pub dataset: Option<String>,
-    /// Path to the commit-pinned `voxel-rss-gen`. `None` -> env, else default path.
-    pub rss_gen: Option<String>,
     /// Project root that `cargo-bay/` and `.falcon/` live under. Absolute; lets
     /// `voxel` run from anywhere (e.g. installed in `/usr/bin`). `None` -> the
     /// directory containing this `voxel.toml`.
@@ -418,6 +417,18 @@ pub enum SledDataLinksSchema {
 impl Image {
     pub fn cp_image(&self) -> String {
         self.cp.clone().unwrap_or_else(|| format!("voxel-cp-{}", self.version))
+    }
+
+    /// The omicron commit encoded in the cp image name (`voxel-cp-<commit>` with
+    /// an optional `-<variant>` suffix like `-rd`). Used to locate the matching
+    /// `voxel-rss-gen` build under `<build_root>/omicron-<commit>/`. `None` if the
+    /// name doesn't follow the `voxel-cp-` convention.
+    pub fn cp_commit(&self) -> Option<String> {
+        let name = self.cp_image();
+        name.strip_prefix("voxel-cp-")
+            .and_then(|s| s.split('-').next())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
     pub fn frr_image(&self) -> String {
         self.frr.clone().unwrap_or_else(|| format!("voxel-frr-{}", self.version))
@@ -916,14 +927,27 @@ mod tests {
     #[test]
     fn falcon_section_parses_and_defaults_to_none() {
         let cfg = VoxelConfig::from_toml(
-            "[falcon]\ndataset = \"testbed/falcon\"\nrss_gen = \"/x/voxel-rss-gen\"\n",
+            "[falcon]\ndataset = \"testbed/falcon\"\nbuild_root = \"/x/builds\"\n",
         )
         .unwrap();
         assert_eq!(cfg.falcon.dataset.as_deref(), Some("testbed/falcon"));
-        assert_eq!(cfg.falcon.rss_gen.as_deref(), Some("/x/voxel-rss-gen"));
+        assert_eq!(cfg.falcon.build_root.as_deref(), Some("/x/builds"));
         // Absent section -> both None (env/default fallback at runtime).
         let d = VoxelConfig::default();
-        assert!(d.falcon.dataset.is_none() && d.falcon.rss_gen.is_none());
+        assert!(d.falcon.dataset.is_none() && d.falcon.build_root.is_none());
+    }
+
+    #[test]
+    fn cp_commit_strips_prefix_and_variant_suffix() {
+        let mut img = Image::default();
+        img.cp = Some("voxel-cp-43bb5af-rd".into());
+        assert_eq!(img.cp_commit().as_deref(), Some("43bb5af"));
+        img.cp = Some("voxel-cp-99a0aec".into());
+        assert_eq!(img.cp_commit().as_deref(), Some("99a0aec"));
+        // Falls back to `voxel-cp-<version>` when `cp` is unset.
+        img.cp = None;
+        img.version = "abc1234".into();
+        assert_eq!(img.cp_commit().as_deref(), Some("abc1234"));
     }
 
     #[test]
