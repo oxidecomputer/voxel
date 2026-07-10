@@ -448,8 +448,10 @@ async fn sp_ipcc(
     target: &str,
     command: &str,
 ) -> anyhow::Result<()> {
-    if !matches!(command, "identity" | "bsu") {
-        return Err(anyhow!("--cmd must be `identity` or `bsu` (got `{command}`)"));
+    if !matches!(command, "identity" | "bsu" | "macs" | "status" | "inventory") {
+        return Err(anyhow!(
+            "--cmd must be one of identity|bsu|macs|status|inventory (got `{command}`)"
+        ));
     }
     let topo = build_topo(cfg, name)?;
     let (fleet, ip, sw) = switch_ip(&topo, switch).await?;

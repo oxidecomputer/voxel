@@ -403,7 +403,8 @@ enum SpCmd {
     Ipcc {
         /// Target SP: `sidecar` | `gN` | a port.
         target: String,
-        /// Which request to send: `identity` (VPD) or `bsu` (boot storage unit).
+        /// Request to send: identity (VPD) | bsu (boot storage unit) | macs |
+        /// status (host boot options) | inventory.
         #[arg(long, default_value = "identity")]
         cmd: String,
         #[arg(long, default_value = "switch0")]
