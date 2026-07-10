@@ -17,7 +17,7 @@ use voxel_config::sp::{Sp, SpBackend, SpFleet, SpRole, PORT_STRIDE, SP_PORT_BASE
 use voxel_config::VoxelConfig;
 
 use crate::access::resolve_switch;
-use crate::net::{node_external_ip, scp_to, ssh_capture, ssh_output, zlogin, SWITCH_ZONE_ROOT};
+use crate::net::{node_external_ip, scp_from, scp_to, ssh_capture, ssh_output, zlogin, SWITCH_ZONE_ROOT};
 use crate::topo::{build_topo, Topo, GIMLET_SERIAL_PREFIX};
 use crate::SpCmd;
 
@@ -67,6 +67,7 @@ pub(crate) async fn cmd_sp(cfg: &VoxelConfig, name: &str, cmd: &SpCmd) -> anyhow
         }
         SpCmd::Reflash { target, image, switch } => sp_reflash(cfg, name, switch, target, image).await,
         SpCmd::Debug { target, off, switch } => sp_debug(cfg, name, switch, target, *off).await,
+        SpCmd::Dump { target, ringbuf, switch } => sp_dump(cfg, name, switch, target, *ringbuf).await,
     }
 }
 
@@ -427,6 +428,181 @@ async fn sp_debug(
     } else {
         println!("  read+write (-p ocd) needs port 6666 (hardcoded in humility) - only the sidecar (33300); this SP's ocd is :{ocd}");
     }
+    Ok(())
+}
+
+/// `voxel sp dump <target> [--ringbuf]` - force + decode a crash dump of one live
+/// emulated SP. sp-emu writes a humility-hydrate RAM snapshot on demand: when
+/// `<SP_EMU_DUMP_DIR>/.trigger` appears it dumps RAM (flash comes from the archive)
+/// and swaps in `.done` (src/mem.rs `write_hydrate_dump`). We arm the SP's service
+/// with that dir + its archive id (a one-time ~30s restart if not already armed),
+/// touch the trigger in-zone, pull the zip to the host, and run `humility hydrate`
+/// + `tasks`/`ringbuf` against the SP's hubris archive - all where humility + the
+/// archive live (the debug listeners are in-zone loopback, so a probe-based dump
+/// would need a tunnel; this needs none). Live + ephemeral: the arming reverts on
+/// a clean relaunch. Emu-only (sp-sim never faults / has no dump dir).
+async fn sp_dump(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+    target: &str,
+    ringbuf: bool,
+) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let port = resolve_port(&fleet, target)?;
+    let selector = fleet
+        .sps
+        .iter()
+        .find(|s| s.base_port == port)
+        .map(|s| s.selector())
+        .unwrap_or_else(|| target.to_string());
+
+    // The hubris archive for this SP (host path): humility needs it to fill flash
+    // (the dump omits flash) and its image id must match the dump's.
+    let archive = cfg.sp.image_for(&selector).ok_or_else(|| {
+        anyhow!(
+            "no hubris archive for {selector} in [sp] (set sidecar_image / gimlet_image) - \
+             is this an --emu rack?"
+        )
+    })?;
+    if !Path::new(archive).exists() {
+        return Err(anyhow!("hubris archive not found: {archive}"));
+    }
+    // humility runs on the HOST; don't bake a sibling-repo path - take it from
+    // $VOXEL_HUMILITY, else `humility` on PATH.
+    let humility = std::env::var("VOXEL_HUMILITY").unwrap_or_else(|_| "humility".to_string());
+
+    // A baked sp-emu (emu rack) is required - sp-sim has no dump dir to arm.
+    let have = ssh_capture(&ip, &format!("test -x {SP_EMU_ZONE}/sp-emu && echo ok"))
+        .map(|o| o.contains("ok"))
+        .unwrap_or(false);
+    if !have {
+        clear_cached_ip(&sw);
+        return Err(anyhow!(
+            "no baked sp-emu in {sw}:{SP_EMU_ZONE} - dump needs a running --emu / --emu-rot rack"
+        ));
+    }
+
+    // The dump's archive id must equal the archive's image id (humility hydrate
+    // rejects a mismatch), so read the SP's running archive id over MGS.
+    let state = sp_faux(cfg, name, switch, target, &["state"]).await?;
+    let archive_id = state
+        .lines()
+        .find_map(|l| l.split("hubris archive:").nth(1))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("couldn't read {target}'s hubris archive id from `sp state`"))?;
+
+    let fmri = format!("svc:/oxide/voxel-sp-emu:sp{port}");
+    let dump_dir = format!("/var/tmp/spdump-{port}");
+    let want_dir = format!("SP_EMU_DUMP_DIR={dump_dir}");
+    let want_id = format!("SP_EMU_DUMP_ARCHIVE_ID={archive_id}");
+
+    // Arm the service with the dump dir + archive id if it isn't already. The env
+    // only takes effect on (re)start, so a first-time arm costs one ~30s preboot;
+    // an already-armed SP triggers immediately. Same svccfg-file edit as sp_debug.
+    let env = ssh_capture(&ip, &zlogin(&format!("svcprop -p start/environment {fmri}")))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            clear_cached_ip(&sw);
+            anyhow!("couldn't read {fmri} env on {sw} - is this a running --emu rack?")
+        })?;
+    let armed = env.split_whitespace().any(|t| t == want_dir)
+        && env.split_whitespace().any(|t| t == want_id);
+    if !armed {
+        let mut tokens: Vec<String> = env
+            .split_whitespace()
+            .filter(|t| {
+                !t.starts_with("SP_EMU_DUMP_DIR=") && !t.starts_with("SP_EMU_DUMP_ARCHIVE_ID=")
+            })
+            .map(String::from)
+            .collect();
+        tokens.push(want_dir.clone());
+        tokens.push(want_id.clone());
+        let quoted: Vec<String> = tokens.iter().map(|t| format!("\"{t}\"")).collect();
+        let content = format!(
+            "select {fmri}\nsetprop start/environment = astring: ({})\n",
+            quoted.join(" ")
+        );
+        let local = std::env::temp_dir().join(format!("voxel-sp-dumpenv-{port}.scfg"));
+        std::fs::write(&local, &content).map_err(|e| anyhow!("write {}: {e}", local.display()))?;
+        let remote_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-dumpenv-{port}.scfg");
+        let remote = format!("/var/tmp/voxel-sp-dumpenv-{port}.scfg");
+        if !scp_to(&ip, local.to_str().unwrap_or_default(), &remote_gz) {
+            clear_cached_ip(&sw);
+            return Err(anyhow!("scp of the svccfg file into {sw} failed"));
+        }
+        let apply = zlogin(&format!(
+            "'svccfg -f {remote} && svcadm refresh {fmri} && svcadm restart {fmri} && rm -f {remote} && echo APPLIED_OK'"
+        ));
+        let out = ssh_output(&ip, &format!("{apply} 2>&1")).unwrap_or_default();
+        if !out.contains("APPLIED_OK") {
+            return Err(anyhow!("failed to arm dump on {sw}: {}", out.trim()));
+        }
+        eprintln!("[voxel] armed {target} (port {port}) for dumps on {sw}; sp-emu restarting, waiting for boot (~30s) ...");
+        // Block until the SP answers MGS again (sp_faux retries out the preboot).
+        let _ = sp_faux(cfg, name, switch, target, &["state"]).await?;
+    }
+
+    // Trigger the dump in-zone, wait for `.done`, and zip the artifact (dump.json +
+    // 0x*.bin at the zip root - exactly what `humility hydrate` reads).
+    eprintln!("[voxel] triggering dump of {target} on {sw} ...");
+    let trigger = format!(
+        "set -e; D={dump_dir}; mkdir -p $D; rm -f $D/.done $D/dump.zip $D/dump.json $D/0x*.bin; \
+         touch $D/.trigger; i=0; while [ ! -f $D/.done ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i+1)); done; \
+         if [ ! -f $D/.done ]; then echo DUMP_TIMEOUT; exit 1; fi; \
+         cd $D && zip -q dump.zip dump.json 0x*.bin && echo DUMP_OK"
+    );
+    let out = ssh_output(&ip, &zlogin(&format!("'{trigger}' 2>&1"))).unwrap_or_default();
+    if !out.contains("DUMP_OK") {
+        return Err(anyhow!("dump trigger failed on {sw}: {}", out.trim()));
+    }
+
+    // Pull the zip to the host and decode it there (humility + archive live here).
+    let host_dir = std::env::temp_dir().join(format!("voxel-spdump-{port}"));
+    std::fs::create_dir_all(&host_dir).map_err(|e| anyhow!("mkdir {}: {e}", host_dir.display()))?;
+    let zip_local = host_dir.join("dump.zip");
+    let zip_remote = format!("{SWITCH_ZONE_ROOT}{dump_dir}/dump.zip");
+    if !scp_from(&ip, &zip_remote, zip_local.to_str().unwrap_or_default()) {
+        return Err(anyhow!("couldn't pull the dump zip from {sw}"));
+    }
+    let hydrated = host_dir.join("hydrated.dump");
+    // humility hydrate refuses to overwrite its `-o` target, so clear a stale one
+    // from a previous dump of this SP.
+    let _ = std::fs::remove_file(&hydrated);
+    eprintln!("[voxel] hydrating with `{humility} -a {archive}` ...");
+    let hy = std::process::Command::new(&humility)
+        .args(["-a", archive, "hydrate"])
+        .arg(&zip_local)
+        .arg("-o")
+        .arg(&hydrated)
+        .status();
+    match hy {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(anyhow!("humility hydrate exited {s} (archive/image-id mismatch?)")),
+        Err(e) => {
+            return Err(anyhow!(
+                "couldn't run humility (`{humility}`): {e} - put humility on PATH or set $VOXEL_HUMILITY"
+            ))
+        }
+    }
+    // The hydrated dump is self-contained (humility `-d`); no archive needed to decode.
+    let cmd = if ringbuf { "ringbuf" } else { "tasks" };
+    let dec = std::process::Command::new(&humility)
+        .arg("-d")
+        .arg(&hydrated)
+        .arg(cmd)
+        .output()
+        .map_err(|e| anyhow!("couldn't run humility {cmd}: {e}"))?;
+    print!("{}", String::from_utf8_lossy(&dec.stdout));
+    eprint!("{}", String::from_utf8_lossy(&dec.stderr));
+    eprintln!(
+        "[voxel] dump saved: {} - inspect further with `{humility} -d {} <ringbuf|readvar|...>`",
+        hydrated.display(),
+        hydrated.display()
+    );
     Ok(())
 }
 

@@ -398,6 +398,22 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
+    /// Force + decode a crash dump of one live emulated SP (`--emu` only). Arms
+    /// the SP's `sp-emu` service with a dump dir (a one-time restart, ~30s
+    /// preboot, if not already armed), triggers a humility-hydrate RAM snapshot
+    /// in-zone, pulls it to the host, and runs `humility hydrate` + `tasks`
+    /// against the SP's hubris archive - printing the decoded task table. No
+    /// probe/tunnel; the dump is generated in-zone and decoded on the host where
+    /// humility + the archive live. Needs `humility` on PATH (or `$VOXEL_HUMILITY`).
+    Dump {
+        /// Target SP: `sidecar` | `gN` | a port.
+        target: String,
+        /// Run humility `ringbuf` instead of `tasks` on the hydrated dump.
+        #[arg(long)]
+        ringbuf: bool,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+    },
     /// Build the gimlet-c + sidecar-c-emu v25 images from a hubris commit (via
     /// build-sp.sh), then print the `[sp]` paths to set.
     Build {
