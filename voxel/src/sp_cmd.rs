@@ -58,7 +58,10 @@ pub(crate) async fn cmd_sp(cfg: &VoxelConfig, name: &str, cmd: &SpCmd) -> anyhow
             Ok(())
         }
         SpCmd::Exec { target, switch, command } => {
-            let parts: Vec<&str> = command.split_whitespace().collect();
+            // `command` is the passthrough token(s) after `-e`. Split each on
+            // whitespace so a single quoted string (`-e "read-caboose 0"`) and
+            // separate args (`-e read-caboose 0`) both flatten to faux-mgs argv.
+            let parts: Vec<&str> = command.iter().flat_map(|s| s.split_whitespace()).collect();
             print!("{}", sp_faux(cfg, name, switch, target, &parts).await?);
             Ok(())
         }

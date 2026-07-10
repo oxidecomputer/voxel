@@ -344,16 +344,20 @@ enum SpCmd {
         switch: String,
     },
     /// Pass a raw faux-mgs command to an SP (pilot `sp exec -e`), e.g.
-    /// `voxel sp exec g0 -e inventory`. Full surface: inventory,
-    /// component-details, read-sensor-value, dump, read-caboose, rot-boot-info, ...
+    /// `voxel sp exec g0 -e inventory`. The command's own arguments follow
+    /// unquoted: `-e read-caboose 0`, `-e dump count`, `-e dump read 0`. Full
+    /// surface: inventory, component-details, read-sensor-value, dump,
+    /// read-caboose, rot-boot-info, ...
     Exec {
         /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
-        /// The faux-mgs command to run (pilot-style single command string).
-        #[arg(short = 'e', long = "exec")]
-        command: String,
+        /// The faux-mgs command to run (pilot-style). May be a single quoted
+        /// string (`-e "read-caboose 0"`) or the command followed by its own
+        /// args (`-e read-caboose 0`); everything after `-e` is passed through.
+        #[arg(short = 'e', long = "exec", num_args = 1.., allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Show the configured sp-emu build artifacts and whether `launch --emu` is
     /// ready (pre-launch readiness check; no running rack needed).
