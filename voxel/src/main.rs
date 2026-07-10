@@ -39,12 +39,11 @@ mod wicket_setup;
     about = "Launch and operate an image-backed virtual Oxide rack"
 )]
 struct Cli {
-    /// Path to voxel.toml. Unset -> the user config ~/.config/voxel/voxel.toml,
-    /// then /etc/voxel/voxel.toml. Use this flag (or `config load`) for a one-off.
+    /// voxel.toml to use (default: ~/.config/voxel/voxel.toml, then /etc/voxel/voxel.toml).
     #[arg(long, global = true, env = "VOXEL_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Project root that cargo-bay/ and .falcon/ live under 
+    /// Project root that cargo-bay/ and .falcon/ live under.
     #[arg(long, global = true, env = "VOXEL_WORKDIR")]
     workdir: Option<PathBuf>,
 
@@ -52,19 +51,15 @@ struct Cli {
     #[arg(long, global = true, default_value = "voxel", env = "VOXEL_NAME")]
     name: String,
 
-    /// zfs dataset falcon uses (overrides voxel.toml `[falcon].dataset` / env;
-    /// default `rpool/falcon`).
+    /// zfs dataset falcon uses (default: `rpool/falcon`).
     #[arg(long, global = true)]
     dataset: Option<String>,
 
-    /// Path to the commit-pinned `voxel-rss-gen`. Normally derived from the image's
-    /// omicron commit (`<build_root>/omicron-<commit>/...`); this + `$VOXEL_RSS_GEN`
-    /// override it for one-offs.
+    /// Override the `voxel-rss-gen` path (default: derived from the image's commit).
     #[arg(long, global = true)]
     rss_gen: Option<PathBuf>,
 
-    /// Build root for `voxel image create` (overrides `[falcon].build_root` /
-    /// `$BUILD_ROOT`; default `$HOME/voxel-builds`).
+    /// Build root for `image create` (default: `$HOME/voxel-builds`).
     #[arg(long, global = true)]
     build_root: Option<PathBuf>,
 
@@ -82,20 +77,22 @@ enum Cmd {
         /// Don't set the host route to the rack's external network after launch.
         #[arg(long)]
         no_route: bool,
-        /// Run real-firmware SPs on the `sp-emu` emulator (whole fleet) instead of
-        /// `sp-sim`. Needs `[sp].emu_bin` + the hubris images in `[sp]`. Default: sp-sim.
+        /// Run real-firmware SPs on `sp-emu` instead of `sp-sim`.
+        ///
+        /// The whole fleet. Needs `[sp].emu_bin` + the hubris images in `[sp]`.
         #[arg(long)]
         emu_sp: bool,
-        /// Additionally wire the RoT bridge (oxide-rot-1) onto the sidecar SP.
-        /// Implies --emu-sp. Needs [sp].rot_image. Runs the sidecar as two
-        /// emulated cores - keep OFF during initial bring-up (wedges handoff).
+        /// Also wire the RoT bridge (oxide-rot-1) onto the sidecar SP. Implies --emu-sp.
+        ///
+        /// Needs `[sp].rot_image`. Runs the sidecar as two emulated cores; keep
+        /// OFF during initial bring-up (it wedges handoff).
         #[arg(long = "emu-rot")]
         emu_rot: bool,
-        /// Drive rack setup THROUGH wicketd (the real operator flow) instead of
-        /// the file-based sled-agent auto-init: suppresses the staged config-rss
-        /// so sled-agent waits, then uploads the config + a self-signed cert +
-        /// the recovery password to wicketd and POSTs to start RSS. Fully
-        /// populates wicket's RACK SETUP page. (Uses the progress path.)
+        /// Drive rack setup through wicketd (the real operator flow).
+        ///
+        /// Suppresses the staged config-rss so sled-agent waits, then uploads the
+        /// config + a self-signed cert + recovery password to wicketd and POSTs to
+        /// start RSS - fully populating wicket's RACK SETUP page.
         #[arg(long = "wicket-setup")]
         wicket_setup: bool,
     },
@@ -149,7 +146,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NetworkCmd,
     },
-    /// Manage real-firmware SP-emulator (`sp-emu`) artifacts for `launch --emu`.
+    /// Operate and manage the emulated SPs (`sp-emu`) of an `--emu` rack.
     Sp {
         #[command(subcommand)]
         cmd: SpCmd,
@@ -183,15 +180,15 @@ enum ImageCmd {
     /// List image bundles on disk.
     #[command(visible_alias = "list")]
     Ls,
-    /// Build a `voxel-cp` image for an omicron commit (builds omicron from
-    /// source - TUF lacks the i86pc global-zone software, see roadmap).
+    /// Build a `voxel-cp` image for an omicron commit (from source).
     Create {
         /// omicron git commit (or tag) to build and pin the image to.
         commit: String,
     },
-    /// Export an image bundle to a file for distribution. Defaults to a `zfs
-    /// send | zstd` stream (`<name>.zfs.zst`); `--raw` makes a portable
-    /// `<name>.raw.xz` disk image instead.
+    /// Export an image bundle to a file for distribution.
+    ///
+    /// Default: a `zfs send | zstd` stream (`<name>.zfs.zst`); `--raw` makes a
+    /// portable `<name>.raw.xz` disk image instead.
     Export {
         /// Image name (e.g. `voxel-cp-a3fee0ec`).
         name: String,
@@ -201,8 +198,7 @@ enum ImageCmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Import an image bundle from a file (`.zfs.zst` or `.raw.xz`) produced by
-    /// `image export`, into `<dataset>/img/<name>@base`.
+    /// Import an image bundle (`.zfs.zst` or `.raw.xz`) from `image export`.
     Import {
         /// File to import (name is derived from it).
         file: PathBuf,
@@ -215,11 +211,11 @@ enum ImageCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Fold a component patch into the image's @base so it persists across
-    /// relaunches (boot-modify-capture: boots the source image, places the
-    /// artifact in-guest, re-captures). Durable counterpart to `rack patch`;
-    /// slower (~minutes) but survives a clean relaunch. propolis + ddm-gz only
-    /// for now (switch-zone services need a switch.tar.gz repack).
+    /// Fold a component patch into the image's @base so it survives relaunches.
+    ///
+    /// Boot-modify-capture: boots the source image, places the artifact in-guest,
+    /// re-captures. The durable counterpart to `rack patch` (slower, ~minutes).
+    /// propolis + ddm-gz only for now (switch-zone services need a repack).
     Patch {
         /// Component to patch (e.g. propolis, ddm-gz).
         component: String,
@@ -248,17 +244,17 @@ enum ImageCmd {
 enum NetworkCmd {
     /// Show the per-rack network projection, switches, and switch interconnects.
     Show,
-    /// Add a switch-to-switch interconnect (a direct sidecar<->sidecar QSFP link
-    /// carrying the underlay) between two switches; applied on the next launch.
-    /// Selectors: `switch0` | `switch1` | `switchN` | `rackR/switchS`.
+    /// Add a switch-to-switch interconnect; applied on the next launch.
+    ///
+    /// A direct sidecar<->sidecar QSFP link carrying the underlay. Selectors:
+    /// `switch0` | `switch1` | `switchN` | `rackR/switchS`.
     AddPort { a: String, b: String },
     /// Remove a switch interconnect (either order); applied on the next launch.
     RmPort { a: String, b: String },
-    /// (debug/transient) Bring up a switch port's link on a RUNNING rack via
-    /// `swadm`: create (if needed) + enable the link in the switch zone, e.g.
-    /// `voxel network link-up switch0 qsfp2` for the interconnect. Run on both
-    /// ends - the link reaches Up once both are enabled. ⚠️ Nexus's reconciler
-    /// reaps manual swadm links in ~30s; persistent config must use the Oxide API.
+    /// Bring up a switch port's link on a running rack (transient).
+    ///
+    /// Creates (if needed) + enables the link via `swadm`; run on both ends. ⚠
+    /// Nexus reaps manual swadm links in ~30s - persistent config must use the API.
     LinkUp {
         /// Switch: `switch0` | `switch1` | `switchN` | `rackR/switchS` | node `gN`.
         switch: String,
@@ -277,11 +273,9 @@ enum NetworkCmd {
         switch: String,
         port: String,
     },
-    /// Validate live networking on a running rack: per switch zone the link
-    /// states, BGP sessions, and programmed routes, plus the host routes.
+    /// Validate live networking: link states, BGP sessions, routes, host routes.
     Validate {
-        /// Show the full `swadm`/`mgadm` output (links, switch ports, bgp,
-        /// routes) in long form instead of summary counts.
+        /// Full `swadm`/`mgadm` output instead of summary counts.
         #[arg(long)]
         detail: bool,
     },
@@ -289,11 +283,11 @@ enum NetworkCmd {
 
 #[derive(Subcommand)]
 enum RackCmd {
-    /// Swap a single component on the running rack at a given ref (commit), then
-    /// restart its service. Fetches the prebuilt artifact from buildomat,
-    /// sha-verifies it, and places it on the relevant nodes. Live + ephemeral: a
-    /// clean relaunch reverts to the image (see `voxel image patch` to persist).
-    /// `voxel rack patch --list` shows the patchable components.
+    /// Swap a single component on the running rack at a ref, then restart it.
+    ///
+    /// Fetches the prebuilt artifact from buildomat, sha-verifies it, and places
+    /// it on the relevant nodes. Live + ephemeral (a clean relaunch reverts; see
+    /// `image patch` to persist). `--list` shows the patchable components.
     Patch {
         /// Component to patch (e.g. propolis, mgd, dendrite, lldp). Omit with
         /// `--list` to see them all.
@@ -311,15 +305,16 @@ enum RackCmd {
 
 #[derive(Subcommand)]
 enum SpCmd {
-    /// List the live SPs over MGS (pilot `sp list`): type, serial, power, archive
-    /// id - via `faux-mgs` in the switch zone. Needs a running `--emu` rack.
+    /// List the live SPs over MGS: type, serial, power, archive id.
+    ///
+    /// Via faux-mgs in the switch zone; needs a running `--emu` rack.
     #[command(visible_alias = "list")]
     Ls {
         /// Which switch zone to query (`switch0`|`switch1`|`<scrimlet>`).
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Ask one SP for its state (pilot `sp info`): serial, power, RoT, archive.
+    /// Show one SP's state: serial, power, RoT, archive.
     #[command(visible_alias = "state")]
     Info {
         /// Target SP: serial (e.g. BRM44220001), node (sidecar | g0 | g1 ...),
@@ -328,7 +323,7 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Get an SP's power state (pilot `sp status`).
+    /// Show an SP's power state.
     #[command(visible_alias = "st")]
     Status {
         /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
@@ -336,46 +331,41 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Inject an NMI into the host via the SP (pilot `sp nmi`).
+    /// Inject an NMI into the host via the SP.
     Nmi {
         /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Pass a raw faux-mgs command to an SP (pilot `sp exec -e`), e.g.
-    /// `voxel sp exec g0 -e inventory`. The command's own arguments follow
-    /// unquoted: `-e read-caboose 0`, `-e dump count`, `-e dump read 0`. Full
-    /// surface: inventory, component-details, read-sensor-value, dump,
-    /// read-caboose, rot-boot-info, ...
+    /// Pass a raw faux-mgs command to an SP.
+    ///
+    /// The command's own args follow after `-e`, e.g. `-e inventory`,
+    /// `-e read-caboose 0`, `-e dump count`, `-e dump read --index 0`. Everything
+    /// after `-e` is passed through (a quoted string works too).
     Exec {
         /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
-        /// The faux-mgs command to run (pilot-style). May be a single quoted
-        /// string (`-e "read-caboose 0"`) or the command followed by its own
-        /// args (`-e read-caboose 0`); everything after `-e` is passed through.
+        /// The faux-mgs command + its args (`-e read-caboose 0`).
         #[arg(short = 'e', long = "exec", num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Show the configured sp-emu build artifacts and whether `launch --emu` is
-    /// ready (pre-launch readiness check; no running rack needed).
+    /// Check whether `launch --emu` is ready (artifacts present; no rack needed).
     Ready,
-    /// Flash a hubris image (`.zip`) into an sp-emu slot-A flash file (offline:
-    /// produces a flash file on disk; see `reflash` to swap one on a live rack).
+    /// Flash a hubris `.zip` into an sp-emu slot-A flash file (offline).
     Flash {
         /// Hubris image archive (e.g. build-gimlet-c-image-default.zip).
         image: PathBuf,
         /// Output flash file.
         out: PathBuf,
     },
-    /// Re-flash a live SP (or the shared RoT) on a running rack and restart its
-    /// sp-emu service - the firmware counterpart to `voxel rack patch`. SP
-    /// target: `sidecar` | `g0` | `g1` ... | a port; `rot` reflashes the shared
-    /// RoT image (restarts every RoT bridge). `<image>` is a hubris `.zip` for an
-    /// SP, or a raw oxide-rot-1 flash image for `rot`. Live + ephemeral (reverts
-    /// on a clean relaunch); to persist, bake it in via `build-cp.sh` + relaunch.
+    /// Re-flash a live SP (or the shared RoT) and restart its sp-emu service.
+    ///
+    /// The firmware counterpart to `rack patch`. `<image>` is a hubris `.zip`
+    /// for an SP, or a raw oxide-rot-1 image for target `rot` (restarts every RoT
+    /// bridge). Live + ephemeral (reverts on relaunch; bake via `build-cp.sh`).
     Reflash {
         /// Target: `sidecar` | `gN` | a port | `rot`.
         target: String,
@@ -384,11 +374,10 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Enable (or `--off` to disable) the in-zone humility debug listeners
-    /// (gdb/ocd) for one SP - toggles `SP_EMU_NO_DEBUG` on its sp-emu service +
-    /// restarts it. On enable, prints the per-SP humility ports + attach command;
-    /// the SP reboots (~30s preboot) before the listeners are up. Live +
-    /// ephemeral (a clean relaunch reverts to debug-off).
+    /// Enable (or `--off`) the in-zone humility debug listeners (gdb/ocd) for one SP.
+    ///
+    /// Toggles `SP_EMU_NO_DEBUG` + restarts the SP (~30s preboot). On enable,
+    /// prints the humility ports + attach command. Live + ephemeral.
     Debug {
         /// Target SP: `sidecar` | `gN` | a port.
         target: String,
@@ -398,13 +387,11 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Force + decode a crash dump of one live emulated SP (`--emu` only). Arms
-    /// the SP's `sp-emu` service with a dump dir (a one-time restart, ~30s
-    /// preboot, if not already armed), triggers a humility-hydrate RAM snapshot
-    /// in-zone, pulls it to the host, and runs `humility hydrate` + `tasks`
-    /// against the SP's hubris archive - printing the decoded task table. No
-    /// probe/tunnel; the dump is generated in-zone and decoded on the host where
-    /// humility + the archive live. Needs `humility` on PATH (or `$VOXEL_HUMILITY`).
+    /// Force + decode a crash dump of one live emulated SP.
+    ///
+    /// Arms the SP for dumps (a one-time ~30s restart if needed), triggers a
+    /// humility RAM snapshot in-zone, pulls it to the host, and runs `humility
+    /// hydrate` + `tasks`/`ringbuf`. Needs `humility` on PATH (or `$VOXEL_HUMILITY`).
     Dump {
         /// Target SP: `sidecar` | `gN` | a port.
         target: String,
@@ -414,8 +401,7 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Build the gimlet-c + sidecar-c-emu v25 images from a hubris commit (via
-    /// build-sp.sh), then print the `[sp]` paths to set.
+    /// Build the gimlet-c + sidecar-c-emu images from a hubris commit.
     Build {
         /// hubris git commit to build (v1 builds from the configured checkout).
         commit: String,
@@ -438,8 +424,9 @@ enum TpCmd {
     /// List switch zones (scrimlets) and their external IPs.
     Ls,
     /// SSH into a switch zone (technician port): `voxel tp login switch0`.
+    ///
     /// Drops you in oxz_switch, where the dendrite/maghemite tools live
-    /// (`swadm`, `dpd`, `mgadm`). (Real `pilot` isn't in omicron's sim build.)
+    /// (`swadm`, `dpd`, `mgadm`).
     Login {
         #[arg(default_value = "switch0")]
         switch: String,
