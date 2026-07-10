@@ -488,7 +488,6 @@ FIRST=$("$BIN" ipcc-req "$CTL" "$CMD" 2>/dev/null)
 rc=$?
 if [ "$rc" -eq 0 ]; then
   printf '%s\n' "$FIRST"
-  echo "[voxel] (fast path - no reboot)"
   exit 0
 fi
 # rc 3 = broker down -> start it (persistent); rc 4 = broker up, SP not connected.
@@ -519,7 +518,7 @@ exit 1
         clear_cached_ip(&sw);
         return Err(anyhow!("scp of the IPCC script into {sw} failed"));
     }
-    eprintln!("[voxel] {target} (port {port}) on {sw}: IPCC {command} request via the broker (first time on this SP arms + reboots it ~40s; after that it's instant) ...");
+    eprintln!("[voxel] {target} (port {port}) on {sw}: ipcc {command}");
     let out = ssh_output(&ip, &zlogin(&format!("bash /var/tmp/voxel-ipcc-{port}.sh")))
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| {
