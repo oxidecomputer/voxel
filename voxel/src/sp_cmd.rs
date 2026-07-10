@@ -68,6 +68,7 @@ pub(crate) async fn cmd_sp(cfg: &VoxelConfig, name: &str, cmd: &SpCmd) -> anyhow
         SpCmd::Reflash { target, image, switch } => sp_reflash(cfg, name, switch, target, image).await,
         SpCmd::Debug { target, off, switch } => sp_debug(cfg, name, switch, target, *off).await,
         SpCmd::Dump { target, ringbuf, switch } => sp_dump(cfg, name, switch, target, *ringbuf).await,
+        SpCmd::Ipcc { target, cmd, switch } => sp_ipcc(cfg, name, switch, target, cmd).await,
     }
 }
 
@@ -427,6 +428,89 @@ async fn sp_debug(
         println!("    humility -a <archive.zip> -p ocd <cmd>");
     } else {
         println!("  read+write (-p ocd) needs port 6666 (hardcoded in humility) - only the sidecar (33300); this SP's ocd is :{ocd}");
+    }
+    Ok(())
+}
+
+/// `voxel sp ipcc <target> [--cmd identity|bsu]` - drive one host<->SP exchange
+/// over the SP's control UART (RFD 316 / IPCC). sp-emu models UART7 and exposes
+/// it as `SP_EMU_HOST_UART` (a Unix socket it connects to). We stage the host
+/// sp-emu (which has the `ipcc` host-role subcommand) into the zone as the probe,
+/// start it listening, arm the SP with that socket + restart (so it connects at
+/// boot), then the probe sends a `HostToSp` request and decodes the `SpToHost`
+/// reply - proving the emulated SP speaks IPCC. Everything runs in-zone (the SP's
+/// UART socket is in-zone loopback). Live + ephemeral (the arming reverts on a
+/// clean relaunch). Emu-only.
+async fn sp_ipcc(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+    target: &str,
+    command: &str,
+) -> anyhow::Result<()> {
+    if !matches!(command, "identity" | "bsu") {
+        return Err(anyhow!("--cmd must be `identity` or `bsu` (got `{command}`)"));
+    }
+    let topo = build_topo(cfg, name)?;
+    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let port = resolve_port(&fleet, target)?;
+    // The probe is the host sp-emu binary (it carries the `ipcc` subcommand); the
+    // baked in-zone sp-emu already handles SP_EMU_HOST_UART on the SP side.
+    let emu_bin = cfg.sp.emu_bin.as_deref().ok_or_else(|| {
+        anyhow!("[sp].emu_bin not set - need the sp-emu binary (with the `ipcc` subcommand)")
+    })?;
+    if !Path::new(emu_bin).exists() {
+        return Err(anyhow!("sp-emu binary not found: {emu_bin}"));
+    }
+    if !scp_to(&ip, emu_bin, &format!("{SWITCH_ZONE_ROOT}/var/tmp/sp-emu-ipcc")) {
+        clear_cached_ip(&sw);
+        return Err(anyhow!("scp of sp-emu into {sw} failed"));
+    }
+
+    // Orchestration shipped as a FILE (avoids nested ssh/zlogin quoting): start
+    // the probe listening, arm the SP's UART7 socket + restart so it connects,
+    // wait for the probe to complete, print its decode. Only PORT + CMD vary.
+    let script = format!(
+        r#"set -u
+PORT={port}
+CMD={command}
+FMRI=svc:/oxide/voxel-sp-emu:sp$PORT
+S=/var/tmp/ipcc-$PORT.sock
+OUT=/var/tmp/ipcc-$PORT.out
+chmod +x /var/tmp/sp-emu-ipcc
+rm -f "$S" "$OUT"
+nohup /var/tmp/sp-emu-ipcc ipcc "$S" "$CMD" >"$OUT" 2>&1 </dev/null &
+PROBE=$!
+sleep 1
+cur=$(svcprop -p start/environment "$FMRI" 2>/dev/null)
+q=""
+for t in $(printf '%s\n' $cur | grep -v '^SP_EMU_HOST_UART=') "SP_EMU_HOST_UART=$S"; do
+  q="$q \"$t\""
+done
+printf 'select %s\nsetprop start/environment = astring: (%s )\n' "$FMRI" "$q" > /var/tmp/ipcc-env-$PORT.scfg
+svccfg -f /var/tmp/ipcc-env-$PORT.scfg && svcadm refresh "$FMRI" && svcadm restart "$FMRI"
+for i in $(seq 1 110); do kill -0 "$PROBE" 2>/dev/null || break; sleep 1; done
+cat "$OUT"
+"#
+    );
+    let local = std::env::temp_dir().join(format!("voxel-ipcc-{port}.sh"));
+    std::fs::write(&local, &script).map_err(|e| anyhow!("write {}: {e}", local.display()))?;
+    if !scp_to(&ip, local.to_str().unwrap_or_default(), &format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-ipcc-{port}.sh")) {
+        clear_cached_ip(&sw);
+        return Err(anyhow!("scp of the IPCC script into {sw} failed"));
+    }
+    eprintln!("[voxel] {target} (port {port}) on {sw}: arming SP_EMU_HOST_UART + driving one IPCC {command} request (~40s - the SP reboots, then answers) ...");
+    let out = ssh_output(&ip, &zlogin(&format!("bash /var/tmp/voxel-ipcc-{port}.sh")))
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            clear_cached_ip(&sw);
+            anyhow!("couldn't run the IPCC probe in {sw}")
+        })?;
+    print!("{out}");
+    if !out.contains("SpToHost reply") {
+        return Err(anyhow!(
+            "no decoded IPCC reply (the SP may still be booting - retry `voxel sp ipcc {target}`)"
+        ));
     }
     Ok(())
 }

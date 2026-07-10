@@ -395,6 +395,20 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
+    /// Drive one host<->SP IPCC exchange over the SP's control UART (RFD 316).
+    ///
+    /// Arms the SP's UART7 with a socket (`SP_EMU_HOST_UART`, a one-time ~30s
+    /// restart), plays the host from in-zone, sends a `HostToSp` request, and
+    /// decodes the `SpToHost` reply - proving the emulated SP speaks IPCC.
+    Ipcc {
+        /// Target SP: `sidecar` | `gN` | a port.
+        target: String,
+        /// Which request to send: `identity` (VPD) or `bsu` (boot storage unit).
+        #[arg(long, default_value = "identity")]
+        cmd: String,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+    },
     /// Build the gimlet-c + sidecar-c-emu images from a hubris commit.
     Build {
         /// hubris git commit to build (v1 builds from the configured checkout).
