@@ -5,18 +5,48 @@ use anyhow::anyhow;
 use libfalcon::{cli::console, NodeRef};
 use voxel_config::{SledDesc, VoxelConfig};
 
-use crate::net::{node_external_ip, ZLOGIN};
+use crate::net::{node_external_ip, ssh_output, zlogin, ZLOGIN};
 use crate::topo::{build_topo, Topo};
 
-pub(crate) async fn cmd_exec(
+/// `voxel host exec -c "<cmd>" <sled>` - run a command in a sled's global zone
+/// over ssh (the non-interactive `host login`) and print its output.
+pub(crate) async fn cmd_host_exec(
     cfg: &VoxelConfig,
     name: &str,
-    node: &str,
-    command: &[String],
+    sled: &str,
+    command: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let n = topo.node_ref(node).ok_or_else(|| anyhow!("no such node: {node}"))?;
-    let out = topo.runner.exec(n, &command.join(" ")).await.map_err(|e| anyhow!("exec: {e}"))?;
+    let (_, n) = topo
+        .sleds
+        .iter()
+        .find(|(s, _)| s.name == sled)
+        .ok_or_else(|| anyhow!("no such sled: {sled}"))?;
+    let ip = node_external_ip(&topo.runner, *n, false)
+        .await
+        .map_err(|e| anyhow!("{e} - is the rack up? (`voxel serial {sled}` for the console)"))?;
+    let out = ssh_output(&ip, command)
+        .ok_or_else(|| anyhow!("couldn't ssh root@{ip} ({sled}) - is the rack up?"))?;
+    print!("{out}");
+    Ok(())
+}
+
+/// `voxel tp exec -c "<cmd>" <switch>` - run a command inside a switch zone
+/// (`oxz_switch`, where swadm/dpd/mgadm live) over ssh+zlogin and print its
+/// output. The non-interactive `tp login`.
+pub(crate) async fn cmd_tp_exec(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+    command: &str,
+) -> anyhow::Result<()> {
+    let topo = build_topo(cfg, name)?;
+    let (s, n) = resolve_switch(&topo, switch)?;
+    let ip = node_external_ip(&topo.runner, *n, false)
+        .await
+        .map_err(|e| anyhow!("{e} - is the rack up? (`voxel serial {}` for the console)", s.name))?;
+    let out = ssh_output(&ip, &zlogin(command))
+        .ok_or_else(|| anyhow!("couldn't reach oxz_switch on {} ({switch})", s.name))?;
     print!("{out}");
     Ok(())
 }

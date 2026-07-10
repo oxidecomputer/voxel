@@ -114,12 +114,6 @@ enum Cmd {
     },
     /// Destroy the rack.
     Destroy,
-    /// Run a command on a node: `voxel exec g0 svcs -x`.
-    Exec {
-        node: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        command: Vec<String>,
-    },
     /// Open a serial console to a node (^q to exit).
     Serial { node: String },
     /// Print topology information.
@@ -151,12 +145,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SpCmd,
     },
-    /// Log into a sled's global zone.
+    /// Access a sled's global zone (ls / login / exec).
     Host {
         #[command(subcommand)]
         cmd: HostCmd,
     },
-    /// Log into a switch zone (technician port).
+    /// Access a switch zone / technician port (ls / login / exec).
     Tp {
         #[command(subcommand)]
         cmd: TpCmd,
@@ -417,6 +411,15 @@ enum HostCmd {
         #[arg(default_value = "g0")]
         sled: String,
     },
+    /// Run a command in a sled's global zone: `voxel host exec -c "svcs -x" g1`.
+    Exec {
+        /// Command to run (quote multi-word commands).
+        #[arg(short = 'c', long = "command")]
+        command: String,
+        /// Target sled (g0, g1, ...).
+        #[arg(default_value = "g0")]
+        sled: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -428,6 +431,15 @@ enum TpCmd {
     /// Drops you in oxz_switch, where the dendrite/maghemite tools live
     /// (`swadm`, `dpd`, `mgadm`).
     Login {
+        #[arg(default_value = "switch0")]
+        switch: String,
+    },
+    /// Run a command in a switch zone: `voxel tp exec -c "swadm link ls" switch0`.
+    Exec {
+        /// Command to run in oxz_switch (quote multi-word commands).
+        #[arg(short = 'c', long = "command")]
+        command: String,
+        /// Target switch (`switch0` | `switchN` | `rackR/switchS` | scrimlet node).
         #[arg(default_value = "switch0")]
         switch: String,
     },
@@ -570,9 +582,6 @@ async fn main() -> Result<(), Error> {
             rack::cmd_route(&load_config(&config_path)?, &cli.name, *dry_run).await
         }
         Cmd::Destroy => rack::cmd_destroy(&load_config(&config_path)?, &cli.name),
-        Cmd::Exec { node, command } => {
-            access::cmd_exec(&load_config(&config_path)?, &cli.name, node, command).await
-        }
         Cmd::Serial { node } => {
             access::cmd_serial(&load_config(&config_path)?, &cli.name, node).await
         }
@@ -624,11 +633,17 @@ async fn main() -> Result<(), Error> {
             HostCmd::Login { sled } => {
                 access::cmd_host_login(&load_config(&config_path)?, &cli.name, sled).await
             }
+            HostCmd::Exec { command, sled } => {
+                access::cmd_host_exec(&load_config(&config_path)?, &cli.name, sled, command).await
+            }
         },
         Cmd::Tp { cmd } => match cmd {
             TpCmd::Ls => access::cmd_tp_ls(&load_config(&config_path)?, &cli.name).await,
             TpCmd::Login { switch } => {
                 access::cmd_tp_login(&load_config(&config_path)?, &cli.name, switch).await
+            }
+            TpCmd::Exec { command, switch } => {
+                access::cmd_tp_exec(&load_config(&config_path)?, &cli.name, switch, command).await
             }
         },
     }
