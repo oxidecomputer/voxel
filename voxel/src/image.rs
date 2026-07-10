@@ -49,7 +49,7 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             let dataset = falcon_dataset();
             let img = format!("{dataset}/img");
             let out = std::process::Command::new("zfs")
-                .args(["list", "-H", "-o", "name,used,type", "-t", "volume,snapshot", "-r", &img])
+                .args(["list", "-H", "-o", "name,used,creation,type", "-t", "volume,snapshot", "-r", &img])
                 .output()
                 .map_err(|e| anyhow!("run zfs list: {e}"))?;
             if !out.status.success() {
@@ -60,18 +60,20 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             }
             let text = String::from_utf8_lossy(&out.stdout);
             let prefix = format!("{img}/");
-            let mut sizes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            // volume name (short) -> (used, creation).
+            let mut meta: std::collections::HashMap<String, (String, String)> =
+                std::collections::HashMap::new();
             let mut bundles: Vec<String> = Vec::new();
             for line in text.lines() {
                 let mut f = line.split('\t');
-                let (name, used, ty) = match (f.next(), f.next(), f.next()) {
-                    (Some(n), Some(u), Some(t)) => (n, u, t),
+                let (name, used, creation, ty) = match (f.next(), f.next(), f.next(), f.next()) {
+                    (Some(n), Some(u), Some(c), Some(t)) => (n, u, c, t),
                     _ => continue,
                 };
                 match ty {
                     "volume" => {
                         if let Some(short) = name.strip_prefix(&prefix) {
-                            sizes.insert(short.to_string(), used.to_string());
+                            meta.insert(short.to_string(), (used.to_string(), creation.to_string()));
                         }
                     }
                     // A `<name>@base` snapshot is what makes <name> a bundle.
@@ -101,24 +103,30 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                     .unwrap_or("-")
                     .to_string()
             };
-            // Leading marker column flags the currently-configured image.cp.
+            // The dataset is the same for every image, so name it once here and
+            // drop the redundant per-row path; a leading marker flags image.cp.
+            println!("images under {img}:\n");
             let active = active.as_deref();
             let mut any_active = false;
             let mut table: Vec<Vec<String>> = vec![vec![
                 "".into(),
                 "IMAGE".into(),
-                "LOCATION".into(),
                 "SIZE".into(),
+                "CREATED".into(),
                 "COMMIT".into(),
             ]];
             for name in &bundles {
                 let is_active = active == Some(name.as_str());
                 any_active |= is_active;
+                let (used, created) = meta
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| ("-".into(), "-".into()));
                 table.push(vec![
                     if is_active { "*".into() } else { "".into() },
                     name.clone(),
-                    format!("{prefix}{name}@base"),
-                    sizes.get(name).cloned().unwrap_or_else(|| "-".into()),
+                    used,
+                    created,
                     commit_of(name),
                 ]);
             }
