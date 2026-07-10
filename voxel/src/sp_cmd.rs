@@ -469,30 +469,48 @@ async fn sp_ipcc(
         return Err(anyhow!("scp of sp-emu into {sw} failed"));
     }
 
-    // Orchestration shipped as a FILE (avoids nested ssh/zlogin quoting): start
-    // the probe listening, arm the SP's UART7 socket + restart so it connects,
-    // wait for the probe to complete, print its decode. Only PORT + CMD vary.
+    // Orchestration shipped as a FILE (avoids nested ssh/zlogin quoting). A
+    // persistent broker (`ipcc-serve`) holds the SP's UART connection so repeats
+    // skip the reboot: FAST path just asks the broker (`ipcc-req`); on a miss we
+    // start the broker (if down) + arm the SP's UART7 socket + restart it so it
+    // connects, then poll the broker for the reply. Only PORT + CMD vary.
     let script = format!(
         r#"set -u
 PORT={port}
 CMD={command}
 FMRI=svc:/oxide/voxel-sp-emu:sp$PORT
-S=/var/tmp/ipcc-$PORT.sock
-OUT=/var/tmp/ipcc-$PORT.out
-chmod +x /var/tmp/sp-emu-ipcc
-rm -f "$S" "$OUT"
-nohup /var/tmp/sp-emu-ipcc ipcc "$S" "$CMD" >"$OUT" 2>&1 </dev/null &
-PROBE=$!
-sleep 1
+SP=/var/tmp/ipcc-$PORT.sock
+CTL=/var/tmp/ipcc-ctl-$PORT.sock
+BIN=/var/tmp/sp-emu-ipcc
+chmod +x "$BIN"
+# Fast path: broker already up + holding the SP connection.
+FIRST=$("$BIN" ipcc-req "$CTL" "$CMD" 2>/dev/null)
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  printf '%s\n' "$FIRST"
+  echo "[voxel] (fast path - no reboot)"
+  exit 0
+fi
+# rc 3 = broker down -> start it (persistent); rc 4 = broker up, SP not connected.
+if [ "$rc" -eq 3 ]; then
+  nohup "$BIN" ipcc-serve "$SP" "$CTL" >/var/tmp/ipcc-broker-$PORT.log 2>&1 </dev/null &
+  sleep 1
+fi
+# Arm the SP's UART7 with the broker socket + restart so it connects at boot.
 cur=$(svcprop -p start/environment "$FMRI" 2>/dev/null)
 q=""
-for t in $(printf '%s\n' $cur | grep -v '^SP_EMU_HOST_UART=') "SP_EMU_HOST_UART=$S"; do
+for t in $(printf '%s\n' $cur | grep -v '^SP_EMU_HOST_UART=') "SP_EMU_HOST_UART=$SP"; do
   q="$q \"$t\""
 done
 printf 'select %s\nsetprop start/environment = astring: (%s )\n' "$FMRI" "$q" > /var/tmp/ipcc-env-$PORT.scfg
 svccfg -f /var/tmp/ipcc-env-$PORT.scfg && svcadm refresh "$FMRI" && svcadm restart "$FMRI"
-for i in $(seq 1 110); do kill -0 "$PROBE" 2>/dev/null || break; sleep 1; done
-cat "$OUT"
+# Wait for the SP to boot + connect, then read the reply through the broker.
+for i in $(seq 1 70); do
+  R=$("$BIN" ipcc-req "$CTL" "$CMD" 2>/dev/null) && {{ printf '%s\n' "$R"; exit 0; }}
+  sleep 1
+done
+echo "[voxel] IPCC timed out"
+exit 1
 "#
     );
     let local = std::env::temp_dir().join(format!("voxel-ipcc-{port}.sh"));
@@ -501,7 +519,7 @@ cat "$OUT"
         clear_cached_ip(&sw);
         return Err(anyhow!("scp of the IPCC script into {sw} failed"));
     }
-    eprintln!("[voxel] {target} (port {port}) on {sw}: arming SP_EMU_HOST_UART + driving one IPCC {command} request (~40s - the SP reboots, then answers) ...");
+    eprintln!("[voxel] {target} (port {port}) on {sw}: IPCC {command} request via the broker (first time on this SP arms + reboots it ~40s; after that it's instant) ...");
     let out = ssh_output(&ip, &zlogin(&format!("bash /var/tmp/voxel-ipcc-{port}.sh")))
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| {
