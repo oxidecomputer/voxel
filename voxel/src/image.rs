@@ -39,14 +39,17 @@ fn build_cp_script() -> anyhow::Result<PathBuf> {
     locate_script("VOXEL_BUILD_CP", "build-cp.sh")
 }
 
-pub(crate) fn cmd_image(cmd: &ImageCmd) -> anyhow::Result<()> {
+pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Result<()> {
     match cmd {
         ImageCmd::Ls => {
             // Image bundles are falcon base images at <dataset>/img/<name>@base.
+            // One `zfs list` covers both the volumes (for size) and their @base
+            // snapshots (which mark a name as a real bundle); we join them into a
+            // table: image, location (dataset path), size, omicron commit.
             let dataset = falcon_dataset();
             let img = format!("{dataset}/img");
             let out = std::process::Command::new("zfs")
-                .args(["list", "-H", "-o", "name", "-t", "snapshot", "-r", &img])
+                .args(["list", "-H", "-o", "name,used,type", "-t", "volume,snapshot", "-r", &img])
                 .output()
                 .map_err(|e| anyhow!("run zfs list: {e}"))?;
             if !out.status.success() {
@@ -55,22 +58,88 @@ pub(crate) fn cmd_image(cmd: &ImageCmd) -> anyhow::Result<()> {
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
-            println!("image bundles under {img}:");
             let text = String::from_utf8_lossy(&out.stdout);
-            let mut found = false;
+            let prefix = format!("{img}/");
+            let mut sizes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut bundles: Vec<String> = Vec::new();
             for line in text.lines() {
-                // <dataset>/img/<name>@base  ->  <name>
-                if let Some((path, snap)) = line.rsplit_once('@') {
-                    if let Some(name) = path.strip_prefix(&format!("{img}/")) {
-                        if name.starts_with("voxel-") {
-                            println!("  {name}  ({snap})");
-                            found = true;
+                let mut f = line.split('\t');
+                let (name, used, ty) = match (f.next(), f.next(), f.next()) {
+                    (Some(n), Some(u), Some(t)) => (n, u, t),
+                    _ => continue,
+                };
+                match ty {
+                    "volume" => {
+                        if let Some(short) = name.strip_prefix(&prefix) {
+                            sizes.insert(short.to_string(), used.to_string());
                         }
                     }
+                    // A `<name>@base` snapshot is what makes <name> a bundle.
+                    "snapshot" => {
+                        if let Some((path, "base")) = name.rsplit_once('@') {
+                            if let Some(short) = path.strip_prefix(&prefix) {
+                                if short.starts_with("voxel-") {
+                                    bundles.push(short.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            if !found {
-                println!("  (none - build one with `voxel image create <commit>`)");
+            bundles.sort();
+            bundles.dedup();
+            if bundles.is_empty() {
+                println!("no image bundles under {img} (build one with `voxel image create <commit>`)");
+                return Ok(());
+            }
+            // Commit from the name: voxel-cp-<commit>[-<variant>] -> <commit>.
+            let commit_of = |name: &str| -> String {
+                name.strip_prefix("voxel-cp-")
+                    .and_then(|s| s.split('-').next())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            // Leading marker column flags the currently-configured image.cp.
+            let active = active.as_deref();
+            let mut any_active = false;
+            let mut table: Vec<Vec<String>> = vec![vec![
+                "".into(),
+                "IMAGE".into(),
+                "LOCATION".into(),
+                "SIZE".into(),
+                "COMMIT".into(),
+            ]];
+            for name in &bundles {
+                let is_active = active == Some(name.as_str());
+                any_active |= is_active;
+                table.push(vec![
+                    if is_active { "*".into() } else { "".into() },
+                    name.clone(),
+                    format!("{prefix}{name}@base"),
+                    sizes.get(name).cloned().unwrap_or_else(|| "-".into()),
+                    commit_of(name),
+                ]);
+            }
+            let ncol = table[0].len();
+            let mut w = vec![0usize; ncol];
+            for row in &table {
+                for (i, cell) in row.iter().enumerate() {
+                    w[i] = w[i].max(cell.len());
+                }
+            }
+            for row in &table {
+                let line: String = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cell)| format!("{:<width$}", cell, width = w[i]))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                println!("{}", line.trim_end());
+            }
+            if any_active {
+                println!("\n* = current image.cp");
             }
             Ok(())
         }

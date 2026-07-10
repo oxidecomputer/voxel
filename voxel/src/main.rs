@@ -585,7 +585,7 @@ async fn main() -> Result<(), Error> {
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
             }
-            other => image::cmd_image(other),
+            other => image::cmd_image(other, cfg.as_ref().map(|c| c.image.cp_image())),
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
