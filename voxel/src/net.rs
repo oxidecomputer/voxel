@@ -149,6 +149,7 @@ pub(crate) fn scp_to(ip: &str, local: &str, remote: &str) -> bool {
         .stdin(std::process::Stdio::null())
         .args(EPHEMERAL_HOST_OPTS)
         .args(PASSWORD_AUTH_OPTS)
+        .arg("-q") // no progress meter
         .arg(local)
         .arg(format!("root@{ip}:{remote}"))
         .status()
@@ -169,6 +170,7 @@ pub(crate) fn scp_from(ip: &str, remote: &str, local: &str) -> bool {
         .stdin(std::process::Stdio::null())
         .args(EPHEMERAL_HOST_OPTS)
         .args(PASSWORD_AUTH_OPTS)
+        .arg("-q") // no progress meter
         .arg(format!("root@{ip}:{remote}"))
         .arg(local)
         .status()
