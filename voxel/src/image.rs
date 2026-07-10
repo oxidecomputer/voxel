@@ -89,7 +89,31 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                     _ => {}
                 }
             }
-            bundles.sort();
+            // Order newest-first by creation. zfs's human `creation` string won't
+            // sort, so pull the numeric epoch (`-p`) in a cheap second query keyed
+            // by the same short names, and sort on that (name as the tiebreak).
+            let epochs: std::collections::HashMap<String, i64> = {
+                let mut m = std::collections::HashMap::new();
+                if let Ok(o) = std::process::Command::new("zfs")
+                    .args(["list", "-H", "-p", "-o", "name,creation", "-t", "volume", "-r", &img])
+                    .output()
+                {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        let mut f = line.split('\t');
+                        if let (Some(n), Some(c)) = (f.next(), f.next()) {
+                            if let Some(short) = n.strip_prefix(&prefix) {
+                                m.insert(short.to_string(), c.parse().unwrap_or(0));
+                            }
+                        }
+                    }
+                }
+                m
+            };
+            bundles.sort_by(|a, b| {
+                let ea = epochs.get(a).copied().unwrap_or(0);
+                let eb = epochs.get(b).copied().unwrap_or(0);
+                eb.cmp(&ea).then_with(|| a.cmp(b))
+            });
             bundles.dedup();
             if bundles.is_empty() {
                 println!("no image bundles under {img} (build one with `voxel image create <commit>`)");
