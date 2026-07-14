@@ -368,10 +368,12 @@ impl SledDesc {
         num_sleds: usize,
         num_fabric_routers: usize,
         data_links: SledDataLinksSchema,
+        disks: SledDisksSchema,
     ) -> crate::sled::SledAgentConfig {
         crate::sled::SledAgentConfig::new(self.index, self.scrimlet)
             .with_topology(num_sleds, num_fabric_routers)
             .with_data_links_schema(data_links)
+            .with_disks_schema(disks)
     }
 }
 
@@ -386,6 +388,10 @@ pub struct Image {
     /// Sled-agent `data_links` config shape, which differs by omicron era (the
     /// image's control-plane version). See [`SledDataLinksSchema`].
     pub data_links_schema: SledDataLinksSchema,
+    /// Sled-agent disks config shape (`vdevs` vs `external_disks`), which also
+    /// differs by omicron era - INDEPENDENTLY of `data_links_schema` (e.g.
+    /// 99a0aec has flat `vdevs` but tagged `data_links`). See [`SledDisksSchema`].
+    pub disks_schema: SledDisksSchema,
 }
 
 impl Default for Image {
@@ -395,6 +401,7 @@ impl Default for Image {
             cp: None,
             frr: None,
             data_links_schema: SledDataLinksSchema::default(),
+            disks_schema: SledDisksSchema::default(),
         }
     }
 }
@@ -412,6 +419,21 @@ pub enum SledDataLinksSchema {
     /// omicron main (the `DataLinks` enum):
     /// `data_links = { kind = "virtual", devices = ["vioif0", "vioif1"] }`.
     Tagged,
+}
+
+/// The shape of sled-agent's disk config, which changed across omicron versions:
+/// the flat `vdevs = [...]` list became a tagged `external_disks` enum. Selected
+/// independently of [`SledDataLinksSchema`] (they drifted at different commits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SledDisksSchema {
+    /// Pre-rename omicron (e.g. a3fee0ec / 43bb5af / 99a0aec):
+    /// `vdevs = ["m2_g0_0.vdev", ...]`.
+    #[default]
+    Vdevs,
+    /// omicron main (the `ExternalDisks` enum, `#[serde(tag = "kind")]`):
+    /// `external_disks = { kind = "virtual", vdevs = ["m2_g0_0.vdev", ...] }`.
+    ExternalDisks,
 }
 
 impl Image {

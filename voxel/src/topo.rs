@@ -251,7 +251,7 @@ pub(crate) fn stage_config(
         fs::create_dir_all(&dir)?;
         fs::write(
             dir.join("sled-config.toml"),
-            s.sled_config(num_sleds_per_rack, num_fabric_routers, cfg.image.data_links_schema)
+            s.sled_config(num_sleds_per_rack, num_fabric_routers, cfg.image.data_links_schema, cfg.image.disks_schema)
                 .with_interconnects(cfg.topology.interconnect_count_for(s.index))
                 .render(),
         )?;

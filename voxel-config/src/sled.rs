@@ -42,6 +42,8 @@ pub struct SledAgentConfig {
     pub num_interconnects: usize,
     /// Sled-agent `data_links` config shape (see [`crate::config::SledDataLinksSchema`]).
     pub data_links: crate::config::SledDataLinksSchema,
+    /// Sled-agent disks config shape (see [`crate::config::SledDisksSchema`]).
+    pub disks: crate::config::SledDisksSchema,
 }
 
 impl SledAgentConfig {
@@ -57,6 +59,7 @@ impl SledAgentConfig {
             num_fabric_routers: 2,
             num_interconnects: 0,
             data_links: crate::config::SledDataLinksSchema::default(),
+            disks: crate::config::SledDisksSchema::default(),
         }
     }
 
@@ -82,6 +85,13 @@ impl SledAgentConfig {
         schema: crate::config::SledDataLinksSchema,
     ) -> Self {
         self.data_links = schema;
+        self
+    }
+
+    /// Select the sled-agent disks config shape (see
+    /// [`crate::config::SledDisksSchema`]).
+    pub fn with_disks_schema(mut self, schema: crate::config::SledDisksSchema) -> Self {
+        self.disks = schema;
         self
     }
 
@@ -111,15 +121,34 @@ impl SledAgentConfig {
         writeln!(o, "skip_timesync = false").unwrap();
         writeln!(o).unwrap();
 
-        // Emulated M.2 (×2) + U.2 (×5) vdevs, named per sled.
-        writeln!(o, "vdevs = [").unwrap();
-        writeln!(o, "  \"m2_g{i}_0.vdev\",").unwrap();
-        writeln!(o, "  \"m2_g{i}_1.vdev\",").unwrap();
-        writeln!(o).unwrap();
+        // Emulated M.2 (×2) + U.2 (×5) vdevs, named per sled. The field shape
+        // changed across omicron eras (flat `vdevs` list -> tagged `external_disks`
+        // enum), so render per the selected schema (see SledDisksSchema).
+        let mut vdevs: Vec<String> =
+            vec![format!("m2_g{i}_0.vdev"), format!("m2_g{i}_1.vdev")];
         for u in 0..5 {
-            writeln!(o, "  \"u2_g{i}_{u}.vdev\",").unwrap();
+            vdevs.push(format!("u2_g{i}_{u}.vdev"));
         }
-        writeln!(o, "]").unwrap();
+        match self.disks {
+            crate::config::SledDisksSchema::Vdevs => {
+                writeln!(o, "vdevs = [").unwrap();
+                writeln!(o, "  \"{}\",", vdevs[0]).unwrap();
+                writeln!(o, "  \"{}\",", vdevs[1]).unwrap();
+                writeln!(o).unwrap();
+                for v in &vdevs[2..] {
+                    writeln!(o, "  \"{v}\",").unwrap();
+                }
+                writeln!(o, "]").unwrap();
+            }
+            crate::config::SledDisksSchema::ExternalDisks => {
+                // Inline table (TOML inline tables can't span lines), mirroring
+                // omicron's `ExternalDisks::Virtual { vdevs }` (#[serde(tag="kind")]).
+                let list =
+                    vdevs.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(", ");
+                writeln!(o, "external_disks = {{ kind = \"virtual\", vdevs = [{list}] }}")
+                    .unwrap();
+            }
+        }
         writeln!(o).unwrap();
 
         writeln!(o, "vmm_reservoir_percentage = 0").unwrap();
@@ -273,5 +302,23 @@ mod tests {
         );
         assert_eq!(tagged["data_links"]["kind"].as_str(), Some("virtual"));
         assert_eq!(tagged["data_links"]["devices"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn disks_schema_shapes() {
+        use crate::config::SledDisksSchema;
+        // Default (Vdevs) renders the legacy flat `vdevs` array.
+        let flat = parse(&SledAgentConfig::new(0, false).render());
+        assert_eq!(flat["vdevs"].as_array().unwrap().len(), 7);
+        assert!(flat.get("external_disks").is_none());
+        // ExternalDisks renders omicron main's tagged enum: { kind, vdevs }.
+        let ext = parse(
+            &SledAgentConfig::new(0, false)
+                .with_disks_schema(SledDisksSchema::ExternalDisks)
+                .render(),
+        );
+        assert!(ext.get("vdevs").is_none(), "flat vdevs must be gone");
+        assert_eq!(ext["external_disks"]["kind"].as_str(), Some("virtual"));
+        assert_eq!(ext["external_disks"]["vdevs"].as_array().unwrap().len(), 7);
     }
 }
