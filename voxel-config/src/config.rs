@@ -385,13 +385,14 @@ pub struct Image {
     pub version: String,
     pub cp: Option<String>,
     pub frr: Option<String>,
-    /// Sled-agent `data_links` config shape, which differs by omicron era (the
-    /// image's control-plane version). See [`SledDataLinksSchema`].
-    pub data_links_schema: SledDataLinksSchema,
-    /// Sled-agent disks config shape (`vdevs` vs `external_disks`), which also
-    /// differs by omicron era - INDEPENDENTLY of `data_links_schema` (e.g.
-    /// 99a0aec has flat `vdevs` but tagged `data_links`). See [`SledDisksSchema`].
-    pub disks_schema: SledDisksSchema,
+    /// Override the sled-agent `data_links` config shape. Normally leave this
+    /// unset (`None`): voxel auto-detects it from the image's omicron source at
+    /// launch. Set it only to force a shape. See [`SledDataLinksSchema`].
+    pub data_links_schema: Option<SledDataLinksSchema>,
+    /// Override the sled-agent disks config shape (`vdevs` vs `external_disks`).
+    /// Normally leave unset (`None`) - auto-detected per image. See
+    /// [`SledDisksSchema`].
+    pub disks_schema: Option<SledDisksSchema>,
 }
 
 impl Default for Image {
@@ -400,8 +401,8 @@ impl Default for Image {
             version: "proto".into(),
             cp: None,
             frr: None,
-            data_links_schema: SledDataLinksSchema::default(),
-            disks_schema: SledDisksSchema::default(),
+            data_links_schema: None,
+            disks_schema: None,
         }
     }
 }

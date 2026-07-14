@@ -50,15 +50,14 @@ cargo build
 ```
 voxel config set image.cp voxel-cp-43bb5af
 voxel config set image.frr voxel-frr-proto
-voxel config set image.data_links_schema tagged # Only required for Omicron v21+ for now, set to 'list' for v20.
-voxel config set falcon.rss_gen ~/voxel-builds/omicron-43bb5af/target/debug/voxel-rss-gen
 ```
 
 5. `pfexec voxel launch`
 
 Notes: steps 2-4 default the build/dataset under `$HOME/voxel-builds` and `rpool/falcon`; if you use a non-default dataset, set
-`falcon.dataset` (and pass `FALCON_DATASET=` to `build-frr.sh`, which doesn't read the config). `data_links_schema` is the one knob that
-tracks the omicron version. Everything else is version-independent.
+`falcon.dataset` (and pass `FALCON_DATASET=` to `build-frr.sh`, which doesn't read the config). The `voxel-rss-gen` path and the
+sled-agent config shape (`vdevs`/`external_disks`, `data_links`) are both **auto-derived from the image's omicron commit** - no
+version knobs to set. Everything is version-independent from the operator's side.
 
 Additionally, `BUILD_ROOT` can be used to choose a different location for building omicron. Like other parameters, you can set it as a flag, voxel config, or environment variable.
 

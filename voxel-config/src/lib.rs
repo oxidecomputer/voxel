@@ -17,7 +17,7 @@ pub mod sled;
 pub mod sp;
 
 pub use config::{
-    Falcon, Image, Network, RecoverySiloCfg, SledDataLinksSchema, SledDesc, SpCfg, Topology,
+    Falcon, Image, Network, RecoverySiloCfg, SledDataLinksSchema, SledDisksSchema, SledDesc, SpCfg, Topology,
     UplinkCfg, VoxelConfig,
 };
 pub use frr::{FrrNeighbor, FrrRouter};

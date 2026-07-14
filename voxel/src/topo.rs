@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context};
 use libfalcon::{unit::gb, NodeRef, Runner, SmbiosType1Input};
 use std::fs;
 use std::path::{Path, PathBuf};
-use voxel_config::{SledDesc, VoxelConfig};
+use voxel_config::{SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig};
 
 /// Gimlet board-serial prefix. The SMBIOS serial ([`populate_smbios`]) and the
 /// faux-mgs lookup serial (`sp_cmd::sp_serial`) both build `{prefix}{index+1}`
@@ -230,6 +230,40 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
     Ok(())
 }
 
+/// Auto-detect the sled-agent config shapes (`data_links`, disks) from the
+/// image's omicron source, so operators never hand-set per-era knobs. The source
+/// sits beside the commit-pinned rss-gen (`$VOXEL_RSS_GEN` =
+/// `<build_root>/omicron-<commit>/target/debug/voxel-rss-gen`), so we read its
+/// `sled-agent/src/config.rs` and key off the field declarations - which are the
+/// ground truth for that commit. Falls back to the oldest shapes if the source
+/// can't be read; an explicit `[image]` override wins over detection.
+///
+/// This is the "schema changelog", automated: instead of a hand-maintained
+/// commits->requirements table, voxel reads what the commit itself declares.
+fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
+    let src = std::env::var("VOXEL_RSS_GEN")
+        .ok()
+        .and_then(|g| Path::new(&g).ancestors().nth(3).map(|p| p.join("sled-agent/src/config.rs")))
+        .and_then(|p| fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    // `pub external_disks: ExternalDisks` (main) vs `pub vdevs: ...` (older).
+    let disks = if src.contains("pub external_disks") {
+        SledDisksSchema::ExternalDisks
+    } else {
+        SledDisksSchema::Vdevs
+    };
+    // `data_links: DataLinks` (tagged enum) vs the older flat list.
+    let data_links = if src.contains("data_links: DataLinks") {
+        SledDataLinksSchema::Tagged
+    } else {
+        SledDataLinksSchema::List
+    };
+    (
+        cfg.image.data_links_schema.unwrap_or(data_links),
+        cfg.image.disks_schema.unwrap_or(disks),
+    )
+}
+
 /// Generate + stage per-node config into the cargo-bay before launch.
 pub(crate) fn stage_config(
     cfg: &VoxelConfig,
@@ -246,12 +280,16 @@ pub(crate) fn stage_config(
     let num_sleds_per_rack = cfg.topology.sleds;
     let num_fabric_routers =
         cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
+    // Auto-detect the sled-agent config shapes from the image's omicron (no
+    // per-era operator knobs); an [image] override wins if set.
+    let (data_links, disks) = detect_sled_schema(cfg);
+    eprintln!("[voxel] sled-agent config schema: data_links={data_links:?} disks={disks:?}");
     for s in &sleds {
         let dir = cargo_bay(&s.name);
         fs::create_dir_all(&dir)?;
         fs::write(
             dir.join("sled-config.toml"),
-            s.sled_config(num_sleds_per_rack, num_fabric_routers, cfg.image.data_links_schema, cfg.image.disks_schema)
+            s.sled_config(num_sleds_per_rack, num_fabric_routers, data_links, disks)
                 .with_interconnects(cfg.topology.interconnect_count_for(s.index))
                 .render(),
         )?;

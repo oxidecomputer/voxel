@@ -175,7 +175,7 @@ schema and cost an hour of one-field-per-launch thrash (`bootstrap_discovery` vs
    (`voxel-rss-gen`) is built against the SAME omicron as the image and travels with it.
    The host tool stays version-agnostic and passes a small topology descriptor;
    `voxel-cp-19.4` carries 19.4's config-gen, etc. - correct by construction, no global
-   pin. (The one residual version knob is `data_links_schema`; see README.)
+   pin. (Sled-agent config shape is auto-detected from the image's omicron.)
 
 Why not the topology-quest crate wholesale: different topology class (CLOS-of-racks
 vs single-rack+routers), it emits the *insensitive* wicket config (no certs/silo), and
