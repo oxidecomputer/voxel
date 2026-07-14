@@ -24,8 +24,13 @@ use omicron_common::api::external::AllowedSourceIps;
 use sled_agent_types::early_networking::{
     BgpConfig, BgpPeerConfig, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
     MaxPathConfig, PortConfig, RackNetworkConfig, RouterLifetimeConfig, RouterPeerType,
-    SwitchSlot, UplinkAddress, UplinkAddressConfig, UplinkPorts,
+    SwitchSlot, UplinkAddress, UplinkAddressConfig,
 };
+// Newer omicron wraps the uplink port list in a non-empty `UplinkPorts` newtype;
+// v20-era omicron uses a bare `Vec<PortConfig>`. build.rs sets `has_uplink_ports`
+// when the type exists in the pinned omicron, so one source builds for any era.
+#[cfg(has_uplink_ports)]
+use sled_agent_types::early_networking::UplinkPorts;
 use voxel_config::{UplinkCfg, VoxelConfig};
 
 fn switch_slot(s: &str) -> SwitchSlot {
@@ -127,14 +132,17 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
     for u in &n.uplinks {
         ports.push(uplink_port(u)?);
     }
+    // Newer omicron requires the non-empty `UplinkPorts` newtype; older takes the
+    // bare Vec. Rebind per era (build.rs cfg); `ports` gets the right type either way.
+    #[cfg(has_uplink_ports)]
+    let ports = UplinkPorts::new(ports)
+        .map_err(|_| anyhow::anyhow!("rack network config needs at least one uplink port"))?;
 
     let rack_network_config = RackNetworkConfig {
         rack_subnet: n.rack_subnet.parse().context("rack_subnet")?,
         infra_ip_first: "::".parse::<IpAddr>()?,
         infra_ip_last: "::".parse::<IpAddr>()?,
-        // omicron wrapped the uplink port list in a non-empty newtype.
-        ports: UplinkPorts::new(ports)
-            .map_err(|_| anyhow::anyhow!("rack network config needs at least one uplink port"))?,
+        ports,
         bgp: vec![BgpConfig {
             asn: n.bgp_asn,
             originate: vec![n.infra_prefix.parse().context("infra_prefix")?],

@@ -39,6 +39,18 @@ sed -i "s#path = \"../../voxel-config\"#path = \"${TESTBED}/voxel-config\"#" "${
 # Plain `cargo build` (not --locked) keeps these pins and adds rss-gen's extras.
 cp "${OMICRON_SRC}/Cargo.lock" "${RSS_GEN_DIR}/Cargo.lock"
 
+# Detect this omicron era's uplink-ports shape: newer wraps the port list in a
+# non-empty `UplinkPorts` newtype; v20-era uses a bare Vec. rss-gen's build.rs
+# keys off this env to `#[cfg]` the right construction, so one source builds for
+# any commit (no per-era edits).
+if grep -rq "struct UplinkPorts" "${OMICRON_SRC}/sled-agent/types" 2>/dev/null; then
+    export VOXEL_HAS_UPLINK_PORTS=1
+    echo "[build-rss-gen] omicron has UplinkPorts newtype -> has_uplink_ports"
+else
+    unset VOXEL_HAS_UPLINK_PORTS
+    echo "[build-rss-gen] omicron uses bare Vec ports (v20-era)"
+fi
+
 echo "[build-rss-gen] building against ${OMICRON_SRC}/target"
 build_log="$(mktemp)"
 set +e
