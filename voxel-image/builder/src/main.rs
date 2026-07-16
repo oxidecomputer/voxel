@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use clap::Args;
 use libfalcon::{
-    cli::{run_with_extra, RunMode},
-    unit::gb,
     Runner,
+    cli::{RunMode, run_with_extra},
+    unit::gb,
 };
 use slog::info;
 
@@ -33,11 +33,17 @@ const HELIOS_IMG: &str = "helios-3.0";
 const NODE: &str = "vbuild";
 
 fn env_u8(key: &str, default: u8) -> u8 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[tokio::main]
@@ -73,9 +79,8 @@ async fn main() -> Result<(), Error> {
         std::env::var("VBUILD_CARGO_BAY").unwrap_or_else(|_| "./cargo-bay/vbuild".to_string());
     // illumos guests use mount(); linux guests need mount_linux() (the guest-side
     // share mechanism differs). Pick based on the base image.
-    let is_linux = image.starts_with("debian")
-        || image.starts_with("ubuntu")
-        || image.starts_with("linux");
+    let is_linux =
+        image.starts_with("debian") || image.starts_with("ubuntu") || image.starts_with("linux");
     let mounted = if is_linux {
         d.mount_linux(&cargo_bay, "/opt/cargo-bay", vbuild)
     } else {
@@ -87,7 +92,10 @@ async fn main() -> Result<(), Error> {
         // VBUILD_SKIP_INSTALL=1 boots the node and runs nothing - used to smoke
         // test that a captured image boots with its payload intact.
         if std::env::var("VBUILD_SKIP_INSTALL").is_ok() {
-            info!(d.log, "VBUILD_SKIP_INSTALL set; booted from image {}, skipping install", image);
+            info!(
+                d.log,
+                "VBUILD_SKIP_INSTALL set; booted from image {}, skipping install", image
+            );
         } else {
             let script =
                 std::env::var("INSTALL_SCRIPT").unwrap_or_else(|_| "install-cp.sh".to_string());
@@ -100,7 +108,10 @@ async fn main() -> Result<(), Error> {
             d.exec(vbuild, &install_cmd)
                 .await
                 .map_err(|e| anyhow!("install ({script}): {e}"))?;
-            info!(d.log, "install ({}) complete; node ready for capture", script);
+            info!(
+                d.log,
+                "install ({}) complete; node ready for capture", script
+            );
         }
     }
 

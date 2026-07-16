@@ -9,6 +9,13 @@
 #
 # RUN ON THE HELIOS BOX. ~10 min (apt install + capture; no omicron build).
 #
+# On a box using voxel's isolated external segment (no LAN DHCP), export
+#   EXT_INTERFACE=voxel_ext_stub0
+#   VOXEL_BUILDER_NET="192.168.1.198/24 192.168.1.199"
+# before running (adjust for your [external] subnet/host_ip). build-image.sh
+# stages that as `builder-net` in the cargo-bay, and install-frr.sh applies it
+# as a static address on the builder VM in place of DHCP.
+#
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"

@@ -101,7 +101,9 @@ FALCON_DATASET=testbed/falcon CAPTURE_MODE=zfs VBUILD_DISK_GB=20 \
   `voxel_build`; `hyperstop` needs a node name.
 - **External NIC.** A single-ext-link helios node exposes `vioif0`;
   `install-cp.sh` auto-detects the first `vioif`. Override with `EXT_IF` /
-  `EXT_INTERFACE` if DHCP doesn't come up.
+  `EXT_INTERFACE` if DHCP doesn't come up. On voxel's isolated segment (no
+  DHCP), export `VOXEL_BUILDER_NET="<cidr> <gw>"` and the installer applies it
+  as a static address instead.
 - **We don't use `falcon snapshot`** - it snapshots `source@base` again instead
   of creating `img/<name>@base` (`lib/src/cli.rs:498`); a one-line upstream fix
   (`source` -> `dest`) would make it usable. We capture via zfs send/recv (mode

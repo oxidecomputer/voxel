@@ -29,5 +29,7 @@ pub(crate) fn locate_script(env_var: &str, rel: &str) -> anyhow::Result<PathBuf>
     if cwd.exists() {
         return Ok(cwd);
     }
-    Err(anyhow::anyhow!("can't find {rel} - set {env_var} to its path"))
+    Err(anyhow::anyhow!(
+        "can't find {rel} - set {env_var} to its path"
+    ))
 }

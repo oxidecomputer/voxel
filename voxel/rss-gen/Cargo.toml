@@ -10,7 +10,7 @@
 [package]
 name = "voxel-rss-gen"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # Standalone: this crate is excluded from the testbed workspace and pulls its
 # omicron path deps from /opt/omicron, so it must be its own workspace root.

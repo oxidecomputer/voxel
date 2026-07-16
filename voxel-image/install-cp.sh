@@ -36,14 +36,24 @@ if [[ -z "$EXT_IF" ]]; then
 fi
 EXT_IF="${EXT_IF:-vioif0}"
 log "using external interface ${EXT_IF}"
-ipadm create-addr -T dhcp "${EXT_IF}/v4" || true
 echo 'nameserver 1.1.1.1' > /etc/resolv.conf
 
-log "waiting for DHCP lease..."
-for _ in $(seq 1 30); do
-    ipadm show-addr "${EXT_IF}/v4" -p -o addr 2>/dev/null | grep -q '/' && break
-    sleep 2
-done
+# Isolated-mode static network (no DHCP server on the segment): if builder-net
+# was staged by build-image.sh, apply "<cidr> <gw>" instead of leasing an
+# address.
+if [[ -f /opt/cargo-bay/builder-net ]]; then
+    read -r BUILDER_CIDR BUILDER_GW < /opt/cargo-bay/builder-net
+    log "static builder net: ${BUILDER_CIDR} via ${BUILDER_GW}"
+    ipadm create-addr -T static -a "${BUILDER_CIDR}" "${EXT_IF}/v4" || true
+    route add default "${BUILDER_GW}" || true
+else
+    ipadm create-addr -T dhcp "${EXT_IF}/v4" || true
+    log "waiting for DHCP lease..."
+    for _ in $(seq 1 30); do
+        ipadm show-addr "${EXT_IF}/v4" -p -o addr 2>/dev/null | grep -q '/' && break
+        sleep 2
+    done
+fi
 log "waiting for DNS..."
 for _ in $(seq 1 15); do
     getent hosts pkg.oxide.computer >/dev/null 2>&1 && break

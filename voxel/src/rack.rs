@@ -1,12 +1,13 @@
 //! Rack lifecycle commands: launch, route, destroy, info, status.
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
 use std::collections::HashSet;
 use std::process::Command;
 use voxel_config::VoxelConfig;
 
+use crate::isolated_external::{link_mtu, up as external_up};
 use crate::net::{set_external_route, wait_external_reachable};
 use crate::rss::watch_rss;
 use crate::topo::{build_topo, reset_node_cargo_bay, stage_config, stage_sprockets};
@@ -24,13 +25,21 @@ fn rack_label(racks: usize, rack: usize, single: &str) -> String {
 
 pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let ce = topo.node_ref("ce").ok_or_else(|| anyhow!("no ce router in topology"))?;
+    let ce = topo
+        .node_ref("ce")
+        .ok_or_else(|| anyhow!("no ce router in topology"))?;
     // One host route per rack's external prefix - all racks egress via the shared ce.
     let racks = cfg.topology.racks();
     for rack in 0..racks {
         let prefix = cfg.network.for_rack(rack).infra_prefix;
-        set_external_route(&topo.runner, ce, &prefix, !dry_run, cfg.topology.ce_external_ip.as_deref())
-            .await?;
+        set_external_route(
+            &topo.runner,
+            ce,
+            &prefix,
+            !dry_run,
+            cfg.topology.ce_external_ip.as_deref(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -41,7 +50,11 @@ fn physical_ram_gb() -> Option<u64> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok().map(|mb| mb / 1024)
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|mb| mb / 1024)
 }
 
 /// Refuse a launch that can't physically fit. Guest RAM shows up as `VMM Memory`
@@ -67,6 +80,49 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
              (or set VOXEL_SKIP_MEM_PREFLIGHT=1 to override).",
             cfg.topology.sled_memory_gb
         ));
+    }
+    Ok(())
+}
+
+/// The host's default-route interface via `route -n get default`, or `None`
+/// when there is no default route (falcon reports that on its own).
+fn default_route_iface() -> Option<String> {
+    let out = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface:"))
+        .map(|s| s.trim().to_string())
+}
+
+/// Refuse a `lan`-mode launch whose external link is jumbo. voxel-init classifies
+/// a sled NIC as underlay iff it accepts mtu=9000. Guest VNICs on a jumbo link
+/// all pass that probe, so the sleds' external NICs get misclassified as
+/// underlay and never come up. Anything below 9000 is fine. Best-effort: if
+/// the link or its MTU can't be read we skip and let falcon surface the
+/// problem.
+fn lan_mtu_preflight() -> anyhow::Result<()> {
+    let link = match std::env::var("EXT_INTERFACE") {
+        Ok(l) => l,
+        Err(_) => match default_route_iface() {
+            Some(l) => l,
+            None => return Ok(()),
+        },
+    };
+    if let Some(mtu) = link_mtu(&link) {
+        if mtu.parse::<u32>().is_ok_and(|m| m >= 9000) {
+            return Err(anyhow!(
+                "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
+                 iff they accept mtu=9000, so external NICs on a jumbo link are \
+                 misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
+                 link or use isolated mode (voxel config set external.mode isolated)."
+            ));
+        }
     }
     Ok(())
 }
@@ -112,7 +168,10 @@ pub(crate) async fn cmd_launch(
         ));
     }
     for rack in 0..racks {
-        let scrimlets = sleds.iter().filter(|s| s.rack == rack && s.scrimlet).count();
+        let scrimlets = sleds
+            .iter()
+            .filter(|s| s.rack == rack && s.scrimlet)
+            .count();
         if scrimlets != 2 {
             return Err(anyhow!(
                 "rack {rack} needs exactly 2 scrimlets for the dual-switch RSS->Nexus handoff; got {scrimlets}"
@@ -124,6 +183,14 @@ pub(crate) async fn cmd_launch(
     crate::image::ensure_image(&cfg.image.cp_image())?;
     crate::image::ensure_image(&cfg.image.frr_image())?;
     memory_preflight(cfg)?;
+    // The isolated external segment must exist before any node boots, as the
+    // nodes' static addresses (staged into each cargo-bay) stay in use after
+    // bring-up (RSS watch, router NAT, host route to ce).
+    if cfg.external.isolated() {
+        external_up(&cfg.external, false).context("bringing up the isolated external segment")?;
+    } else {
+        lan_mtu_preflight()?;
+    }
     reset_node_cargo_bay(cfg)?;
     stage_config(cfg, emu_sp, emu_rot, wicket_setup)?;
     stage_sprockets(cfg)?;
@@ -159,14 +226,20 @@ pub(crate) async fn cmd_launch(
 
     // Customer routers (the shared transit) first - quick, and must be up for
     // the racks' uplink BGP.
-    let routers: Vec<(NodeRef, &'static str, String)> =
-        topo.routers.iter().map(|(r, n)| (*n, ROUTER_LAUNCH, r.clone())).collect();
+    let routers: Vec<(NodeRef, &'static str, String)> = topo
+        .routers
+        .iter()
+        .map(|(r, n)| (*n, ROUTER_LAUNCH, r.clone()))
+        .collect();
     run_voxel_init(d, routers).await;
 
     if no_progress {
         // No RSS watcher to use as a barrier, so bring every sled up at once.
-        let sleds: Vec<(NodeRef, &'static str, String)> =
-            topo.sleds.iter().map(|(s, n)| (*n, GIMLET_LAUNCH, s.name.clone())).collect();
+        let sleds: Vec<(NodeRef, &'static str, String)> = topo
+            .sleds
+            .iter()
+            .map(|(s, n)| (*n, GIMLET_LAUNCH, s.name.clone()))
+            .collect();
         run_voxel_init(d, sleds).await;
         info!(d.log, "launch complete (progress watch skipped)");
     } else {
@@ -185,7 +258,12 @@ pub(crate) async fn cmd_launch(
                 .map(|(s, n)| (*n, GIMLET_LAUNCH, s.name.clone()))
                 .collect();
             if racks > 1 {
-                info!(d.log, "rack{}: bringing up {} sleds", rack + 1, rack_sleds.len());
+                info!(
+                    d.log,
+                    "rack{}: bringing up {} sleds",
+                    rack + 1,
+                    rack_sleds.len()
+                );
             }
             run_voxel_init(d, rack_sleds).await;
             if let Some((s, n)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
@@ -196,8 +274,9 @@ pub(crate) async fn cmd_launch(
                 // wicketd-triggered bring-up exactly as for the file path.
                 if wicket_setup {
                     let net = cfg.network.for_rack(rack);
-                    let config_rss =
-                        std::path::Path::new("wicket-setup").join(format!("rack{rack}")).join("config-rss.toml");
+                    let config_rss = std::path::Path::new("wicket-setup")
+                        .join(format!("rack{rack}"))
+                        .join("config-rss.toml");
                     // wicketd's bootstrap_sleds must be THIS rack's cubby slots =
                     // its sleds' GLOBAL indices (rack 1 -> 3,4,5), matching what the
                     // MGS sim reports (`location = ["sled", global_index]`); a flat
@@ -208,16 +287,26 @@ pub(crate) async fn cmd_launch(
                         .filter(|(s, _)| s.rack == rack)
                         .map(|(s, _)| s.index as u16)
                         .collect();
-                    if let Err(e) = crate::wicket_setup::drive(
-                        d, *n, &slots, &config_rss, &net.dns_zone, &tag,
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::wicket_setup::drive(d, *n, &slots, &config_rss, &net.dns_zone, &tag)
+                            .await
                     {
-                        warn!(d.log, "{tag}: wicket-setup failed: {e}; rack will not initialize");
+                        warn!(
+                            d.log,
+                            "{tag}: wicket-setup failed: {e}; rack will not initialize"
+                        );
                     }
                 }
                 let watch_cap = rss_watch_cap(emu_sp, racks);
-                watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap).await;
+                let known_ip = if cfg.external.isolated() {
+                    cfg.static_external_ips()
+                        .into_iter()
+                        .find(|(name, _)| name == &s.name)
+                        .map(|(_, ip)| ip)
+                } else {
+                    None
+                };
+                watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap, known_ip).await;
             }
         }
         info!(d.log, "launch complete");
@@ -232,7 +321,15 @@ pub(crate) async fn cmd_launch(
         for rack in 0..racks {
             let net = cfg.network.for_rack(rack);
             let label = rack_label(racks, rack, "rack");
-            if let Err(e) = set_external_route(d, ce, &net.infra_prefix, !no_route, cfg.topology.ce_external_ip.as_deref()).await {
+            if let Err(e) = set_external_route(
+                d,
+                ce,
+                &net.infra_prefix,
+                !no_route,
+                cfg.topology.ce_external_ip.as_deref(),
+            )
+            .await
+            {
                 warn!(d.log, "{label} external route: {e}");
                 continue;
             }
@@ -277,7 +374,10 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
         }
     }
 
-    let out = match Command::new("pgrep").args(["-f", "propolis-server"]).output() {
+    let out = match Command::new("pgrep")
+        .args(["-f", "propolis-server"])
+        .output()
+    {
         Ok(o) if o.status.success() => o.stdout,
         // pgrep exits non-zero when there are no matches - nothing to reap.
         _ => return 0,
@@ -298,7 +398,10 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
             Err(_) => continue,
         };
         if String::from_utf8_lossy(&pf).contains(&needle) {
-            warn!(log, "reaping orphaned propolis {pid} holding {name} resources (no falcon pid file)");
+            warn!(
+                log,
+                "reaping orphaned propolis {pid} holding {name} resources (no falcon pid file)"
+            );
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             reaped += 1;
         }
@@ -323,11 +426,16 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
     }
     let result = runner.destroy();
     let topo_ds = format!("{}/topo/{name}", crate::image::falcon_dataset());
-    let wipe = std::process::Command::new("zfs").args(["destroy", "-r", &topo_ds]).output();
+    let wipe = std::process::Command::new("zfs")
+        .args(["destroy", "-r", &topo_ds])
+        .output();
     match (&result, wipe) {
         // destroy errored but the disk wipe succeeded - the rack is gone + clean.
         (Err(e), Ok(o)) if o.status.success() => {
-            warn!(runner.log, "falcon destroy reported '{e}', but node disks wiped clean ({topo_ds})");
+            warn!(
+                runner.log,
+                "falcon destroy reported '{e}', but node disks wiped clean ({topo_ds})"
+            );
             Ok(())
         }
         _ => result.map_err(|e| anyhow!("destroy: {e}")),
@@ -336,7 +444,11 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
 
 pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    teardown(&topo.runner, name)
+    teardown(&topo.runner, name)?;
+    // Isolated mode's segment stays up (per-host, reused by the next launch);
+    // node addresses are static and staged fresh at each launch, so there's
+    // nothing to reset on destroy.
+    Ok(())
 }
 
 pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
@@ -351,8 +463,16 @@ pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     for s in cfg.sleds() {
         let role = if s.scrimlet { "scrimlet" } else { "gimlet  " };
         let rss = if s.rss { "rss" } else { "   " };
-        let rack = if racks > 1 { format!("rack{} ", s.rack + 1) } else { String::new() };
-        println!("    {} {rack}[{role}] {rss}  bootstrap {}", s.name, s.bootstrap_addr());
+        let rack = if racks > 1 {
+            format!("rack{} ", s.rack + 1)
+        } else {
+            String::new()
+        };
+        println!(
+            "    {} {rack}[{role}] {rss}  bootstrap {}",
+            s.name,
+            s.bootstrap_addr()
+        );
     }
     println!("  routers: {}", cfg.topology.routers.join(", "));
     Ok(())
@@ -377,10 +497,19 @@ pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<
     // Multi-rack racks converge under each other's load - watch longer (matches
     // cmd_launch). Duration is Copy, so each watcher closure gets its own.
     let watch_cap = rss_watch_cap(false, racks);
+    let ips = if cfg.external.isolated() {
+        cfg.static_external_ips()
+    } else {
+        Vec::new()
+    };
     let watchers = rss_nodes.into_iter().map(|(s, n)| {
         let tag = rack_label(racks, s.rack, "rack-init");
         let addr = s.bootstrap_addr();
-        async move { watch_rss(d, *n, &addr, &tag, watch_cap).await }
+        let known_ip = ips
+            .iter()
+            .find(|(name, _)| name == &s.name)
+            .map(|(_, ip)| ip.clone());
+        async move { watch_rss(d, *n, &addr, &tag, watch_cap, known_ip).await }
     });
     futures::future::join_all(watchers).await;
     Ok(())

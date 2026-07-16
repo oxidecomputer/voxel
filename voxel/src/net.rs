@@ -38,7 +38,10 @@ pub(crate) async fn node_external_ip(
     } else {
         "ipadm show-addr -p -o addr 2>/dev/null"
     };
-    let raw = d.exec(n, cmd).await.map_err(|e| anyhow!("read external IP: {e}"))?;
+    let raw = d
+        .exec(n, cmd)
+        .await
+        .map_err(|e| anyhow!("read external IP: {e}"))?;
     let out = strip_ansi(&raw);
     out.split_whitespace()
         .filter_map(|t| t.split('/').next()) // drop any CIDR suffix
@@ -63,18 +66,25 @@ pub(crate) async fn node_external_ip(
 /// constantly, so host-key checking is off and known-hosts is ephemeral; this is
 /// the pilot/captain access pattern.
 pub(crate) const EPHEMERAL_HOST_OPTS: &[&str] = &[
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "LogLevel=ERROR",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "LogLevel=ERROR",
 ];
 
 /// The empty-root-password auth options shared by every voxel ssh/scp invocation
 /// (force password auth, one prompt, fail fast). ssh adds keepalive options on top.
 const PASSWORD_AUTH_OPTS: &[&str] = &[
-    "-o", "PreferredAuthentications=password",
-    "-o", "PubkeyAuthentication=no",
-    "-o", "NumberOfPasswordPrompts=1",
-    "-o", "ConnectTimeout=8",
+    "-o",
+    "PreferredAuthentications=password",
+    "-o",
+    "PubkeyAuthentication=no",
+    "-o",
+    "NumberOfPasswordPrompts=1",
+    "-o",
+    "ConnectTimeout=8",
 ];
 
 /// Materialize the SSH_ASKPASS helper that supplies the rack's empty root password
@@ -95,7 +105,9 @@ fn ensure_askpass() -> Option<std::path::PathBuf> {
 
 pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
     let out = ssh_exec(ip, remote)?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Like [`ssh_capture`], but returns the remote command's combined output even
@@ -186,13 +198,21 @@ pub(crate) fn scp_from(ip: &str, remote: &str, local: &str) -> bool {
 /// waits that out *here* instead of letting it surface to the operator as a dead
 /// DNS. Best-effort: logs the outcome, never fails the launch. No-op (with a note)
 /// if `dig` isn't installed.
-pub(crate) fn wait_external_reachable(log: &slog::Logger, dns_ip: &str, dns_zone: &str, label: &str) {
+pub(crate) fn wait_external_reachable(
+    log: &slog::Logger,
+    dns_ip: &str,
+    dns_zone: &str,
+    label: &str,
+) {
     const ATTEMPTS: u32 = 30; // ~90s at 3s spacing
     const SPACING: Duration = Duration::from_secs(3);
     for attempt in 1..=ATTEMPTS {
         match dig_soa(dns_ip, dns_zone) {
             None => {
-                info!(log, "{label}: skipping external reachability check (dig unavailable)");
+                info!(
+                    log,
+                    "{label}: skipping external reachability check (dig unavailable)"
+                );
                 return;
             }
             Some(true) => {
@@ -201,7 +221,10 @@ pub(crate) fn wait_external_reachable(log: &slog::Logger, dns_ip: &str, dns_zone
             }
             Some(false) => {
                 if attempt == 1 {
-                    info!(log, "{label}: waiting for external network to converge (dns {dns_ip}) ...");
+                    info!(
+                        log,
+                        "{label}: waiting for external network to converge (dns {dns_ip}) ..."
+                    );
                 }
                 std::thread::sleep(SPACING);
             }
@@ -221,7 +244,14 @@ pub(crate) fn wait_external_reachable(log: &slog::Logger, dns_ip: &str, dns_zone
 /// knowledge - it just proves the rack's external DNS is reachable.
 fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
     match std::process::Command::new("dig")
-        .args(["+short", "+timeout=3", "+tries=1", &format!("@{dns_ip}"), zone, "SOA"])
+        .args([
+            "+short",
+            "+timeout=3",
+            "+tries=1",
+            &format!("@{dns_ip}"),
+            zone,
+            "SOA",
+        ])
         .output()
     {
         Ok(o) => Some(o.status.success() && !o.stdout.iter().all(u8::is_ascii_whitespace)),
@@ -239,7 +269,10 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
 /// `198.51.100.0`), read from `netstat -rn -f inet`. Used to purge every stale
 /// route for a prefix - dead-ce gateways from prior launches pile up otherwise.
 fn route_gateways(dest: &str) -> Vec<String> {
-    let out = match std::process::Command::new("netstat").args(["-rn", "-f", "inet"]).output() {
+    let out = match std::process::Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => return Vec::new(),
     };
@@ -265,11 +298,16 @@ pub(crate) async fn set_external_route(
     // lookup. Otherwise read ce's DHCP lease as before.
     let ip = match static_ip {
         Some(s) => s.to_string(),
-        None => node_external_ip(d, ce, true).await.map_err(|e| anyhow!("ce: {e}"))?,
+        None => node_external_ip(d, ce, true)
+            .await
+            .map_err(|e| anyhow!("ce: {e}"))?,
     };
 
     if !apply {
-        info!(d.log, "external route (dry-run): route add {} {}", prefix, ip);
+        info!(
+            d.log,
+            "external route (dry-run): route add {} {}", prefix, ip
+        );
         return Ok(());
     }
     // Drop ALL stale routes for this prefix, then point it at the live ce.
@@ -282,10 +320,14 @@ pub(crate) async fn set_external_route(
     // confirm the final state.
     let dest = prefix.split('/').next().unwrap_or(prefix);
     for gw in route_gateways(dest) {
-        let _ = std::process::Command::new("route").args(["delete", prefix, &gw]).output();
+        let _ = std::process::Command::new("route")
+            .args(["delete", prefix, &gw])
+            .output();
     }
     for _ in 0..8 {
-        let out = std::process::Command::new("route").args(["delete", prefix]).output();
+        let out = std::process::Command::new("route")
+            .args(["delete", prefix])
+            .output();
         let gone = match out {
             Ok(o) => String::from_utf8_lossy(&o.stdout).contains("not in table"),
             Err(_) => true,

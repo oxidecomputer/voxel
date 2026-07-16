@@ -26,7 +26,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `routers` | list | `["ce", "cr1", "cr2"]` | Customer routers (boot the frr image). `ce` is the edge; `cr*` are transit. |
 | `sled_memory_gb` | int | `8` | Per-sled guest RAM. Gates how many sleds fit in physical RAM. |
 | `router_memory_gb` | int | `4` | Per-router guest RAM. |
-| `ce_external_ip` | string | unset | Static host-LAN address for `ce`. Unset means `ce` DHCPs and voxel reads the lease over serial. |
+| `ce_external_ip` | string | unset | Static host-LAN address for `ce`. Unset means `ce` DHCPs and voxel reads the lease over serial. In isolated mode keep it outside the static node range (see `[external]`). |
 | `interconnects` | list of pairs | `[]` | Switch-to-switch ASIC links (falcon `softnpu_links`), e.g. cross-rack or `switch0`<->`switch1`. Each entry is a pair of switch selectors (`switch0`, `switchN`, `rackR/switchS`). Managed via `voxel network add-port` / `rm-port`. |
 
 ## [image]
@@ -66,6 +66,21 @@ One block per switch. Defaults: `switch0`/`uplink0` and `switch1`/`uplink1`.
 | `router_lifetime` | int | `300` | Router advertisement lifetime, seconds. |
 | `port_speed` | string | `"40G"` | Link speed. |
 | `lldp_port_description` | string | required | LLDP port description. |
+
+## [external]
+
+Host-side external segment. This is stripped from the resolved config handed to
+rss-gen. See the README's "Isolated external network" section.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `mode` | enum | `"lan"` | `lan` attaches node external NICs to the host's default-route link (or `$EXT_INTERFACE`). `isolated` builds the segment on a host etherstub with NAT out `uplink`. |
+| `uplink` | string | unset | Physical link the isolated segment NATs out of (e.g. `igb0`). Required in isolated mode. |
+| `subnet` | string | `"192.168.1.0/24"` | The isolated segment's subnet. |
+| `host_ip` | string | `"192.168.1.199"` | Host address on the etherstub. The nodes' default gateway and NAT inside address. |
+| `ip_start` | string | `"192.168.1.10"` | First static node address. Nodes number contiguously: sleds first, then `topology.routers` order. |
+| `dns` | list | `["1.1.1.1", "9.9.9.9"]` | Nameservers handed to the nodes. |
+| `mtu` | int | `1500` | Etherstub MTU. Must stay below 9000 so voxel-init's jumbo probe classifies external NICs correctly. |
 
 ## [recovery_silo]
 

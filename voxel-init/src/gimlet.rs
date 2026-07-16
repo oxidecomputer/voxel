@@ -1,12 +1,12 @@
-//! Gimlet (sled) bring-up - replaces `gimlet-launch.sh`. Runs in the voxel-cp
+//! Gimlet (sled) bring-up—replaces `gimlet-launch.sh`. Runs in the voxel-cp
 //! helios guest. The control plane is already installed (`/opt/oxide`); this
 //! applies the per-launch / topology bits that can't be baked: ephemeral virtual
 //! hardware, the detected underlay NICs, the generated sled + RSS configs, the
 //! switch1 identity for the 2nd scrimlet, then activates the control plane (which
 //! kicks RSS on the RSS node).
 
-use crate::sys::{note, run, run_quiet, warn};
-use anyhow::{anyhow, Context, Result};
+use crate::sys::{note, read_external_net, run, run_env, run_quiet, warn};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -23,7 +23,11 @@ const PATCHED_CFG: &str = "/tmp/sled-config.toml";
 /// "dev cargo-bay wins, baked image otherwise" rule used to source every sp-emu
 /// artifact.
 fn pick(staged: String, baked: String) -> String {
-    if std::path::Path::new(&staged).exists() { staged } else { baked }
+    if std::path::Path::new(&staged).exists() {
+        staged
+    } else {
+        baked
+    }
 }
 
 /// Poll `f` every 2s until it returns true or `max_s` seconds elapse; returns
@@ -50,9 +54,9 @@ pub fn bring_up() -> Result<()> {
     if !Path::new(OMICRON).exists() {
         return Err(anyhow!("{OMICRON} not baked into the image"));
     }
-    std::env::set_var("XTASK_BIN", format!("{OMICRON}/xtask"));
-    std::env::set_var("XTASK_DOWNLOADER_BIN", format!("{OMICRON}/xtask-downloader"));
     std::env::set_current_dir(OMICRON).with_context(|| format!("cd {OMICRON}"))?;
+    let xtask_bin = format!("{OMICRON}/xtask");
+    let xtask_dl = format!("{OMICRON}/xtask-downloader");
 
     let (underlay, other) = detect_underlay();
     patch_sled_config(&underlay)?;
@@ -63,7 +67,15 @@ pub fn bring_up() -> Result<()> {
     maybe_start_switch_enforcer()?;
 
     // Activate the (already-unpacked) control plane. On the RSS node this kicks RSS.
-    if !run("./omicron-package", &["activate"]) {
+    // omicron-package reads XTASK_BIN / XTASK_DOWNLOADER_BIN from the environment.
+    if !run_env(
+        "./omicron-package",
+        &["activate"],
+        &[
+            ("XTASK_BIN", &xtask_bin),
+            ("XTASK_DOWNLOADER_BIN", &xtask_dl),
+        ],
+    ) {
         warn("omicron-package activate failed");
     }
     note("gimlet bring-up complete");
@@ -79,10 +91,15 @@ fn setup_ssh() {
         let _ = fs::create_dir_all("/root/.ssh");
         if let Ok(keys) = fs::read(&authorized) {
             use std::io::Write;
-            match fs::OpenOptions::new().create(true).append(true).open("/root/.ssh/authorized_keys")
+            match fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/root/.ssh/authorized_keys")
             {
                 Ok(mut f) => {
-                    let _ = f.write_all(&keys);
+                    if let Err(e) = f.write_all(&keys) {
+                        warn(format!("authorized_keys: {e}"));
+                    }
                 }
                 Err(e) => warn(format!("authorized_keys: {e}")),
             }
@@ -122,7 +139,7 @@ fn crash_dump() {
 }
 
 /// Scrimlets load the baked SoftNPU sidecar P4 program. Gimlets have no softnpu
-/// device, so `scadm propolis load-program` would fail there - gate on sled_mode.
+/// device, so `scadm propolis load-program` would fail there—gate on sled_mode.
 fn maybe_load_sidecar() {
     let scrimlet = fs::read_to_string(SLED_CFG)
         .map(|s| s.contains(r#"sled_mode = "scrimlet""#))
@@ -130,14 +147,18 @@ fn maybe_load_sidecar() {
     if scrimlet {
         run(
             "/opt/oxide/sidecar/scadm",
-            &["propolis", "load-program", "/opt/oxide/sidecar/libsidecar_lite.so"],
+            &[
+                "propolis",
+                "load-program",
+                "/opt/oxide/sidecar/libsidecar_lite.so",
+            ],
         );
     }
 }
 
 /// The Oxide underlay is jumbo (MTU 9000). The guest vioif ordering is
 /// topology-dependent (scrimlet vs gimlet, sled count), so we can't hardcode
-/// names: probe `vioif0..7` - the ones that accept MTU 9000 are the underlay, the
+/// names: probe `vioif0..7`—the ones that accept MTU 9000 are the underlay, the
 /// rest are ext / host-LAN candidates.
 fn detect_underlay() -> (Vec<String>, Vec<String>) {
     let mut underlay = Vec::new();
@@ -153,14 +174,16 @@ fn detect_underlay() -> (Vec<String>, Vec<String>) {
             other.push(nic);
         }
     }
-    note(format!("underlay(jumbo)={underlay:?} ext-candidates={other:?}"));
+    note(format!(
+        "underlay(jumbo)={underlay:?} ext-candidates={other:?}"
+    ));
     (underlay, other)
 }
 
 /// Patch this sled's config to the detected underlay links (the generated config
 /// ships placeholders), write the patched copy to /tmp, and seed the xtask
 /// WORKSPACE config (`smf/sled-agent/non-gimlet/config.toml`) that
-/// virtual-hardware reads. Uses `toml_edit` - no `sed`.
+/// virtual-hardware reads. Uses `toml_edit`—no `sed`.
 fn patch_sled_config(underlay: &[String]) -> Result<()> {
     let text = fs::read_to_string(SLED_CFG).with_context(|| format!("read {SLED_CFG}"))?;
     let mut doc: toml_edit::DocumentMut =
@@ -189,10 +212,44 @@ fn patch_sled_config(underlay: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// DHCP the non-underlay NICs that reach the host LAN - but never vioif0, the
-/// SoftNPU packet source the switch zone must claim (plumbing it in the GZ makes
-/// oxz_switch fail "interface used in the global zone").
+/// Bring up the non-underlay NICs that reach the host LAN—but never vioif0,
+/// the SoftNPU packet source the switch zone must claim (plumbing it in the GZ
+/// makes oxz_switch fail "interface used in the global zone").
+///
+/// Isolated mode (voxel-managed segment) stages a static address in
+/// `/opt/cargo-bay/ external-net`, applying it to the first non-vioif0 NIC and
+/// using the staged DNS list. `lan` mode falls back to DHCP + a hardcoded
+/// resolver.
 fn setup_external_networking(other: &[String]) {
+    if let Some(ext) = read_external_net() {
+        let resolv: String = ext
+            .dns
+            .iter()
+            .map(|s| format!("nameserver {s}\n"))
+            .collect();
+        if let Err(e) = fs::write("/etc/resolv.conf", resolv) {
+            warn(format!("resolv.conf: {e}"));
+        }
+
+        match other.iter().find(|ifc| ifc.as_str() != "vioif0") {
+            Some(ifc) => {
+                run(
+                    "ipadm",
+                    &[
+                        "create-addr",
+                        "-T",
+                        "static",
+                        "-a",
+                        &ext.ip_cidr,
+                        &format!("{ifc}/v4"),
+                    ],
+                );
+                run("route", &["add", "default", &ext.gateway]);
+            }
+            None => warn("external-net staged but no external NIC candidate found"),
+        }
+        return;
+    }
     if let Err(e) = fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n") {
         warn(format!("resolv.conf: {e}"));
     }
@@ -200,20 +257,23 @@ fn setup_external_networking(other: &[String]) {
         if ifc == "vioif0" {
             continue;
         }
-        run("ipadm", &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")]);
+        run(
+            "ipadm",
+            &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")],
+        );
     }
 }
 
 /// Ephemeral emulated U.2/M.2 (deliberately not baked). Wipe any vdevs from a
-/// prior launch first - falcon keeps the sled disk across destroy/relaunch, so
+/// prior launch first—falcon keeps the sled disk across destroy/relaunch, so
 /// stale vdevs carry the OLD rack's trust-quorum ledger + crucible/cockroach
 /// data; reusing them makes a fresh launch falsely report "initialized". A clean
 /// launch must start from fresh storage.
 fn setup_virtual_hardware() {
-    std::env::set_var("SOFTNPU_MODE", "propolis");
-    run("./xtask", &["virtual-hardware", "destroy"]);
+    let softnpu = [("SOFTNPU_MODE", "propolis")];
+    run_env("./xtask", &["virtual-hardware", "destroy"], &softnpu);
     wipe_vdevs();
-    if !run("./xtask", &["virtual-hardware", "create"]) {
+    if !run_env("./xtask", &["virtual-hardware", "create"], &softnpu) {
         warn("virtual-hardware create failed");
     }
 }
@@ -244,7 +304,7 @@ fn inject_runtime_configs() -> Result<()> {
     Ok(())
 }
 
-/// Force vioif0 (the SoftNPU pkt_source) unplumbed in the GZ - the switch zone
+/// Force vioif0 (the SoftNPU pkt_source) unplumbed in the GZ—the switch zone
 /// must claim it, but the softnpu fabric / DHCP keeps grabbing it. Harmless on
 /// gimlets (vioif0 unused there).
 fn unplumb_softnpu_source() {
@@ -278,7 +338,7 @@ const SIDECAR_SP_PORT: u16 = 33300;
 /// swaps them into the switch zone (+ bounces the services) as soon as it
 /// extracts. Detached into its own session with stdio to a log so it doesn't hold
 /// `voxel launch`'s exec pipe open. Runs on every scrimlet (slot from the staged
-/// filename) - but it's a no-op when the baked configs already match (see
+/// filename)—but it's a no-op when the baked configs already match (see
 /// `switch_enforcer`), so a matched-count launch behaves exactly as before.
 fn maybe_start_switch_enforcer() -> Result<()> {
     let Some(slot) = staged_switch_slot() else {
@@ -293,7 +353,7 @@ fn maybe_start_switch_enforcer() -> Result<()> {
         .stdout(log.try_clone()?)
         .stderr(log);
     // New session so it survives this exec returning (no SIGHUP) and so its own
-    // fds - not the launch pipe - are all that hold its stdio.
+    // fds—not the launch pipe—are all that hold its stdio.
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -301,18 +361,24 @@ fn maybe_start_switch_enforcer() -> Result<()> {
         });
     }
     let child = cmd.spawn().context("spawn switch-enforcer")?;
-    note(format!("switch{slot} enforcer started (pid {}), log /tmp/switch-enforcer.log", child.id()));
+    note(format!(
+        "switch{slot} enforcer started (pid {}), log /tmp/switch-enforcer.log",
+        child.id()
+    ));
     Ok(())
 }
 
 /// This node's switch slot, from the `mgs-config-switch{N}.toml` `stage_config`
-/// dropped into its cargo-bay - or `None` if it isn't a scrimlet.
+/// dropped into its cargo-bay—or `None` if it isn't a scrimlet.
 fn staged_switch_slot() -> Option<u8> {
     for entry in fs::read_dir(CARGO_BAY).ok()?.flatten() {
         let name = entry.file_name();
         let name = name.to_str()?;
         if let Some(rest) = name.strip_prefix("mgs-config-switch") {
-            if let Some(slot) = rest.strip_suffix(".toml").and_then(|d| d.parse::<u8>().ok()) {
+            if let Some(slot) = rest
+                .strip_suffix(".toml")
+                .and_then(|d| d.parse::<u8>().ok())
+            {
                 return Some(slot);
             }
         }
@@ -324,7 +390,7 @@ fn staged_switch_slot() -> Option<u8> {
 /// this scrimlet's launch-count MGS (switch{slot}) + sp-sim configs into the
 /// switch zone the moment it extracts, restarting each service, until the live
 /// files match what we staged. Uses content-equality so it's a **no-op when the
-/// baked configs already match the launch count** - only a true count/slot
+/// baked configs already match the launch count**—only a true count/slot
 /// mismatch triggers a swap + restart. Output -> /tmp/switch-enforcer.log.
 pub fn switch_enforcer(slot: u8) {
     let mgs_staged = format!("{CARGO_BAY}/mgs-config-switch{slot}.toml");
@@ -350,13 +416,24 @@ pub fn switch_enforcer(slot: u8) {
             if let Err(e) = fs::copy(&mgs_staged, SWITCH_ZONE_MGS) {
                 warn(format!("copy switch{slot} MGS config: {e}"));
             }
-            run("zlogin", &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgs:default"]);
+            run(
+                "zlogin",
+                &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgs:default"],
+            );
         }
         if sp_present && !sp_ok {
             if let Err(e) = fs::copy(&sp_staged, SWITCH_ZONE_SP) {
                 warn(format!("copy sp-sim config: {e}"));
             }
-            run("zlogin", &["oxz_switch", "svcadm", "restart", "svc:/oxide/sp-sim:default"]);
+            run(
+                "zlogin",
+                &[
+                    "oxz_switch",
+                    "svcadm",
+                    "restart",
+                    "svc:/oxide/sp-sim:default",
+                ],
+            );
         }
         note(format!("forced switch{slot} / sp-sim configs"));
         std::thread::sleep(Duration::from_secs(1));
@@ -428,7 +505,10 @@ fn setup_sp_emu() {
         return;
     }
     let bin_to = format!("{SP_EMU_ZONE_DIR}/sp-emu");
-    let bin_src = pick(format!("{SP_EMU_CARGO_DIR}/sp-emu"), format!("{BAKED}/sp-emu"));
+    let bin_src = pick(
+        format!("{SP_EMU_CARGO_DIR}/sp-emu"),
+        format!("{BAKED}/sp-emu"),
+    );
     if let Err(e) = fs::copy(&bin_src, &bin_to) {
         warn(format!("copy sp-emu binary from {bin_src}: {e}"));
         return;
@@ -476,10 +556,35 @@ fn setup_sp_emu() {
     // Whole-fleet emu: every SP is emulated, so sp-sim isn't needed. Disable it
     // (releasing the shared ports) before sp-emu binds them. Wait for sp-sim to be
     // imported first, else the disable is a no-op and the baked sp-sim races us.
-    let _ = wait_until(60, || run_quiet("zlogin", &["oxz_switch", "svcs", "svc:/oxide/sp-sim:default"]));
-    run("zlogin", &["oxz_switch", "svcadm", "disable", "-s", "svc:/oxide/sp-sim:default"]);
-    run("zlogin", &["oxz_switch", "svccfg", "import", "/var/svc/manifest/site/voxel-sp-emu.xml"]);
-    note(format!("sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled", ports.len()));
+    let _ = wait_until(60, || {
+        run_quiet(
+            "zlogin",
+            &["oxz_switch", "svcs", "svc:/oxide/sp-sim:default"],
+        )
+    });
+    run(
+        "zlogin",
+        &[
+            "oxz_switch",
+            "svcadm",
+            "disable",
+            "-s",
+            "svc:/oxide/sp-sim:default",
+        ],
+    );
+    run(
+        "zlogin",
+        &[
+            "oxz_switch",
+            "svccfg",
+            "import",
+            "/var/svc/manifest/site/voxel-sp-emu.xml",
+        ],
+    );
+    note(format!(
+        "sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled",
+        ports.len()
+    ));
 }
 
 /// SMF manifest for the emulated SP fleet, each instance running the locked
@@ -499,7 +604,9 @@ fn setup_sp_emu() {
 fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\"?>\n");
-    s.push_str("<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n");
+    s.push_str(
+        "<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n",
+    );
     s.push_str("<service_bundle type=\"manifest\" name=\"voxel-sp-emu\">\n");
     // Per-SP RoT services: one oxide-rot-1 per SP, each on its own zone-local port.
     if rot {
@@ -509,7 +616,9 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         s.push_str("    </dependency>\n");
         for &port in ports {
             let rport = port - SP_EMU_ROT_PORT_OFFSET;
-            s.push_str(&format!("    <instance name=\"rot{port}\" enabled=\"true\">\n"));
+            s.push_str(&format!(
+                "    <instance name=\"rot{port}\" enabled=\"true\">\n"
+            ));
             s.push_str(&format!("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu rot-serve [::1]:{rport} /opt/oxide/sp-emu/rot.flash\" timeout_seconds=\"0\"/>\n"));
             s.push_str("      <exec_method type=\"method\" name=\"stop\" exec=\":kill\" timeout_seconds=\"30\"/>\n");
             s.push_str("      <property_group name=\"startd\" type=\"framework\">\n");
@@ -530,18 +639,32 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         s.push_str("    </dependency>\n");
     }
     for &port in ports {
-        let board = if port == SIDECAR_SP_PORT { "sidecar" } else { "gimlet" };
-        s.push_str(&format!("    <instance name=\"sp{port}\" enabled=\"true\">\n"));
+        let board = if port == SIDECAR_SP_PORT {
+            "sidecar"
+        } else {
+            "gimlet"
+        };
+        s.push_str(&format!(
+            "    <instance name=\"sp{port}\" enabled=\"true\">\n"
+        ));
         s.push_str("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu gdb a 340000000\" timeout_seconds=\"0\">\n");
         s.push_str("        <method_context>\n          <method_environment>\n");
-        s.push_str(&format!("            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"));
-        s.push_str(&format!("            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"));
-        s.push_str(&format!("            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"));
+        s.push_str(&format!(
+            "            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"
+        ));
+        s.push_str(&format!(
+            "            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"
+        ));
+        s.push_str(&format!(
+            "            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"
+        ));
         // Point the SP at ITS OWN rot-serve (one RoT per SP): single-core SP +
-        // out-of-process RoT, live from boot through RSS - no two-core wedge.
+        // out-of-process RoT, live from boot through RSS—no two-core wedge.
         if rot {
             let rport = port - SP_EMU_ROT_PORT_OFFSET;
-            s.push_str(&format!("            <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"));
+            s.push_str(&format!(
+                "            <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"
+            ));
         }
         s.push_str("            <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n");
         s.push_str("            <envvar name=\"SP_EMU_IDLE_MS\" value=\"20\"/>\n");
@@ -557,10 +680,10 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
     s
 }
 
-/// SMF-service entry point - the baked `svc:/oxide/voxel-switch-enforcer`, run on
+/// SMF-service entry point—the baked `svc:/oxide/voxel-switch-enforcer`, run on
 /// **every boot**. This is the reboot/restart-safe path: the one-shot detached
 /// enforcer (`maybe_start_switch_enforcer`) is lost if the sled is restarted or
-/// its process is killed under load mid-bring-up - and then the scrimlet silently
+/// its process is killed under load mid-bring-up—and then the scrimlet silently
 /// reverts to the baked switch0, which wedges that rack's Nexus handoff
 /// ("switch-port qsfp0 not found"). As an SMF service, startd re-runs it at every
 /// boot and restarts it if it dies, so the slot identity can't be silently lost.

@@ -1,10 +1,10 @@
-//! Router/edge bring-up - replaces `router-launch.sh`. Runs in the voxel-frr
+//! Router/edge bring-up—replaces `router-launch.sh`. Runs in the voxel-frr
 //! debian guest. FRR + bgpd are pre-installed; this applies the generated
 //! unnumbered `frr.conf` and NATs rack egress out to the host LAN (the RSS
-//! time-sync path - the boundary NTP zone must reach its upstream).
+//! time-sync path—the boundary NTP zone must reach its upstream).
 
-use crate::sys::{capture, note, run, run_quiet, warn};
-use anyhow::{anyhow, Context, Result};
+use crate::sys::{ExternalNet, capture, note, read_external_net, run, run_quiet, warn};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -16,12 +16,21 @@ pub fn bring_up() -> Result<()> {
     sysctl("net.ipv6.conf.all.accept_ra", "0");
 
     // apt-daily timers can wipe FRR state (disabled at bake; belt + braces).
-    run("systemctl", &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"]);
+    run(
+        "systemctl",
+        &[
+            "disable",
+            "--now",
+            "apt-daily-upgrade.timer",
+            "apt-daily.timer",
+        ],
+    );
 
     // rp_filter drops the rack's asymmetric / unnumbered transit traffic.
     sysctl("net.ipv4.conf.all.rp_filter", "0");
     sysctl("net.ipv4.conf.default.rp_filter", "0");
 
+    apply_static_external();
     nat_rack_egress();
     apply_static_edge_ip();
     apply_frr()?;
@@ -50,7 +59,10 @@ fn apply_static_edge_ip() {
         return;
     };
     let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
-    if cur.split_whitespace().any(|t| t == ip || t.starts_with(&format!("{ip}/"))) {
+    if cur
+        .split_whitespace()
+        .any(|t| t == ip || t.starts_with(&format!("{ip}/")))
+    {
         note(format!("static edge IP {ip} already on {ifc}"));
         return;
     }
@@ -72,22 +84,88 @@ fn sysctl(key: &str, val: &str) {
 
 /// NAT rack-sourced traffic out this node's host-LAN uplink (the interface
 /// carrying its own default route), so the boundary NTP zone can reach its
-/// upstream. Makes every router a valid egress regardless of NIC naming - wait
+/// upstream. Makes every router a valid egress regardless of NIC naming—wait
 /// for the DHCP default to appear first.
 fn nat_rack_egress() {
     match uplink_iface() {
         Some(ifc) => {
             let present = run_quiet(
                 "iptables",
-                &["-t", "nat", "-C", "POSTROUTING", "-o", &ifc, "-j", "MASQUERADE"],
+                &[
+                    "-t",
+                    "nat",
+                    "-C",
+                    "POSTROUTING",
+                    "-o",
+                    &ifc,
+                    "-j",
+                    "MASQUERADE",
+                ],
             );
             if !present {
-                run("iptables", &["-t", "nat", "-A", "POSTROUTING", "-o", &ifc, "-j", "MASQUERADE"]);
+                run(
+                    "iptables",
+                    &[
+                        "-t",
+                        "nat",
+                        "-A",
+                        "POSTROUTING",
+                        "-o",
+                        &ifc,
+                        "-j",
+                        "MASQUERADE",
+                    ],
+                );
             }
             note(format!("NAT rack egress via {ifc}"));
         }
         None => warn("no default-route uplink found; rack egress/NTP may fail"),
     }
+}
+
+/// Apply the voxel-managed static external address (isolated mode) before any
+/// downstream step consults the uplink. This means bringing the staged
+/// `iface` up, adding the address (mirroring `apply_static_edge_ip`), replacing
+/// the default route via `gateway`, and writing `/etc/resolv.conf` from `dns`.
+///
+/// No-op in `lan` mode (no file staged).
+fn apply_static_external() {
+    let Some(ExternalNet {
+        ip_cidr,
+        gateway,
+        dns,
+        iface,
+    }) = read_external_net()
+    else {
+        return;
+    };
+    let Some(ifc) = iface else {
+        warn("external-net staged without an iface line; router bring-up needs it");
+        return;
+    };
+    run("ip", &["link", "set", &ifc, "up"]);
+    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
+    let already = cur.split_whitespace().any(|t| t == ip_cidr);
+    if already {
+        note(format!("static external {ip_cidr} already on {ifc}"));
+    } else {
+        run("ip", &["addr", "add", &ip_cidr, "dev", &ifc]);
+    }
+    run(
+        "ip",
+        &["route", "replace", "default", "via", &gateway, "dev", &ifc],
+    );
+
+    let resolv: String = dns.iter().map(|s| format!("nameserver {s}\n")).collect();
+    if !resolv.is_empty() {
+        // Replace the systemd-resolved symlink with a static file so our
+        // nameservers stick (isolated mode has no DHCP to populate resolved).
+        let _ = fs::remove_file("/etc/resolv.conf");
+        if let Err(e) = fs::write("/etc/resolv.conf", resolv) {
+            warn(format!("resolv.conf: {e}"));
+        }
+    }
+    note(format!("static external {ip_cidr} on {ifc} (gw {gateway})"));
 }
 
 fn uplink_iface() -> Option<String> {
@@ -96,9 +174,17 @@ fn uplink_iface() -> Option<String> {
             return Some(v);
         }
     }
+    // Isolated mode dictates the uplink up front (no DHCP to poll for).
+    //
+    // We handle it before the `lan`-mode default-route poll.
+    if let Some(ext) = read_external_net() {
+        if let Some(ifc) = ext.iface {
+            return Some(ifc);
+        }
+    }
     for _ in 0..30 {
         if let Some(line) = capture("ip", &["-o", "-4", "route", "show", "default"]) {
-            // "default via <gw> dev <iface> ..." - the iface is whitespace field 5.
+            // "default via <gw> dev <iface> ...", so the iface is whitespace field 5.
             if let Some(dev) = line.split_whitespace().nth(4) {
                 if !dev.is_empty() {
                     return Some(dev.to_string());

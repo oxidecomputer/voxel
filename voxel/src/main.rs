@@ -13,7 +13,7 @@
 //! startup that anchors voxel to its project root; the commands themselves live
 //! in the topic modules below.
 
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ use voxel_config::VoxelConfig;
 mod access;
 mod config_cmd;
 mod image;
+mod isolated_external;
 mod net;
 mod network;
 mod patch;
@@ -263,16 +264,37 @@ enum NetworkCmd {
     },
     /// Take down a switch port's link (disable + delete) on a running rack,
     /// e.g. `voxel network link-down switch0 qsfp2`.
-    LinkDown {
-        switch: String,
-        port: String,
-    },
+    LinkDown { switch: String, port: String },
     /// Validate live networking: link states, BGP sessions, routes, host routes.
     Validate {
         /// Full `swadm`/`mgadm` output instead of summary counts.
         #[arg(long)]
         detail: bool,
     },
+    /// Manage the isolated ("fake") external segment (`[external] mode = "isolated"`).
+    External {
+        #[command(subcommand)]
+        cmd: ExternalCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExternalCmd {
+    /// Stand the segment up (the same path `launch` uses).
+    Up {
+        /// Print the host commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Tear the segment down (VNIC + etherstub ~ the ipnat rule and
+    /// ipv4-forwarding stay).
+    Down {
+        /// Print the host commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Assert the whole path is live (uplink, links, NAT); PASS/FAIL per item.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -526,7 +548,12 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .or_else(|| cfg.and_then(|c| c.falcon.dataset.clone()))
         .or_else(|| std::env::var("FALCON_DATASET").ok());
     if let Some(d) = dataset {
-        std::env::set_var("FALCON_DATASET", d);
+        // SAFETY: runs before the tokio runtime spawns any worker, while the
+        // process is still single-threaded, so no concurrent getenv (from
+        // Rust or C) can race the write.
+        unsafe {
+            std::env::set_var("FALCON_DATASET", d);
+        }
     }
     // Resolve the build root first (cli > config > env), since the rss-gen path is
     // derived from it below. Export it as-is; apply the default only for our derive.
@@ -537,10 +564,16 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .or_else(|| cfg.and_then(|c| c.falcon.build_root.clone()))
         .or_else(|| std::env::var("BUILD_ROOT").ok());
     if let Some(b) = &build_root {
-        std::env::set_var("BUILD_ROOT", b);
+        // SAFETY: same single-threaded argument as FALCON_DATASET above.
+        unsafe {
+            std::env::set_var("BUILD_ROOT", b);
+        }
     }
     let build_root_eff = build_root.unwrap_or_else(|| {
-        format!("{}/voxel-builds", std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+        format!(
+            "{}/voxel-builds",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+        )
     });
     // voxel-rss-gen: `--rss-gen` flag or `$VOXEL_RSS_GEN` still override, but by
     // default DERIVE the path from the image's omicron commit so it can never drift
@@ -556,7 +589,10 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
             })
         });
     if let Some(r) = rss {
-        std::env::set_var("VOXEL_RSS_GEN", r);
+        // SAFETY: same single-threaded argument as FALCON_DATASET above.
+        unsafe {
+            std::env::set_var("VOXEL_RSS_GEN", r);
+        }
     }
 }
 
@@ -568,7 +604,10 @@ fn anchor_workdir(cli: &Cli, cfg: Option<&VoxelConfig>, config_path: &Path) -> a
     let root = cli
         .workdir
         .clone()
-        .or_else(|| cfg.and_then(|c| c.falcon.workdir.clone()).map(PathBuf::from))
+        .or_else(|| {
+            cfg.and_then(|c| c.falcon.workdir.clone())
+                .map(PathBuf::from)
+        })
         .or_else(|| config_path.parent().map(Path::to_path_buf));
     if let Some(root) = root {
         if root.is_dir() {
@@ -588,9 +627,23 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route, emu_sp, emu_rot, wicket_setup } => {
-            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route, *emu_sp || *emu_rot, *emu_rot, *wicket_setup)
-                .await
+        Cmd::Launch {
+            no_progress,
+            no_route,
+            emu_sp,
+            emu_rot,
+            wicket_setup,
+        } => {
+            rack::cmd_launch(
+                &load_config(&config_path)?,
+                &cli.name,
+                *no_progress,
+                *no_route,
+                *emu_sp || *emu_rot,
+                *emu_rot,
+                *wicket_setup,
+            )
+            .await
         }
         Cmd::WicketDryrun { config_rss, sleds } => wicket_setup::dryrun(config_rss, *sleds),
         Cmd::Route { dry_run } => {
@@ -604,19 +657,41 @@ async fn main() -> Result<(), Error> {
         Cmd::Status => rack::cmd_status(&load_config(&config_path)?, &cli.name).await,
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
-            ImageCmd::Patch { component, reference, image, out } => {
+            ImageCmd::Patch {
+                component,
+                reference,
+                image,
+                out,
+            } => {
                 let cfg = load_config(&config_path)?;
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
             }
-            other => image::cmd_image(other, cfg.as_ref().map(|c| c.image.cp_image())),
+            other => image::cmd_image(
+                other,
+                cfg.as_ref().map(|c| c.image.cp_image()),
+                cfg.as_ref().map(|c| &c.external),
+            ),
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
             NetworkCmd::AddPort { a, b } => network::add_port(&config_path, a, b),
             NetworkCmd::RmPort { a, b } => network::rm_port(&config_path, a, b),
-            NetworkCmd::LinkUp { switch, port, speed, fec } => {
-                network::link_up(&load_config(&config_path)?, &cli.name, switch, port, speed, fec).await
+            NetworkCmd::LinkUp {
+                switch,
+                port,
+                speed,
+                fec,
+            } => {
+                network::link_up(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    switch,
+                    port,
+                    speed,
+                    fec,
+                )
+                .await
             }
             NetworkCmd::LinkDown { switch, port } => {
                 network::link_down(&load_config(&config_path)?, &cli.name, switch, port).await
@@ -624,21 +699,42 @@ async fn main() -> Result<(), Error> {
             NetworkCmd::Validate { detail } => {
                 network::validate(&load_config(&config_path)?, &cli.name, *detail).await
             }
+            NetworkCmd::External { cmd } => {
+                let cfg = load_config(&config_path)?;
+                match cmd {
+                    ExternalCmd::Up { dry_run } => isolated_external::up(&cfg.external, *dry_run),
+                    ExternalCmd::Down { dry_run } => {
+                        isolated_external::down(&cfg.external, *dry_run)
+                    }
+                    ExternalCmd::Check => isolated_external::check(&cfg.external),
+                }
+            }
         },
         Cmd::Rack { cmd } => match cmd {
-            RackCmd::Patch { component, reference, list, dry_run } => {
+            RackCmd::Patch {
+                component,
+                reference,
+                list,
+                dry_run,
+            } => {
                 if *list {
                     patch::list();
                     Ok(())
                 } else {
-                    let component = component
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("missing component (try `voxel rack patch --list`)"))?;
-                    let reference = reference
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("missing ref (usage: voxel rack patch {component} <ref>)"))?;
-                    patch::cmd_rack_patch(&load_config(&config_path)?, &cli.name, component, reference, *dry_run)
-                        .await
+                    let component = component.as_deref().ok_or_else(|| {
+                        anyhow!("missing component (try `voxel rack patch --list`)")
+                    })?;
+                    let reference = reference.as_deref().ok_or_else(|| {
+                        anyhow!("missing ref (usage: voxel rack patch {component} <ref>)")
+                    })?;
+                    patch::cmd_rack_patch(
+                        &load_config(&config_path)?,
+                        &cli.name,
+                        component,
+                        reference,
+                        *dry_run,
+                    )
+                    .await
                 }
             }
         },

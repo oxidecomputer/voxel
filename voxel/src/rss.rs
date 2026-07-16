@@ -63,57 +63,102 @@ fn rss_step_display(step: &str) -> (usize, String) {
 /// Stream RSS bring-up: poll the RSS node's bootstrap-agent `/rack-initialize`
 /// endpoint and log each step transition until the rack initializes or fails.
 ///
-/// We poll over SSH, NOT the serial console. The bootstrap-agent listens on the
-/// bootstrap net (the host can't reach it), so the curl runs *on* the RSS node -
-/// but driving it over the serial console is fatally fragile under RSS load: the
-/// single-user console gets contended during zone-init, and a stalled exec (or a
-/// timed-out/cancelled one) leaves a shell logged in on it that poisons every
-/// later poll. So we discover the node's host-LAN IP once, up front while the
-/// console is still quiet, then `ssh root@<ip> 'curl ...'` each poll - no console
-/// involvement, no wedge, no poisoning. (`setup_ssh` has enabled empty-password
-/// root login by the time launch completes.) Always returns within the cap so
+/// We poll over SSH, not the serial console. The bootstrap-agent listens on
+/// the bootstrap net (the host can't reach it), so the curl runs *on* the
+/// RSS node - but driving it over the serial console is fatally fragile
+/// under RSS load: the single-user console gets contended during zone-init,
+/// and a stalled exec (or a timed-out/cancelled one) leaves a shell logged
+/// in on it that poisons every later poll. In `lan` mode we discover the
+/// node's host-LAN IP once, up front while the console is still quiet, then
+/// `ssh root@<ip> 'curl ...'` each poll - no console involvement, no wedge,
+/// no poisoning. In isolated mode, the caller passes the node's known static
+/// IP as `known_ip`, so we skip discovery entirely (there's no DHCP race:
+/// the address is deterministic). The polls need no credentials: voxel-init
+/// runs `setup_ssh` at the start of bring-up, enabling empty-password root
+/// login before any poll fires. This always returns within the `cap` so
 /// `cmd_launch` proceeds to re-point the host route at ce.
-/// `cap` bounds how long we watch one rack's RSS before giving up (the rack keeps
-/// converging regardless). The caller sizes it: a single sp-sim rack settles in
-/// ~12m, but emulated SPs slow every MGS RPC and a multi-rack launch runs the
-/// racks' bring-up under each other's load, so those need a bigger budget (see
-/// the callers in `rack.rs`).
-pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, tag: &str, cap: Duration) {
-    let curl = format!(
-        "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
-    );
-    const POLL_INTERVAL: Duration = Duration::from_secs(8);
-    const HEARTBEAT: Duration = Duration::from_secs(90); // re-affirm liveness this often
+///
+/// `cap` bounds how long we watch one rack's RSS before giving up (the rack
+/// keeps converging regardless). The caller sizes it: a single sp-sim rack
+/// settles in ~12m, but emulated SPs slow every MGS RPC and a multi-rack launch
+/// runs the racks' bring-up under each other's load, so those need a bigger
+/// budget (see the callers in `rack.rs`).
+pub(crate) async fn watch_rss(
+    d: &Runner,
+    rss: NodeRef,
+    bootstrap_addr: &str,
+    tag: &str,
+    cap: Duration,
+    known_ip: Option<String>,
+) {
+    let curl =
+        format!("curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null");
 
     info!(d.log, "{tag}: watching RSS progress on the RSS node ...");
 
-    // The one and only serial read: find the RSS node's LAN IP up front (console
-    // still quiet here, before zone-init spam). Bounded so a wedged console can't
-    // hang us; if it fails we just stop watching - the rack keeps converging.
-    let rss_ip = match tokio::time::timeout(
-        Duration::from_secs(60),
-        crate::net::node_external_ip(d, rss, false),
-    )
-    .await
-    {
-        Ok(Ok(ip)) => ip,
-        Ok(Err(e)) => {
-            warn!(d.log, "{tag}: can't find the RSS node's IP to watch over SSH ({e}); \
-                bring-up continues - check `voxel status` / the console");
-            return;
-        }
-        Err(_) => {
-            warn!(d.log, "{tag}: timed out finding the RSS node's IP; bring-up \
-                continues - check `voxel status` / the console");
-            return;
+    // Isolated mode dictates the RSS node's IP up front (static, staged), so
+    // the caller passes it in and we skip discovery entirely. Otherwise: serial
+    // reads up front only (console still quiet here, before zone-init spam) to
+    // find the LAN IP, retrying within the window because the DHCP lease can
+    // land a few seconds after bring-up reports done. Each read is bounded so a
+    // wedged console can't hang us; if the IP never shows we stop watching -
+    // the rack keeps converging.
+    let rss_ip = if let Some(ip) = known_ip {
+        ip
+    } else {
+        match discover_rss_ip(d, rss, tag).await {
+            Some(ip) => ip,
+            None => return,
         }
     };
     info!(d.log, "{tag}: polling RSS status via ssh root@{rss_ip}");
+    watch_rss_loop(d, tag, &curl, rss_ip, cap).await;
+}
 
+/// Serial-console IP discovery (`lan` mode). Bounded; `None` if the IP never
+/// appears within the window - the caller stops watching and the rack keeps
+/// converging on its own.
+async fn discover_rss_ip(d: &Runner, rss: NodeRef, tag: &str) -> Option<String> {
+    let ip_deadline = Instant::now() + Duration::from_secs(60);
+    let rss_ip = loop {
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            crate::net::node_external_ip(d, rss, false),
+        )
+        .await
+        {
+            Ok(Ok(ip)) => break ip,
+            Ok(Err(e)) if Instant::now() >= ip_deadline => {
+                warn!(
+                    d.log,
+                    "{tag}: can't find the RSS node's IP to watch over SSH ({e}); \
+                    bring-up continues - check `voxel status` / the console"
+                );
+                return None;
+            }
+            Err(_) if Instant::now() >= ip_deadline => {
+                warn!(
+                    d.log,
+                    "{tag}: timed out finding the RSS node's IP; bring-up \
+                    continues - check `voxel status` / the console"
+                );
+                return None;
+            }
+            _ => tokio::time::sleep(Duration::from_secs(5)).await,
+        }
+    };
+    Some(rss_ip)
+}
+
+/// Poll the bootstrap-agent's `/rack-initialize` over SSH until it initializes,
+/// fails, or the cap expires. Emits step transitions + a periodic heartbeat.
+async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: Duration) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(8);
+    const HEARTBEAT: Duration = Duration::from_secs(90);
     let start = Instant::now();
     let mut last = String::new();
     let mut last_emit = Instant::now();
-    let mut step_start = Instant::now(); // when the CURRENT step began (for in-step timing)
+    let mut step_start = Instant::now(); // when the current step began (for in-step timing)
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         if start.elapsed() > cap {
@@ -283,7 +328,8 @@ mod tests {
     #[test]
     fn strip_ansi_yields_clean_ip() {
         // ip(8) colorizes: ESC[36menp0s10ESC[0m ... ESC[35m192.168.68.171ESC[0m/22
-        let colored = "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
+        let colored =
+            "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
         let clean = strip_ansi(colored);
         let ip = clean
             .split_whitespace()

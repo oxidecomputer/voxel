@@ -84,6 +84,15 @@ log "staging ${INSTALL_SCRIPT} into ${CARGO_BAY}"
 cp "${HERE}/${INSTALL_SCRIPT}" "${CARGO_BAY}/${INSTALL_SCRIPT}"
 chmod +x "${CARGO_BAY}/${INSTALL_SCRIPT}"
 
+# Isolated-mode static network for the builder VM: the isolated segment runs no
+# DHCP server, so voxel (or the operator) passes VOXEL_BUILDER_NET="<cidr> <gw>"
+# and we stage it as `builder-net` in the cargo-bay for the in-guest installer
+# to apply in place of DHCP.
+if [[ -n "${VOXEL_BUILDER_NET:-}" ]]; then
+    log "staging builder-net (${VOXEL_BUILDER_NET}) into ${CARGO_BAY}"
+    printf '%s\n' "${VOXEL_BUILDER_NET}" > "${CARGO_BAY}/builder-net"
+fi
+
 # --- 2. build + launch builder (boots BASE_IMAGE, runs INSTALL_SCRIPT) ---------
 log "building voxel-image-builder"
 ( cd "${HERE}/.." && cargo build -p voxel-image-builder )
