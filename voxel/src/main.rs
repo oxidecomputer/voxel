@@ -22,6 +22,7 @@ use voxel_config::VoxelConfig;
 mod access;
 mod config_cmd;
 mod image;
+mod mupdate;
 mod net;
 mod network;
 mod patch;
@@ -144,6 +145,11 @@ enum Cmd {
     Sp {
         #[command(subcommand)]
         cmd: SpCmd,
+    },
+    /// Stage recovery/host-phase-2 (mupdate) artifacts into the live rack's MGS.
+    Mupdate {
+        #[command(subcommand)]
+        cmd: MupdateCmd,
     },
     /// Access a sled's global zone (ls / login / exec).
     Host {
@@ -298,6 +304,23 @@ enum RackCmd {
 }
 
 #[derive(Subcommand)]
+enum MupdateCmd {
+    /// Upload a host phase-2 (trampoline) image into MGS's recovery cache, so a
+    /// recovering host's relayed `GetPhase2Data` can be served. Prints the sha256
+    /// to feed to `voxel sp ipcc <sp> --cmd get-phase2:<hash>`.
+    Stage {
+        /// Path to the host phase-2 image to cache in MGS.
+        image: PathBuf,
+        /// Which switch's MGS to target (switch0|switch1|rackR/switchS).
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+        /// Override the MGS base URL (else auto-discovered in the switch zone).
+        #[arg(long)]
+        mgs: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SpCmd {
     /// List the live SPs over MGS: type, serial, power, archive id.
     ///
@@ -404,7 +427,8 @@ enum SpCmd {
         /// Target SP: `sidecar` | `gN` | a port.
         target: String,
         /// Request to send: identity (VPD) | bsu (boot storage unit) | macs |
-        /// status (host boot options) | inventory.
+        /// status (host boot options) | inventory | get-phase2[:<hash>[:<offset>]]
+        /// (recovery phase-2 pull; stage the image first with `voxel mupdate stage`).
         #[arg(long, default_value = "identity")]
         cmd: String,
         #[arg(long, default_value = "switch0")]
@@ -643,6 +667,18 @@ async fn main() -> Result<(), Error> {
             }
         },
         Cmd::Sp { cmd } => sp_cmd::cmd_sp(&load_config(&config_path)?, &cli.name, cmd).await,
+        Cmd::Mupdate { cmd } => match cmd {
+            MupdateCmd::Stage { image, switch, mgs } => {
+                mupdate::cmd_stage(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    switch,
+                    image,
+                    mgs.as_deref(),
+                )
+                .await
+            }
+        },
         Cmd::Host { cmd } => match cmd {
             HostCmd::Ls => access::cmd_host_ls(&load_config(&config_path)?, &cli.name).await,
             HostCmd::Login { sled } => {

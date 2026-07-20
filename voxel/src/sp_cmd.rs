@@ -192,7 +192,7 @@ fn faux_on(ip: &str, port: u16, args: &[&str], attempts: u32, timeout_ms: u32) -
 /// wedges under RSS/console load; ssh to the cached IP is unaffected). The first
 /// lookup is bounded so a wedged console fails fast instead of hanging; a stale
 /// cache (after a relaunch) is cleared on the next ssh miss by the callers.
-async fn switch_ip(topo: &Topo, switch: &str) -> anyhow::Result<(SpFleet, String, String)> {
+pub(crate) async fn switch_ip(topo: &Topo, switch: &str) -> anyhow::Result<(SpFleet, String, String)> {
     let (fleet, node, sw) = switch_fleet(topo, switch)?;
     if let Some(ip) = read_cached_ip(&sw) {
         return Ok((fleet, ip, sw));
@@ -225,7 +225,7 @@ fn read_cached_ip(node: &str) -> Option<String> {
 fn write_cached_ip(node: &str, ip: &str) {
     let _ = std::fs::write(ip_cache(node), ip);
 }
-fn clear_cached_ip(node: &str) {
+pub(crate) fn clear_cached_ip(node: &str) {
     let _ = std::fs::remove_file(ip_cache(node));
 }
 
@@ -448,9 +448,12 @@ async fn sp_ipcc(
     target: &str,
     command: &str,
 ) -> anyhow::Result<()> {
-    if !matches!(command, "identity" | "bsu" | "macs" | "status" | "inventory") {
+    let known = matches!(command, "identity" | "bsu" | "macs" | "status" | "inventory")
+        || command == "get-phase2"
+        || command.starts_with("get-phase2:");
+    if !known {
         return Err(anyhow!(
-            "--cmd must be one of identity|bsu|macs|status|inventory (got `{command}`)"
+            "--cmd must be identity|bsu|macs|status|inventory|get-phase2[:<hash>[:<offset>]] (got `{command}`)"
         ));
     }
     let topo = build_topo(cfg, name)?;
