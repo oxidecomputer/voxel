@@ -1,7 +1,8 @@
 //! Router/edge bring-up - replaces `router-launch.sh`. Runs in the voxel-frr
-//! debian guest. FRR + bgpd are pre-installed; this applies the generated
-//! unnumbered `frr.conf` and NATs rack egress out to the host LAN (the RSS
-//! time-sync path - the boundary NTP zone must reach its upstream).
+//! debian guest. FRR (bgpd + bfdd) is pre-installed; this applies the generated
+//! `frr.conf` (unnumbered eBGP or static, per router_mode) and NATs rack egress
+//! out to the host LAN (the RSS time-sync path - the boundary NTP zone must reach
+//! its upstream).
 
 use crate::sys::{capture, note, run, run_quiet, warn};
 use anyhow::{anyhow, Context, Result};
@@ -10,6 +11,9 @@ use std::path::Path;
 use std::time::Duration;
 
 pub fn bring_up() -> Result<()> {
+    // Give the host-LAN uplink a UNIQUE DHCP lease before NAT depends on it.
+    ensure_unique_uplink_lease();
+
     // Forwarding is baked, but re-assert + stop lab-net RAs from clobbering us.
     sysctl("net.ipv4.ip_forward", "1");
     sysctl("net.ipv6.conf.all.forwarding", "1");
@@ -64,6 +68,30 @@ fn apply_static_edge_ip() {
     let cidr = format!("{ip}/{prefix}");
     run("ip", &["addr", "add", &cidr, "dev", &ifc]);
     note(format!("static edge IP {cidr} added on {ifc}"));
+}
+
+/// Every router boots from the same frr image with the same baked machine-id,
+/// so systemd-networkd derives an identical DHCP client-id (DUID) and the
+/// upstream server leases them all the SAME host-LAN IP. NAT return traffic then
+/// races to whichever router owns that IP's ARP entry, starving the others' rack
+/// egress: RSS time-sync in static mode took 18-28min or stalled. Pin the
+/// uplink's DHCP client-id to its (always-unique) MAC and re-DHCP, so each router
+/// gets a distinct lease. Scoped to the uplink interface only, leaving the
+/// FRR-managed transit links untouched.
+fn ensure_unique_uplink_lease() {
+    let Some(ifc) = uplink_iface() else {
+        warn("unique-lease: no host-LAN uplink found; skipping");
+        return;
+    };
+    let cfg = format!(
+        "[Match]\nName={ifc}\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\nRouteMetric=100\n"
+    );
+    if let Err(e) = fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg) {
+        warn(format!("unique-lease: write networkd config: {e}"));
+        return;
+    }
+    run("systemctl", &["restart", "systemd-networkd"]);
+    note(format!("pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"));
 }
 
 fn sysctl(key: &str, val: &str) {
