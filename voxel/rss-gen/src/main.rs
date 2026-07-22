@@ -139,6 +139,37 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
     })
 }
 
+/// A cross-rack sidecar interconnect port: link-local (`AddrConf`), no routes or
+/// BGP - a "cluster port" for the multirack underlay. DDM (if it runs on the port)
+/// carries the shared-/48 across the mesh. 100G to match the sidecar<->sidecar
+/// rear-port links.
+fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
+    Ok(PortConfig {
+        routes: vec![],
+        // Link-local via addrconf so mg-ddm can peer cross-rack over the
+        // interconnect. Nexus lot-validates this against the infra lot; the v6
+        // block added to that lot (nexus rack.rs, build-cp patch 1c) lets it
+        // reserve in Static mode as it already does in BGP mode.
+        addresses: vec![UplinkAddressConfig { address: UplinkAddress::AddrConf, vlan_id: None }],
+        switch: switch_slot(switch),
+        port: port.to_string(),
+        uplink_port_speed: link_speed("100G"),
+        uplink_port_fec: Some(LinkFec::None),
+        bgp_peers: vec![],
+        autoneg: false,
+        lldp: Some(LldpPortConfig {
+            status: LldpAdminStatus::Enabled,
+            chassis_id: Some(switch.to_string()),
+            port_id: None,
+            port_description: Some(format!("interconnect-{port}")),
+            system_name: None,
+            system_description: None,
+            management_addrs: None,
+        }),
+        tx_eq: None,
+    })
+}
+
 /// Build a typed `RackInitializeRequest` for a single rack (`rack`, 0-based) of a
 /// voxel config. Multi-rack deployments call this once per rack: each rack is an
 /// independent RSS domain, so the bootstrap set is filtered to that rack's sleds
@@ -161,6 +192,11 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
     let mut ports = Vec::new();
     for p in &uplink_ports {
         ports.push(uplink_port(p, n.router_mode)?);
+    }
+    // Cross-rack sidecar interconnect ports: link-local (AddrConf) cluster ports,
+    // no routes/BGP, so DDM can carry the shared-/48 underlay across the mesh.
+    for (sw, port) in cfg.interconnect_ports(rack) {
+        ports.push(interconnect_port(&sw, &port)?);
     }
     // Newer omicron requires the non-empty `UplinkPorts` newtype; older takes the
     // bare Vec. Rebind per era (build.rs cfg); `ports` gets the right type either way.

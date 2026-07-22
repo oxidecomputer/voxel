@@ -132,9 +132,6 @@ impl VoxelConfig {
         // it predates would fail to parse. `ce_external_ip` is purely a voxel host
         // routing detail, irrelevant to RSS config generation.
         c.topology.ce_external_ip = None;
-        // Same: switch interconnects are a launch-time topology detail (falcon
-        // links + sled-agent front-port budget), invisible to RSS config.
-        c.topology.interconnects = Vec::new();
         c.to_toml()
     }
 
@@ -184,17 +181,6 @@ pub struct Topology {
     /// launches - no serial lookup, no stale-route accumulation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ce_external_ip: Option<String>,
-    /// Switch-to-switch ASIC interconnects: extra QSFP front ports linking two
-    /// scrimlet sidecars directly (falcon `softnpu_links`), carrying the underlay
-    /// (DDM) switch-to-switch - e.g. a cross-rack cable, or `switch0`<->`switch1`
-    /// within a rack (the DDM PoC). Each entry is a pair of switch selectors
-    /// (`switch0` | `switch1` | `switchN` | `rackR/switchS`). Empty -> none. Each
-    /// link adds one front port to BOTH endpoint scrimlets (wired after the
-    /// fabric-router uplinks, so it lands on the next `qsfp` tfport). The link
-    /// itself is plumbed at launch; DDM/routing over it is configured per
-    /// `voxel network`. Managed via `voxel network add-port` / `rm-port`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub interconnects: Vec<(String, String)>,
 }
 
 impl Default for Topology {
@@ -208,7 +194,6 @@ impl Default for Topology {
             sled_memory_gb: 8,
             router_memory_gb: 4,
             ce_external_ip: None,
-            interconnects: Vec::new(),
         }
     }
 }
@@ -288,41 +273,24 @@ impl Topology {
         out
     }
 
-    /// Resolve a switch selector to a scrimlet's GLOBAL sled index. Accepts a
-    /// node name (`g3`), a rack-qualified `rackR/switchS` (R 1-based, S the
-    /// 0-based slot within the rack), or a bare global `switchN` (the Nth
-    /// scrimlet across all racks). Config-time mirror of `access::resolve_switch`
-    /// (works off the descriptor list, no live topology).
-    pub fn resolve_switch_index(&self, sel: &str) -> Option<usize> {
+    /// Cross-rack sidecar interconnect pairs, as GLOBAL scrimlet index pairs
+    /// (`ai < bi`): every scrimlet links to every scrimlet in a DIFFERENT rack
+    /// (full cross-rack mesh), directly meshing a multi-rack deployment's sidecars
+    /// for the shared-/48 underlay. Empty for a single rack. Each pair is a
+    /// `softnpu_links` sidecar<->sidecar (see `topo::build_topo`) and adds one
+    /// front port to both endpoints.
+    pub fn interconnect_pairs(&self) -> Vec<(usize, usize)> {
         let sleds = self.sleds();
         let scrimlets: Vec<&SledDesc> = sleds.iter().filter(|s| s.scrimlet).collect();
-        if let Some(s) = scrimlets.iter().find(|s| s.name == sel) {
-            return Some(s.index);
-        }
-        if let Some((r, sw)) = sel.split_once('/') {
-            if let (Some(rack), Some(slot)) = (
-                r.strip_prefix("rack").and_then(|x| x.parse::<usize>().ok()),
-                sw.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()),
-            ) {
-                let rack0 = rack.saturating_sub(1);
-                return scrimlets.iter().filter(|s| s.rack == rack0).nth(slot).map(|s| s.index);
+        let mut out = Vec::new();
+        for i in 0..scrimlets.len() {
+            for j in (i + 1)..scrimlets.len() {
+                if scrimlets[i].rack != scrimlets[j].rack {
+                    out.push((scrimlets[i].index, scrimlets[j].index));
+                }
             }
         }
-        if let Some(n) = sel.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()) {
-            return scrimlets.get(n).map(|s| s.index);
-        }
-        None
-    }
-
-    /// Resolved interconnect endpoint index pairs (unresolvable / self pairs dropped).
-    pub fn interconnect_pairs(&self) -> Vec<(usize, usize)> {
-        self.interconnects
-            .iter()
-            .filter_map(|(a, b)| {
-                let (ai, bi) = (self.resolve_switch_index(a)?, self.resolve_switch_index(b)?);
-                (ai != bi).then_some((ai, bi))
-            })
-            .collect()
+        out
     }
 
     /// How many interconnects scrimlet `index` participates in (its front-port bump).
@@ -547,12 +515,15 @@ fn offset_v4(s: &str, rack: u8) -> String {
     })
 }
 
-/// Bump an IPv6 prefix's 3rd hextet by `rack` (preserving any `/prefix`).
-fn offset_v6_prefix(s: &str, rack: u16) -> String {
+/// Offset an IPv6 rack subnet by `rack` /56s WITHIN its /48 (bits 48-55, the high
+/// byte of hextet 3), so every rack shares one /48 AZ (omicron's AZ=/48, rack=/56
+/// scheme) and cross-rack underlay is a single aggregate prefix. rack 0 is
+/// unchanged. Preserves any `/prefix`.
+fn offset_v6_rack56(s: &str, rack: u16) -> String {
     map_addr(s, |addr| {
         addr.parse::<std::net::Ipv6Addr>().ok().map(|ip| {
             let mut seg = ip.segments();
-            seg[2] = seg[2].wrapping_add(rack);
+            seg[3] = seg[3].wrapping_add(rack << 8);
             std::net::Ipv6Addr::from(seg).to_string()
         })
     })
@@ -582,7 +553,7 @@ impl Network {
             external_dns_ips: self.external_dns_ips.iter().map(|ip| offset_v4(ip, r8)).collect(),
             ntp_servers: self.ntp_servers.clone(),
             dns_servers: self.dns_servers.clone(),
-            rack_subnet: offset_v6_prefix(&self.rack_subnet, rack as u16),
+            rack_subnet: offset_v6_rack56(&self.rack_subnet, rack as u16),
             service_pool_first: offset_v4(&self.service_pool_first, r8),
             service_pool_last: offset_v4(&self.service_pool_last, r8),
             bgp_asn: self.bgp_asn + rack as u32,
@@ -757,6 +728,30 @@ impl VoxelConfig {
                     sidecar_addr: format!("{sidecar}/30"),
                     gateway,
                 });
+            }
+        }
+        out
+    }
+
+    /// Cross-rack interconnect ports on `rack`'s switches, as `(switch, port)`.
+    /// Each cross-rack sidecar link (see `Topology::interconnect_pairs`) lands on
+    /// a front port after the fabric uplinks - `qsfp{n_cr + k}`, in
+    /// `interconnect_pairs` order, matching `build_topo`'s per-switch front-port
+    /// assignment. rss-gen emits these as link-local (`AddrConf`) cluster ports so
+    /// DDM can run the cross-rack underlay over the mesh. Empty for a single rack.
+    pub fn interconnect_ports(&self, rack: usize) -> Vec<(String, String)> {
+        let n_cr = self.fabric_router_count();
+        let pairs = self.topology.interconnect_pairs();
+        let sleds = self.sleds();
+        let scrimlets: Vec<&SledDesc> = sleds.iter().filter(|s| s.scrimlet).collect();
+        let mut out = Vec::new();
+        for (slot, s) in scrimlets.iter().filter(|s| s.rack == rack).enumerate() {
+            let mut k = 0;
+            for (a, b) in &pairs {
+                if *a == s.index || *b == s.index {
+                    out.push((format!("switch{slot}"), format!("qsfp{}", n_cr + k)));
+                    k += 1;
+                }
             }
         }
         out
@@ -1184,7 +1179,9 @@ mod tests {
         assert_eq!(net.for_rack(1).infra_prefix, "198.51.101.0/24");
         assert_eq!(net.for_rack(1).service_pool_first, "198.51.101.20");
         assert_eq!(net.for_rack(1).external_dns_ips[0], "198.51.101.20");
-        assert_eq!(net.for_rack(1).rack_subnet, "fd00:17:2:d00::/56");
+        // Shared /48 (fd00:17:1::/48), per-rack /56: rack 0 = d00, rack 1 = e00.
+        assert_eq!(net.for_rack(0).rack_subnet, "fd00:17:1:d00::/56");
+        assert_eq!(net.for_rack(1).rack_subnet, "fd00:17:1:e00::/56");
         assert_eq!(net.for_rack(1).bgp_asn, 65001);
         // The uplink peer_asn tracks the rack's local ASN (rack 0 unchanged).
         assert_eq!(net.for_rack(0).uplinks[0].peer_asn, 65000);
@@ -1198,22 +1195,18 @@ mod tests {
     }
 
     #[test]
-    fn interconnects_resolve_and_count() {
-        // Default single-rack 4-sled: scrimlets g0 (switch0) + g3 (switch1).
-        let mut t = Topology::default();
-        t.interconnects = vec![("switch0".into(), "switch1".into())];
-        assert_eq!(t.resolve_switch_index("switch0"), Some(0));
-        assert_eq!(t.resolve_switch_index("switch1"), Some(3));
-        assert_eq!(t.resolve_switch_index("g3"), Some(3));
-        assert_eq!(t.resolve_switch_index("rack1/switch1"), Some(3));
-        assert_eq!(t.resolve_switch_index("bogus"), None);
-        assert_eq!(t.interconnect_pairs(), vec![(0, 3)]);
-        assert_eq!(t.interconnect_count_for(0), 1);
-        assert_eq!(t.interconnect_count_for(3), 1);
+    fn interconnects_auto_mesh_cross_rack() {
+        // Single rack: no cross-rack interconnects.
+        assert!(Topology::default().interconnect_pairs().is_empty());
+
+        // 2 racks x 3 sleds -> scrimlets g0,g2 (rack0), g3,g5 (rack1). Full
+        // cross-rack mesh: every rack-0 scrimlet <-> every rack-1 scrimlet.
+        let t = Topology { racks: 2, sleds: 3, ..Topology::default() };
+        assert_eq!(t.interconnect_pairs(), vec![(0, 3), (0, 5), (2, 3), (2, 5)]);
+        // Each scrimlet is on (other-rack scrimlet count) = 2 links; g1 on none.
+        assert_eq!(t.interconnect_count_for(0), 2);
+        assert_eq!(t.interconnect_count_for(3), 2);
         assert_eq!(t.interconnect_count_for(1), 0); // a non-scrimlet sled
-        // A self / unresolvable pair is dropped from the resolved pairs.
-        t.interconnects = vec![("switch0".into(), "switch0".into()), ("switch0".into(), "nope".into())];
-        assert!(t.interconnect_pairs().is_empty());
     }
 
     #[test]

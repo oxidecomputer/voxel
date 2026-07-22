@@ -119,6 +119,21 @@ pub(crate) async fn cmd_launch(
             ));
         }
     }
+    // Each scrimlet's SoftNPU front ports = fabric uplinks + cross-rack
+    // interconnects. Guard against exceeding the sidecar's port budget (the full
+    // cross-rack mesh grows with racks*switches).
+    const MAX_FRONT_PORTS: usize = 128;
+    let n_cr = cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
+    for s in sleds.iter().filter(|s| s.scrimlet) {
+        let front = n_cr + cfg.topology.interconnect_count_for(s.index);
+        if front > MAX_FRONT_PORTS {
+            return Err(anyhow!(
+                "scrimlet {} needs {front} SoftNPU front ports (> {MAX_FRONT_PORTS}); \
+                 reduce racks or switches-per-rack",
+                s.name
+            ));
+        }
+    }
     // Fail fast if the configured images aren't built yet - a clear message
     // beats the cryptic clone error falcon would throw partway through launch.
     crate::image::ensure_image(&cfg.image.cp_image())?;
@@ -188,6 +203,18 @@ pub(crate) async fn cmd_launch(
                 info!(d.log, "rack{}: bringing up {} sleds", rack + 1, rack_sleds.len());
             }
             run_voxel_init(d, rack_sleds).await;
+            // Multirack: only rack 0 (the cluster) runs RSS. rack > 0 boots (sleds +
+            // the cross-rack interconnect wired) but is left PRE-RSS - the unclaimed
+            // state a future cluster-join (RFD 573) would start from. omicron can't
+            // join racks into one AZ yet, so we stage it and stop here.
+            if rack > 0 {
+                info!(
+                    d.log,
+                    "rack{}: booted, left pre-RSS (unclaimed - multirack join not yet supported)",
+                    rack + 1
+                );
+                continue;
+            }
             if let Some((s, n)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
                 let tag = rack_label(racks, rack, "rack-init");
                 // --wicket-setup: nothing auto-inited (no staged config-rss), so
