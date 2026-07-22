@@ -98,18 +98,33 @@ fn sysctl(key: &str, val: &str) {
     run("sysctl", &["-w", &format!("{key}={val}")]);
 }
 
-/// NAT rack-sourced traffic out this node's host-LAN uplink (the interface
-/// carrying its own default route), so the boundary NTP zone can reach its
-/// upstream. Makes every router a valid egress regardless of NIC naming - wait
-/// for the DHCP default to appear first.
+/// NAT rack egress out this node's host-LAN uplink (the interface carrying its
+/// own default route) so the boundary NTP zone can reach its internet upstream.
+/// Excludes the directly-connected customer LAN: traffic there is the racks'
+/// external-service replies (Nexus/DNS/console) sourced from public service IPs,
+/// which must reach the host unchanged. Masquerading those rewrites the source to
+/// this router's uplink IP so the host drops the reply. Waits for the DHCP
+/// default to appear first.
 fn nat_rack_egress() {
     match uplink_iface() {
         Some(ifc) => {
-            let present = run_quiet(
+            // Skip NAT for the connected customer subnet (the external-service
+            // reply path) before masquerading the internet-bound rest (NTP).
+            if let Some(subnet) = uplink_subnet(&ifc) {
+                if !run_quiet(
+                    "iptables",
+                    &["-t", "nat", "-C", "POSTROUTING", "-o", &ifc, "-d", &subnet, "-j", "RETURN"],
+                ) {
+                    run(
+                        "iptables",
+                        &["-t", "nat", "-I", "POSTROUTING", "1", "-o", &ifc, "-d", &subnet, "-j", "RETURN"],
+                    );
+                }
+            }
+            if !run_quiet(
                 "iptables",
                 &["-t", "nat", "-C", "POSTROUTING", "-o", &ifc, "-j", "MASQUERADE"],
-            );
-            if !present {
+            ) {
                 run("iptables", &["-t", "nat", "-A", "POSTROUTING", "-o", &ifc, "-j", "MASQUERADE"]);
             }
             note(format!("NAT rack egress via {ifc}"));
@@ -136,6 +151,15 @@ fn uplink_iface() -> Option<String> {
         std::thread::sleep(Duration::from_secs(1));
     }
     None
+}
+
+/// The directly-connected IPv4 subnet on `ifc` (its kernel scope-link route,
+/// e.g. "192.168.68.0/24"), the customer LAN the host reaches the rack from.
+/// None if it can't be read.
+fn uplink_subnet(ifc: &str) -> Option<String> {
+    let line = capture("ip", &["-o", "-4", "route", "show", "dev", ifc, "scope", "link"])?;
+    let cidr = line.split_whitespace().next()?;
+    (cidr.contains('/') && cidr.contains('.')).then(|| cidr.to_string())
 }
 
 fn apply_frr() -> Result<()> {
