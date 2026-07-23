@@ -68,11 +68,17 @@ fn cr1_static(track_bfd: bool) -> FrrRouter {
 #[test]
 fn cr1_static_plain() {
     // Default: plain static routes, no BFD (the a4x2 working config).
-    expectorate::assert_contents("tests/output/cr1-static-frr.conf", &cr1_static(false).render());
+    expectorate::assert_contents(
+        "tests/output/cr1-static-frr.conf",
+        &cr1_static(false).render(),
+    );
 }
 
 #[test]
 fn cr1_static_bfd() {
     // transit_bfd on: BFD-tracked routes + peers.
-    expectorate::assert_contents("tests/output/cr1-static-bfd-frr.conf", &cr1_static(true).render());
+    expectorate::assert_contents(
+        "tests/output/cr1-static-bfd-frr.conf",
+        &cr1_static(true).render(),
+    );
 }

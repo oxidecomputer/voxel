@@ -27,7 +27,12 @@ impl Topo {
             .iter()
             .find(|(s, _)| s.name == name)
             .map(|(_, n)| *n)
-            .or_else(|| self.routers.iter().find(|(r, _)| r == name).map(|(_, n)| *n))
+            .or_else(|| {
+                self.routers
+                    .iter()
+                    .find(|(r, _)| r == name)
+                    .map(|(_, n)| *n)
+            })
     }
 
     /// Each rack's RSS node (its first bootstrap sled), in rack order. One per
@@ -101,8 +106,11 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         routers.push((r.clone(), n));
     }
 
-    let all_scrimlets: Vec<NodeRef> =
-        sleds.iter().filter(|(s, _)| s.scrimlet).map(|(_, n)| *n).collect();
+    let all_scrimlets: Vec<NodeRef> = sleds
+        .iter()
+        .filter(|(s, _)| s.scrimlet)
+        .map(|(_, n)| *n)
+        .collect();
     let ce = routers.iter().find(|(r, _)| r == "ce").map(|(_, n)| *n);
     let fabric_routers: Vec<(String, NodeRef)> =
         routers.iter().filter(|(r, _)| r != "ce").cloned().collect();
@@ -127,7 +135,11 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         format!("a8:40:25:00:00:{mac_counter:02}")
     };
     for (s, n) in &sleds {
-        for sc in sleds.iter().filter(|(o, _)| o.scrimlet && o.rack == s.rack).map(|(_, m)| *m) {
+        for sc in sleds
+            .iter()
+            .filter(|(o, _)| o.scrimlet && o.rack == s.rack)
+            .map(|(_, m)| *m)
+        {
             d.softnpu_link(sc, *n, Some(new_mac()), None);
         }
         ext_interface(&mut d, *n)?;
@@ -164,7 +176,11 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
             .map_err(|e| anyhow!("mount_linux {r}: {e}"))?;
     }
 
-    Ok(Topo { runner: d, sleds, routers })
+    Ok(Topo {
+        runner: d,
+        sleds,
+        routers,
+    })
 }
 
 /// Host-side cargo-bay root (per-node staging dirs live under `<CARGO_BAY>/<node>`,
@@ -216,9 +232,7 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
         .arg("--rack")
         .arg(rack.to_string())
         .status()
-        .map_err(|e| {
-            anyhow!("run {gen}: {e} - build voxel/rss-gen or set VOXEL_RSS_GEN")
-        })?;
+        .map_err(|e| anyhow!("run {gen}: {e} - build voxel/rss-gen or set VOXEL_RSS_GEN"))?;
     if !status.success() {
         return Err(anyhow!(
             "{gen} generate failed. If the error above is a TOML 'unknown field', \
@@ -244,7 +258,12 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
 fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
     let src = std::env::var("VOXEL_RSS_GEN")
         .ok()
-        .and_then(|g| Path::new(&g).ancestors().nth(3).map(|p| p.join("sled-agent/src/config.rs")))
+        .and_then(|g| {
+            Path::new(&g)
+                .ancestors()
+                .nth(3)
+                .map(|p| p.join("sled-agent/src/config.rs"))
+        })
         .and_then(|p| fs::read_to_string(p).ok())
         .unwrap_or_default();
     // `pub external_disks: ExternalDisks` (main) vs `pub vdevs: ...` (older).
@@ -279,8 +298,12 @@ pub(crate) fn stage_config(
     // count (`topology.sleds`), not the deployment total. (For a single rack the
     // two are equal.) Fabric routers = every router except the customer edge `ce`.
     let num_sleds_per_rack = cfg.topology.sleds;
-    let num_fabric_routers =
-        cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
+    let num_fabric_routers = cfg
+        .topology
+        .routers
+        .iter()
+        .filter(|r| r.as_str() != "ce")
+        .count();
     // Auto-detect the sled-agent config shapes from the image's omicron (no
     // per-era operator knobs); an [image] override wins if set.
     let (data_links, disks) = detect_sled_schema(cfg);
@@ -355,14 +378,20 @@ pub(crate) fn stage_config(
     for rack in 0..cfg.topology.racks() {
         let rack_sleds: Vec<&SledDesc> = sleds.iter().filter(|s| s.rack == rack).collect();
         let gimlet_indices: Vec<usize> = rack_sleds.iter().map(|s| s.index).collect();
-        let scrimlet_indices: Vec<usize> =
-            rack_sleds.iter().filter(|s| s.scrimlet).map(|s| s.index).collect();
+        let scrimlet_indices: Vec<usize> = rack_sleds
+            .iter()
+            .filter(|s| s.scrimlet)
+            .map(|s| s.index)
+            .collect();
         // The SP fleet (sidecar + one SP per rack sled) is the shared MGS↔SP
         // contract; sim backend today, swappable to a real-firmware host.
         // `--emu`: every SP is real-firmware on sp-emu (voxel-init disables sp-sim
         // in-zone). Default: sp-sim for the whole fleet, no emu staging.
         let fleet = if emu_sp {
-            voxel_config::sp::SpFleet::for_gimlets(&gimlet_indices, voxel_config::sp::SpBackend::Emu)
+            voxel_config::sp::SpFleet::for_gimlets(
+                &gimlet_indices,
+                voxel_config::sp::SpBackend::Emu,
+            )
         } else {
             voxel_config::sp::SpFleet::sim_for_gimlets(&gimlet_indices)
         };
@@ -409,7 +438,11 @@ fn stage_sp_emu(
     // previously the only signal of --emu-rot; the baked path needs it explicit.)
     let mut manifest = format!("rot {}\n", if emu_rot { 1 } else { 0 });
     for sp in &emu {
-        let role = if sp.selector() == "sidecar" { "sidecar" } else { "gimlet" };
+        let role = if sp.selector() == "sidecar" {
+            "sidecar"
+        } else {
+            "gimlet"
+        };
         manifest.push_str(&format!("{} {}\n", sp.base_port, role));
     }
     let ports_manifest = out.join("ports");
@@ -418,7 +451,9 @@ fn stage_sp_emu(
     // Dev override: with [sp].emu_bin set, stage the binary + per-SP flashes from
     // the local build for fast iteration (no rebake). Unset -> voxel-init uses the
     // baked image artifacts (the per-SP flash from the baked per-role flash).
-    let Some(emu_bin) = cfg.sp.emu_bin.as_deref() else { return Ok(()) };
+    let Some(emu_bin) = cfg.sp.emu_bin.as_deref() else {
+        return Ok(());
+    };
     fs::copy(emu_bin, out.join("sp-emu"))
         .with_context(|| format!("stage sp-emu binary from {emu_bin}"))?;
     // Stage `faux-mgs` (the MGS client) alongside it when configured, so
@@ -433,16 +468,21 @@ fn stage_sp_emu(
     // default: the two-core sidecar cannot answer MGS switch-id in time during
     // RSS, which wedges the nexus handoff - attach the bridge after bring-up.
     if emu_rot {
-        let rot = cfg.sp.rot_image.as_deref().ok_or_else(|| {
-            anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
-        })?;
+        let rot =
+            cfg.sp.rot_image.as_deref().ok_or_else(|| {
+                anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
+            })?;
         fs::copy(rot, out.join("rot.flash"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
     }
     for sp in emu {
         let sel = sp.selector();
         let image = cfg.sp.image_for(&sel).ok_or_else(|| {
-            let key = if sel == "sidecar" { "sidecar_image" } else { "gimlet_image" };
+            let key = if sel == "sidecar" {
+                "sidecar_image"
+            } else {
+                "gimlet_image"
+            };
             anyhow!("[sp].emu includes {sel} but [sp].{key} is unset")
         })?;
         let flash = out.join(format!("{}.flash", sp.base_port));
@@ -475,9 +515,12 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
 
     let file_behavior = sprockets::OutputFileExistsBehavior::Overwrite;
     let doc = sprockets::generate_config_start_from_0(sleds.len());
-    doc.write_key_pairs(src.clone(), file_behavior).map_err(|e| anyhow!("{e}"))?;
-    doc.write_certificates(src.clone(), file_behavior).map_err(|e| anyhow!("{e}"))?;
-    doc.write_certificate_lists(src.clone(), file_behavior).map_err(|e| anyhow!("{e}"))?;
+    doc.write_key_pairs(src.clone(), file_behavior)
+        .map_err(|e| anyhow!("{e}"))?;
+    doc.write_certificates(src.clone(), file_behavior)
+        .map_err(|e| anyhow!("{e}"))?;
+    doc.write_certificate_lists(src.clone(), file_behavior)
+        .map_err(|e| anyhow!("{e}"))?;
 
     // Fake attestation log + measurements. The digests are arbitrary (we don't
     // run a corpus); sled-agent only needs at least one measurement present, in a

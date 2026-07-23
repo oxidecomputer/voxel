@@ -49,7 +49,16 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             let dataset = falcon_dataset();
             let img = format!("{dataset}/img");
             let out = std::process::Command::new("zfs")
-                .args(["list", "-H", "-o", "name,used,creation,type", "-t", "volume,snapshot", "-r", &img])
+                .args([
+                    "list",
+                    "-H",
+                    "-o",
+                    "name,used,creation,type",
+                    "-t",
+                    "volume,snapshot",
+                    "-r",
+                    &img,
+                ])
                 .output()
                 .map_err(|e| anyhow!("run zfs list: {e}"))?;
             if !out.status.success() {
@@ -73,7 +82,10 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 match ty {
                     "volume" => {
                         if let Some(short) = name.strip_prefix(&prefix) {
-                            meta.insert(short.to_string(), (used.to_string(), creation.to_string()));
+                            meta.insert(
+                                short.to_string(),
+                                (used.to_string(), creation.to_string()),
+                            );
                         }
                     }
                     // A `<name>@base` snapshot is what makes <name> a bundle.
@@ -95,7 +107,17 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             let epochs: std::collections::HashMap<String, i64> = {
                 let mut m = std::collections::HashMap::new();
                 if let Ok(o) = std::process::Command::new("zfs")
-                    .args(["list", "-H", "-p", "-o", "name,creation", "-t", "volume", "-r", &img])
+                    .args([
+                        "list",
+                        "-H",
+                        "-p",
+                        "-o",
+                        "name,creation",
+                        "-t",
+                        "volume",
+                        "-r",
+                        &img,
+                    ])
                     .output()
                 {
                     for line in String::from_utf8_lossy(&o.stdout).lines() {
@@ -116,7 +138,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             });
             bundles.dedup();
             if bundles.is_empty() {
-                println!("no image bundles under {img} (build one with `voxel image create <commit>`)");
+                println!(
+                    "no image bundles under {img} (build one with `voxel image create <commit>`)"
+                );
                 return Ok(());
             }
             // Commit from the name: voxel-cp-<commit>[-<variant>] -> <commit>.
@@ -177,7 +201,10 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         }
         ImageCmd::Create { commit } => {
             let script = build_cp_script()?;
-            eprintln!("[voxel] building voxel-cp-{commit} via {}", script.display());
+            eprintln!(
+                "[voxel] building voxel-cp-{commit} via {}",
+                script.display()
+            );
             let status = std::process::Command::new("bash")
                 .arg(&script)
                 .arg(commit)
@@ -199,25 +226,39 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if !exists {
-                return Err(anyhow!("no such image snapshot: {snap} (try `voxel image ls`)"));
+                return Err(anyhow!(
+                    "no such image snapshot: {snap} (try `voxel image ls`)"
+                ));
             }
             let (default_out, pipe) = if *raw {
                 // Portable raw disk image: dd the zvol through xz.
                 let zvol = format!("/dev/zvol/rdsk/{dataset}/img/{name}");
-                (format!("{name}.raw.xz"), format!("dd if={zvol} bs=1M status=none | xz -T0 -c"))
+                (
+                    format!("{name}.raw.xz"),
+                    format!("dd if={zvol} bs=1M status=none | xz -T0 -c"),
+                )
             } else {
                 // ZFS-native stream (allocated blocks only): zfs send through zstd.
-                (format!("{name}.zfs.zst"), format!("zfs send {snap} | zstd -T0 -c"))
+                (
+                    format!("{name}.zfs.zst"),
+                    format!("zfs send {snap} | zstd -T0 -c"),
+                )
             };
             let out = out.clone().unwrap_or_else(|| PathBuf::from(default_out));
             eprintln!("[voxel] exporting {snap} -> {}", out.display());
             let status = std::process::Command::new("bash")
                 .arg("-c")
-                .arg(format!("{pipe} > {}", shell_quote(&out.display().to_string())))
+                .arg(format!(
+                    "{pipe} > {}",
+                    shell_quote(&out.display().to_string())
+                ))
                 .status()
                 .map_err(|e| anyhow!("export: {e}"))?;
             if !status.success() {
-                return Err(anyhow!("export failed (need {} on PATH)", if *raw { "xz" } else { "zstd" }));
+                return Err(anyhow!(
+                    "export failed (need {} on PATH)",
+                    if *raw { "xz" } else { "zstd" }
+                ));
             }
             println!("exported {}", out.display());
             Ok(())
@@ -230,14 +271,19 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .ok_or_else(|| anyhow!("bad file path"))?;
             // Derive image name + decompressor from the extension.
             let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst") {
-                (n.to_string(), format!("zstd -dc {}", shell_quote(&file.display().to_string())))
+                (
+                    n.to_string(),
+                    format!("zstd -dc {}", shell_quote(&file.display().to_string())),
+                )
             } else if let Some(n) = fname.strip_suffix(".raw.xz") {
                 return Err(anyhow!(
                     "raw import for {n} not wired here yet - use build-image.sh's \
                      streaming raw import (presized zvol). zfs streams (.zfs.zst) import directly."
                 ));
             } else {
-                return Err(anyhow!("unrecognized extension on {fname} (want .zfs.zst or .raw.xz)"));
+                return Err(anyhow!(
+                    "unrecognized extension on {fname} (want .zfs.zst or .raw.xz)"
+                ));
             };
             let dst = format!("{dataset}/img/{name}");
             eprintln!("[voxel] importing {} -> {dst}", file.display());
@@ -247,7 +293,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .status()
                 .map_err(|e| anyhow!("import: {e}"))?;
             if !status.success() {
-                return Err(anyhow!("import failed (need zstd + zfs; {dst} must not already exist)"));
+                return Err(anyhow!(
+                    "import failed (need zstd + zfs; {dst} must not already exist)"
+                ));
             }
             println!("imported {dst}@base (use: voxel config set image.cp {name})");
             Ok(())
@@ -271,7 +319,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .status()
                 .map_err(|e| anyhow!("zfs destroy: {e}"))?;
             if !status.success() {
-                return Err(anyhow!("zfs destroy {ds} failed (in use, or no such image?)"));
+                return Err(anyhow!(
+                    "zfs destroy {ds} failed (in use, or no such image?)"
+                ));
             }
             println!("removed {ds}");
             Ok(())
@@ -279,7 +329,10 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         // `image patch` needs the loaded config (for the default source image),
         // so it's dispatched in `main` before delegating the rest here.
         ImageCmd::Patch { .. } => Err(anyhow!("internal: `image patch` is dispatched in main")),
-        ImageCmd::RenderSmf { omicron_root, gimlets } => {
+        ImageCmd::RenderSmf {
+            omicron_root,
+            gimlets,
+        } => {
             // Bake switch0 for `gimlets` sleds with scrimlets at the first + last
             // sled (the convention the default topology follows). The launch-time
             // topology must keep scrimlets at those indices for the baked switch0

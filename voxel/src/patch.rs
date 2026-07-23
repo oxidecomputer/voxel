@@ -93,7 +93,10 @@ enum Shape {
     /// A running SMF service packaged as a flat "tarball" (no `root/`): extract
     /// the archive's contents straight into `dir` (its install dir) on the sled
     /// GZ and `svcadm restart fmri`. Used by the GZ ddm (`mg-ddm-gz`).
-    DirReplace { dir: &'static str, fmri: &'static str },
+    DirReplace {
+        dir: &'static str,
+        fmri: &'static str,
+    },
 }
 
 /// A patchable component: its buildomat coordinates (`repo`/`pkg`) and its on-node
@@ -124,7 +127,9 @@ fn registry() -> Vec<Component> {
             repo: "propolis",
             pkg: "propolis-server",
             archive: Archive::TarGz,
-            shape: Shape::ZoneImage { dest: "/opt/oxide/propolis-server.tar.gz" },
+            shape: Shape::ZoneImage {
+                dest: "/opt/oxide/propolis-server.tar.gz",
+            },
             targets: Targets::AllSleds,
             note: "zone image; effective on the next instance (no service restart)",
         },
@@ -133,7 +138,9 @@ fn registry() -> Vec<Component> {
             repo: "maghemite",
             pkg: "mgd",
             archive: Archive::TarGz,
-            shape: Shape::Overlay { fmri:"svc:/oxide/mgd:default" },
+            shape: Shape::Overlay {
+                fmri: "svc:/oxide/mgd:default",
+            },
             targets: Targets::Scrimlets,
             note: "BGP/static routing daemon; restart briefly flaps BGP (reconverges)",
         },
@@ -142,7 +149,9 @@ fn registry() -> Vec<Component> {
             repo: "maghemite",
             pkg: "mg-ddm",
             archive: Archive::TarGz,
-            shape: Shape::Overlay { fmri:"svc:/oxide/mg-ddm:default" },
+            shape: Shape::Overlay {
+                fmri: "svc:/oxide/mg-ddm:default",
+            },
             targets: Targets::Scrimlets,
             note: "switch-zone underlay ddm router",
         },
@@ -153,7 +162,10 @@ fn registry() -> Vec<Component> {
             repo: "maghemite",
             pkg: "mg-ddm-gz",
             archive: Archive::Tar,
-            shape: Shape::DirReplace { dir: "/opt/oxide/mg-ddm", fmri: "svc:/oxide/mg-ddm:default" },
+            shape: Shape::DirReplace {
+                dir: "/opt/oxide/mg-ddm",
+                fmri: "svc:/oxide/mg-ddm:default",
+            },
             targets: Targets::AllSleds,
             note: "global-zone underlay ddm router (every sled)",
         },
@@ -162,7 +174,9 @@ fn registry() -> Vec<Component> {
             repo: "dendrite",
             pkg: "dendrite-softnpu",
             archive: Archive::TarGz,
-            shape: Shape::Overlay { fmri:"svc:/oxide/dendrite:default" },
+            shape: Shape::Overlay {
+                fmri: "svc:/oxide/dendrite:default",
+            },
             targets: Targets::Scrimlets,
             note: "the data-plane controller (dpd); restart disrupts switching briefly",
         },
@@ -171,7 +185,9 @@ fn registry() -> Vec<Component> {
             repo: "lldp",
             pkg: "lldp",
             archive: Archive::TarGz,
-            shape: Shape::Overlay { fmri:"svc:/oxide/lldpd:default" },
+            shape: Shape::Overlay {
+                fmri: "svc:/oxide/lldpd:default",
+            },
             targets: Targets::Scrimlets,
             note: "link-layer discovery daemon; restart is benign",
         },
@@ -182,13 +198,19 @@ fn lookup(name: &str) -> anyhow::Result<Component> {
     let reg = registry();
     let names: Vec<&str> = reg.iter().map(|c| c.name).collect();
     reg.into_iter().find(|c| c.name == name).ok_or_else(|| {
-        anyhow!("unknown component '{name}'. patchable components: {}", names.join(", "))
+        anyhow!(
+            "unknown component '{name}'. patchable components: {}",
+            names.join(", ")
+        )
     })
 }
 
 /// Print the component registry (`voxel rack patch --list`).
 pub(crate) fn list() {
-    println!("{:<10}  {:<10}  {:<16}  {:<10}  {}", "COMPONENT", "REPO", "PKG", "TARGETS", "KIND");
+    println!(
+        "{:<10}  {:<10}  {:<16}  {:<10}  {}",
+        "COMPONENT", "REPO", "PKG", "TARGETS", "KIND"
+    );
     for c in registry() {
         let (targets, kind) = (
             match c.targets {
@@ -201,7 +223,10 @@ pub(crate) fn list() {
                 Shape::DirReplace { .. } => "service (gz)",
             },
         );
-        println!("{:<10}  {:<10}  {:<16}  {:<10}  {}", c.name, c.repo, c.pkg, targets, kind);
+        println!(
+            "{:<10}  {:<10}  {:<16}  {:<10}  {}",
+            c.name, c.repo, c.pkg, targets, kind
+        );
         println!("{:<54}{}", "", c.note);
     }
 }
@@ -214,7 +239,11 @@ fn cache_dir() -> PathBuf {
     let root = std::env::var("BUILD_ROOT")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join("voxel-builds")))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join("voxel-builds"))
+        })
         .unwrap_or_else(|| PathBuf::from("."));
     root.join("patch-cache")
 }
@@ -228,7 +257,11 @@ fn sha256(file: &Path) -> anyhow::Result<String> {
         .output()
         .map_err(|e| anyhow!("run digest: {e}"))?;
     if !out.status.success() {
-        return Err(anyhow!("digest {}: {}", file.display(), String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(anyhow!(
+            "digest {}: {}",
+            file.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -241,7 +274,10 @@ fn fetch_sha(url: &str) -> anyhow::Result<String> {
         .output()
         .map_err(|e| anyhow!("run curl: {e}"))?;
     if !out.status.success() {
-        return Err(anyhow!("fetch {url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(anyhow!(
+            "fetch {url}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
@@ -261,12 +297,19 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<PathBuf> {
 
     let base = format!("{BUILDOMAT}/{}/image/{reference}", comp.repo);
     let want = fetch_sha(&format!("{base}/{}.sha256.txt", comp.pkg)).with_context(|| {
-        format!("no published artifact for {} {} at {reference} (check the ref)", comp.repo, comp.pkg)
+        format!(
+            "no published artifact for {} {} at {reference} (check the ref)",
+            comp.repo, comp.pkg
+        )
     })?;
 
     // Reuse a cached download only if it already matches the published digest.
     if tarball.exists() && sha256(&tarball).map(|s| s == want).unwrap_or(false) {
-        eprintln!("[voxel] {} {reference}: using cached {} (sha ok)", comp.pkg, tarball.display());
+        eprintln!(
+            "[voxel] {} {reference}: using cached {} (sha ok)",
+            comp.pkg,
+            tarball.display()
+        );
         return Ok(tarball);
     }
     let url = format!("{base}/{}.{ext}", comp.pkg);
@@ -285,7 +328,10 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<PathBuf> {
     let got = sha256(&tarball)?;
     if got != want {
         let _ = std::fs::remove_file(&tarball);
-        return Err(anyhow!("sha256 mismatch for {}: got {got}, want {want}", comp.pkg));
+        return Err(anyhow!(
+            "sha256 mismatch for {}: got {got}, want {want}",
+            comp.pkg
+        ));
     }
     eprintln!("[voxel] {} {reference}: sha256 verified ({want})", comp.pkg);
     Ok(tarball)
@@ -297,7 +343,9 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<PathBuf> {
 async fn node_ip(d: &Runner, n: NodeRef) -> anyhow::Result<String> {
     tokio::time::timeout(Duration::from_secs(20), node_external_ip(d, n, false))
         .await
-        .map_err(|_| anyhow!("timed out resolving node IP over the serial console (is the rack up?)"))?
+        .map_err(|_| {
+            anyhow!("timed out resolving node IP over the serial console (is the rack up?)")
+        })?
 }
 
 /// The target `(name, NodeRef)` set for a component.
@@ -367,15 +415,24 @@ fn restart_and_verify(d: &Runner, node: &str, ip: &str, pkg: &str, in_switch: bo
     } else {
         format!("svcadm restart {fmri} && echo RESTART_OK")
     };
-    if !ssh_capture(ip, &restart).map(|o| o.contains("RESTART_OK")).unwrap_or(false) {
-        warn!(d.log, "{node}: placed {pkg} but `svcadm restart {fmri}` failed", );
+    if !ssh_capture(ip, &restart)
+        .map(|o| o.contains("RESTART_OK"))
+        .unwrap_or(false)
+    {
+        warn!(
+            d.log,
+            "{node}: placed {pkg} but `svcadm restart {fmri}` failed",
+        );
         return;
     }
     let state = wait_online(ip, in_switch, fmri);
     if state == "online" {
         info!(d.log, "{node}: {pkg} patched, {fmri} online");
     } else {
-        warn!(d.log, "{node}: {pkg} placed + restarted but {fmri} is '{state}' (check `voxel tp login`)");
+        warn!(
+            d.log,
+            "{node}: {pkg} placed + restarted but {fmri} is '{state}' (check `voxel tp login`)"
+        );
     }
 }
 
@@ -386,7 +443,10 @@ fn apply_overlay(d: &Runner, node: &str, ip: &str, comp: &Component, remote: &st
         .map(|o| o.contains("PATCH_PLACED_OK"))
         .unwrap_or(false);
     if !placed {
-        warn!(d.log, "{node}: failed to overlay {} into oxz_switch", comp.pkg);
+        warn!(
+            d.log,
+            "{node}: failed to overlay {} into oxz_switch", comp.pkg
+        );
         return;
     }
     restart_and_verify(d, node, ip, comp.pkg, true, fmri);
@@ -394,7 +454,15 @@ fn apply_overlay(d: &Runner, node: &str, ip: &str, comp: &Component, remote: &st
 
 /// Apply a DirReplace patch (flat GZ tarball) on one node: extract into the
 /// install dir, then restart + verify (GZ service).
-fn apply_dir_replace(d: &Runner, node: &str, ip: &str, comp: &Component, remote: &str, dir: &str, fmri: &str) {
+fn apply_dir_replace(
+    d: &Runner,
+    node: &str,
+    ip: &str,
+    comp: &Component,
+    remote: &str,
+    dir: &str,
+    fmri: &str,
+) {
     let placed = ssh_capture(ip, &dir_replace_cmd(comp, remote, dir))
         .map(|o| o.contains("PATCH_PLACED_OK"))
         .unwrap_or(false);
@@ -407,11 +475,17 @@ fn apply_dir_replace(d: &Runner, node: &str, ip: &str, comp: &Component, remote:
 
 /// Apply a ZoneImage patch on one node: replace the on-disk tarball.
 fn apply_zone_image(d: &Runner, node: &str, ip: &str, comp: &Component, remote: &str, dest: &str) {
-    let ok = ssh_capture(ip, &format!("cp {} {} && echo PATCH_PLACED_OK", q(remote), q(dest)))
-        .map(|o| o.contains("PATCH_PLACED_OK"))
-        .unwrap_or(false);
+    let ok = ssh_capture(
+        ip,
+        &format!("cp {} {} && echo PATCH_PLACED_OK", q(remote), q(dest)),
+    )
+    .map(|o| o.contains("PATCH_PLACED_OK"))
+    .unwrap_or(false);
     if ok {
-        info!(d.log, "{node}: {} replaced ({dest}) - {}", comp.pkg, comp.note);
+        info!(
+            d.log,
+            "{node}: {} replaced ({dest}) - {}", comp.pkg, comp.note
+        );
     } else {
         warn!(d.log, "{node}: failed to replace {dest}");
     }
@@ -438,8 +512,14 @@ pub(crate) async fn cmd_rack_patch(
     info!(
         d.log,
         "patch plan: {} ({}/{}) @ {reference} -> {where_} [{}] - {}",
-        comp.name, comp.repo, comp.pkg,
-        nodes.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+        comp.name,
+        comp.repo,
+        comp.pkg,
+        nodes
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         comp.note
     );
     if dry_run {
@@ -450,7 +530,9 @@ pub(crate) async fn cmd_rack_patch(
     // Fetch + sha-verify once on the box, then distribute the same artifact.
     let tarball = acquire(&comp, reference)?;
     let remote = format!("/var/tmp/{}.{}", comp.pkg, comp.archive.ext());
-    let local = tarball.to_str().ok_or_else(|| anyhow!("non-utf8 tarball path"))?;
+    let local = tarball
+        .to_str()
+        .ok_or_else(|| anyhow!("non-utf8 tarball path"))?;
 
     for (node, n) in nodes {
         let ip = match node_ip(d, n).await {
@@ -467,11 +549,16 @@ pub(crate) async fn cmd_rack_patch(
         match comp.shape {
             Shape::ZoneImage { dest } => apply_zone_image(d, &node, &ip, &comp, &remote, dest),
             Shape::Overlay { fmri } => apply_overlay(d, &node, &ip, &comp, &remote, fmri),
-            Shape::DirReplace { dir, fmri } => apply_dir_replace(d, &node, &ip, &comp, &remote, dir, fmri),
+            Shape::DirReplace { dir, fmri } => {
+                apply_dir_replace(d, &node, &ip, &comp, &remote, dir, fmri)
+            }
         }
         let _ = ssh_capture(&ip, &format!("rm -f {}", q(&remote)));
     }
-    info!(d.log, "patch complete ({} @ {reference}); reverts to the image on a clean relaunch", comp.name);
+    info!(
+        d.log,
+        "patch complete ({} @ {reference}); reverts to the image on a clean relaunch", comp.name
+    );
     Ok(())
 }
 
@@ -506,7 +593,8 @@ pub(crate) fn cmd_image_patch(
                 "`image patch` for switch-zone service '{}' isn't supported yet - it lives inside \
                  /opt/oxide/switch.tar.gz in the image and needs a zone-image repack. Use \
                  `voxel rack patch {}` for a live (ephemeral) patch.",
-                comp.name, comp.name
+                comp.name,
+                comp.name
             ));
         }
     };
@@ -537,7 +625,9 @@ pub(crate) fn cmd_image_patch(
     }
     // FALCON_DATASET is already exported by resolve_falcon_env; patch-image.sh +
     // build-image.sh read it.
-    let status = cmd.status().map_err(|e| anyhow!("run {}: {e}", script.display()))?;
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
     if !status.success() {
         return Err(anyhow!("patch-image.sh failed"));
     }

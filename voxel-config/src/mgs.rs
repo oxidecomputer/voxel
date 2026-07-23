@@ -115,7 +115,11 @@ mode = "stderr-terminal"
 /// construction (the sidecar SP is the switch port; each gimlet SP is a sled
 /// port).
 fn switch0_config(fleet: &SpFleet, scrimlets: &[usize]) -> String {
-    assert_eq!(scrimlets.len(), 2, "MGS sim models exactly two switches (scrimlets)");
+    assert_eq!(
+        scrimlets.len(),
+        2,
+        "MGS sim models exactly two switches (scrimlets)"
+    );
     let num_sleds = fleet.gimlets().len();
     let mut o = String::with_capacity(HEAD.len() + 200 * num_sleds);
 
@@ -133,8 +137,11 @@ fn switch0_config(fleet: &SpFleet, scrimlets: &[usize]) -> String {
     // Determination: contact every sled SP's fake-interface to locate ourselves.
     writeln!(o, "{DET_COMMENT}").unwrap();
     writeln!(o, "[[switch.location.determination]]").unwrap();
-    let ifaces: Vec<String> =
-        fleet.gimlets().iter().map(|sp| format!("\"{}\"", sp.fake_interface)).collect();
+    let ifaces: Vec<String> = fleet
+        .gimlets()
+        .iter()
+        .map(|sp| format!("\"{}\"", sp.fake_interface))
+        .collect();
     writeln!(o, "interfaces = [{}]", ifaces.join(", ")).unwrap();
     writeln!(o, "sp_port_1 = [\"switch0\"]").unwrap();
     writeln!(o, "sp_port_2 = [\"switch1\"]").unwrap();
@@ -354,7 +361,11 @@ mode = "stderr-terminal"
         // the port scheme + structure (still valid, still byte-identical except
         // the host).
         let host = "[fdb0:a840:2500:1::1]";
-        let s = switch_config(0, &SpFleet::new(4, crate::sp::SpBackend::Central { host: host.into() }), &[0, 3]);
+        let s = switch_config(
+            0,
+            &SpFleet::new(4, crate::sp::SpBackend::Central { host: host.into() }),
+            &[0, 3],
+        );
         let _: toml::Value = toml::from_str(&s).expect("emulated switch0 valid TOML");
         assert!(s.contains(&format!("addr = \"{host}:33300\"")));
         assert!(s.contains(&format!("addr = \"{host}:33310\"")));

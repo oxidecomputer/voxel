@@ -158,7 +158,12 @@ fn render_sp_block(o: &mut String, key: &str, sp: &Sp) {
         writeln!(o, "part_number = \"{pn}\"").unwrap();
     }
     writeln!(o, "serial_number = \"{}\"", sp.serial).unwrap();
-    writeln!(o, "manufacturing_root_cert_seed = \"{}\"", sp.root_cert_seed).unwrap();
+    writeln!(
+        o,
+        "manufacturing_root_cert_seed = \"{}\"",
+        sp.root_cert_seed
+    )
+    .unwrap();
     writeln!(o, "device_id_cert_seed = \"{}\"", sp.device_id_seed).unwrap();
     for inst in 0u16..2 {
         writeln!(o, "\n[[simulated_sps.{key}.network_config]]").unwrap();
@@ -278,7 +283,10 @@ impl SpFleet {
     /// The emulator-backed SPs in fleet order (sidecar first) - one in-zone sp-emu
     /// process + flash file each.
     pub fn emu_sps(&self) -> Vec<&Sp> {
-        self.sps.iter().filter(|sp| sp.backend == SpBackend::Emu).collect()
+        self.sps
+            .iter()
+            .filter(|sp| sp.backend == SpBackend::Emu)
+            .collect()
     }
 
     /// The sidecar SP (always present, first).
@@ -320,7 +328,12 @@ impl SpFleet {
             writeln!(o, "description = \"FAKE host cpu\"").unwrap();
             writeln!(o, "capabilities = 0").unwrap();
             writeln!(o, "presence = \"Present\"").unwrap();
-            writeln!(o, "serial_console = \"[::1]:{}\"", sp.base_port + CONSOLE_PORT_OFFSET).unwrap();
+            writeln!(
+                o,
+                "serial_console = \"[::1]:{}\"",
+                sp.base_port + CONSOLE_PORT_OFFSET
+            )
+            .unwrap();
         }
 
         writeln!(o, "\n[log]").unwrap();
@@ -380,8 +393,11 @@ mod tests {
         assert_eq!(g[0].base_port, 33340); // 33300 + 10*(3+1)
         assert_eq!(g[2].fake_interface, "fake-sled5");
         assert!(g[0].device_id_seed.ends_with("04")); // device_seed(3+1)
-        // The SP slot (location) is the global index - rack 1 sits in cubbies 3,4,5.
-        assert_eq!(g[0].mgs_location(), "{ switch0 = [\"sled\", 3], switch1 = [\"sled\", 3] }");
+                                                      // The SP slot (location) is the global index - rack 1 sits in cubbies 3,4,5.
+        assert_eq!(
+            g[0].mgs_location(),
+            "{ switch0 = [\"sled\", 3], switch1 = [\"sled\", 3] }"
+        );
         // ignition-target is a per-rack permutation (pos+2 mod n+1): 2,3,0 - and
         // never collides with the sidecar's target (1).
         assert_eq!(f.sidecar().ignition_target, 1);
@@ -396,11 +412,18 @@ mod tests {
         let f = SpFleet::sim_with_emu(&[0, 1, 2, 3], &["sidecar".into(), "g0".into()]);
         assert!(f.has_emu());
         // emu set is sidecar + g0, in fleet order.
-        let emu: Vec<&str> = f.emu_sps().iter().map(|s| s.fake_interface.as_str()).collect();
+        let emu: Vec<&str> = f
+            .emu_sps()
+            .iter()
+            .map(|s| s.fake_interface.as_str())
+            .collect();
         assert_eq!(emu, vec!["fake-switch0", "fake-sled0"]);
         // sp-sim config omits the emulated SPs: no sidecar block, gimlets g1..g3 only.
         let v: toml::Value = toml::from_str(&f.sp_sim_config()).expect("valid TOML");
-        assert!(v["simulated_sps"].get("sidecar").is_none(), "emu sidecar not in sp-sim");
+        assert!(
+            v["simulated_sps"].get("sidecar").is_none(),
+            "emu sidecar not in sp-sim"
+        );
         assert_eq!(v["simulated_sps"]["gimlet"].as_array().unwrap().len(), 3);
         // Both providers are in-zone on loopback - MGS surface is unchanged.
         assert_eq!(f.sidecar().mgs_host, "[::1]");
@@ -421,7 +444,10 @@ mod tests {
     #[test]
     fn new_is_for_gimlets_zero_to_n() {
         // The single-rack constructor must stay byte-identical to the explicit form.
-        assert_eq!(SpFleet::sim(4).sp_sim_config(), SpFleet::for_gimlets(&[0, 1, 2, 3], SpBackend::Sim).sp_sim_config());
+        assert_eq!(
+            SpFleet::sim(4).sp_sim_config(),
+            SpFleet::for_gimlets(&[0, 1, 2, 3], SpBackend::Sim).sp_sim_config()
+        );
     }
 
     #[test]
@@ -429,13 +455,21 @@ mod tests {
         // Identities + ports are invariant across backends; only the MGS host
         // (the pluggable bit) changes.
         let sim = SpFleet::sim(4);
-        let emu = SpFleet::new(4, SpBackend::Central { host: "[fdb0:a840:2500:1::1]".into() });
+        let emu = SpFleet::new(
+            4,
+            SpBackend::Central {
+                host: "[fdb0:a840:2500:1::1]".into(),
+            },
+        );
 
         // Same fleet shape + identities.
         assert_eq!(sim.sps.len(), 5); // sidecar + 4 gimlets
         assert_eq!(sim.sidecar().serial, "SimSidecar0");
         assert_eq!(sim.gimlets()[0].base_port, emu.gimlets()[0].base_port);
-        assert_eq!(sim.gimlets()[2].device_id_seed, emu.gimlets()[2].device_id_seed);
+        assert_eq!(
+            sim.gimlets()[2].device_id_seed,
+            emu.gimlets()[2].device_id_seed
+        );
 
         // Only the MGS-facing host differs.
         assert_eq!(sim.sidecar().mgs_host, "[::1]");

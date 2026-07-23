@@ -257,10 +257,7 @@ enum NetworkCmd {
     },
     /// Take down a switch port's link (disable + delete) on a running rack,
     /// e.g. `voxel network link-down switch0 qsfp2`.
-    LinkDown {
-        switch: String,
-        port: String,
-    },
+    LinkDown { switch: String, port: String },
     /// Validate live networking: link states, BGP sessions, routes, host routes.
     Validate {
         /// Full `swadm`/`mgadm` output instead of summary counts.
@@ -534,7 +531,10 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         std::env::set_var("BUILD_ROOT", b);
     }
     let build_root_eff = build_root.unwrap_or_else(|| {
-        format!("{}/voxel-builds", std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+        format!(
+            "{}/voxel-builds",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+        )
     });
     // voxel-rss-gen: `--rss-gen` flag or `$VOXEL_RSS_GEN` still override, but by
     // default DERIVE the path from the image's omicron commit so it can never drift
@@ -562,7 +562,10 @@ fn anchor_workdir(cli: &Cli, cfg: Option<&VoxelConfig>, config_path: &Path) -> a
     let root = cli
         .workdir
         .clone()
-        .or_else(|| cfg.and_then(|c| c.falcon.workdir.clone()).map(PathBuf::from))
+        .or_else(|| {
+            cfg.and_then(|c| c.falcon.workdir.clone())
+                .map(PathBuf::from)
+        })
         .or_else(|| config_path.parent().map(Path::to_path_buf));
     if let Some(root) = root {
         if root.is_dir() {
@@ -582,9 +585,23 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route, emu_sp, emu_rot, wicket_setup } => {
-            rack::cmd_launch(&load_config(&config_path)?, &cli.name, *no_progress, *no_route, *emu_sp || *emu_rot, *emu_rot, *wicket_setup)
-                .await
+        Cmd::Launch {
+            no_progress,
+            no_route,
+            emu_sp,
+            emu_rot,
+            wicket_setup,
+        } => {
+            rack::cmd_launch(
+                &load_config(&config_path)?,
+                &cli.name,
+                *no_progress,
+                *no_route,
+                *emu_sp || *emu_rot,
+                *emu_rot,
+                *wicket_setup,
+            )
+            .await
         }
         Cmd::WicketDryrun { config_rss, sleds } => wicket_setup::dryrun(config_rss, *sleds),
         Cmd::Route { dry_run } => {
@@ -598,7 +615,12 @@ async fn main() -> Result<(), Error> {
         Cmd::Status => rack::cmd_status(&load_config(&config_path)?, &cli.name).await,
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
-            ImageCmd::Patch { component, reference, image, out } => {
+            ImageCmd::Patch {
+                component,
+                reference,
+                image,
+                out,
+            } => {
                 let cfg = load_config(&config_path)?;
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
@@ -607,8 +629,21 @@ async fn main() -> Result<(), Error> {
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
-            NetworkCmd::LinkUp { switch, port, speed, fec } => {
-                network::link_up(&load_config(&config_path)?, &cli.name, switch, port, speed, fec).await
+            NetworkCmd::LinkUp {
+                switch,
+                port,
+                speed,
+                fec,
+            } => {
+                network::link_up(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    switch,
+                    port,
+                    speed,
+                    fec,
+                )
+                .await
             }
             NetworkCmd::LinkDown { switch, port } => {
                 network::link_down(&load_config(&config_path)?, &cli.name, switch, port).await
@@ -618,19 +653,30 @@ async fn main() -> Result<(), Error> {
             }
         },
         Cmd::Rack { cmd } => match cmd {
-            RackCmd::Patch { component, reference, list, dry_run } => {
+            RackCmd::Patch {
+                component,
+                reference,
+                list,
+                dry_run,
+            } => {
                 if *list {
                     patch::list();
                     Ok(())
                 } else {
-                    let component = component
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("missing component (try `voxel rack patch --list`)"))?;
-                    let reference = reference
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("missing ref (usage: voxel rack patch {component} <ref>)"))?;
-                    patch::cmd_rack_patch(&load_config(&config_path)?, &cli.name, component, reference, *dry_run)
-                        .await
+                    let component = component.as_deref().ok_or_else(|| {
+                        anyhow!("missing component (try `voxel rack patch --list`)")
+                    })?;
+                    let reference = reference.as_deref().ok_or_else(|| {
+                        anyhow!("missing ref (usage: voxel rack patch {component} <ref>)")
+                    })?;
+                    patch::cmd_rack_patch(
+                        &load_config(&config_path)?,
+                        &cli.name,
+                        component,
+                        reference,
+                        *dry_run,
+                    )
+                    .await
                 }
             }
         },

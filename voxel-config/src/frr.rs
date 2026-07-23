@@ -21,7 +21,10 @@ pub struct FrrNeighbor {
 
 impl FrrNeighbor {
     pub fn new(interface: impl Into<String>, description: impl Into<String>) -> Self {
-        Self { interface: interface.into(), description: description.into() }
+        Self {
+            interface: interface.into(),
+            description: description.into(),
+        }
     }
 }
 

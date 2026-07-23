@@ -80,10 +80,7 @@ impl SledAgentConfig {
 
     /// Select the sled-agent `data_links` config shape (see
     /// [`crate::config::SledDataLinksSchema`]).
-    pub fn with_data_links_schema(
-        mut self,
-        schema: crate::config::SledDataLinksSchema,
-    ) -> Self {
+    pub fn with_data_links_schema(mut self, schema: crate::config::SledDataLinksSchema) -> Self {
         self.data_links = schema;
         self
     }
@@ -110,7 +107,11 @@ impl SledAgentConfig {
         // (front) port per fabric router. dpd assigns the rear ports first, so
         // they line up with the topology's softnpu_link order (sleds, then fabric
         // routers). Gimlets have no switch zone, so the values are vestigial.
-        let front = if self.scrimlet { self.num_fabric_routers + self.num_interconnects } else { 1 };
+        let front = if self.scrimlet {
+            self.num_fabric_routers + self.num_interconnects
+        } else {
+            1
+        };
         let rear = self.num_sleds;
         writeln!(
             o,
@@ -124,8 +125,7 @@ impl SledAgentConfig {
         // Emulated M.2 (×2) + U.2 (×5) vdevs, named per sled. The field shape
         // changed across omicron eras (flat `vdevs` list -> tagged `external_disks`
         // enum), so render per the selected schema (see SledDisksSchema).
-        let mut vdevs: Vec<String> =
-            vec![format!("m2_g{i}_0.vdev"), format!("m2_g{i}_1.vdev")];
+        let mut vdevs: Vec<String> = vec![format!("m2_g{i}_0.vdev"), format!("m2_g{i}_1.vdev")];
         for u in 0..5 {
             vdevs.push(format!("u2_g{i}_{u}.vdev"));
         }
@@ -143,10 +143,16 @@ impl SledAgentConfig {
             crate::config::SledDisksSchema::ExternalDisks => {
                 // Inline table (TOML inline tables can't span lines), mirroring
                 // omicron's `ExternalDisks::Virtual { vdevs }` (#[serde(tag="kind")]).
-                let list =
-                    vdevs.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(", ");
-                writeln!(o, "external_disks = {{ kind = \"virtual\", vdevs = [{list}] }}")
-                    .unwrap();
+                let list = vdevs
+                    .iter()
+                    .map(|v| format!("\"{v}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    o,
+                    "external_disks = {{ kind = \"virtual\", vdevs = [{list}] }}"
+                )
+                .unwrap();
             }
         }
         writeln!(o).unwrap();
@@ -174,8 +180,11 @@ impl SledAgentConfig {
         }
         writeln!(o).unwrap();
 
-        let devices =
-            if self.scrimlet { "\"vioif1\", \"vioif2\"" } else { "\"vioif0\", \"vioif1\"" };
+        let devices = if self.scrimlet {
+            "\"vioif1\", \"vioif2\""
+        } else {
+            "\"vioif0\", \"vioif1\""
+        };
         let data_links = match self.data_links {
             crate::config::SledDataLinksSchema::List => format!("[{devices}]"),
             crate::config::SledDataLinksSchema::Tagged => {
@@ -262,13 +271,26 @@ mod tests {
     fn interconnects_bump_scrimlet_front_ports() {
         // A scrimlet on 1 interconnect: front = num_fabric_routers + 1 (the
         // extra QSFP for the sidecar<->sidecar link). Rear unchanged.
-        let v = parse(&SledAgentConfig::new(0, true).with_topology(4, 2).with_interconnects(1).render());
+        let v = parse(
+            &SledAgentConfig::new(0, true)
+                .with_topology(4, 2)
+                .with_interconnects(1)
+                .render(),
+        );
         let sp = &v["sidecar_revision"]["soft_propolis"];
         assert_eq!(sp["front_port_count"].as_integer(), Some(3));
         assert_eq!(sp["rear_port_count"].as_integer(), Some(4));
         // Gimlets have no switch zone, so interconnects don't apply.
-        let g = parse(&SledAgentConfig::new(1, false).with_topology(4, 2).with_interconnects(1).render());
-        assert_eq!(g["sidecar_revision"]["soft_propolis"]["front_port_count"].as_integer(), Some(1));
+        let g = parse(
+            &SledAgentConfig::new(1, false)
+                .with_topology(4, 2)
+                .with_interconnects(1)
+                .render(),
+        );
+        assert_eq!(
+            g["sidecar_revision"]["soft_propolis"]["front_port_count"].as_integer(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -279,7 +301,10 @@ mod tests {
             v["sidecar_revision"]["soft_propolis"]["front_port_count"].as_integer(),
             Some(1)
         );
-        assert!(v["switch_zone_maghemite_links"].as_array().unwrap().is_empty());
+        assert!(v["switch_zone_maghemite_links"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         let vdevs = v["vdevs"].as_array().unwrap();
         assert_eq!(vdevs[2].as_str(), Some("u2_g1_0.vdev"));
         assert!(v["sprockets"]["attest"]["priv_key"]

@@ -43,7 +43,10 @@ pub(crate) fn dryrun(config_rss_path: &Path, num_sleds: usize) -> Result<()> {
     let slots: Vec<u16> = (0..num_sleds as u16).collect();
     let (body, pw_hash) = build_bodies(&config_rss, &slots)?;
     println!("{body}");
-    eprintln!("[dryrun] recovery password hash present: {}", !pw_hash.is_empty());
+    eprintln!(
+        "[dryrun] recovery password hash present: {}",
+        !pw_hash.is_empty()
+    );
     Ok(())
 }
 
@@ -70,8 +73,15 @@ fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, St
     let mut switch1 = serde_json::Map::new();
     if let Some(ports) = rnc.get("ports").and_then(|p| p.as_array()) {
         for p in ports {
-            let switch = p.get("switch").and_then(|s| s.as_str()).unwrap_or("switch0");
-            let port = p.get("port").and_then(|s| s.as_str()).unwrap_or("qsfp0").to_string();
+            let switch = p
+                .get("switch")
+                .and_then(|s| s.as_str())
+                .unwrap_or("switch0");
+            let port = p
+                .get("port")
+                .and_then(|s| s.as_str())
+                .unwrap_or("qsfp0")
+                .to_string();
             let cfg = reshape_port(p);
             if switch == "switch1" {
                 switch1.insert(port, cfg);
@@ -126,7 +136,11 @@ fn reshape_port(p: &toml::Value) -> serde_json::Value {
     let addresses: Vec<serde_json::Value> = p
         .get("addresses")
         .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().map(|a| serde_json::json!({"address": flat_uplink_addr(a)})).collect())
+        .map(|arr| {
+            arr.iter()
+                .map(|a| serde_json::json!({"address": flat_uplink_addr(a)}))
+                .collect()
+        })
         .unwrap_or_default();
     let bgp_peers: Vec<serde_json::Value> = p
         .get("bgp_peers")
@@ -187,7 +201,9 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
         toml::Value::Boolean(b) => serde_json::Value::Bool(b),
         toml::Value::Float(f) => serde_json::json!(f),
         toml::Value::Datetime(d) => serde_json::Value::String(d.to_string()),
-        toml::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(toml_to_json).collect()),
+        toml::Value::Array(a) => {
+            serde_json::Value::Array(a.into_iter().map(toml_to_json).collect())
+        }
         toml::Value::Table(t) => {
             serde_json::Value::Object(t.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect())
         }
@@ -204,9 +220,13 @@ fn gen_cert(zone: &str) -> Result<(String, String)> {
     let cert = dir.join("voxel-wicket-cert.pem");
     let san = format!("DNS:*.sys.{zone},DNS:*.{zone},DNS:{zone}");
     let status = std::process::Command::new("openssl")
-        .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-sha256"])
-        .arg("-keyout").arg(&key)
-        .arg("-out").arg(&cert)
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-sha256",
+        ])
+        .arg("-keyout")
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
         .args(["-subj", &format!("/CN=*.sys.{zone}")])
         .args(["-addext", &format!("subjectAltName={san}")])
         .status()
@@ -214,7 +234,10 @@ fn gen_cert(zone: &str) -> Result<(String, String)> {
     if !status.success() {
         return Err(anyhow!("openssl cert generation failed"));
     }
-    Ok((std::fs::read_to_string(&cert)?, std::fs::read_to_string(&key)?))
+    Ok((
+        std::fs::read_to_string(&cert)?,
+        std::fs::read_to_string(&key)?,
+    ))
 }
 
 /// JSON-encode a string body (`TypedBody<String>` -- the cert/key endpoints take
@@ -238,7 +261,9 @@ fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> R
          -H content-type:application/json --data @/var/tmp/{name} {WICKETD}{path}"
     ));
     let code = ssh_capture(ip, &curl).ok_or_else(|| anyhow!("ssh curl {path} failed"))?;
-    code.trim().parse::<u32>().map_err(|_| anyhow!("{path}: unexpected response {code:?}"))
+    code.trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow!("{path}: unexpected response {code:?}"))
 }
 
 /// Poll wicketd until it's up and has discovered the rack's SPs (so
@@ -291,7 +316,13 @@ pub(crate) async fn drive(
     // retry a handful of times before giving up.
     let mut put_config = 0;
     for attempt in 1..=CONFIG_PUT_ATTEMPTS {
-        put_config = wicketd_call(&ip, "PUT", "/rack-setup/config", &config_body, "wsetup-config.json")?;
+        put_config = wicketd_call(
+            &ip,
+            "PUT",
+            "/rack-setup/config",
+            &config_body,
+            "wsetup-config.json",
+        )?;
         if put_config == 204 {
             break;
         }
@@ -299,10 +330,24 @@ pub(crate) async fn drive(
         std::thread::sleep(Duration::from_secs(6));
     }
     if put_config != 204 {
-        return Err(anyhow!("PUT /rack-setup/config -> HTTP {put_config} after {CONFIG_PUT_ATTEMPTS} attempts"));
+        return Err(anyhow!(
+            "PUT /rack-setup/config -> HTTP {put_config} after {CONFIG_PUT_ATTEMPTS} attempts"
+        ));
     }
-    let c = wicketd_call(&ip, "POST", "/rack-setup/config/cert", &json_string(&cert_pem), "wsetup-cert.json")?;
-    let k = wicketd_call(&ip, "POST", "/rack-setup/config/key", &json_string(&key_pem), "wsetup-key.json")?;
+    let c = wicketd_call(
+        &ip,
+        "POST",
+        "/rack-setup/config/cert",
+        &json_string(&cert_pem),
+        "wsetup-cert.json",
+    )?;
+    let k = wicketd_call(
+        &ip,
+        "POST",
+        "/rack-setup/config/key",
+        &json_string(&key_pem),
+        "wsetup-key.json",
+    )?;
     if !(200..300).contains(&c) || !(200..300).contains(&k) {
         return Err(anyhow!("cert/key upload -> HTTP {c}/{k}"));
     }
@@ -316,7 +361,10 @@ pub(crate) async fn drive(
     if pw != 204 {
         return Err(anyhow!("PUT recovery-user-password-hash -> HTTP {pw}"));
     }
-    info!(d.log, "{tag}: config + cert + recovery password uploaded; triggering RSS");
+    info!(
+        d.log,
+        "{tag}: config + cert + recovery password uploaded; triggering RSS"
+    );
 
     // Trigger init. `post_run_rack_setup` assembles the RackInitializeRequest from
     // the uploaded config + the discovered bootstrap_sleds and calls the

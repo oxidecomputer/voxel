@@ -78,10 +78,15 @@ fn rss_step_display(step: &str) -> (usize, String) {
 /// ~12m, but emulated SPs slow every MGS RPC and a multi-rack launch runs the
 /// racks' bring-up under each other's load, so those need a bigger budget (see
 /// the callers in `rack.rs`).
-pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, tag: &str, cap: Duration) {
-    let curl = format!(
-        "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
-    );
+pub(crate) async fn watch_rss(
+    d: &Runner,
+    rss: NodeRef,
+    bootstrap_addr: &str,
+    tag: &str,
+    cap: Duration,
+) {
+    let curl =
+        format!("curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null");
     const POLL_INTERVAL: Duration = Duration::from_secs(8);
     const HEARTBEAT: Duration = Duration::from_secs(90); // re-affirm liveness this often
 
@@ -98,13 +103,19 @@ pub(crate) async fn watch_rss(d: &Runner, rss: NodeRef, bootstrap_addr: &str, ta
     {
         Ok(Ok(ip)) => ip,
         Ok(Err(e)) => {
-            warn!(d.log, "{tag}: can't find the RSS node's IP to watch over SSH ({e}); \
-                bring-up continues - check `voxel status` / the console");
+            warn!(
+                d.log,
+                "{tag}: can't find the RSS node's IP to watch over SSH ({e}); \
+                bring-up continues - check `voxel status` / the console"
+            );
             return;
         }
         Err(_) => {
-            warn!(d.log, "{tag}: timed out finding the RSS node's IP; bring-up \
-                continues - check `voxel status` / the console");
+            warn!(
+                d.log,
+                "{tag}: timed out finding the RSS node's IP; bring-up \
+                continues - check `voxel status` / the console"
+            );
             return;
         }
     };
@@ -283,7 +294,8 @@ mod tests {
     #[test]
     fn strip_ansi_yields_clean_ip() {
         // ip(8) colorizes: ESC[36menp0s10ESC[0m ... ESC[35m192.168.68.171ESC[0m/22
-        let colored = "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
+        let colored =
+            "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
         let clean = strip_ansi(colored);
         let ip = clean
             .split_whitespace()

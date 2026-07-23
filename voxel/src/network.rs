@@ -22,15 +22,27 @@ const MGADM: &str = "/opt/oxide/mgd/bin/mgadm";
 
 /// The global switch index (`switchN`) for each scrimlet, in order.
 fn switches(cfg: &VoxelConfig) -> Vec<(usize, SledDesc)> {
-    cfg.sleds().into_iter().filter(|s| s.scrimlet).enumerate().collect()
+    cfg.sleds()
+        .into_iter()
+        .filter(|s| s.scrimlet)
+        .enumerate()
+        .collect()
 }
 
 // --- show ------------------------------------------------------------------
 
 pub(crate) fn show(cfg: &VoxelConfig) -> anyhow::Result<()> {
     let racks = cfg.topology.racks();
-    let nfr = cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
-    println!("network topology - {racks} rack{}", if racks == 1 { "" } else { "s" });
+    let nfr = cfg
+        .topology
+        .routers
+        .iter()
+        .filter(|r| r.as_str() != "ce")
+        .count();
+    println!(
+        "network topology - {racks} rack{}",
+        if racks == 1 { "" } else { "s" }
+    );
 
     let sw = switches(cfg);
     for rack in 0..racks {
@@ -38,7 +50,10 @@ pub(crate) fn show(cfg: &VoxelConfig) -> anyhow::Result<()> {
         println!();
         println!("rack{} [{}]", rack + 1, net.dns_zone);
         println!("  customer prefix : {}", net.infra_prefix);
-        println!("  service pool    : {} - {}", net.service_pool_first, net.service_pool_last);
+        println!(
+            "  service pool    : {} - {}",
+            net.service_pool_first, net.service_pool_last
+        );
         println!("  external DNS    : {}", net.external_dns_ips.join(", "));
         println!("  rack subnet     : {}", net.rack_subnet);
         println!("  BGP ASN         : {}", net.bgp_asn);
@@ -54,7 +69,9 @@ pub(crate) fn show(cfg: &VoxelConfig) -> anyhow::Result<()> {
     if pairs.is_empty() {
         println!("cross-rack interconnects: none (single rack)");
     } else {
-        println!("cross-rack sidecar interconnects (auto full mesh; softnpu_links, land on qsfp{nfr}+):");
+        println!(
+            "cross-rack sidecar interconnects (auto full mesh; softnpu_links, land on qsfp{nfr}+):"
+        );
         for (a, b) in &pairs {
             println!("  g{a} <-> g{b}");
         }
@@ -65,7 +82,11 @@ pub(crate) fn show(cfg: &VoxelConfig) -> anyhow::Result<()> {
 // --- link-up / link-down (live) --------------------------------------------
 
 /// Resolve a switch selector to its scrimlet name + host-LAN IP on a running rack.
-async fn switch_ip(cfg: &VoxelConfig, name: &str, switch: &str) -> anyhow::Result<(String, String)> {
+async fn switch_ip(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+) -> anyhow::Result<(String, String)> {
     let topo = build_topo(cfg, name)?;
     let (sw, n) = {
         let (sd, nr) = crate::access::resolve_switch(&topo, switch)?;
@@ -100,21 +121,28 @@ pub(crate) async fn link_up(
     if present {
         eprintln!("[voxel] {link} already exists; (re)enabling");
     } else {
-        let create =
-            zlogin(&format!("{SWADM} link create -s {speed} --fec {fec} {port} 2>&1 && echo CREATE_OK"));
+        let create = zlogin(&format!(
+            "{SWADM} link create -s {speed} --fec {fec} {port} 2>&1 && echo CREATE_OK"
+        ));
         let out = ssh_output(&ip, &create).unwrap_or_default();
         if !out.contains("CREATE_OK") {
             return Err(anyhow!("link create {link} on {sw} failed: {}", out.trim()));
         }
     }
-    let en = ssh_output(&ip, &zlogin(&format!("{SWADM} link enable {link} 2>&1 && echo ENABLE_OK")))
-        .unwrap_or_default();
+    let en = ssh_output(
+        &ip,
+        &zlogin(&format!(
+            "{SWADM} link enable {link} 2>&1 && echo ENABLE_OK"
+        )),
+    )
+    .unwrap_or_default();
     if !en.contains("ENABLE_OK") {
         return Err(anyhow!("link enable {link} on {sw} failed: {}", en.trim()));
     }
     // Brief settle, then show the link state (Down until the peer end is up too).
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let st = ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1"))).unwrap_or_default();
+    let st =
+        ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1"))).unwrap_or_default();
     print!("{st}");
     eprintln!("[voxel] {sw}: {link} created + enabled (reaches Up once the peer switch's {port} is also up)");
     eprintln!("[voxel] ⚠️  transient: Nexus's reconciler will reap this manual link in ~30s - debug only; use the Oxide API to persist");
@@ -123,13 +151,23 @@ pub(crate) async fn link_up(
 
 /// `voxel network link-down <switch> <port>` - disable + delete a switch port's
 /// link in the live switch zone.
-pub(crate) async fn link_down(cfg: &VoxelConfig, name: &str, switch: &str, port: &str) -> anyhow::Result<()> {
+pub(crate) async fn link_down(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+    port: &str,
+) -> anyhow::Result<()> {
     let (sw, ip) = switch_ip(cfg, name, switch).await?;
     let link = format!("{port}/0");
     eprintln!("[voxel] {sw} ({ip}): taking down link {link}");
     let _ = ssh_output(&ip, &zlogin(&format!("{SWADM} link disable {link} 2>&1")));
-    let out = ssh_output(&ip, &zlogin(&format!("{SWADM} link delete {link} 2>&1 && echo DELETE_OK")))
-        .unwrap_or_default();
+    let out = ssh_output(
+        &ip,
+        &zlogin(&format!(
+            "{SWADM} link delete {link} 2>&1 && echo DELETE_OK"
+        )),
+    )
+    .unwrap_or_default();
     if out.contains("DELETE_OK") {
         println!("{sw}: link {link} disabled + deleted");
         Ok(())
@@ -161,7 +199,10 @@ fn section(title: &str, body: &str) {
 pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let racks = cfg.topology.racks();
-    println!("validating live network for '{name}'{} ...", if detail { " (--detail)" } else { "" });
+    println!(
+        "validating live network for '{name}'{} ...",
+        if detail { " (--detail)" } else { "" }
+    );
 
     for (s, n) in topo.sleds.iter().filter(|(s, _)| s.scrimlet) {
         let ip = match node_external_ip(&topo.runner, *n, false).await {
@@ -188,12 +229,19 @@ pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> any
             let (up, down) = (count_lines(&links, "Up"), count_lines(&links, "Down"));
             let nports = ports.lines().filter(|l| !l.trim().is_empty()).count();
             println!("    links  : {up} up, {down} down  ({nports} switch ports)");
-            println!("    bgp    : {} established (asn {asn})", count_lines(&bgp, "Established"));
+            println!(
+                "    bgp    : {} established (asn {asn})",
+                count_lines(&bgp, "Established")
+            );
             let xrack = routes.lines().filter(|l| l.contains("198.51.10")).count();
             println!(
                 "    routes : {} entries{}",
                 routes.lines().count(),
-                if racks > 1 { format!(", {xrack} customer /24") } else { String::new() }
+                if racks > 1 {
+                    format!(", {xrack} customer /24")
+                } else {
+                    String::new()
+                }
             );
         }
     }
@@ -202,14 +250,23 @@ pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> any
     println!("  host routes:");
     for rack in 0..racks {
         let net = cfg.network.for_rack(rack);
-        let dest = net.infra_prefix.split('/').next().unwrap_or(&net.infra_prefix).to_string();
+        let dest = net
+            .infra_prefix
+            .split('/')
+            .next()
+            .unwrap_or(&net.infra_prefix)
+            .to_string();
         let gw = std::process::Command::new("route")
             .args(["-n", "get", &dest])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .and_then(|s| {
-                s.lines().find_map(|l| l.trim().strip_prefix("gateway:").map(|g| g.trim().to_string()))
+                s.lines().find_map(|l| {
+                    l.trim()
+                        .strip_prefix("gateway:")
+                        .map(|g| g.trim().to_string())
+                })
             })
             .unwrap_or_else(|| "(none)".into());
         println!("    rack{} {} -> {gw}", rack + 1, net.infra_prefix);

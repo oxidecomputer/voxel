@@ -23,7 +23,11 @@ const PATCHED_CFG: &str = "/tmp/sled-config.toml";
 /// "dev cargo-bay wins, baked image otherwise" rule used to source every sp-emu
 /// artifact.
 fn pick(staged: String, baked: String) -> String {
-    if std::path::Path::new(&staged).exists() { staged } else { baked }
+    if std::path::Path::new(&staged).exists() {
+        staged
+    } else {
+        baked
+    }
 }
 
 /// Poll `f` every 2s until it returns true or `max_s` seconds elapse; returns
@@ -51,7 +55,10 @@ pub fn bring_up() -> Result<()> {
         return Err(anyhow!("{OMICRON} not baked into the image"));
     }
     std::env::set_var("XTASK_BIN", format!("{OMICRON}/xtask"));
-    std::env::set_var("XTASK_DOWNLOADER_BIN", format!("{OMICRON}/xtask-downloader"));
+    std::env::set_var(
+        "XTASK_DOWNLOADER_BIN",
+        format!("{OMICRON}/xtask-downloader"),
+    );
     std::env::set_current_dir(OMICRON).with_context(|| format!("cd {OMICRON}"))?;
 
     let (underlay, other) = detect_underlay();
@@ -79,7 +86,10 @@ fn setup_ssh() {
         let _ = fs::create_dir_all("/root/.ssh");
         if let Ok(keys) = fs::read(&authorized) {
             use std::io::Write;
-            match fs::OpenOptions::new().create(true).append(true).open("/root/.ssh/authorized_keys")
+            match fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/root/.ssh/authorized_keys")
             {
                 Ok(mut f) => {
                     let _ = f.write_all(&keys);
@@ -130,7 +140,11 @@ fn maybe_load_sidecar() {
     if scrimlet {
         run(
             "/opt/oxide/sidecar/scadm",
-            &["propolis", "load-program", "/opt/oxide/sidecar/libsidecar_lite.so"],
+            &[
+                "propolis",
+                "load-program",
+                "/opt/oxide/sidecar/libsidecar_lite.so",
+            ],
         );
     }
 }
@@ -153,7 +167,9 @@ fn detect_underlay() -> (Vec<String>, Vec<String>) {
             other.push(nic);
         }
     }
-    note(format!("underlay(jumbo)={underlay:?} ext-candidates={other:?}"));
+    note(format!(
+        "underlay(jumbo)={underlay:?} ext-candidates={other:?}"
+    ));
     (underlay, other)
 }
 
@@ -200,7 +216,10 @@ fn setup_external_networking(other: &[String]) {
         if ifc == "vioif0" {
             continue;
         }
-        run("ipadm", &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")]);
+        run(
+            "ipadm",
+            &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")],
+        );
     }
 }
 
@@ -301,7 +320,10 @@ fn maybe_start_switch_enforcer() -> Result<()> {
         });
     }
     let child = cmd.spawn().context("spawn switch-enforcer")?;
-    note(format!("switch{slot} enforcer started (pid {}), log /tmp/switch-enforcer.log", child.id()));
+    note(format!(
+        "switch{slot} enforcer started (pid {}), log /tmp/switch-enforcer.log",
+        child.id()
+    ));
     Ok(())
 }
 
@@ -312,7 +334,10 @@ fn staged_switch_slot() -> Option<u8> {
         let name = entry.file_name();
         let name = name.to_str()?;
         if let Some(rest) = name.strip_prefix("mgs-config-switch") {
-            if let Some(slot) = rest.strip_suffix(".toml").and_then(|d| d.parse::<u8>().ok()) {
+            if let Some(slot) = rest
+                .strip_suffix(".toml")
+                .and_then(|d| d.parse::<u8>().ok())
+            {
                 return Some(slot);
             }
         }
@@ -350,13 +375,24 @@ pub fn switch_enforcer(slot: u8) {
             if let Err(e) = fs::copy(&mgs_staged, SWITCH_ZONE_MGS) {
                 warn(format!("copy switch{slot} MGS config: {e}"));
             }
-            run("zlogin", &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgs:default"]);
+            run(
+                "zlogin",
+                &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgs:default"],
+            );
         }
         if sp_present && !sp_ok {
             if let Err(e) = fs::copy(&sp_staged, SWITCH_ZONE_SP) {
                 warn(format!("copy sp-sim config: {e}"));
             }
-            run("zlogin", &["oxz_switch", "svcadm", "restart", "svc:/oxide/sp-sim:default"]);
+            run(
+                "zlogin",
+                &[
+                    "oxz_switch",
+                    "svcadm",
+                    "restart",
+                    "svc:/oxide/sp-sim:default",
+                ],
+            );
         }
         note(format!("forced switch{slot} / sp-sim configs"));
         std::thread::sleep(Duration::from_secs(1));
@@ -428,7 +464,10 @@ fn setup_sp_emu() {
         return;
     }
     let bin_to = format!("{SP_EMU_ZONE_DIR}/sp-emu");
-    let bin_src = pick(format!("{SP_EMU_CARGO_DIR}/sp-emu"), format!("{BAKED}/sp-emu"));
+    let bin_src = pick(
+        format!("{SP_EMU_CARGO_DIR}/sp-emu"),
+        format!("{BAKED}/sp-emu"),
+    );
     if let Err(e) = fs::copy(&bin_src, &bin_to) {
         warn(format!("copy sp-emu binary from {bin_src}: {e}"));
         return;
@@ -476,10 +515,35 @@ fn setup_sp_emu() {
     // Whole-fleet emu: every SP is emulated, so sp-sim isn't needed. Disable it
     // (releasing the shared ports) before sp-emu binds them. Wait for sp-sim to be
     // imported first, else the disable is a no-op and the baked sp-sim races us.
-    let _ = wait_until(60, || run_quiet("zlogin", &["oxz_switch", "svcs", "svc:/oxide/sp-sim:default"]));
-    run("zlogin", &["oxz_switch", "svcadm", "disable", "-s", "svc:/oxide/sp-sim:default"]);
-    run("zlogin", &["oxz_switch", "svccfg", "import", "/var/svc/manifest/site/voxel-sp-emu.xml"]);
-    note(format!("sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled", ports.len()));
+    let _ = wait_until(60, || {
+        run_quiet(
+            "zlogin",
+            &["oxz_switch", "svcs", "svc:/oxide/sp-sim:default"],
+        )
+    });
+    run(
+        "zlogin",
+        &[
+            "oxz_switch",
+            "svcadm",
+            "disable",
+            "-s",
+            "svc:/oxide/sp-sim:default",
+        ],
+    );
+    run(
+        "zlogin",
+        &[
+            "oxz_switch",
+            "svccfg",
+            "import",
+            "/var/svc/manifest/site/voxel-sp-emu.xml",
+        ],
+    );
+    note(format!(
+        "sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled",
+        ports.len()
+    ));
 }
 
 /// SMF manifest for the emulated SP fleet, each instance running the locked
@@ -499,7 +563,9 @@ fn setup_sp_emu() {
 fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\"?>\n");
-    s.push_str("<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n");
+    s.push_str(
+        "<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n",
+    );
     s.push_str("<service_bundle type=\"manifest\" name=\"voxel-sp-emu\">\n");
     // Per-SP RoT services: one oxide-rot-1 per SP, each on its own zone-local port.
     if rot {
@@ -509,7 +575,9 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         s.push_str("    </dependency>\n");
         for &port in ports {
             let rport = port - SP_EMU_ROT_PORT_OFFSET;
-            s.push_str(&format!("    <instance name=\"rot{port}\" enabled=\"true\">\n"));
+            s.push_str(&format!(
+                "    <instance name=\"rot{port}\" enabled=\"true\">\n"
+            ));
             s.push_str(&format!("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu rot-serve [::1]:{rport} /opt/oxide/sp-emu/rot.flash\" timeout_seconds=\"0\"/>\n"));
             s.push_str("      <exec_method type=\"method\" name=\"stop\" exec=\":kill\" timeout_seconds=\"30\"/>\n");
             s.push_str("      <property_group name=\"startd\" type=\"framework\">\n");
@@ -530,18 +598,30 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         s.push_str("    </dependency>\n");
     }
     for &port in ports {
-        let board = if port == SIDECAR_SP_PORT { "sidecar" } else { "gimlet" };
-        s.push_str(&format!("    <instance name=\"sp{port}\" enabled=\"true\">\n"));
+        let board = if port == SIDECAR_SP_PORT {
+            "sidecar"
+        } else {
+            "gimlet"
+        };
+        s.push_str(&format!(
+            "    <instance name=\"sp{port}\" enabled=\"true\">\n"
+        ));
         s.push_str("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu gdb a 340000000\" timeout_seconds=\"0\">\n");
         s.push_str("        <method_context>\n          <method_environment>\n");
-        s.push_str(&format!("            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"));
+        s.push_str(&format!(
+            "            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"
+        ));
         s.push_str(&format!("            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"));
-        s.push_str(&format!("            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"));
+        s.push_str(&format!(
+            "            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"
+        ));
         // Point the SP at ITS OWN rot-serve (one RoT per SP): single-core SP +
         // out-of-process RoT, live from boot through RSS - no two-core wedge.
         if rot {
             let rport = port - SP_EMU_ROT_PORT_OFFSET;
-            s.push_str(&format!("            <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"));
+            s.push_str(&format!(
+                "            <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"
+            ));
         }
         s.push_str("            <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n");
         s.push_str("            <envvar name=\"SP_EMU_IDLE_MS\" value=\"20\"/>\n");

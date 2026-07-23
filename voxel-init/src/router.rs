@@ -20,7 +20,15 @@ pub fn bring_up() -> Result<()> {
     sysctl("net.ipv6.conf.all.accept_ra", "0");
 
     // apt-daily timers can wipe FRR state (disabled at bake; belt + braces).
-    run("systemctl", &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"]);
+    run(
+        "systemctl",
+        &[
+            "disable",
+            "--now",
+            "apt-daily-upgrade.timer",
+            "apt-daily.timer",
+        ],
+    );
 
     // rp_filter drops the rack's asymmetric / unnumbered transit traffic.
     sysctl("net.ipv4.conf.all.rp_filter", "0");
@@ -54,7 +62,10 @@ fn apply_static_edge_ip() {
         return;
     };
     let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
-    if cur.split_whitespace().any(|t| t == ip || t.starts_with(&format!("{ip}/"))) {
+    if cur
+        .split_whitespace()
+        .any(|t| t == ip || t.starts_with(&format!("{ip}/")))
+    {
         note(format!("static edge IP {ip} already on {ifc}"));
         return;
     }
@@ -91,7 +102,9 @@ fn ensure_unique_uplink_lease() {
         return;
     }
     run("systemctl", &["restart", "systemd-networkd"]);
-    note(format!("pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"));
+    note(format!(
+        "pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"
+    ));
 }
 
 fn sysctl(key: &str, val: &str) {
@@ -113,19 +126,63 @@ fn nat_rack_egress() {
             if let Some(subnet) = uplink_subnet(&ifc) {
                 if !run_quiet(
                     "iptables",
-                    &["-t", "nat", "-C", "POSTROUTING", "-o", &ifc, "-d", &subnet, "-j", "RETURN"],
+                    &[
+                        "-t",
+                        "nat",
+                        "-C",
+                        "POSTROUTING",
+                        "-o",
+                        &ifc,
+                        "-d",
+                        &subnet,
+                        "-j",
+                        "RETURN",
+                    ],
                 ) {
                     run(
                         "iptables",
-                        &["-t", "nat", "-I", "POSTROUTING", "1", "-o", &ifc, "-d", &subnet, "-j", "RETURN"],
+                        &[
+                            "-t",
+                            "nat",
+                            "-I",
+                            "POSTROUTING",
+                            "1",
+                            "-o",
+                            &ifc,
+                            "-d",
+                            &subnet,
+                            "-j",
+                            "RETURN",
+                        ],
                     );
                 }
             }
             if !run_quiet(
                 "iptables",
-                &["-t", "nat", "-C", "POSTROUTING", "-o", &ifc, "-j", "MASQUERADE"],
+                &[
+                    "-t",
+                    "nat",
+                    "-C",
+                    "POSTROUTING",
+                    "-o",
+                    &ifc,
+                    "-j",
+                    "MASQUERADE",
+                ],
             ) {
-                run("iptables", &["-t", "nat", "-A", "POSTROUTING", "-o", &ifc, "-j", "MASQUERADE"]);
+                run(
+                    "iptables",
+                    &[
+                        "-t",
+                        "nat",
+                        "-A",
+                        "POSTROUTING",
+                        "-o",
+                        &ifc,
+                        "-j",
+                        "MASQUERADE",
+                    ],
+                );
             }
             note(format!("NAT rack egress via {ifc}"));
         }
@@ -157,7 +214,10 @@ fn uplink_iface() -> Option<String> {
 /// e.g. "192.168.68.0/24"), the customer LAN the host reaches the rack from.
 /// None if it can't be read.
 fn uplink_subnet(ifc: &str) -> Option<String> {
-    let line = capture("ip", &["-o", "-4", "route", "show", "dev", ifc, "scope", "link"])?;
+    let line = capture(
+        "ip",
+        &["-o", "-4", "route", "show", "dev", ifc, "scope", "link"],
+    )?;
     let cidr = line.split_whitespace().next()?;
     (cidr.contains('/') && cidr.contains('.')).then(|| cidr.to_string())
 }

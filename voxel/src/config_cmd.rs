@@ -28,8 +28,10 @@ pub(crate) fn cmd_config(path: &Path, cmd: &ConfigCmd) -> anyhow::Result<()> {
             println!("{key} = {value}");
         }
         ConfigCmd::Load { file } => {
-            let text = fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-            VoxelConfig::from_toml(&text).map_err(|e| anyhow!("invalid config {}: {e}", file.display()))?;
+            let text =
+                fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
+            VoxelConfig::from_toml(&text)
+                .map_err(|e| anyhow!("invalid config {}: {e}", file.display()))?;
             ensure_parent_dir(path)?;
             fs::write(path, &text).with_context(|| format!("write {}", path.display()))?;
             println!("loaded {} -> {}", file.display(), path.display());
