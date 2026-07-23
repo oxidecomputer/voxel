@@ -504,28 +504,29 @@ fn map_addr(s: &str, f: impl FnOnce(&str) -> Option<String>) -> String {
 
 /// Bump an IPv4 address's 3rd octet by `rack` (preserving any `/prefix`), so each
 /// rack gets a distinct customer/service network. Returns the input unchanged if
-/// it doesn't parse.
-fn offset_v4(s: &str, rack: u8) -> String {
+/// it doesn't parse or the offset would leave the octet range (checked, not
+/// wrapping, so an out-of-range rack can't silently alias another rack's net).
+fn offset_v4(s: &str, rack: usize) -> String {
     map_addr(s, |addr| {
-        addr.parse::<std::net::Ipv4Addr>().ok().map(|ip| {
-            let mut o = ip.octets();
-            o[2] = o[2].wrapping_add(rack);
-            std::net::Ipv4Addr::from(o).to_string()
-        })
+        let ip = addr.parse::<std::net::Ipv4Addr>().ok()?;
+        let mut o = ip.octets();
+        o[2] = o[2].checked_add(u8::try_from(rack).ok()?)?;
+        Some(std::net::Ipv4Addr::from(o).to_string())
     })
 }
 
 /// Offset an IPv6 rack subnet by `rack` /56s WITHIN its /48 (bits 48-55, the high
 /// byte of hextet 3), so every rack shares one /48 AZ (omicron's AZ=/48, rack=/56
 /// scheme) and cross-rack underlay is a single aggregate prefix. rack 0 is
-/// unchanged. Preserves any `/prefix`.
-fn offset_v6_rack56(s: &str, rack: u16) -> String {
+/// unchanged. Preserves any `/prefix`. Returns the input unchanged if it doesn't
+/// parse or the offset overflows hextet 3 (checked, not wrapping).
+fn offset_v6_rack56(s: &str, rack: usize) -> String {
     map_addr(s, |addr| {
-        addr.parse::<std::net::Ipv6Addr>().ok().map(|ip| {
-            let mut seg = ip.segments();
-            seg[3] = seg[3].wrapping_add(rack << 8);
-            std::net::Ipv6Addr::from(seg).to_string()
-        })
+        let ip = addr.parse::<std::net::Ipv6Addr>().ok()?;
+        let mut seg = ip.segments();
+        let delta = u16::try_from(rack).ok()?.checked_mul(256)?; // rack << 8
+        seg[3] = seg[3].checked_add(delta)?;
+        Some(std::net::Ipv6Addr::from(seg).to_string())
     })
 }
 
@@ -546,20 +547,22 @@ impl Network {
     /// one split-DNS / silo-URL convention covers every deployment size. Upstream
     /// NTP/DNS + uplink ports are left as-is.
     pub fn for_rack(&self, rack: usize) -> Network {
-        let r8 = rack as u8;
+        // Rack index as an ASN offset; saturating so an absurd rack count can't
+        // wrap an ASN back onto a lower rack's. (racks() is tiny in practice.)
+        let rack_asn = u32::try_from(rack).unwrap_or(u32::MAX);
         let dns_zone = format!("rack{}.{}", rack + 1, self.dns_zone);
         Network {
             dns_zone,
-            external_dns_ips: self.external_dns_ips.iter().map(|ip| offset_v4(ip, r8)).collect(),
+            external_dns_ips: self.external_dns_ips.iter().map(|ip| offset_v4(ip, rack)).collect(),
             ntp_servers: self.ntp_servers.clone(),
             dns_servers: self.dns_servers.clone(),
-            rack_subnet: offset_v6_rack56(&self.rack_subnet, rack as u16),
-            service_pool_first: offset_v4(&self.service_pool_first, r8),
-            service_pool_last: offset_v4(&self.service_pool_last, r8),
-            bgp_asn: self.bgp_asn + rack as u32,
-            infra_prefix: offset_v4(&self.infra_prefix, r8),
+            rack_subnet: offset_v6_rack56(&self.rack_subnet, rack),
+            service_pool_first: offset_v4(&self.service_pool_first, rack),
+            service_pool_last: offset_v4(&self.service_pool_last, rack),
+            bgp_asn: self.bgp_asn.saturating_add(rack_asn),
+            infra_prefix: offset_v4(&self.infra_prefix, rack),
             router_mode: self.router_mode,
-            transit_prefix: offset_v4(&self.transit_prefix, r8),
+            transit_prefix: offset_v4(&self.transit_prefix, rack),
             transit_bfd: self.transit_bfd,
             // The uplink's `peer_asn` is the switch's *local* BGP ASN for that
             // session (it references a `[[bgp]]` entry, whose `asn` is offset
@@ -569,7 +572,7 @@ impl Network {
             uplinks: self
                 .uplinks
                 .iter()
-                .map(|u| UplinkCfg { peer_asn: u.peer_asn + rack as u32, ..u.clone() })
+                .map(|u| UplinkCfg { peer_asn: u.peer_asn.saturating_add(rack_asn), ..u.clone() })
                 .collect(),
         }
     }
@@ -583,9 +586,10 @@ impl Network {
     /// `(router gateway, sidecar)` as bare IPv4 (`.1` router, `.2` sidecar, the
     /// a4x2 scheme). None if `transit_prefix` doesn't parse.
     pub fn transit_slash30(&self, block: usize) -> Option<(String, String)> {
-        let b = u32::from(self.transit_base()?).wrapping_add((block as u32).wrapping_mul(4));
-        let gateway = std::net::Ipv4Addr::from(b.wrapping_add(1));
-        let sidecar = std::net::Ipv4Addr::from(b.wrapping_add(2));
+        let block = u32::try_from(block).ok()?;
+        let b = u32::from(self.transit_base()?).checked_add(block.checked_mul(4)?)?;
+        let gateway = std::net::Ipv4Addr::from(b.checked_add(1)?);
+        let sidecar = std::net::Ipv4Addr::from(b.checked_add(2)?);
         Some((gateway.to_string(), sidecar.to_string()))
     }
 
@@ -611,9 +615,11 @@ impl Network {
         if nblocks == 0 {
             return None;
         }
+        let nblocks = u32::try_from(nblocks).ok()?;
         let b = u32::from(self.transit_base()?);
-        let first = std::net::Ipv4Addr::from(b.wrapping_add(1));
-        let last = std::net::Ipv4Addr::from(b.wrapping_add((nblocks as u32).wrapping_mul(4).wrapping_sub(1)));
+        let first = std::net::Ipv4Addr::from(b.checked_add(1)?);
+        let span = nblocks.checked_mul(4)?.checked_sub(1)?;
+        let last = std::net::Ipv4Addr::from(b.checked_add(span)?);
         Some((first, last))
     }
 }
