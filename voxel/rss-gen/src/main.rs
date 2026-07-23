@@ -22,16 +22,16 @@ use bootstrap_agent_lockstep_types::{
 use omicron_common::address::{IpRange, Ipv4Range, Ipv6Range};
 use omicron_common::api::external::AllowedSourceIps;
 use sled_agent_types::early_networking::{
-    BgpConfig, BgpPeerConfig, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
-    MaxPathConfig, PortConfig, RackNetworkConfig, RouterLifetimeConfig, RouterPeerType,
-    SwitchSlot, UplinkAddress, UplinkAddressConfig,
+    BfdMode, BfdPeerConfig, BgpConfig, BgpPeerConfig, LinkFec, LinkSpeed, LldpAdminStatus,
+    LldpPortConfig, MaxPathConfig, PortConfig, RackNetworkConfig, RouteConfig,
+    RouterLifetimeConfig, RouterPeerType, SwitchSlot, UplinkAddress, UplinkAddressConfig,
 };
 // Newer omicron wraps the uplink port list in a non-empty `UplinkPorts` newtype;
 // v20-era omicron uses a bare `Vec<PortConfig>`. build.rs sets `has_uplink_ports`
 // when the type exists in the pinned omicron, so one source builds for any era.
 #[cfg(has_uplink_ports)]
 use sled_agent_types::early_networking::UplinkPorts;
-use voxel_config::{UplinkCfg, VoxelConfig};
+use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
 
 fn switch_slot(s: &str) -> SwitchSlot {
     match s {
@@ -66,43 +66,71 @@ fn ip_range(first: &str, last: &str) -> Result<IpRange> {
     }
 }
 
-fn uplink_port(u: &UplinkCfg) -> Result<PortConfig> {
+/// One uplink port toward a single fabric router (`UplinkPort` carries the
+/// 2-way fanout: one port per router per switch). `Static` mode uses the port's
+/// numbered /30 + default route; `Bgp` mode an unnumbered eBGP peer.
+fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
+    let (routes, addresses, bgp_peers) = match mode {
+        RouterMode::Bgp => (
+            vec![],
+            vec![UplinkAddressConfig { address: UplinkAddress::AddrConf, vlan_id: None }],
+            vec![BgpPeerConfig {
+                asn: p.peer_asn,
+                port: p.port.clone(),
+                addr: RouterPeerType::Unnumbered {
+                    router_lifetime: RouterLifetimeConfig::new(p.router_lifetime)
+                        .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
+                },
+                hold_time: None,
+                idle_hold_time: None,
+                delay_open: None,
+                connect_retry: None,
+                keepalive: None,
+                remote_asn: None,
+                min_ttl: None,
+                md5_auth_key: None,
+                multi_exit_discriminator: None,
+                communities: vec![],
+                local_pref: None,
+                enforce_first_as: false,
+                allowed_import: Default::default(),
+                allowed_export: Default::default(),
+                vlan_id: None,
+            }],
+        ),
+        RouterMode::Static => (
+            // Default route upstream via this router.
+            vec![RouteConfig {
+                destination: "0.0.0.0/0".parse().context("default route")?,
+                nexthop: p.gateway.parse().context("uplink gateway")?,
+                vlan_id: None,
+                rib_priority: None,
+            }],
+            // Numbered /30 on the sidecar side.
+            vec![UplinkAddressConfig {
+                address: UplinkAddress::Static {
+                    ip_net: p.sidecar_addr.parse().context("uplink /30")?,
+                },
+                vlan_id: None,
+            }],
+            // No BGP; BFD tracks the nexthop (rack_network_config.bfd).
+            vec![],
+        ),
+    };
     Ok(PortConfig {
-        routes: vec![],
-        addresses: vec![UplinkAddressConfig { address: UplinkAddress::AddrConf, vlan_id: None }],
-        switch: switch_slot(&u.switch),
-        port: u.port.clone(),
-        uplink_port_speed: link_speed(&u.port_speed),
+        routes,
+        addresses,
+        switch: switch_slot(&p.switch),
+        port: p.port.clone(),
+        uplink_port_speed: link_speed(&p.port_speed),
         uplink_port_fec: Some(LinkFec::None),
-        bgp_peers: vec![BgpPeerConfig {
-            asn: u.peer_asn,
-            port: u.port.clone(),
-            addr: RouterPeerType::Unnumbered {
-                router_lifetime: RouterLifetimeConfig::new(u.router_lifetime)
-                    .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
-            },
-            hold_time: None,
-            idle_hold_time: None,
-            delay_open: None,
-            connect_retry: None,
-            keepalive: None,
-            remote_asn: None,
-            min_ttl: None,
-            md5_auth_key: None,
-            multi_exit_discriminator: None,
-            communities: vec![],
-            local_pref: None,
-            enforce_first_as: false,
-            allowed_import: Default::default(),
-            allowed_export: Default::default(),
-            vlan_id: None,
-        }],
+        bgp_peers,
         autoneg: false,
         lldp: Some(LldpPortConfig {
             status: LldpAdminStatus::Enabled,
-            chassis_id: Some(u.switch.clone()),
+            chassis_id: Some(p.switch.clone()),
             port_id: None,
-            port_description: Some(u.lldp_port_description.clone()),
+            port_description: Some(p.lldp.clone()),
             system_name: None,
             system_description: None,
             management_addrs: None,
@@ -128,9 +156,11 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
 
     let pool = ip_range(&n.service_pool_first, &n.service_pool_last)?;
 
+    // 2-way fanout: one port per fabric router per switch (qsfp0, qsfp1, ...).
+    let uplink_ports = cfg.uplink_ports(rack);
     let mut ports = Vec::new();
-    for u in &n.uplinks {
-        ports.push(uplink_port(u)?);
+    for p in &uplink_ports {
+        ports.push(uplink_port(p, n.router_mode)?);
     }
     // Newer omicron requires the non-empty `UplinkPorts` newtype; older takes the
     // bare Vec. Rebind per era (build.rs cfg); `ports` gets the right type either way.
@@ -138,19 +168,63 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
     let ports = UplinkPorts::new(ports)
         .map_err(|_| anyhow::anyhow!("rack network config needs at least one uplink port"))?;
 
+    // Static-mode uplinks are numbered /30s; Nexus validates each switch-port
+    // address against this lot at handoff. Derived from transit_prefix to cover
+    // the sidecar /30s. Bgp uplinks are unnumbered, so the lot is unused.
+    let (infra_first, infra_last): (IpAddr, IpAddr) = match n.router_mode {
+        RouterMode::Static => {
+            let (f, l) = n
+                .infra_ip_range(uplink_ports.len())
+                .context("infra_ip_range from transit_prefix")?;
+            (IpAddr::V4(f), IpAddr::V4(l))
+        }
+        RouterMode::Bgp => ("::".parse()?, "::".parse()?),
+    };
+
     let rack_network_config = RackNetworkConfig {
         rack_subnet: n.rack_subnet.parse().context("rack_subnet")?,
-        infra_ip_first: "::".parse::<IpAddr>()?,
-        infra_ip_last: "::".parse::<IpAddr>()?,
+        infra_ip_first: infra_first,
+        infra_ip_last: infra_last,
         ports,
-        bgp: vec![BgpConfig {
-            asn: n.bgp_asn,
-            originate: vec![n.infra_prefix.parse().context("infra_prefix")?],
-            shaper: None,
-            checker: None,
-            max_paths: MaxPathConfig::default(),
-        }],
-        bfd: vec![],
+        // BGP config only in Bgp mode; Static mode carries no [[bgp]].
+        bgp: match n.router_mode {
+            RouterMode::Bgp => vec![BgpConfig {
+                asn: n.bgp_asn,
+                originate: vec![n.infra_prefix.parse().context("infra_prefix")?],
+                shaper: None,
+                checker: None,
+                max_paths: MaxPathConfig::default(),
+            }],
+            RouterMode::Static => vec![],
+        },
+        // Static mode optionally tracks each uplink gateway with single-hop BFD.
+        bfd: match (n.router_mode, n.transit_bfd) {
+            (RouterMode::Static, true) => uplink_ports
+                .iter()
+                .map(|p| {
+                    Ok(BfdPeerConfig {
+                        // The sidecar's own /30 address is the BFD listen/source.
+                        // Without it, early networking programs listen=0.0.0.0 and
+                        // mgd rejects the peer, so the session never establishes and
+                        // the router's BFD-tracked route (hence time sync) hangs.
+                        local: Some(
+                            p.sidecar_addr
+                                .split('/')
+                                .next()
+                                .unwrap_or(&p.sidecar_addr)
+                                .parse()
+                                .context("bfd local")?,
+                        ),
+                        remote: p.gateway.parse().context("bfd gateway")?,
+                        detection_threshold: 3,
+                        required_rx: 1_000_000,
+                        mode: BfdMode::SingleHop,
+                        switch: switch_slot(&p.switch),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => vec![],
+        },
     };
 
     let dns_servers = n

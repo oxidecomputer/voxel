@@ -38,8 +38,10 @@ until install_pkgs; do
     sleep 2
 done
 
-# enable bgpd; frr.conf itself is generated per-topology at launch.
+# enable bgpd + bfdd (static mode uses BFD-tracked routes); frr.conf itself is
+# generated per-topology at launch.
 sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons
+sed -i 's/^bfdd=no/bfdd=yes/' /etc/frr/daemons
 
 # persistent IP forwarding (generic; per-interface knobs set at launch).
 cat > /etc/sysctl.d/99-voxel-frr.conf <<'EOF'

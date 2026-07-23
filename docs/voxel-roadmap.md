@@ -113,6 +113,20 @@ The Rust-emulator track of the SP-fidelity work (the Renode track stays Deferred
   cross-rack BGP, a shared transit fabric, or a simulated WAN, over the
   highest-bandwidth path the box affords. This is where Voxel goes past "one virtual
   rack" to "a virtual datacenter."
+- **Real transit BFD** *(after the static-routing-bfd merge).* `transit_bfd = true`
+  now converges, but only on the floating-static (admin distance 250) backstop in
+  `frr.rs render_static`; the BFD sessions themselves never come up. Two reasons, both
+  need work: (1) mgd 500s on the RSS cold-start `add_bfd_peer` and omicron swallows it
+  with no retry (`early-networking/src/lib.rs`), so the sidecar peer is never programmed
+  (fix upstream, or re-add once mgd is warm); (2) with one sidecar per uplink and the cr2
+  path non-functional (bestpath fanout stays 1 in static mode), BFD has no alternate
+  nexthop to fail over to anyway. Real failover needs both a programmed peer and a live
+  second uplink.
+- **Real trust quorum** *(after these merges).* Voxel sets `trust_quorum_peers: None`
+  (`rss-gen/src/main.rs`), so RSS skips LRTQ init (`rack-setup/src/service.rs`) and Nexus
+  stores no config (`omdb nexus trust-quorum get-config` 404s). Now that `--emu-rot` boots
+  real `oxide-rot-1` firmware, try setting `trust_quorum_peers` to the sled baseboards and
+  see whether the emulated fleet completes `init_trust_quorum` end-to-end.
 - **Docs** - hardware reqs, Helios install guide, end-to-end usage (per docket).
 - **I/O - parked** *(investigated 2026-06-16, no low-hanging fruit).* The zfs substrate
   is already sim-tuned (`sync=disabled`, `atime=off`, `compression=on`, ~96 G ARC, jumbo

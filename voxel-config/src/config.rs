@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::frr::{FrrNeighbor, FrrRouter};
+use crate::frr::{FrrNeighbor, FrrRouter, StaticUplink};
 
 /// Bootstrap-network IPv6 prefix (first three hextets); see
 /// [`SledDesc::bootstrap_addr`]. Each sled appends `:{2*index+1}::1`.
@@ -458,6 +458,17 @@ impl Image {
     }
 }
 
+/// Upstream routing mode toward the customer routers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RouterMode {
+    /// Unnumbered eBGP (default).
+    #[default]
+    Bgp,
+    /// Numbered /30 uplinks with static routes and BFD.
+    Static,
+}
+
 /// Customer-network / RSS parameters. Maps onto `PutRssUserConfigInsensitive`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -474,6 +485,14 @@ pub struct Network {
     pub bgp_asn: u32,
     /// IPv4 prefix the rack originates upstream.
     pub infra_prefix: String,
+    /// Upstream routing mode.
+    pub router_mode: RouterMode,
+    /// IPv4 /24 carved into per-uplink /30s for `Static` mode (.1 router, .2 sidecar).
+    pub transit_prefix: String,
+    /// `Static` mode: BFD-track the transit routes (FRR `ip route ... bfd` +
+    /// peers + rss BFD). Requires a dataplane where softnpu BFD establishes;
+    /// a4x2 ships this off and uses plain static routes, so it defaults off.
+    pub transit_bfd: bool,
     /// Scrimlet uplink ports (one per switch toward the customer routers).
     pub uplinks: Vec<UplinkCfg>,
 }
@@ -490,6 +509,9 @@ impl Default for Network {
             service_pool_last: "198.51.100.29".into(),
             bgp_asn: DEFAULT_RACK_ASN,
             infra_prefix: "198.51.100.0/24".into(),
+            router_mode: RouterMode::Bgp,
+            transit_prefix: "198.51.101.0/24".into(),
+            transit_bfd: false,
             uplinks: vec![
                 UplinkCfg::default_for("switch0", "uplink0"),
                 UplinkCfg::default_for("switch1", "uplink1"),
@@ -565,6 +587,9 @@ impl Network {
             service_pool_last: offset_v4(&self.service_pool_last, r8),
             bgp_asn: self.bgp_asn + rack as u32,
             infra_prefix: offset_v4(&self.infra_prefix, r8),
+            router_mode: self.router_mode,
+            transit_prefix: offset_v4(&self.transit_prefix, r8),
+            transit_bfd: self.transit_bfd,
             // The uplink's `peer_asn` is the switch's *local* BGP ASN for that
             // session (it references a `[[bgp]]` entry, whose `asn` is offset
             // above); the actual customer-router ASN is auto-discovered via
@@ -577,6 +602,71 @@ impl Network {
                 .collect(),
         }
     }
+
+    /// Base address of `transit_prefix` (its `.0`). None if it doesn't parse.
+    fn transit_base(&self) -> Option<std::net::Ipv4Addr> {
+        self.transit_prefix.split('/').next()?.parse().ok()
+    }
+
+    /// The `/30` for transit `block` (0-based), carved from `transit_prefix`:
+    /// `(router gateway, sidecar)` as bare IPv4 (`.1` router, `.2` sidecar, the
+    /// a4x2 scheme). None if `transit_prefix` doesn't parse.
+    pub fn transit_slash30(&self, block: usize) -> Option<(String, String)> {
+        let b = u32::from(self.transit_base()?).wrapping_add((block as u32).wrapping_mul(4));
+        let gateway = std::net::Ipv4Addr::from(b.wrapping_add(1));
+        let sidecar = std::net::Ipv4Addr::from(b.wrapping_add(2));
+        Some((gateway.to_string(), sidecar.to_string()))
+    }
+
+    /// The transit `/30` for the uplink from fabric router `router_index` (0-based)
+    /// to the switch in slot `switch_slot`, with `n_switches` per rack. Block =
+    /// `router*n_switches + slot`. The single source both the sidecar side
+    /// (`uplink_ports`) and router side (`to_frr`) use, so their /30s always agree.
+    pub fn transit_slash30_for(
+        &self,
+        router_index: usize,
+        switch_slot: usize,
+        n_switches: usize,
+    ) -> Option<(String, String)> {
+        self.transit_slash30(router_index * n_switches + switch_slot)
+    }
+
+    /// `Static`-mode infra address lot `(first, last)`, spanning the `nblocks`
+    /// per-uplink `/30`s from `transit_prefix`. Every numbered switch-port address
+    /// must fall inside it or Nexus rejects the handoff ("address not in lot").
+    /// Range `.1` to `.{nblocks*4 - 1}` (a4x2 uses `.1`/`.15` for 2x2). None if
+    /// `transit_prefix` doesn't parse or `nblocks` is 0.
+    pub fn infra_ip_range(&self, nblocks: usize) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+        if nblocks == 0 {
+            return None;
+        }
+        let b = u32::from(self.transit_base()?);
+        let first = std::net::Ipv4Addr::from(b.wrapping_add(1));
+        let last = std::net::Ipv4Addr::from(b.wrapping_add((nblocks as u32).wrapping_mul(4).wrapping_sub(1)));
+        Some((first, last))
+    }
+}
+
+/// One generated scrimlet uplink port toward a specific fabric router (the
+/// 2-way fanout: every switch gets one port per fabric router). Derived, not a
+/// config knob; consumed by rss-gen (sidecar side) and mirrored by `to_frr`
+/// (router side).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UplinkPort {
+    pub switch: String,
+    pub switch_slot: usize,
+    pub router_index: usize,
+    /// `qsfp{router_index}` (fabric uplinks take the first front ports, in
+    /// router link-creation order; see `build_topo`).
+    pub port: String,
+    pub peer_asn: u32,
+    pub router_lifetime: u16,
+    pub port_speed: String,
+    pub lldp: String,
+    /// `Static`-mode sidecar side, `addr/30`.
+    pub sidecar_addr: String,
+    /// `Static`-mode router side (nexthop + BFD peer), bare addr.
+    pub gateway: String,
 }
 
 /// One scrimlet uplink port that peers (unnumbered) with a customer router.
@@ -631,6 +721,47 @@ impl Default for RecoverySiloCfg {
 // ---------------------------------------------------------------------------
 
 impl VoxelConfig {
+    /// Number of fabric (transit) routers, i.e. routers other than `ce`.
+    fn fabric_router_count(&self) -> usize {
+        self.topology.routers.iter().filter(|r| r.as_str() != "ce").count()
+    }
+
+    /// Number of scrimlets (switches) in `rack`.
+    fn scrimlets_in_rack(&self, rack: usize) -> usize {
+        self.sleds().into_iter().filter(|s| s.scrimlet && s.rack == rack).count()
+    }
+
+    /// Generated uplink ports for `rack` (0-based): every switch fans out to
+    /// every fabric router (`qsfp{router}`), so a switch reaches upstream via
+    /// either router. `Static`-mode /30 addressing follows the datacenter
+    /// scheme: block = `router * n_switches + switch`, `.1` router / `.2`
+    /// sidecar. One `[[network.uplinks]]` entry per switch supplies the shared
+    /// per-port settings (asn, speed, ...).
+    pub fn uplink_ports(&self, rack: usize) -> Vec<UplinkPort> {
+        let net = self.network.for_rack(rack);
+        let n_cr = self.fabric_router_count();
+        let n_sc = self.scrimlets_in_rack(rack);
+        let mut out = Vec::new();
+        for (sc, u) in net.uplinks.iter().enumerate() {
+            for c in 0..n_cr {
+                let (gateway, sidecar) = net.transit_slash30_for(c, sc, n_sc).unwrap_or_default();
+                out.push(UplinkPort {
+                    switch: u.switch.clone(),
+                    switch_slot: sc,
+                    router_index: c,
+                    port: format!("qsfp{c}"),
+                    peer_asn: u.peer_asn,
+                    router_lifetime: u.router_lifetime,
+                    port_speed: u.port_speed.clone(),
+                    lldp: format!("{}-cr{}", u.lldp_port_description, c + 1),
+                    sidecar_addr: format!("{sidecar}/30"),
+                    gateway,
+                });
+            }
+        }
+        out
+    }
+
     /// Build each customer router's `frr.conf` as `(name, FrrRouter)` pairs.
     /// `cr*` are the **shared transit**: each peers `ce` plus *every* scrimlet
     /// across *all* racks, and originates nothing - eBGP (`no bgp
@@ -673,23 +804,61 @@ impl VoxelConfig {
                     neighbors,
                     originate4: vec!["0.0.0.0/0".into()],
                     originate6: vec!["::/0".into()],
+                    static_uplinks: vec![],
+                    track_bfd: false,
                 }
             } else {
                 cr_index += 1;
-                let mut neighbors =
-                    vec![FrrNeighbor::new(format!("enp0s{FRR_IFACE_BASE}"), "to ce")];
-                for (k, (sname, rack, slot)) in scrimlets.iter().enumerate() {
-                    neighbors.push(FrrNeighbor::new(
-                        format!("enp0s{}", FRR_IFACE_BASE + 1 + k),
-                        format!("to {sname} (rack{rack} switch{slot})"),
-                    ));
-                }
-                FrrRouter {
-                    hostname: name.clone(),
-                    asn: TRANSIT_ASN_BASE + cr_index,
-                    neighbors,
-                    originate4: vec![],
-                    originate6: vec![],
+                let ce_nb = FrrNeighbor::new(format!("enp0s{FRR_IFACE_BASE}"), "to ce");
+                match self.network.router_mode {
+                    RouterMode::Bgp => {
+                        let mut neighbors = vec![ce_nb];
+                        for (k, (sname, rack, slot)) in scrimlets.iter().enumerate() {
+                            neighbors.push(FrrNeighbor::new(
+                                format!("enp0s{}", FRR_IFACE_BASE + 1 + k),
+                                format!("to {sname} (rack{rack} switch{slot})"),
+                            ));
+                        }
+                        FrrRouter {
+                            hostname: name.clone(),
+                            asn: TRANSIT_ASN_BASE + cr_index,
+                            neighbors,
+                            originate4: vec![],
+                            originate6: vec![],
+                            static_uplinks: vec![],
+                            track_bfd: false,
+                        }
+                    }
+                    // 2-way fanout: this cr has a numbered /30 to EVERY scrimlet
+                    // (matching the physical mesh), so both routers reach every
+                    // switch. Block = router*n_switches + slot (the datacenter
+                    // scheme). Keeps eBGP to ce, redistributing the static routes.
+                    RouterMode::Static => {
+                        let c = (cr_index - 1) as usize;
+                        let mut static_uplinks = Vec::new();
+                        for (k, (_, rack, slot)) in scrimlets.iter().enumerate() {
+                            let net = self.network.for_rack(*rack);
+                            let n_sc = self.scrimlets_in_rack(*rack);
+                            if let Some((gateway, sidecar)) = net.transit_slash30_for(c, *slot, n_sc) {
+                                static_uplinks.push(StaticUplink {
+                                    interface: format!("enp0s{}", FRR_IFACE_BASE + 1 + k),
+                                    address: format!("{gateway}/30"),
+                                    peer: sidecar,
+                                    peer_asn: net.bgp_asn,
+                                    route: net.infra_prefix.clone(),
+                                });
+                            }
+                        }
+                        FrrRouter {
+                            hostname: name.clone(),
+                            asn: TRANSIT_ASN_BASE + cr_index,
+                            neighbors: vec![ce_nb],
+                            originate4: vec![],
+                            originate6: vec![],
+                            static_uplinks,
+                            track_bfd: self.network.transit_bfd,
+                        }
+                    }
                 }
             };
             out.push((name.clone(), router));
@@ -1045,6 +1214,67 @@ mod tests {
         // A self / unresolvable pair is dropped from the resolved pairs.
         t.interconnects = vec![("switch0".into(), "switch0".into()), ("switch0".into(), "nope".into())];
         assert!(t.interconnect_pairs().is_empty());
+    }
+
+    #[test]
+    fn static_fanout_matches_datacenter_scheme() {
+        let mut cfg = VoxelConfig::default(); // 2 switches, cr1 + cr2
+        cfg.network.router_mode = RouterMode::Static;
+        // Transit /30s (gateway .1, sidecar .2 per block), datacenter.png layout.
+        let n = &cfg.network;
+        assert_eq!(n.transit_slash30(0), Some(("198.51.101.1".into(), "198.51.101.2".into())));
+        assert_eq!(n.transit_slash30(1), Some(("198.51.101.5".into(), "198.51.101.6".into())));
+        assert_eq!(n.transit_slash30(2), Some(("198.51.101.9".into(), "198.51.101.10".into())));
+        assert_eq!(n.transit_slash30(3), Some(("198.51.101.13".into(), "198.51.101.14".into())));
+        // per-rack /24 offset.
+        assert_eq!(n.for_rack(1).transit_slash30(0), Some(("198.51.102.1".into(), "198.51.102.2".into())));
+
+        // Infra address lot spans the 4 uplink /30s (matches a4x2's .1 .. .15).
+        assert_eq!(
+            n.infra_ip_range(4),
+            Some(("198.51.101.1".parse().unwrap(), "198.51.101.15".parse().unwrap()))
+        );
+        assert_eq!(
+            n.for_rack(1).infra_ip_range(4),
+            Some(("198.51.102.1".parse().unwrap(), "198.51.102.15".parse().unwrap()))
+        );
+        assert_eq!(n.infra_ip_range(0), None);
+
+        // Sidecar side: every switch fans out to both routers (block = c*n_sc + sc).
+        let ports = cfg.uplink_ports(0);
+        assert_eq!(ports.len(), 4);
+        let find = |sw: &str, port: &str| {
+            ports.iter().find(|p| p.switch == sw && p.port == port).unwrap().clone()
+        };
+        assert_eq!(find("switch0", "qsfp0").sidecar_addr, "198.51.101.2/30"); // sc0 -> cr1
+        assert_eq!(find("switch0", "qsfp1").sidecar_addr, "198.51.101.10/30"); // sc0 -> cr2
+        assert_eq!(find("switch1", "qsfp0").sidecar_addr, "198.51.101.6/30"); // sc1 -> cr1
+        assert_eq!(find("switch1", "qsfp1").sidecar_addr, "198.51.101.14/30"); // sc1 -> cr2
+        assert_eq!(find("switch0", "qsfp1").gateway, "198.51.101.9");
+
+        // Router side: cr1 -> both scrimlets (.1, .5); cr2 -> both (.9, .13).
+        // Default is plain static routes (no BFD, matching a4x2).
+        let frr = cfg.to_frr();
+        let cr = |name: &str| frr.iter().find(|(n, _)| n == name).unwrap().1.render();
+        let cr1 = cr("cr1");
+        assert!(cr1.contains("ip address 198.51.101.1/30"));
+        assert!(cr1.contains("ip address 198.51.101.5/30"));
+        assert!(cr1.contains("ip route 198.51.100.0/24 198.51.101.2\n"));
+        assert!(cr1.contains("ip route 198.51.100.0/24 198.51.101.6\n"));
+        assert!(!cr1.contains(" bfd"));
+        assert!(cr1.contains("redistribute static"));
+        let cr2 = cr("cr2");
+        assert!(cr2.contains("ip address 198.51.101.9/30"));
+        assert!(cr2.contains("ip address 198.51.101.13/30"));
+        // ce keeps unnumbered eBGP (no static uplinks).
+        let ce = &frr.iter().find(|(n, _)| n == "ce").unwrap().1;
+        assert!(ce.static_uplinks.is_empty());
+
+        // With transit_bfd on, routes are BFD-tracked and peers appear.
+        cfg.network.transit_bfd = true;
+        let cr1b = cfg.to_frr().iter().find(|(n, _)| n == "cr1").unwrap().1.render();
+        assert!(cr1b.contains("ip route 198.51.100.0/24 198.51.101.2 bfd"));
+        assert!(cr1b.contains("peer 198.51.101.2"));
     }
 
     #[test]
