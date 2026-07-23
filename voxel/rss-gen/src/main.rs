@@ -203,7 +203,18 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
                 .iter()
                 .map(|p| {
                     Ok(BfdPeerConfig {
-                        local: None,
+                        // The sidecar's own /30 address is the BFD listen/source.
+                        // Without it, early networking programs listen=0.0.0.0 and
+                        // mgd rejects the peer, so the session never establishes and
+                        // the router's BFD-tracked route (hence time sync) hangs.
+                        local: Some(
+                            p.sidecar_addr
+                                .split('/')
+                                .next()
+                                .unwrap_or(&p.sidecar_addr)
+                                .parse()
+                                .context("bfd local")?,
+                        ),
                         remote: p.gateway.parse().context("bfd gateway")?,
                         detection_threshold: 3,
                         required_rx: 1_000_000,
