@@ -3,33 +3,27 @@
 **V**irtual **OX**ide **E**mulation **L**ab. A tool for standing up emulated Oxide
 rack deployments on a single Helios host.
 
-Voxel emulates an Oxide rack's control plane: real
+Voxel emulates an Oxide rack's control plane;
 [omicron](https://github.com/oxidecomputer/omicron) software on
 [falcon](https://github.com/oxidecomputer/falcon)-managed propolis VMs, with
-SoftNPU switches and FRR customer routers. Pick a platform version and a topology
-(sled count, multi-rack, customer routers) and launch. It succeeds the `a4x2`
+SoftNPU switches and FRR routers. Pick a platform version and a topology
+(sled count, multi-rack, BGP/static) and launch. It succeeds the `a4x2`
 testbed topology, reworked around a first-class CLI and on-the-fly config
-generation (no hand-maintained per-node config files).
+generation.
 
 ## Layout
 
-- **`voxel/`**: the clap-based CLI. Subcommands: `image`, `config`,
-  `launch`/`destroy` (including `--emu-sp`/`--emu-rot` real-firmware SPs and
-  `--wicket-setup`), `rack`, `network` (patching, link/port ops), `sp-emu`
-  (emulator artifacts), `exec`/`serial`/`status`, and pilot-style access
-  (`tp login`, `host login`). Uses falcon as a library, not a wrapper.
+- **`voxel/`**: CLI and launcher
   - **`voxel/rss-gen/`**: typed, release-pinned `config-rss.toml` generator, built
-    against the image's omicron source (path dependency). Excluded from the workspace.
+    against the image's omicron source (path dependency).
 - **`voxel-config/`**: the `VoxelConfig` model (`voxel.toml`) and all per-topology
-  config generation (sled-agent, RSS, FRR, MGS/SP-sim). Pure Rust, testable anywhere.
+  config generation (sled-agent, RSS, FRR, MGS/SP-sim). 
 - **`voxel-init/`**: the in-guest bring-up agent baked into the images (gimlet/router
-  roles). Replaces the old launch shell scripts.
+  roles). 
 - **`voxel-image/`**: image build machinery (`voxel image create`) and the install
   scripts that bake a control-plane image from an omicron commit.
 
-See [`docs/voxel-roadmap.md`](docs/voxel-roadmap.md) for the engineering roadmap,
-[`docs/build-vs-run.md`](docs/build-vs-run.md) for the build-time vs launch-time
-split, and [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference.
+See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference, there are a LOT of tuning knobs.
 
 ## Building
 
@@ -38,11 +32,12 @@ cargo build
 ```
 
 `voxel/rss-gen` builds separately against the target image's omicron source. See
-[`voxel-image/build-rss-gen.sh`](voxel-image/build-rss-gen.sh).
+[`voxel-image/build-rss-gen.sh`](voxel-image/build-rss-gen.sh). It will auto-run
+if you create a new `voxel image`.
 
 ## Quickstart
 
-1. `cargo build` builds the CLI.
+1. `cargo build` builds voxel.
 2. `voxel image create 43bb5af` builds omicron (v21), bakes `voxel-cp-43bb5af`, and
    builds the commit-pinned `voxel-rss-gen` (30-45 min).
 3. `bash voxel-image/build-frr.sh proto` bakes `voxel-frr-proto` (omicron-independent;
@@ -56,27 +51,14 @@ voxel config set image.frr voxel-frr-proto
 
 5. `pfexec voxel launch`
 
-Steps 2-4 default the build root and dataset to `$HOME/voxel-builds` and
-`rpool/falcon`. For a non-default dataset, set `falcon.dataset` and pass
-`FALCON_DATASET=` to `build-frr.sh` (it does not read the config). The
-`voxel-rss-gen` path and the sled-agent config shape (`vdevs`/`external_disks`,
-`data_links`) are auto-derived from the image's omicron commit; there are no version
-knobs. Configuration is version-independent from the operator side.
+A few notes: by default, this will all happen under $HOME. If you don't like that or need
+to improve performance by using a separate disk, there are some knobs set via `voxel config set`:
 
-`BUILD_ROOT` selects the omicron build location. Set it as a flag, config key, or
-environment variable:
+* falcon.dataset: Location for built control plane snapshots
+* falcon.build_root: Location where omicron will clone and compile for new images
+* falcon.workdir: Location where voxel will do its configuration and setup for new launches
 
-```
-voxel --build-root /data/builds image create 43bb5af   # flag
-voxel config set falcon.build_root /data/builds        # config ([falcon].build_root)
-BUILD_ROOT=/data/builds voxel image create 43bb5af     # env
-```
-
-Two build-location knobs:
-- `FALCON_DATASET`: where images and topo zvols live (`<ds>/img/...`).
-- `BUILD_ROOT`: where the omicron checkout and rss-gen build live.
-
-## Emulated SPs and RoTs (sp-emu)
+## OPTIONAL, Emulated SPs and RoTs (sp-emu)
 
 By default voxel backs each SP with omicron's `sp-sim`. To run real SP and RoT
 firmware, voxel uses [sp-emu](https://github.com/oxidecomputer/sp-emu), which boots
@@ -111,12 +93,4 @@ run inside the switch zone, not a Cargo dependency, so build it and point voxel 
    ```
 
    `--wicket-setup` runs rack setup through wicketd instead of the file-based
-   sled-agent auto-init: it uploads the config, a self-signed cert, and the recovery
-   password, starts RSS, and populates wicket's RACK SETUP page. It requires the
-   emulated SP/RoT fleet, so run it with `--emu-rot`. Because it posts a cert, the
-   console comes up over https rather than http.
-
-Building a cp image bakes the sp-emu binary and per-role firmware into the image from
-`[sp]`, so a launched rack is self-contained and `emu_bin` can be left unset at
-launch. Setting `emu_bin` at launch stages it on the fly instead, for iterating on
-sp-emu without rebaking.
+   sled-agent auto-init.
