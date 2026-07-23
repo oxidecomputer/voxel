@@ -140,10 +140,22 @@ impl FrrRouter {
             writeln!(o, "!").unwrap();
         }
 
-        // Static routes to the rack pool via each sidecar, BFD-tracked when enabled.
-        let suffix = if self.track_bfd { " bfd" } else { "" };
+        // Static routes to the rack pool via each sidecar. With BFD tracking we
+        // also emit an unconditional floating static (admin distance 250) as a
+        // backstop. FRR withdraws a `... bfd` route while its session is down,
+        // and during RSS the sidecar side of BFD may not be up yet (early
+        // networking programs the mgd peer best effort, with no retry), so
+        // without a backstop the router loses its return route to the rack and
+        // time sync deadlocks. The distance 250 static carries traffic until BFD
+        // comes up, then the tracked route (distance 1) preempts. Matches a4x2's
+        // floating static idiom.
         for s in &self.static_uplinks {
-            writeln!(o, "ip route {} {}{}", s.route, s.peer, suffix).unwrap();
+            if self.track_bfd {
+                writeln!(o, "ip route {} {} bfd", s.route, s.peer).unwrap();
+                writeln!(o, "ip route {} {} 250", s.route, s.peer).unwrap();
+            } else {
+                writeln!(o, "ip route {} {}", s.route, s.peer).unwrap();
+            }
         }
         o
     }
