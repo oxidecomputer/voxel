@@ -10,7 +10,7 @@
 //! added (`bfdd` must be enabled in the image); off (the a4x2 default) renders
 //! plain static routes.
 
-use std::fmt::Write as _;
+use std::fmt;
 
 /// An unnumbered eBGP neighbor reachable over an interface (no peer IP).
 #[derive(Debug, Clone)]
@@ -58,86 +58,94 @@ pub struct FrrRouter {
     pub track_bfd: bool,
 }
 
+impl fmt::Display for FrrRouter {
+    /// Render a complete `frr.conf`. Writing to a `Formatter` is infallible for
+    /// the `String` backing `render`, but `Display` lets every writeln propagate
+    /// via `?` instead of `.unwrap()`.
+    fn fmt(&self, o: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.static_uplinks.is_empty() {
+            self.render_bgp(o)
+        } else {
+            self.render_static(o)
+        }
+    }
+}
+
 impl FrrRouter {
     /// Render a complete `frr.conf`.
     pub fn render(&self) -> String {
-        if self.static_uplinks.is_empty() {
-            self.render_bgp()
-        } else {
-            self.render_static()
-        }
+        self.to_string()
     }
 
-    fn write_header(&self, o: &mut String) {
-        writeln!(o, "frr defaults datacenter").unwrap();
-        writeln!(o, "hostname {}", self.hostname).unwrap();
-        writeln!(o, "!").unwrap();
+    fn write_header(&self, o: &mut impl fmt::Write) -> fmt::Result {
+        writeln!(o, "frr defaults datacenter")?;
+        writeln!(o, "hostname {}", self.hostname)?;
+        writeln!(o, "!")
     }
 
     /// `interface`/`description` blocks for the unnumbered (ce) neighbors.
-    fn write_neighbor_interfaces(&self, o: &mut String) {
+    fn write_neighbor_interfaces(&self, o: &mut impl fmt::Write) -> fmt::Result {
         for n in &self.neighbors {
-            writeln!(o, "interface {}", n.interface).unwrap();
-            writeln!(o, " description {}", n.description).unwrap();
-            writeln!(o, "!").unwrap();
+            writeln!(o, "interface {}", n.interface)?;
+            writeln!(o, " description {}", n.description)?;
+            writeln!(o, "!")?;
         }
+        Ok(())
     }
 
     /// `router bgp` open, `no ebgp-requires-policy`, and the unnumbered eBGP
     /// neighbors (toward ce). Callers append numbered peers + address-families.
-    fn write_bgp_open(&self, o: &mut String) {
-        writeln!(o, "router bgp {}", self.asn).unwrap();
-        writeln!(o, " no bgp ebgp-requires-policy").unwrap();
+    fn write_bgp_open(&self, o: &mut impl fmt::Write) -> fmt::Result {
+        writeln!(o, "router bgp {}", self.asn)?;
+        writeln!(o, " no bgp ebgp-requires-policy")?;
         for n in &self.neighbors {
-            writeln!(o, " neighbor {} interface remote-as external", n.interface).unwrap();
-            writeln!(o, " neighbor {} timers connect 1", n.interface).unwrap();
+            writeln!(o, " neighbor {} interface remote-as external", n.interface)?;
+            writeln!(o, " neighbor {} timers connect 1", n.interface)?;
         }
+        Ok(())
     }
 
-    fn render_bgp(&self) -> String {
-        let mut o = String::new();
-        self.write_header(&mut o);
-        self.write_neighbor_interfaces(&mut o);
-        self.write_bgp_open(&mut o);
-        writeln!(o, " !").unwrap();
-        self.render_afi(&mut o, "ipv4", &self.originate4, false);
-        writeln!(o, " !").unwrap();
-        self.render_afi(&mut o, "ipv6", &self.originate6, false);
-        writeln!(o, "!").unwrap();
-        o
+    fn render_bgp(&self, o: &mut impl fmt::Write) -> fmt::Result {
+        self.write_header(o)?;
+        self.write_neighbor_interfaces(o)?;
+        self.write_bgp_open(o)?;
+        writeln!(o, " !")?;
+        self.render_afi(o, "ipv4", &self.originate4, false)?;
+        writeln!(o, " !")?;
+        self.render_afi(o, "ipv6", &self.originate6, false)?;
+        writeln!(o, "!")
     }
 
-    fn render_static(&self) -> String {
-        let mut o = String::new();
-        self.write_header(&mut o);
-        self.write_neighbor_interfaces(&mut o);
+    fn render_static(&self, o: &mut impl fmt::Write) -> fmt::Result {
+        self.write_header(o)?;
+        self.write_neighbor_interfaces(o)?;
         // Numbered /30 toward each sidecar.
         for s in &self.static_uplinks {
-            writeln!(o, "interface {}", s.interface).unwrap();
-            writeln!(o, " ip address {}", s.address).unwrap();
-            writeln!(o, "!").unwrap();
+            writeln!(o, "interface {}", s.interface)?;
+            writeln!(o, " ip address {}", s.address)?;
+            writeln!(o, "!")?;
         }
 
         // Single-hop BFD sessions to the sidecars (only when BFD-tracking).
         if self.track_bfd {
-            writeln!(o, "bfd").unwrap();
+            writeln!(o, "bfd")?;
             for s in &self.static_uplinks {
-                writeln!(o, " peer {}", s.peer).unwrap();
-                writeln!(o, "  no shutdown").unwrap();
+                writeln!(o, " peer {}", s.peer)?;
+                writeln!(o, "  no shutdown")?;
             }
-            writeln!(o, "!").unwrap();
+            writeln!(o, "!")?;
         }
 
         // eBGP toward ce plus a numbered peer per sidecar (see StaticUplink.peer_asn).
         if !self.neighbors.is_empty() || !self.static_uplinks.is_empty() {
-            self.write_bgp_open(&mut o);
+            self.write_bgp_open(o)?;
             for s in &self.static_uplinks {
-                writeln!(o, " neighbor {} remote-as {}", s.peer, s.peer_asn).unwrap();
-                writeln!(o, " neighbor {} timers connect 1", s.peer).unwrap();
+                writeln!(o, " neighbor {} remote-as {}", s.peer, s.peer_asn)?;
+                writeln!(o, " neighbor {} timers connect 1", s.peer)?;
             }
-            writeln!(o, " !").unwrap();
-            self.render_afi(&mut o, "ipv4", &self.originate4, true);
-            writeln!(o, "!").unwrap();
+            writeln!(o, " !")?;
+            self.render_afi(o, "ipv4", &self.originate4, true)?;
+            writeln!(o, "!")?;
         }
 
         // Static routes to the rack pool via each sidecar. With BFD tracking we
@@ -151,32 +159,38 @@ impl FrrRouter {
         // floating static idiom.
         for s in &self.static_uplinks {
             if self.track_bfd {
-                writeln!(o, "ip route {} {} bfd", s.route, s.peer).unwrap();
-                writeln!(o, "ip route {} {} 250", s.route, s.peer).unwrap();
+                writeln!(o, "ip route {} {} bfd", s.route, s.peer)?;
+                writeln!(o, "ip route {} {} 250", s.route, s.peer)?;
             } else {
-                writeln!(o, "ip route {} {}", s.route, s.peer).unwrap();
+                writeln!(o, "ip route {} {}", s.route, s.peer)?;
             }
         }
-        o
+        Ok(())
     }
 
-    fn render_afi(&self, o: &mut String, afi: &str, originate: &[String], redistribute_static: bool) {
-        writeln!(o, " address-family {afi} unicast").unwrap();
+    fn render_afi(
+        &self,
+        o: &mut impl fmt::Write,
+        afi: &str,
+        originate: &[String],
+        redistribute_static: bool,
+    ) -> fmt::Result {
+        writeln!(o, " address-family {afi} unicast")?;
         if redistribute_static && afi == "ipv4" {
-            writeln!(o, "  redistribute static").unwrap();
+            writeln!(o, "  redistribute static")?;
         }
         for p in originate {
-            writeln!(o, "  network {p}").unwrap();
+            writeln!(o, "  network {p}")?;
         }
         for n in &self.neighbors {
-            writeln!(o, "  neighbor {} activate", n.interface).unwrap();
+            writeln!(o, "  neighbor {} activate", n.interface)?;
         }
         // Numbered sidecar peers are IPv4; only activate in the v4 AF.
         if afi == "ipv4" {
             for s in &self.static_uplinks {
-                writeln!(o, "  neighbor {} activate", s.peer).unwrap();
+                writeln!(o, "  neighbor {} activate", s.peer)?;
             }
         }
-        writeln!(o, " exit-address-family").unwrap();
+        writeln!(o, " exit-address-family")
     }
 }

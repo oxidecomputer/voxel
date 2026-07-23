@@ -236,15 +236,9 @@ enum ImageCmd {
 
 #[derive(Subcommand)]
 enum NetworkCmd {
-    /// Show the per-rack network projection, switches, and switch interconnects.
+    /// Show the per-rack network projection, switches, and the auto cross-rack
+    /// sidecar interconnect mesh.
     Show,
-    /// Add a switch-to-switch interconnect; applied on the next launch.
-    ///
-    /// A direct sidecar<->sidecar QSFP link carrying the underlay. Selectors:
-    /// `switch0` | `switch1` | `switchN` | `rackR/switchS`.
-    AddPort { a: String, b: String },
-    /// Remove a switch interconnect (either order); applied on the next launch.
-    RmPort { a: String, b: String },
     /// Bring up a switch port's link on a running rack (transient).
     ///
     /// Creates (if needed) + enables the link via `swadm`; run on both ends. ⚠
@@ -613,8 +607,6 @@ async fn main() -> Result<(), Error> {
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
-            NetworkCmd::AddPort { a, b } => network::add_port(&config_path, a, b),
-            NetworkCmd::RmPort { a, b } => network::rm_port(&config_path, a, b),
             NetworkCmd::LinkUp { switch, port, speed, fec } => {
                 network::link_up(&load_config(&config_path)?, &cli.name, switch, port, speed, fec).await
             }

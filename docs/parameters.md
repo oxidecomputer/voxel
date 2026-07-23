@@ -27,7 +27,6 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `sled_memory_gb` | int | `8` | Per-sled guest RAM. Gates how many sleds fit in physical RAM. |
 | `router_memory_gb` | int | `4` | Per-router guest RAM. |
 | `ce_external_ip` | string | unset | Static host-LAN address for `ce`. Unset means `ce` DHCPs and voxel reads the lease over serial. |
-| `interconnects` | list of pairs | `[]` | Switch-to-switch ASIC links (falcon `softnpu_links`), e.g. cross-rack or `switch0`<->`switch1`. Each entry is a pair of switch selectors (`switch0`, `switchN`, `rackR/switchS`). Managed via `voxel network add-port` / `rm-port`. |
 
 ## [image]
 
@@ -52,6 +51,9 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `service_pool_last` | string | `"198.51.100.29"` | Internal service IP pool end. |
 | `bgp_asn` | int | `65000` | Rack BGP ASN. |
 | `infra_prefix` | string | `"198.51.100.0/24"` | IPv4 prefix the rack originates upstream. |
+| `router_mode` | enum | `bgp` | `bgp` (unnumbered eBGP) or `static` (numbered /30 uplinks, static routes, BFD). |
+| `transit_prefix` | string | `"198.51.101.0/24"` | IPv4 /24 carved into per-uplink /30s for `static` mode. |
+| `transit_bfd` | bool | `false` | `static` mode: BFD-track transit routes. Needs a dataplane where softnpu BFD establishes. |
 | `uplinks` | list of tables | two entries (see below) | Scrimlet uplink ports toward the customer routers. |
 
 ### [[network.uplinks]]
