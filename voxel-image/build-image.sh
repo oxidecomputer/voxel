@@ -93,13 +93,41 @@ log "launching builder (boots ${BASE_IMAGE}, runs ${INSTALL_SCRIPT}; takes a whi
 
 # --- 3. verify ready marker ---------------------------------------------------
 # falcon `exec` does NOT propagate the guest command's exit code, so we validate
-# the marker's CONTENT (written only at the end of a successful install).
-log "verifying in-guest ready marker"
+# the marker's CONTENT (written only at the end of a successful install). Match a
+# specific string (READY_MATCH) so a STALE marker from the base image (e.g. the
+# `voxel-builder` provision marker) can't pass as success. On mismatch, dump the
+# tail of the in-guest install log so the real failure is visible, then abort
+# WITHOUT capturing a bogus image.
+READY_MATCH="${READY_MATCH:-version=}"
+log "verifying in-guest ready marker (expect '${READY_MATCH}')"
 MARKER="$( cd "${HERE}" && pfexec "${BUILDER}" exec "${NODE}" "cat /var/voxel-image-ready" 2>/dev/null )"
-case "${MARKER}" in
-    *version=*) log "ready: ${MARKER}" ;;
-    *) log "FATAL: ready marker missing/empty; ${INSTALL_SCRIPT} did not complete"; exit 1 ;;
-esac
+if [[ "${MARKER}" == *"${READY_MATCH}"* ]]; then
+    log "ready: ${MARKER}"
+else
+    log "FATAL: ready marker missing/wrong ('${MARKER}'); ${INSTALL_SCRIPT} did not complete."
+    log "----- in-guest ${INSTALL_SCRIPT} log (tail) -----"
+    ( cd "${HERE}" && pfexec "${BUILDER}" exec "${NODE}" "tail -n 60 /tmp/install.log" 2>/dev/null ) || true
+    log "------------------------------------------------"
+    ( cd "${HERE}" && pfexec "${BUILDER}" destroy ) 2>/dev/null || true
+    exit 1
+fi
+
+# --- 3b. extract the schema manifest to the host stub (voxel-cp VM build) ------
+# The commit-pinned schema manifest is baked into the image; mirror it to the
+# host stub (MANIFEST_OUT) so voxel reads it at launch without any omicron source
+# on the box. Fenced so the serial console's command echo/prompt is ignored.
+if [[ -n "${MANIFEST_OUT:-}" ]]; then
+    log "extracting schema manifest -> ${MANIFEST_OUT}"
+    raw="$( cd "${HERE}" && pfexec "${BUILDER}" exec "${NODE}" \
+        "echo VOXBEGIN; cat /opt/oxide/voxel-image.toml; echo VOXEND" 2>/dev/null )"
+    mkdir -p "$(dirname "${MANIFEST_OUT}")"
+    printf '%s\n' "${raw}" \
+        | awk '/^VOXBEGIN\r?$/{f=1;next} /^VOXEND\r?$/{f=0} f' \
+        | sed 's/\r$//' > "${MANIFEST_OUT}"
+    [[ -s "${MANIFEST_OUT}" ]] \
+        && log "manifest: $(tr '\n' ' ' < "${MANIFEST_OUT}")" \
+        || log "WARN: manifest extraction produced an empty file"
+fi
 
 # --- 4. quiesce + stop --------------------------------------------------------
 # Clear the device-instance map as the LAST thing before capture: a snapshot
@@ -167,8 +195,14 @@ raw)
 esac
 
 # --- 6. cleanup --------------------------------------------------------------
-log "destroying builder topology"
-( cd "${HERE}" && pfexec "${BUILDER}" destroy ) || true
+# KEEP_BUILDER=1 leaves the builder topology (and its disk, with the omicron
+# source) in place so it can be relaunched for in-place source edits.
+if [[ "${KEEP_BUILDER:-0}" == "1" ]]; then
+    log "KEEP_BUILDER=1: leaving builder topology in place (relaunch to edit source)"
+else
+    log "destroying builder topology"
+    ( cd "${HERE}" && pfexec "${BUILDER}" destroy ) || true
+fi
 
 if [[ "${CAPTURE_MODE}" == "raw" ]]; then
     log "done. artifact: ${ARTIFACT}"

@@ -250,15 +250,42 @@ fn wipe_vdevs() {
     }
 }
 
-/// Inject the (data-link-patched) sled config + the generated RSS config (the
-/// latter present only on the RSS node) as the runtime sled-agent configs.
+/// Inject the (data-link-patched) sled config + the RSS config (the latter on the
+/// RSS node only) as the runtime sled-agent configs. On the RSS node config-rss is
+/// generated here from the staged resolved config using the image-baked,
+/// commit-pinned rss-gen, unless suppressed (wicketd / pre-RSS racks have the host
+/// produce it out-of-band).
 fn inject_runtime_configs() -> Result<()> {
     fs::copy(PATCHED_CFG, "/opt/oxide/sled-agent/pkg/config.toml")
         .context("inject sled-agent config.toml")?;
     let rss = format!("{CARGO_BAY}/config-rss.toml");
+    let effective = format!("{CARGO_BAY}/voxel-effective.toml");
+    let suppress = Path::new(&format!("{CARGO_BAY}/rss-suppress")).exists();
+    if !Path::new(&rss).exists() && !suppress && Path::new(&effective).exists() {
+        generate_rss_config(&effective, &rss)?;
+    }
     if Path::new(&rss).exists() {
         fs::copy(&rss, "/opt/oxide/sled-agent/pkg/config-rss.toml")
             .context("inject config-rss.toml")?;
+    }
+    Ok(())
+}
+
+/// Render config-rss.toml in-guest via the baked rss-gen (RSS node only). The
+/// rack index (for rss-gen's `--rack`, which filters the bootstrap set + offsets
+/// the customer network) comes from the staged `rss-rack`, defaulting to 0.
+fn generate_rss_config(effective: &str, out: &str) -> Result<()> {
+    let rack = fs::read_to_string(format!("{CARGO_BAY}/rss-rack"))
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    note(format!("generating config-rss (rack {rack}) via baked rss-gen"));
+    let ok = run(
+        "/opt/oxide/voxel-rss-gen",
+        &["generate", effective, out, "--rack", &rack.to_string()],
+    );
+    if !ok {
+        return Err(anyhow!("voxel-rss-gen failed (rack {rack})"));
     }
     Ok(())
 }

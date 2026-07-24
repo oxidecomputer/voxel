@@ -104,6 +104,46 @@ async fn run_voxel_init(d: &Runner, items: Vec<(NodeRef, &'static str, String)>)
     futures::future::join_all(handles).await;
 }
 
+/// Produce a rack's `config-rss.toml` by running the image-baked, commit-pinned
+/// rss-gen inside its (already booted) RSS node and pulling the text back. Used
+/// where the host needs config-rss out-of-band: the wicketd bodies
+/// (`--wicket-setup`) and multirack staging for a future join. The normal path
+/// has voxel-init generate + inject it in-guest. A sentinel fence keeps the pull
+/// robust to the serial console's command echo and prompt noise.
+async fn generate_rss_in_node(
+    d: &Runner,
+    node: NodeRef,
+    rack: usize,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    let cmd = format!(
+        "/opt/oxide/voxel-rss-gen generate /opt/cargo-bay/voxel-effective.toml \
+         /tmp/config-rss.toml --rack {rack} 1>&2; \
+         echo VOXRSS_BEGIN; cat /tmp/config-rss.toml; echo VOXRSS_END"
+    );
+    let out_text = d
+        .exec(node, &cmd)
+        .await
+        .map_err(|e| anyhow!("in-node rss-gen: {e}"))?;
+    // Whole-line match on the markers so the console's echo of the command (which
+    // contains the marker words) is ignored; take the lines strictly between them.
+    let body: Vec<&str> = out_text
+        .lines()
+        .skip_while(|l| l.trim() != "VOXRSS_BEGIN")
+        .skip(1)
+        .take_while(|l| l.trim() != "VOXRSS_END")
+        .map(|l| l.trim_end_matches('\r'))
+        .collect();
+    if body.is_empty() {
+        return Err(anyhow!("in-node rss-gen produced no config-rss (rack {rack})"));
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, body.join("\n") + "\n")?;
+    Ok(())
+}
+
 /// Bring up the cross-rack interconnect front ports on a HELD (pre-RSS) rack.
 /// rack 0 gets these from early networking during RSS (rss-gen emits them as
 /// AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
@@ -307,6 +347,16 @@ pub(crate) async fn cmd_launch(
                 // rack's switch front ports. Bring up the interconnect ports by
                 // hand so the cross-rack DDM underlay has a live link on both ends.
                 bring_up_interconnect(d, &topo, cfg, rack).await;
+                // Stage this held rack's config-rss (for a future cluster-join)
+                // from its baked in-guest rss-gen.
+                if let Some((_, rn)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
+                    let staged = std::path::Path::new("multirack-staged")
+                        .join(format!("rack{rack}"))
+                        .join("config-rss.toml");
+                    if let Err(e) = generate_rss_in_node(d, *rn, rack, &staged).await {
+                        warn!(d.log, "rack{}: staging config-rss failed: {e}", rack + 1);
+                    }
+                }
                 info!(
                     d.log,
                     "rack{}: booted, left pre-RSS (unclaimed - multirack join not yet supported)",
@@ -325,6 +375,11 @@ pub(crate) async fn cmd_launch(
                     let config_rss = std::path::Path::new("wicket-setup")
                         .join(format!("rack{rack}"))
                         .join("config-rss.toml");
+                    // wicketd suppresses auto-RSS, so config-rss isn't staged in
+                    // the cargo-bay; produce it now from the baked in-guest rss-gen.
+                    if let Err(e) = generate_rss_in_node(d, *n, rack, &config_rss).await {
+                        warn!(d.log, "{tag}: in-node rss-gen failed: {e}; rack will not initialize");
+                    }
                     // wicketd's bootstrap_sleds must be THIS rack's cubby slots =
                     // its sleds' GLOBAL indices (rack 1 -> 3,4,5), matching what the
                     // MGS sim reports (`location = ["sled", global_index]`); a flat

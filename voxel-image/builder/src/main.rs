@@ -99,19 +99,82 @@ async fn main() -> Result<(), Error> {
         } else {
             let script =
                 std::env::var("INSTALL_SCRIPT").unwrap_or_else(|_| "install-cp.sh".to_string());
-            // Invoke via `bash` rather than `./{script}` + chmod: linux guests
-            // get a read-only 9p mount where chmod fails (and the host already
-            // stages the script executable).
-            let install_cmd =
-                format!("cd /opt/cargo-bay && bash ./{script} 2>&1 | tee /tmp/install.log");
-            info!(d.log, "running install script {}", script);
-            d.exec(vbuild, &install_cmd)
-                .await
-                .map_err(|e| anyhow!("install ({script}): {e}"))?;
-            info!(
-                d.log,
-                "install ({}) complete; node ready for capture", script
+            // falcon `exec` buffers a command's output until it returns, so a long
+            // install (the omicron build can be 30-45 min) shows nothing until the
+            // end. Run it DETACHED (output to /tmp/install.log, exit code to
+            // /tmp/install.done) so it doesn't hold the serial console, then
+            // poll-tail the log so progress streams live. Invoke via `bash` (linux
+            // guests get a read-only 9p mount where chmod fails).
+            info!(d.log, "running install script {} (streaming)", script);
+            let start = format!(
+                "cd /opt/cargo-bay && rm -f /tmp/install.log /tmp/install.done && \
+                 nohup sh -c 'bash ./{script} >/tmp/install.log 2>&1; echo $? >/tmp/install.done' \
+                 >/dev/null 2>&1 & echo launched"
             );
+            d.exec(vbuild, &start)
+                .await
+                .map_err(|e| anyhow!("start install ({script}): {e}"))?;
+
+            // Poll every 10s: print new log lines (fenced so the serial command
+            // echo is ignored) until the wrapper records an exit code. Capped so a
+            // hung build can't spin forever.
+            let poll_secs =
+                std::env::var("VBUILD_POLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10u64);
+            let max_minutes =
+                std::env::var("VBUILD_MAX_MINUTES").ok().and_then(|v| v.parse().ok()).unwrap_or(120u64);
+            let max_polls = (max_minutes * 60 / poll_secs.max(1)).max(1);
+            let mut seen = 0usize;
+            let mut exit_code: Option<String> = None;
+            for _ in 0..max_polls {
+                let poll = format!(
+                    "echo __VBSTART__; sed -n '{},$p' /tmp/install.log 2>/dev/null; echo __VBEOF__; \
+                     (test -f /tmp/install.done && cat /tmp/install.done || echo __RUNNING__)",
+                    seen + 1
+                );
+                let out = d.exec(vbuild, &poll).await.unwrap_or_default();
+                // state: 0 before the real __VBSTART__ echo, 1 in log body, 2 after.
+                let mut state = 0u8;
+                for line in out.lines() {
+                    let l = line.trim_end_matches('\r');
+                    match state {
+                        0 => {
+                            if l.trim() == "__VBSTART__" {
+                                state = 1;
+                            }
+                        }
+                        1 => {
+                            if l.trim() == "__VBEOF__" {
+                                state = 2;
+                            } else {
+                                println!("{l}");
+                                seen += 1;
+                            }
+                        }
+                        _ => {
+                            let t = l.trim();
+                            if !t.is_empty() && t != "__RUNNING__" {
+                                exit_code = Some(t.to_string());
+                            }
+                        }
+                    }
+                }
+                if exit_code.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
+            }
+            match exit_code.as_deref() {
+                Some("0") => info!(d.log, "install ({}) complete; node ready for capture", script),
+                Some(code) => info!(
+                    d.log,
+                    "install ({}) exited {} (build-image.sh gates on the ready marker)", script, code
+                ),
+                None => info!(
+                    d.log,
+                    "install ({}) still running after the poll cap; leaving it (marker check will decide)",
+                    script
+                ),
+            }
         }
     }
 

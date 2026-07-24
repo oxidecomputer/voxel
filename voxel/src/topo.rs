@@ -210,77 +210,62 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render `config-rss.toml` with the typed, release-pinned generator
-/// (`voxel-rss-gen`, built against the image's omicron - see voxel/rss-gen).
-/// This is release-accurate by construction; we deliberately do NOT fall back
-/// to a hand-rolled renderer. Point `VOXEL_RSS_GEN` at the binary if it isn't
-/// at the default path.
-fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Result<()> {
-    let gen = std::env::var("VOXEL_RSS_GEN")
-        .unwrap_or_else(|_| "/opt/omicron/target/debug/voxel-rss-gen".to_string());
-    let effective = dir.join("voxel-effective.toml");
-    // Write the *resolved* config (derived scrimlets/rss_sleds made explicit) -
-    // the separately-built rss-gen doesn't re-run the derivation, so empty
-    // scrimlets / rss_sleds = 0 would yield an empty bootstrap set ("Must
-    // request at least one peer"). rss-gen projects it to a single rack via
-    // `--rack` (filters the bootstrap set + offsets the customer network).
-    fs::write(&effective, cfg.to_resolved_toml())?;
-    let status = std::process::Command::new(&gen)
-        .arg("generate")
-        .arg(&effective)
-        .arg(dir.join("config-rss.toml"))
-        .arg("--rack")
-        .arg(rack.to_string())
-        .status()
-        .map_err(|e| anyhow!("run {gen}: {e} - build voxel/rss-gen or set VOXEL_RSS_GEN"))?;
-    if !status.success() {
-        return Err(anyhow!(
-            "{gen} generate failed. If the error above is a TOML 'unknown field', \
-             voxel-rss-gen is STALE for the current voxel-config (it's built separately and \
-             pins voxel-config at build time) - rebuild it: \
-             `voxel-image/build-rss-gen.sh <omicron-src>`, or run `voxel image create <commit>` \
-             without BUILD_RSS_GEN=0."
-        ));
-    }
-    Ok(())
+/// Host stub dir for the image's omicron: `<build_root>/omicron-<commit>/`.
+/// Mirrors `resolve_falcon_env`'s build-root default. For VM-built images only
+/// the tiny `voxel-image.toml` manifest lives here (the full source is in the
+/// image); `--host-build` also writes the manifest here.
+fn image_src_dir(cfg: &VoxelConfig) -> Option<PathBuf> {
+    let commit = cfg.image.cp_commit()?;
+    let build_root = std::env::var("BUILD_ROOT").unwrap_or_else(|_| {
+        format!(
+            "{}/voxel-builds",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+        )
+    });
+    Some(PathBuf::from(build_root).join(format!("omicron-{commit}")))
 }
 
-/// Auto-detect the sled-agent config shapes (`data_links`, disks) from the
-/// image's omicron source, so operators never hand-set per-era knobs. The source
-/// sits beside the commit-pinned rss-gen (`$VOXEL_RSS_GEN` =
-/// `<build_root>/omicron-<commit>/target/debug/voxel-rss-gen`), so we read its
-/// `sled-agent/src/config.rs` and key off the field declarations - which are the
-/// ground truth for that commit. Falls back to the oldest shapes if the source
-/// can't be read; an explicit `[image]` override wins over detection.
-///
-/// This is the "schema changelog", automated: instead of a hand-maintained
-/// commits->requirements table, voxel reads what the commit itself declares.
+fn parse_data_links(s: &str) -> Option<SledDataLinksSchema> {
+    match s {
+        "tagged" => Some(SledDataLinksSchema::Tagged),
+        "list" => Some(SledDataLinksSchema::List),
+        _ => None,
+    }
+}
+
+fn parse_disks(s: &str) -> Option<SledDisksSchema> {
+    match s {
+        "external_disks" => Some(SledDisksSchema::ExternalDisks),
+        "vdevs" => Some(SledDisksSchema::Vdevs),
+        _ => None,
+    }
+}
+
+/// Sled-agent config shapes (`data_links`, disks) for the image's omicron. The
+/// build derives them in-guest (where the source is) and bakes them into
+/// `voxel-image.toml`, which `image create` extracts to the host stub. Read them
+/// from there; an `[image]` override wins, and the oldest shapes are the fallback
+/// if the manifest is absent.
 fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
-    let src = std::env::var("VOXEL_RSS_GEN")
-        .ok()
-        .and_then(|g| {
-            Path::new(&g)
-                .ancestors()
-                .nth(3)
-                .map(|p| p.join("sled-agent/src/config.rs"))
-        })
+    let (m_dl, m_dk) = image_src_dir(cfg)
+        .map(|d| d.join("voxel-image.toml"))
         .and_then(|p| fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    // `pub external_disks: ExternalDisks` (main) vs `pub vdevs: ...` (older).
-    let disks = if src.contains("pub external_disks") {
-        SledDisksSchema::ExternalDisks
-    } else {
-        SledDisksSchema::Vdevs
-    };
-    // `data_links: DataLinks` (tagged enum) vs the older flat list.
-    let data_links = if src.contains("data_links: DataLinks") {
-        SledDataLinksSchema::Tagged
-    } else {
-        SledDataLinksSchema::List
-    };
+        .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
+        .map(|v| {
+            let dl = v
+                .get("data_links_schema")
+                .and_then(|x| x.as_str())
+                .and_then(parse_data_links);
+            let dk = v
+                .get("disks_schema")
+                .and_then(|x| x.as_str())
+                .and_then(parse_disks);
+            (dl, dk)
+        })
+        .unwrap_or((None, None));
     (
-        cfg.image.data_links_schema.unwrap_or(data_links),
-        cfg.image.disks_schema.unwrap_or(disks),
+        cfg.image.data_links_schema.or(m_dl).unwrap_or_default(),
+        cfg.image.disks_schema.or(m_dk).unwrap_or_default(),
     )
 }
 
@@ -319,36 +304,26 @@ pub(crate) fn stage_config(
         )?;
     }
 
-    // One typed config-rss per rack, staged on that rack's RSS node (its first
-    // bootstrap sled - g0 for rack 0, g{rack*sleds} for the rest). Each rack is an
-    // independent RSS domain: rss-gen (`--rack`) filters the bootstrap set to that
-    // rack and offsets its customer/service network.
+    // RSS input, staged per rack on its RSS node (first bootstrap sled - g0 for
+    // rack 0, g{rack*sleds} for the rest). The commit-pinned rss-gen is baked
+    // into the image and run in-guest: voxel-init on the RSS node reads
+    // `voxel-effective.toml` (the resolved config, with derived scrimlets/rss_sleds
+    // made explicit) and `rss-rack` (which rack to project with `--rack`).
+    // rack 0 in the normal path auto-generates + injects; wicketd drives rack 0
+    // and rack>0 is left pre-RSS, so both get `rss-suppress` (their config-rss is
+    // produced at launch by an in-node run - see rack.rs).
     for rack in 0..cfg.topology.racks() {
         let rss_node = sleds
             .iter()
             .find(|s| s.rss && s.rack == rack)
             .ok_or_else(|| anyhow!("rack {rack} has no RSS sled"))?;
-        // For `--wicket-setup` we drive RSS through wicketd, so the config-rss
-        // must NOT be injected by voxel-init (sled-agent would otherwise auto-init
-        // from it). voxel-init only injects `<cargo-bay>/config-rss.toml`, so we
-        // simply generate it OUTSIDE the cargo-bay (in `wicket-setup/rackN/`) -
-        // `wicket_setup::drive` reads it from there to build the wicketd bodies.
-        let rss_dir = if wicket_setup {
-            let d = Path::new("wicket-setup").join(format!("rack{rack}"));
-            fs::create_dir_all(&d)?;
-            d
-        } else if rack > 0 {
-            // Multirack: rack 0 is the cluster; rack > 0 boots but does NOT RSS -
-            // it's an unclaimed rack staged for a future cluster-join (RFD 573).
-            // Generate its config-rss OUTSIDE the cargo-bay so voxel-init won't
-            // auto-inject + RSS it; kept under multirack-staged/ for the join flow.
-            let d = Path::new("multirack-staged").join(format!("rack{rack}"));
-            fs::create_dir_all(&d)?;
-            d
-        } else {
-            cargo_bay(&rss_node.name)
-        };
-        generate_rss_config(cfg, &rss_dir, rack)?;
+        let cb = cargo_bay(&rss_node.name);
+        fs::create_dir_all(&cb)?;
+        fs::write(cb.join("voxel-effective.toml"), cfg.to_resolved_toml())?;
+        fs::write(cb.join("rss-rack"), rack.to_string())?;
+        if wicket_setup || rack != 0 {
+            fs::write(cb.join("rss-suppress"), "")?;
+        }
     }
 
     // Per-router frr.conf.

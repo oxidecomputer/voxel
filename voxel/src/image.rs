@@ -33,10 +33,20 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Locate `voxel-image/build-cp.sh`: `VOXEL_BUILD_CP` override, else relative to
-/// the running binary, else CWD.
+/// Locate `voxel-image/build-cp.sh` (the `--host-build` fallback):
+/// `VOXEL_BUILD_CP` override, else relative to the running binary, else CWD.
 fn build_cp_script() -> anyhow::Result<PathBuf> {
     locate_script("VOXEL_BUILD_CP", "build-cp.sh")
+}
+
+/// Locate `voxel-image/build-cp-vm.sh` (the default VM build driver).
+fn build_cp_vm_script() -> anyhow::Result<PathBuf> {
+    locate_script("VOXEL_BUILD_CP_VM", "build-cp-vm.sh")
+}
+
+/// Locate `voxel-image/build-builder.sh` (bakes the `voxel-builder` base image).
+fn build_builder_script() -> anyhow::Result<PathBuf> {
+    locate_script("VOXEL_BUILD_BUILDER", "build-builder.sh")
 }
 
 pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Result<()> {
@@ -199,21 +209,56 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             }
             Ok(())
         }
-        ImageCmd::Create { commit } => {
-            let script = build_cp_script()?;
+        ImageCmd::Create {
+            commit,
+            persist_source,
+            host_build,
+        } => {
+            // Default: build inside a `voxel-builder` VM (no host toolchain).
+            // `--host-build`: legacy in-place host build.
+            let script = if *host_build {
+                build_cp_script()?
+            } else {
+                build_cp_vm_script()?
+            };
             eprintln!(
                 "[voxel] building voxel-cp-{commit} via {}",
                 script.display()
             );
-            let status = std::process::Command::new("bash")
-                .arg(&script)
-                .arg(commit)
+            let mut command = std::process::Command::new("bash");
+            command.arg(&script).arg(commit);
+            if *persist_source {
+                // Honored by the VM path (keep source in image + VM up); the host
+                // path always keeps its source on the box and ignores it.
+                command.env("PERSIST_SOURCE", "1");
+            }
+            let status = command
                 .status()
                 .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
             if !status.success() {
-                return Err(anyhow!("build-cp.sh failed for commit {commit}"));
+                return Err(anyhow!(
+                    "{} failed for commit {commit}",
+                    script.display()
+                ));
             }
             println!("built image voxel-cp-{commit}");
+            Ok(())
+        }
+        ImageCmd::BuilderCreate { force } => {
+            let script = build_builder_script()?;
+            eprintln!("[voxel] baking voxel-builder base image via {}", script.display());
+            let mut command = std::process::Command::new("bash");
+            command.arg(&script);
+            if *force {
+                command.env("FORCE", "1");
+            }
+            let status = command
+                .status()
+                .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
+            if !status.success() {
+                return Err(anyhow!("build-builder.sh failed"));
+            }
+            println!("built base image voxel-builder");
             Ok(())
         }
         ImageCmd::Export { name, out, raw } => {
@@ -332,6 +377,7 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         ImageCmd::RenderSmf {
             omicron_root,
             gimlets,
+            out,
         } => {
             // Bake switch0 for `gimlets` sleds with scrimlets at the first + last
             // sled (the convention the default topology follows). The launch-time
@@ -352,8 +398,11 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                     voxel_config::sled::SledAgentConfig::new(0, true).render(),
                 ),
             ];
+            // `--out` writes under a staging dir (same `smf/...` layout, which the
+            // guest copies into its checkout); else in-place under the checkout.
+            let base = out.as_ref().unwrap_or(omicron_root);
             for (rel, text) in writes {
-                let path = omicron_root.join(rel);
+                let path = base.join(rel);
                 let dir = path.parent().expect("smf path has a parent");
                 fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
                 fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;

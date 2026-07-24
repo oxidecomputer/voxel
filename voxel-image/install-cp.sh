@@ -51,7 +51,13 @@ for _ in $(seq 1 15); do
 done
 
 # --- pinned package deps (baked) ----------------------------------------------
-install_packages() { pkg install tofino looker htop jq; }
+# pkg exit 4 = "nothing to do" (already installed, e.g. on a pre-provisioned
+# voxel-builder base); treat it as success, not a retry.
+install_packages() {
+    pkg install tofino looker htop jq
+    local rc=$?
+    [[ $rc -eq 0 || $rc -eq 4 ]]
+}
 n=0
 until install_packages; do
     n=$((n + 1))
@@ -189,6 +195,26 @@ XML
 svccfg import /lib/svc/manifest/site/voxel-switch-enforcer.xml \
     && log "imported voxel-switch-enforcer" \
     || log "WARN: svccfg import voxel-switch-enforcer failed (manifest staged for boot-time import)"
+
+# Commit-pinned voxel-rss-gen: baked so the RSS node renders config-rss in-guest
+# at launch (voxel-init), keeping rss-gen off the host entirely. Staged into the
+# cargo-bay by the build driver (host build) or build-cp-guest.sh (VM build).
+if [[ -f /opt/cargo-bay/voxel-rss-gen ]]; then
+    log "baking voxel-rss-gen"
+    cp /opt/cargo-bay/voxel-rss-gen /opt/oxide/voxel-rss-gen
+    chmod +x /opt/oxide/voxel-rss-gen
+else
+    log "FATAL: voxel-rss-gen not staged at /opt/cargo-bay/voxel-rss-gen"; exit 1
+fi
+
+# Schema manifest (sled-agent config shapes for this commit). Baked here and also
+# mirrored to the host stub by the build driver; voxel reads it at launch.
+if [[ -f /opt/cargo-bay/voxel-image.toml ]]; then
+    log "baking voxel-image.toml manifest"
+    cp /opt/cargo-bay/voxel-image.toml /opt/oxide/voxel-image.toml
+else
+    log "WARN: no voxel-image.toml staged (launch falls back to oldest sled schema)"
+fi
 
 # --- quiesce & mark ready -----------------------------------------------------
 # NOTE: clearing the device-instance map (/etc/path_to_inst) is done by
