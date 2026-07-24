@@ -93,6 +93,17 @@ perl -pi -e 's/Some\(Baseboard::new_pc\(serial_number, product\)\)/Some(Baseboar
 grep -q 'new_gimlet(serial_number, product, 2)' sled-hardware/src/illumos/mod.rs \
     || { log "FATAL: smbios baseboard patch did not apply"; exit 1; }
 
+# --- 1c. voxel patch: v6 block in the infra address lot ------------------------
+# Nexus rack-init lot-validates every switch-port address against the single-block
+# infra lot. In Static mode that lot is v4 (numbered uplinks), so voxel's v6
+# addrconf sidecar-interconnect ports can't reserve (handoff 400 "address not in
+# lot"). Add a v6 block so they reserve, matching BGP mode's :: lot. Re-applied
+# post-checkout (the checkout resets the tree).
+log "patching nexus rack-init: add v6 block to the infra address lot"
+python3 "${HERE}/patches/nexus-infra-lot-v6.py" "${OMICRON_SRC}"
+grep -q 'voxel: add a v6 block' nexus/src/app/rack.rs \
+    || { log "FATAL: nexus infra-lot v6 patch did not apply"; exit 1; }
+
 # --- 2. prerequisites + softnpu machinery -------------------------------------
 log "install_builder_prerequisites.sh -y"
 ./tools/install_builder_prerequisites.sh -y

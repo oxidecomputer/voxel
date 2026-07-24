@@ -8,9 +8,11 @@ use std::process::Command;
 use voxel_config::VoxelConfig;
 
 use crate::isolated_external::{link_mtu, up as external_up};
-use crate::net::{set_external_route, wait_external_reachable};
+use crate::net::{
+    node_external_ip, set_external_route, ssh_output, wait_external_reachable, zlogin,
+};
 use crate::rss::watch_rss;
-use crate::topo::{build_topo, reset_node_cargo_bay, stage_config, stage_sprockets};
+use crate::topo::{Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets};
 
 /// A per-rack progress/label tag: `rackN` (1-based) when the deployment has more
 /// than one rack, else the single-rack fallback the caller passes ("rack",
@@ -146,6 +148,68 @@ async fn run_voxel_init(d: &Runner, items: Vec<(NodeRef, &'static str, String)>)
     futures::future::join_all(handles).await;
 }
 
+/// Bring up the cross-rack interconnect front ports on a HELD (pre-RSS) rack.
+/// rack 0 gets these from early networking during RSS (rss-gen emits them as
+/// AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
+/// ports are never configured. Create each interconnect port + its link-local by
+/// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port rss-gen
+/// emits for rack 0, so the cross-rack DDM underlay has a live link on both ends.
+/// No-op for a single rack (`interconnect_ports` is empty).
+async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack: usize) {
+    let ports = cfg.interconnect_ports(rack);
+    if ports.is_empty() {
+        return;
+    }
+    // This rack's scrimlets in slot order, matching `interconnect_ports`' `switch{slot}`.
+    let scrimlets: Vec<(NodeRef, String)> = topo
+        .sleds
+        .iter()
+        .filter(|(s, _)| s.rack == rack && s.scrimlet)
+        .map(|(s, n)| (*n, s.name.clone()))
+        .collect();
+    for (sw, port) in ports {
+        let Some(slot) = sw
+            .strip_prefix("switch")
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some((n, sled)) = scrimlets.get(slot) else {
+            continue;
+        };
+        let ip = match node_external_ip(d, *n, false).await {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!(
+                    d.log,
+                    "rack{}: interconnect {port}: no switch IP ({e})",
+                    rack + 1
+                );
+                continue;
+            }
+        };
+        // Create the front-port link and plumb its link-local. A re-run errors
+        // harmlessly ("already exists"); the addr create is guarded so it stays
+        // idempotent.
+        let cmd = format!(
+            "/opt/oxide/dendrite/bin/swadm link create -s 100G --fec none {port}; \
+             ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
+        );
+        match ssh_output(&ip, &zlogin(&cmd)) {
+            Some(_) => info!(
+                d.log,
+                "rack{}: interconnect {sled}:{port} up (link-local)",
+                rack + 1
+            ),
+            None => warn!(
+                d.log,
+                "rack{}: interconnect {sled}:{port}: switch-zone exec failed",
+                rack + 1
+            ),
+        }
+    }
+}
+
 pub(crate) async fn cmd_launch(
     cfg: &VoxelConfig,
     name: &str,
@@ -175,6 +239,26 @@ pub(crate) async fn cmd_launch(
         if scrimlets != 2 {
             return Err(anyhow!(
                 "rack {rack} needs exactly 2 scrimlets for the dual-switch RSS->Nexus handoff; got {scrimlets}"
+            ));
+        }
+    }
+    // Each scrimlet's SoftNPU front ports = fabric uplinks + cross-rack
+    // interconnects. Guard against exceeding the sidecar's port budget (the full
+    // cross-rack mesh grows with racks*switches).
+    const MAX_FRONT_PORTS: usize = 128;
+    let n_cr = cfg
+        .topology
+        .routers
+        .iter()
+        .filter(|r| r.as_str() != "ce")
+        .count();
+    for s in sleds.iter().filter(|s| s.scrimlet) {
+        let front = n_cr + cfg.topology.interconnect_count_for(s.index);
+        if front > MAX_FRONT_PORTS {
+            return Err(anyhow!(
+                "scrimlet {} needs {front} SoftNPU front ports (> {MAX_FRONT_PORTS}); \
+                 reduce racks or switches-per-rack",
+                s.name
             ));
         }
     }
@@ -266,6 +350,22 @@ pub(crate) async fn cmd_launch(
                 );
             }
             run_voxel_init(d, rack_sleds).await;
+            // Multirack: only rack 0 (the cluster) runs RSS. rack > 0 boots (sleds +
+            // the cross-rack interconnect wired) but is left PRE-RSS - the unclaimed
+            // state a future cluster-join (RFD 573) would start from. omicron can't
+            // join racks into one AZ yet, so we stage it and stop here.
+            if rack > 0 {
+                // RSS won't run here, so early networking never configures this
+                // rack's switch front ports. Bring up the interconnect ports by
+                // hand so the cross-rack DDM underlay has a live link on both ends.
+                bring_up_interconnect(d, &topo, cfg, rack).await;
+                info!(
+                    d.log,
+                    "rack{}: booted, left pre-RSS (unclaimed - multirack join not yet supported)",
+                    rack + 1
+                );
+                continue;
+            }
             if let Some((s, n)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
                 let tag = rack_label(racks, rack, "rack-init");
                 // --wicket-setup: nothing auto-inited (no staged config-rss), so

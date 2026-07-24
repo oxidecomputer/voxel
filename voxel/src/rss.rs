@@ -77,12 +77,11 @@ fn rss_step_display(step: &str) -> (usize, String) {
 /// runs `setup_ssh` at the start of bring-up, enabling empty-password root
 /// login before any poll fires. This always returns within the `cap` so
 /// `cmd_launch` proceeds to re-point the host route at ce.
-///
-/// `cap` bounds how long we watch one rack's RSS before giving up (the rack
-/// keeps converging regardless). The caller sizes it: a single sp-sim rack
-/// settles in ~12m, but emulated SPs slow every MGS RPC and a multi-rack launch
-/// runs the racks' bring-up under each other's load, so those need a bigger
-/// budget (see the callers in `rack.rs`).
+/// `cap` bounds how long we watch one rack's RSS before giving up (the rack keeps
+/// converging regardless). The caller sizes it: a single sp-sim rack settles in
+/// ~12m, but emulated SPs slow every MGS RPC and a multi-rack launch runs the
+/// racks' bring-up under each other's load, so those need a bigger budget (see
+/// the callers in `rack.rs`).
 pub(crate) async fn watch_rss(
     d: &Runner,
     rss: NodeRef,

@@ -1,11 +1,7 @@
-//! `voxel network` - show the network topology, manage switch interconnects, and
-//! validate live networking.
+//! `voxel network` - show the network topology and validate live networking.
 //!
-//!  - `show`     : render the per-rack network projection + switches + the
-//!                 configured switch interconnects (config-derived; works rack-down).
-//!  - `add-port` / `rm-port` : manage `[topology].interconnects` - direct
-//!                 sidecar<->sidecar links (applied on the next launch). The
-//!                 interconnect plumbing is in [`crate::topo`] / `voxel-config`.
+//!  - `show`     : render the per-rack network projection + switches + the auto
+//!                 cross-rack sidecar interconnect mesh (config-derived, rack-down).
 //!  - `link-up` / `link-down` : ⚠️ TRANSIENT/DEBUG - create+enable / disable+delete
 //!                 a switch port's link directly via `swadm`. Nexus's switch-port
 //!                 reconciler reaps manual `swadm`/`mgadm` changes (~30s), so these
@@ -15,9 +11,8 @@
 //!                 states (`swadm link ls`), BGP sessions (`mgadm bgp status`),
 //!                 and programmed routes (`swadm route list`), plus the host route.
 
-use anyhow::{Context, anyhow};
-use std::path::Path;
-use voxel_config::{SledDesc, VoxelConfig, config as vcfg};
+use anyhow::anyhow;
+use voxel_config::{SledDesc, VoxelConfig};
 
 use crate::net::{node_external_ip, ssh_capture, ssh_output, zlogin};
 use crate::topo::build_topo;
@@ -70,101 +65,17 @@ pub(crate) fn show(cfg: &VoxelConfig) -> anyhow::Result<()> {
     }
 
     println!();
-    if cfg.topology.interconnects.is_empty() {
-        println!("switch interconnects: none");
-        println!("  add one with: voxel network add-port <a> <b>   (e.g. switch0 switch1)");
+    let pairs = cfg.topology.interconnect_pairs();
+    if pairs.is_empty() {
+        println!("cross-rack interconnects: none (single rack)");
     } else {
         println!(
-            "switch interconnects (softnpu_links sidecar<->sidecar; land on qsfp{nfr}+, applied at launch):"
+            "cross-rack sidecar interconnects (auto full mesh; softnpu_links, land on qsfp{nfr}+):"
         );
-        for (a, b) in &cfg.topology.interconnects {
-            match (
-                cfg.topology.resolve_switch_index(a),
-                cfg.topology.resolve_switch_index(b),
-            ) {
-                (Some(ai), Some(bi)) => println!("  {a} <-> {b}   (g{ai} <-> g{bi})"),
-                _ => {
-                    println!("  {a} <-> {b}   (UNRESOLVED - check selectors against `show` above)")
-                }
-            }
+        for (a, b) in &pairs {
+            println!("  g{a} <-> g{b}");
         }
     }
-    Ok(())
-}
-
-// --- add-port / rm-port ----------------------------------------------------
-
-/// Serialize the interconnect list to a TOML array and persist it via the
-/// toml-edit setter (preserves the rest of the file).
-fn write_interconnects(path: &Path, pairs: &[(String, String)]) -> anyhow::Result<()> {
-    let arr = format!(
-        "[{}]",
-        pairs
-            .iter()
-            .map(|(a, b)| format!("[\"{a}\", \"{b}\"]"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let text = crate::config_text(path)?;
-    let updated = vcfg::set(&text, "topology.interconnects", &arr).map_err(|e| anyhow!(e))?;
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).ok();
-        }
-    }
-    std::fs::write(path, &updated).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
-pub(crate) fn add_port(path: &Path, a: &str, b: &str) -> anyhow::Result<()> {
-    let cfg = crate::load_config(path)?;
-    let (ra, rb) = (
-        cfg.topology.resolve_switch_index(a),
-        cfg.topology.resolve_switch_index(b),
-    );
-    let bad = [(a, ra), (b, rb)].into_iter().find(|(_, r)| r.is_none());
-    if let Some((sel, _)) = bad {
-        return Err(anyhow!(
-            "can't resolve switch '{sel}' (use switch0 | switch1 | switchN | rackR/switchS) - see `voxel network show`"
-        ));
-    }
-    if ra == rb {
-        return Err(anyhow!(
-            "'{a}' and '{b}' resolve to the same switch (g{})",
-            ra.unwrap()
-        ));
-    }
-    let mut pairs = cfg.topology.interconnects.clone();
-    if pairs
-        .iter()
-        .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
-    {
-        println!("interconnect {a} <-> {b} already present");
-        return Ok(());
-    }
-    pairs.push((a.to_string(), b.to_string()));
-    write_interconnects(path, &pairs)?;
-    println!("added interconnect {a} <-> {b}  (takes effect on the next `voxel launch`)");
-    Ok(())
-}
-
-pub(crate) fn rm_port(path: &Path, a: &str, b: &str) -> anyhow::Result<()> {
-    let cfg = crate::load_config(path)?;
-    let before = cfg.topology.interconnects.len();
-    let pairs: Vec<(String, String)> = cfg
-        .topology
-        .interconnects
-        .iter()
-        .filter(|(x, y)| !((x == a && y == b) || (x == b && y == a)))
-        .cloned()
-        .collect();
-    if pairs.len() == before {
-        return Err(anyhow!(
-            "no interconnect {a} <-> {b} (see `voxel network show`)"
-        ));
-    }
-    write_interconnects(path, &pairs)?;
-    println!("removed interconnect {a} <-> {b}  (takes effect on the next `voxel launch`)");
     Ok(())
 }
 

@@ -22,6 +22,7 @@ use crate::net::{
     SWITCH_ZONE_ROOT, node_external_ip, scp_from, scp_to, ssh_capture, ssh_output, zlogin,
 };
 use crate::topo::{GIMLET_SERIAL_PREFIX, Topo, build_topo};
+use crate::util::shell_quote;
 
 /// In-zone path we run faux-mgs from (also where we stage it on demand). The
 /// GZ-visible view is `SWITCH_ZONE_ROOT + FAUX_ZONE` (see `ensure_faux`).
@@ -359,7 +360,8 @@ async fn sp_reflash(
         // grep on one word ("voxel-rot-emu") is the nested-ssh-safe way to list
         // the instances (alternation/brackets silently fail through ssh).
         let restart = "n=0; for f in $(svcs -H -o fmri | grep voxel-rot-emu); do svcadm restart $f && n=$((n+1)); done; echo RESTARTED $n";
-        let out = ssh_output(&ip, &zlogin(&format!("'{restart}' 2>&1"))).unwrap_or_default();
+        let out =
+            ssh_output(&ip, &zlogin(&format!("{} 2>&1", shell_quote(restart)))).unwrap_or_default();
         if !out.contains("RESTARTED") {
             return Err(anyhow!(
                 "RoT image placed but restart failed on {sw}: {}",
@@ -396,7 +398,8 @@ async fn sp_reflash(
          mv /var/tmp/reflash.{port} {SP_EMU_ZONE}/{port}.flash; rm -f /var/tmp/{zip}; \
          svcadm restart svc:/oxide/voxel-sp-emu:sp{port}; echo REFLASH_OK"
     );
-    let out = ssh_output(&ip, &zlogin(&format!("'{script}' 2>&1"))).unwrap_or_default();
+    let out =
+        ssh_output(&ip, &zlogin(&format!("{} 2>&1", shell_quote(&script)))).unwrap_or_default();
     if !out.contains("REFLASH_OK") {
         return Err(anyhow!("SP reflash failed on {sw}: {}", out.trim()));
     }
@@ -759,7 +762,8 @@ async fn sp_dump(
          if [ ! -f $D/.done ]; then echo DUMP_TIMEOUT; exit 1; fi; \
          cd $D && zip -q dump.zip dump.json 0x*.bin && echo DUMP_OK"
     );
-    let out = ssh_output(&ip, &zlogin(&format!("'{trigger}' 2>&1"))).unwrap_or_default();
+    let out =
+        ssh_output(&ip, &zlogin(&format!("{} 2>&1", shell_quote(&trigger)))).unwrap_or_default();
     if !out.contains("DUMP_OK") {
         return Err(anyhow!("dump trigger failed on {sw}: {}", out.trim()));
     }
@@ -847,7 +851,7 @@ async fn sp_ls(cfg: &VoxelConfig, name: &str, switch: &str) -> anyhow::Result<()
          --per-attempt-timeout-millis 8000 state >/var/tmp/spls.$p 2>/dev/null & done; wait; \
          for p in{plist}; do echo \"@@SP $p\"; cat /var/tmp/spls.$p; rm -f /var/tmp/spls.$p; done"
     );
-    let combined = ssh_capture(&ip, &zlogin(&format!("'{probe}'"))).unwrap_or_default();
+    let combined = ssh_capture(&ip, &zlogin(&shell_quote(&probe))).unwrap_or_default();
     let outputs: Vec<String> = {
         let mut v = vec![String::new(); ports.len()];
         let mut idx: Option<usize> = None;

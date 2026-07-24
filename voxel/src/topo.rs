@@ -163,9 +163,10 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         ext_interface(&mut d, *n, ext_if)?;
     }
 
-    // Switch-to-switch interconnects: a direct sidecar<->sidecar link per
-    // configured pair (`[topology].interconnects`). Wired AFTER the fabric
-    // uplinks so dpd assigns each the next front (qsfp) tfport. `softnpu_links`
+    // Cross-rack sidecar interconnects: a direct sidecar<->sidecar link per
+    // cross-rack scrimlet pair (auto full mesh when racks > 1; see
+    // `Topology::interconnect_pairs`). Wired AFTER the fabric uplinks so dpd
+    // assigns each the next front (qsfp) tfport. `softnpu_links`
     // (plural) is the ASIC-to-ASIC form - both ends get a MAC, so neither
     // scrimlet gains a viona NIC (which would shift the external vioif index and
     // break the gimlets' hardcoded DHCP interface).
@@ -348,6 +349,14 @@ pub(crate) fn stage_config(
         // `wicket_setup::drive` reads it from there to build the wicketd bodies.
         let rss_dir = if wicket_setup {
             let d = Path::new("wicket-setup").join(format!("rack{rack}"));
+            fs::create_dir_all(&d)?;
+            d
+        } else if rack > 0 {
+            // Multirack: rack 0 is the cluster; rack > 0 boots but does NOT RSS -
+            // it's an unclaimed rack staged for a future cluster-join (RFD 573).
+            // Generate its config-rss OUTSIDE the cargo-bay so voxel-init won't
+            // auto-inject + RSS it; kept under multirack-staged/ for the join flow.
+            let d = Path::new("multirack-staged").join(format!("rack{rack}"));
             fs::create_dir_all(&d)?;
             d
         } else {
