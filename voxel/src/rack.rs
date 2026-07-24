@@ -9,7 +9,7 @@ use voxel_config::VoxelConfig;
 
 use crate::isolated_external::{link_mtu, up as external_up};
 use crate::net::{
-    node_external_ip, set_external_route, ssh_output, wait_external_reachable, zlogin,
+    node_external_ip, set_external_route, ssh_capture, ssh_output, wait_external_reachable, zlogin,
 };
 use crate::rss::watch_rss;
 use crate::topo::{Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets};
@@ -188,24 +188,57 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
                 continue;
             }
         };
-        // Create the front-port link and plumb its link-local. A re-run errors
-        // harmlessly ("already exists"); the addr create is guarded so it stays
-        // idempotent.
-        let cmd = format!(
-            "/opt/oxide/dendrite/bin/swadm link create -s 100G --fec none {port}; \
-             ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
-        );
-        match ssh_output(&ip, &zlogin(&cmd)) {
-            Some(_) => info!(
+        // Create + enable the link via the same path as `voxel network link-up`
+        // (`enable_link` checks the CREATE_OK/ENABLE_OK markers and errors on a
+        // dropped swadm call), retrying through the transient switch-zone exec
+        // flakiness. Then plumb the link-local DDM binds to and confirm it landed
+        // before declaring the port up. Runs at end of launch, so the switch is
+        // past its startup dendrite restart and these runtime links aren't wiped.
+        let mut ok = false;
+        for attempt in 1..=5 {
+            if let Err(e) = crate::network::enable_link(&ip, sled, &port, "100G", "none") {
+                warn!(
+                    d.log,
+                    "rack{}: interconnect {sled}:{port} attempt {attempt}/5: {e}",
+                    rack + 1
+                );
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                continue;
+            }
+            let _ = ssh_output(
+                &ip,
+                &zlogin(&format!(
+                    "ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
+                )),
+            );
+            let addr_present = ssh_capture(
+                &ip,
+                &zlogin(&format!("ipadm show-addr -po addrobj | grep tfport{port}_0")),
+            )
+            .is_some();
+            if addr_present {
+                ok = true;
+                break;
+            }
+            warn!(
+                d.log,
+                "rack{}: interconnect {sled}:{port} attempt {attempt}/5: enabled but no link-local yet",
+                rack + 1
+            );
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        if ok {
+            info!(
                 d.log,
                 "rack{}: interconnect {sled}:{port} up (link-local)",
                 rack + 1
-            ),
-            None => warn!(
+            );
+        } else {
+            warn!(
                 d.log,
-                "rack{}: interconnect {sled}:{port}: switch-zone exec failed",
+                "rack{}: interconnect {sled}:{port}: did not come up after 5 tries",
                 rack + 1
-            ),
+            );
         }
     }
 }
@@ -356,9 +389,9 @@ pub(crate) async fn cmd_launch(
             // join racks into one AZ yet, so we stage it and stop here.
             if rack > 0 {
                 // RSS won't run here, so early networking never configures this
-                // rack's switch front ports. Bring up the interconnect ports by
-                // hand so the cross-rack DDM underlay has a live link on both ends.
-                bring_up_interconnect(d, &topo, cfg, rack).await;
+                // rack's switch front ports; its interconnect ports are brought up
+                // at the end of launch (see below), after the switch zone has
+                // settled past its startup dendrite restart.
                 info!(
                     d.log,
                     "rack{}: booted, left pre-RSS (unclaimed - multirack join not yet supported)",
@@ -419,6 +452,13 @@ pub(crate) async fn cmd_launch(
     // rack's path as the second rack joins).
     if let Some(ce) = topo.node_ref("ce") {
         for rack in 0..racks {
+            // Held racks (rack > 0) never run RSS, so they have no external
+            // services or DNS - there's nothing to route to or wait on, and the
+            // reachability probe would just burn its full timeout on a rack that
+            // never converges. Skip them (their interconnect comes up below).
+            if rack > 0 {
+                continue;
+            }
             let net = cfg.network.for_rack(rack);
             let label = rack_label(racks, rack, "rack");
             if let Err(e) = set_external_route(
@@ -439,6 +479,15 @@ pub(crate) async fn cmd_launch(
                 }
             }
         }
+    }
+
+    // Held racks (rack > 0) never run RSS, so early networking never configures
+    // their switch front ports. Bring up their cross-rack interconnect ports here,
+    // at the end of launch: by now the switch zones are past their startup dendrite
+    // restart (which would otherwise wipe these runtime `swadm` links) and off the
+    // zone-init load, so the create/enable/addr stick.
+    for rack in 1..racks {
+        bring_up_interconnect(d, &topo, cfg, rack).await;
     }
 
     // --emu-rot: nothing to attach here anymore. voxel-init stands up a shared

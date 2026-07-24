@@ -98,6 +98,41 @@ async fn switch_ip(
     Ok((sw, ip))
 }
 
+/// Create (if needed) + enable a link on a switch port in the switch zone at
+/// `ip`, checking the `CREATE_OK`/`ENABLE_OK` markers so callers can retry on the
+/// transient switch-zone exec flakiness. Does NOT plumb an address. Shared by
+/// `link_up` (the operator command) and rack.rs's held-rack interconnect bring-up.
+pub(crate) fn enable_link(
+    ip: &str,
+    sw: &str,
+    port: &str,
+    speed: &str,
+    fec: &str,
+) -> anyhow::Result<()> {
+    let link = format!("{port}/0");
+    let present = ssh_capture(ip, &zlogin(&format!("{SWADM} link get {link} 2>&1")))
+        .map(|o| o.contains(port))
+        .unwrap_or(false);
+    if !present {
+        let create = zlogin(&format!(
+            "{SWADM} link create -s {speed} --fec {fec} {port} 2>&1 && echo CREATE_OK"
+        ));
+        let out = ssh_output(ip, &create).unwrap_or_default();
+        if !out.contains("CREATE_OK") {
+            return Err(anyhow!("link create {link} on {sw} failed: {}", out.trim()));
+        }
+    }
+    let en = ssh_output(
+        ip,
+        &zlogin(&format!("{SWADM} link enable {link} 2>&1 && echo ENABLE_OK")),
+    )
+    .unwrap_or_default();
+    if !en.contains("ENABLE_OK") {
+        return Err(anyhow!("link enable {link} on {sw} failed: {}", en.trim()));
+    }
+    Ok(())
+}
+
 /// `voxel network link-up <switch> <port>` - create (if needed) + enable a link
 /// on a switch port (e.g. the interconnect `qsfp2`) in the live switch zone. The
 /// link only reaches `Up` once BOTH ends are enabled, so for an interconnect run
@@ -115,30 +150,7 @@ pub(crate) async fn link_up(
     let (sw, ip) = switch_ip(cfg, name, switch).await?;
     let link = format!("{port}/0");
     eprintln!("[voxel] {sw} ({ip}): bringing up link {link} ({speed}, fec {fec})");
-    let present = ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1")))
-        .map(|o| o.contains(port))
-        .unwrap_or(false);
-    if present {
-        eprintln!("[voxel] {link} already exists; (re)enabling");
-    } else {
-        let create = zlogin(&format!(
-            "{SWADM} link create -s {speed} --fec {fec} {port} 2>&1 && echo CREATE_OK"
-        ));
-        let out = ssh_output(&ip, &create).unwrap_or_default();
-        if !out.contains("CREATE_OK") {
-            return Err(anyhow!("link create {link} on {sw} failed: {}", out.trim()));
-        }
-    }
-    let en = ssh_output(
-        &ip,
-        &zlogin(&format!(
-            "{SWADM} link enable {link} 2>&1 && echo ENABLE_OK"
-        )),
-    )
-    .unwrap_or_default();
-    if !en.contains("ENABLE_OK") {
-        return Err(anyhow!("link enable {link} on {sw} failed: {}", en.trim()));
-    }
+    enable_link(&ip, &sw, port, speed, fec)?;
     // Brief settle, then show the link state (Down until the peer end is up too).
     std::thread::sleep(std::time::Duration::from_secs(2));
     let st =
