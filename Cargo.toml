@@ -27,10 +27,5 @@ camino = { version = "1.2.2", features = ["serde1"] }
 toml_edit = "0.25"
 
 # sprockets/trust quorum related deps
-attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "06f05ee0fb26ed63f33dde79a7e0e7e766fd124c" }
-sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "d2b68e4f47e3c22bce0455aeb4cfb2e61ad229ba" }
-
-# Use the vendored test-utils (BRM-serial platform-id) instead of the upstream
-# git crate, so sprockets/trust-quorum identities match the SP/SMBIOS baseboard.
-[patch."https://github.com/oxidecomputer/sprockets.git"]
-sprockets-tls-test-utils = { path = "vendor/sprockets-tls-test-utils" }
+attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "43a8b1fab3d48866b83c4f49cf5f7196ec289c8c" }
+sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "48c7faa13554b5cf66e15ade6dd62a0093d57c2b" }

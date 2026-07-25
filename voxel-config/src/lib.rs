@@ -18,7 +18,7 @@ pub mod sp;
 
 pub use config::{
     Falcon, Image, Network, RecoverySiloCfg, RouterMode, SledDataLinksSchema, SledDesc,
-    SledDisksSchema, SpCfg, Topology, UplinkCfg, UplinkPort, VoxelConfig,
+    SledDisksSchema, SpCfg, Topology, UplinkCfg, UplinkPort, VoxelConfig, SLED_SERIAL_PREFIX,
 };
 pub use frr::{FrrNeighbor, FrrRouter, StaticUplink};
 pub use sled::SledAgentConfig;
