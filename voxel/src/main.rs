@@ -13,7 +13,7 @@
 //! startup that anchors voxel to its project root; the commands themselves live
 //! in the topic modules below.
 
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -487,7 +487,8 @@ enum TpCmd {
 
 fn config_text(path: &Path) -> anyhow::Result<String> {
     if path.exists() {
-        Ok(fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?)
+        Ok(fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?)
     } else {
         Ok(VoxelConfig::default().to_toml())
     }
@@ -495,7 +496,8 @@ fn config_text(path: &Path) -> anyhow::Result<String> {
 
 fn load_config(path: &Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    VoxelConfig::from_toml(&text).map_err(|e| anyhow!("parse {}: {e}", path.display()))
+    VoxelConfig::from_toml(&text)
+        .map_err(|e| anyhow!("parse {}: {e}", path.display()))
 }
 
 /// Make a path absolute against the current directory.
@@ -565,19 +567,23 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
 /// resolve correctly no matter where voxel was invoked from (e.g. `/usr/bin`).
 /// Root: `--workdir`/`$VOXEL_WORKDIR` > `[falcon].workdir` > the discovered
 /// `voxel.toml`'s directory. No-op if the chosen root isn't a directory.
-fn anchor_workdir(cli: &Cli, cfg: Option<&VoxelConfig>, config_path: &Path) -> anyhow::Result<()> {
+fn anchor_workdir(
+    cli: &Cli,
+    cfg: Option<&VoxelConfig>,
+    config_path: &Path,
+) -> anyhow::Result<()> {
     let root = cli
         .workdir
         .clone()
         .or_else(|| {
-            cfg.and_then(|c| c.falcon.workdir.clone())
-                .map(PathBuf::from)
+            cfg.and_then(|c| c.falcon.workdir.clone()).map(PathBuf::from)
         })
         .or_else(|| config_path.parent().map(Path::to_path_buf));
     if let Some(root) = root {
         if root.is_dir() {
-            std::env::set_current_dir(&root)
-                .map_err(|e| anyhow!("chdir to workdir {}: {e}", root.display()))?;
+            std::env::set_current_dir(&root).map_err(|e| {
+                anyhow!("chdir to workdir {}: {e}", root.display())
+            })?;
         }
     }
     Ok(())
@@ -610,38 +616,44 @@ async fn main() -> Result<(), Error> {
             )
             .await
         }
-        Cmd::WicketDryrun { config_rss, sleds } => wicket_setup::dryrun(config_rss, *sleds),
-        Cmd::Route { dry_run } => {
-            rack::cmd_route(&load_config(&config_path)?, &cli.name, *dry_run).await
+        Cmd::WicketDryrun { config_rss, sleds } => {
+            wicket_setup::dryrun(config_rss, *sleds)
         }
-        Cmd::Destroy => rack::cmd_destroy(&load_config(&config_path)?, &cli.name),
+        Cmd::Route { dry_run } => {
+            rack::cmd_route(&load_config(&config_path)?, &cli.name, *dry_run)
+                .await
+        }
+        Cmd::Destroy => {
+            rack::cmd_destroy(&load_config(&config_path)?, &cli.name)
+        }
         Cmd::Serial { node } => {
-            access::cmd_serial(&load_config(&config_path)?, &cli.name, node).await
+            access::cmd_serial(&load_config(&config_path)?, &cli.name, node)
+                .await
         }
         Cmd::Info => rack::cmd_info(&load_config(&config_path)?, &cli.name),
-        Cmd::Status => rack::cmd_status(&load_config(&config_path)?, &cli.name).await,
+        Cmd::Status => {
+            rack::cmd_status(&load_config(&config_path)?, &cli.name).await
+        }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
-            ImageCmd::Patch {
-                component,
-                reference,
-                image,
-                out,
-            } => {
+            ImageCmd::Patch { component, reference, image, out } => {
                 let cfg = load_config(&config_path)?;
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
-                patch::cmd_image_patch(component, reference, &src, out.as_deref())
+                patch::cmd_image_patch(
+                    component,
+                    reference,
+                    &src,
+                    out.as_deref(),
+                )
             }
-            other => image::cmd_image(other, cfg.as_ref().map(|c| c.image.cp_image())),
+            other => image::cmd_image(
+                other,
+                cfg.as_ref().map(|c| c.image.cp_image()),
+            ),
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
-            NetworkCmd::LinkUp {
-                switch,
-                port,
-                speed,
-                fec,
-            } => {
+            NetworkCmd::LinkUp { switch, port, speed, fec } => {
                 network::link_up(
                     &load_config(&config_path)?,
                     &cli.name,
@@ -653,57 +665,94 @@ async fn main() -> Result<(), Error> {
                 .await
             }
             NetworkCmd::LinkDown { switch, port } => {
-                network::link_down(&load_config(&config_path)?, &cli.name, switch, port).await
+                network::link_down(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    switch,
+                    port,
+                )
+                .await
             }
             NetworkCmd::Validate { detail } => {
-                network::validate(&load_config(&config_path)?, &cli.name, *detail).await
+                network::validate(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    *detail,
+                )
+                .await
             }
         },
-        Cmd::Rack { cmd } => match cmd {
-            RackCmd::Patch {
-                component,
-                reference,
-                list,
-                dry_run,
-            } => {
-                if *list {
-                    patch::list();
-                    Ok(())
-                } else {
-                    let component = component.as_deref().ok_or_else(|| {
+        Cmd::Rack { cmd } => {
+            match cmd {
+                RackCmd::Patch { component, reference, list, dry_run } => {
+                    if *list {
+                        patch::list();
+                        Ok(())
+                    } else {
+                        let component = component.as_deref().ok_or_else(|| {
                         anyhow!("missing component (try `voxel rack patch --list`)")
                     })?;
-                    let reference = reference.as_deref().ok_or_else(|| {
+                        let reference = reference.as_deref().ok_or_else(|| {
                         anyhow!("missing ref (usage: voxel rack patch {component} <ref>)")
                     })?;
-                    patch::cmd_rack_patch(
-                        &load_config(&config_path)?,
-                        &cli.name,
-                        component,
-                        reference,
-                        *dry_run,
-                    )
-                    .await
+                        patch::cmd_rack_patch(
+                            &load_config(&config_path)?,
+                            &cli.name,
+                            component,
+                            reference,
+                            *dry_run,
+                        )
+                        .await
+                    }
                 }
             }
-        },
-        Cmd::Sp { cmd } => sp_cmd::cmd_sp(&load_config(&config_path)?, &cli.name, cmd).await,
+        }
+        Cmd::Sp { cmd } => {
+            sp_cmd::cmd_sp(&load_config(&config_path)?, &cli.name, cmd).await
+        }
         Cmd::Host { cmd } => match cmd {
-            HostCmd::Ls => access::cmd_host_ls(&load_config(&config_path)?, &cli.name).await,
+            HostCmd::Ls => {
+                access::cmd_host_ls(&load_config(&config_path)?, &cli.name)
+                    .await
+            }
             HostCmd::Login { sled } => {
-                access::cmd_host_login(&load_config(&config_path)?, &cli.name, sled).await
+                access::cmd_host_login(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    sled,
+                )
+                .await
             }
             HostCmd::Exec { command, sled } => {
-                access::cmd_host_exec(&load_config(&config_path)?, &cli.name, sled, command).await
+                access::cmd_host_exec(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    sled,
+                    command,
+                )
+                .await
             }
         },
         Cmd::Tp { cmd } => match cmd {
-            TpCmd::Ls => access::cmd_tp_ls(&load_config(&config_path)?, &cli.name).await,
+            TpCmd::Ls => {
+                access::cmd_tp_ls(&load_config(&config_path)?, &cli.name).await
+            }
             TpCmd::Login { switch } => {
-                access::cmd_tp_login(&load_config(&config_path)?, &cli.name, switch).await
+                access::cmd_tp_login(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    switch,
+                )
+                .await
             }
             TpCmd::Exec { command, switch } => {
-                access::cmd_tp_exec(&load_config(&config_path)?, &cli.name, switch, command).await
+                access::cmd_tp_exec(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    switch,
+                    command,
+                )
+                .await
             }
         },
     }

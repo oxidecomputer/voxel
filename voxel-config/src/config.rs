@@ -245,11 +245,7 @@ impl Topology {
 
     /// Sleds that join RSS: explicit `rss_sleds` if non-zero, else all sleds.
     pub fn rss_count(&self) -> usize {
-        if self.rss_sleds > 0 {
-            self.rss_sleds
-        } else {
-            self.sleds
-        }
+        if self.rss_sleds > 0 { self.rss_sleds } else { self.sleds }
     }
 
     /// Expand into per-sled descriptors across all racks. Rack `r` owns
@@ -283,7 +279,8 @@ impl Topology {
     /// front port to both endpoints.
     pub fn interconnect_pairs(&self) -> Vec<(usize, usize)> {
         let sleds = self.sleds();
-        let scrimlets: Vec<&SledDesc> = sleds.iter().filter(|s| s.scrimlet).collect();
+        let scrimlets: Vec<&SledDesc> =
+            sleds.iter().filter(|s| s.scrimlet).collect();
         let mut out = Vec::new();
         for i in 0..scrimlets.len() {
             for j in (i + 1)..scrimlets.len() {
@@ -384,7 +381,9 @@ impl Default for Image {
 /// omicron versions. `voxel-init` (baked into each image) is shape-preserving:
 /// it substitutes the detected NIC names into whichever shape this selects, so
 /// one agent works on any image. Pick the variant matching the image's omicron.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SledDataLinksSchema {
     /// Pre-main omicron (e.g. v20 / a3fee0ec): `data_links = ["vioif0", "vioif1"]`.
@@ -398,7 +397,9 @@ pub enum SledDataLinksSchema {
 /// The shape of sled-agent's disk config, which changed across omicron versions:
 /// the flat `vdevs = [...]` list became a tagged `external_disks` enum. Selected
 /// independently of [`SledDataLinksSchema`] (they drifted at different commits).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SledDisksSchema {
     /// Pre-rename omicron (e.g. a3fee0ec / 43bb5af / 99a0aec):
@@ -412,9 +413,7 @@ pub enum SledDisksSchema {
 
 impl Image {
     pub fn cp_image(&self) -> String {
-        self.cp
-            .clone()
-            .unwrap_or_else(|| format!("voxel-cp-{}", self.version))
+        self.cp.clone().unwrap_or_else(|| format!("voxel-cp-{}", self.version))
     }
 
     /// The omicron commit encoded in the cp image name (`voxel-cp-<commit>` with
@@ -436,7 +435,9 @@ impl Image {
 }
 
 /// Upstream routing mode toward the customer routers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RouterMode {
     /// Unnumbered eBGP (default).
@@ -478,7 +479,10 @@ impl Default for Network {
     fn default() -> Self {
         Self {
             dns_zone: "oxide.test".into(),
-            external_dns_ips: vec!["198.51.100.20".into(), "198.51.100.21".into()],
+            external_dns_ips: vec![
+                "198.51.100.20".into(),
+                "198.51.100.21".into(),
+            ],
             ntp_servers: vec!["time.cloudflare.com".into()],
             dns_servers: vec!["1.1.1.1".into(), "9.9.9.9".into()],
             rack_subnet: "fd00:17:01:d00::/56".into(),
@@ -603,7 +607,8 @@ impl Network {
     /// a4x2 scheme). None if `transit_prefix` doesn't parse.
     pub fn transit_slash30(&self, block: usize) -> Option<(String, String)> {
         let block = u32::try_from(block).ok()?;
-        let b = u32::from(self.transit_base()?).checked_add(block.checked_mul(4)?)?;
+        let b = u32::from(self.transit_base()?)
+            .checked_add(block.checked_mul(4)?)?;
         let gateway = std::net::Ipv4Addr::from(b.checked_add(1)?);
         let sidecar = std::net::Ipv4Addr::from(b.checked_add(2)?);
         Some((gateway.to_string(), sidecar.to_string()))
@@ -719,11 +724,7 @@ impl Default for RecoverySiloCfg {
 impl VoxelConfig {
     /// Number of fabric (transit) routers, i.e. routers other than `ce`.
     fn fabric_router_count(&self) -> usize {
-        self.topology
-            .routers
-            .iter()
-            .filter(|r| r.as_str() != "ce")
-            .count()
+        self.topology.routers.iter().filter(|r| r.as_str() != "ce").count()
     }
 
     /// Number of scrimlets (switches) in `rack`.
@@ -747,7 +748,8 @@ impl VoxelConfig {
         let mut out = Vec::new();
         for (sc, u) in net.uplinks.iter().enumerate() {
             for c in 0..n_cr {
-                let (gateway, sidecar) = net.transit_slash30_for(c, sc, n_sc).unwrap_or_default();
+                let (gateway, sidecar) =
+                    net.transit_slash30_for(c, sc, n_sc).unwrap_or_default();
                 out.push(UplinkPort {
                     switch: u.switch.clone(),
                     switch_slot: sc,
@@ -775,13 +777,18 @@ impl VoxelConfig {
         let n_cr = self.fabric_router_count();
         let pairs = self.topology.interconnect_pairs();
         let sleds = self.sleds();
-        let scrimlets: Vec<&SledDesc> = sleds.iter().filter(|s| s.scrimlet).collect();
+        let scrimlets: Vec<&SledDesc> =
+            sleds.iter().filter(|s| s.scrimlet).collect();
         let mut out = Vec::new();
-        for (slot, s) in scrimlets.iter().filter(|s| s.rack == rack).enumerate() {
+        for (slot, s) in scrimlets.iter().filter(|s| s.rack == rack).enumerate()
+        {
             let mut k = 0;
             for (a, b) in &pairs {
                 if *a == s.index || *b == s.index {
-                    out.push((format!("switch{slot}"), format!("qsfp{}", n_cr + k)));
+                    out.push((
+                        format!("switch{slot}"),
+                        format!("qsfp{}", n_cr + k),
+                    ));
                     k += 1;
                 }
             }
@@ -829,7 +836,10 @@ impl VoxelConfig {
                     .iter()
                     .enumerate()
                     .map(|(k, r)| {
-                        FrrNeighbor::new(format!("enp0s{}", FRR_IFACE_BASE + k), format!("to {r}"))
+                        FrrNeighbor::new(
+                            format!("enp0s{}", FRR_IFACE_BASE + k),
+                            format!("to {r}"),
+                        )
                     })
                     .collect();
                 FrrRouter {
@@ -843,11 +853,14 @@ impl VoxelConfig {
                 }
             } else {
                 cr_index += 1;
-                let ce_nb = FrrNeighbor::new(format!("enp0s{FRR_IFACE_BASE}"), "to ce");
+                let ce_nb =
+                    FrrNeighbor::new(format!("enp0s{FRR_IFACE_BASE}"), "to ce");
                 match self.network.router_mode {
                     RouterMode::Bgp => {
                         let mut neighbors = vec![ce_nb];
-                        for (k, (sname, rack, slot)) in scrimlets.iter().enumerate() {
+                        for (k, (sname, rack, slot)) in
+                            scrimlets.iter().enumerate()
+                        {
                             neighbors.push(FrrNeighbor::new(
                                 format!("enp0s{}", FRR_IFACE_BASE + 1 + k),
                                 format!("to {sname} (rack{rack} switch{slot})"),
@@ -870,14 +883,18 @@ impl VoxelConfig {
                     RouterMode::Static => {
                         let c = (cr_index - 1) as usize;
                         let mut static_uplinks = Vec::new();
-                        for (k, (_, rack, slot)) in scrimlets.iter().enumerate() {
+                        for (k, (_, rack, slot)) in scrimlets.iter().enumerate()
+                        {
                             let net = self.network.for_rack(*rack);
                             let n_sc = self.scrimlets_in_rack(*rack);
                             if let Some((gateway, sidecar)) =
                                 net.transit_slash30_for(c, *slot, n_sc)
                             {
                                 static_uplinks.push(StaticUplink {
-                                    interface: format!("enp0s{}", FRR_IFACE_BASE + 1 + k),
+                                    interface: format!(
+                                        "enp0s{}",
+                                        FRR_IFACE_BASE + 1 + k
+                                    ),
                                     address: format!("{gateway}/30"),
                                     peer: sidecar,
                                     peer_asn: net.bgp_asn,
@@ -912,9 +929,8 @@ impl VoxelConfig {
 /// value's TOML rendering, or `None` if the path doesn't exist.
 pub fn get(doc_text: &str, key: &str) -> Result<Option<String>, String> {
     use toml_edit::{DocumentMut, Item};
-    let doc: DocumentMut = doc_text
-        .parse()
-        .map_err(|e| format!("parse voxel.toml: {e}"))?;
+    let doc: DocumentMut =
+        doc_text.parse().map_err(|e| format!("parse voxel.toml: {e}"))?;
     let mut item: &Item = doc.as_item();
     for part in key.split('.') {
         match item.get(part) {
@@ -939,9 +955,8 @@ pub fn get(doc_text: &str, key: &str) -> Result<Option<String>, String> {
 pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
     use toml_edit::{DocumentMut, Item, Value};
 
-    let doc: DocumentMut = doc_text
-        .parse()
-        .map_err(|e| format!("parse voxel.toml: {e}"))?;
+    let doc: DocumentMut =
+        doc_text.parse().map_err(|e| format!("parse voxel.toml: {e}"))?;
 
     let parts: Vec<&str> = key.split('.').collect();
     let (leaf, parents) = parts.split_last().ok_or("empty key")?;
@@ -959,7 +974,9 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
     // schema below and keep the first that validates - this lets us infer the
     // type of a key that's ABSENT from the file (a default, e.g. `sled_memory_gb`,
     // which has no existing value to coerce to) without quoting numbers/bools.
-    let candidates: Vec<Value> = if trimmed.starts_with('[') || trimmed.starts_with('{') {
+    let candidates: Vec<Value> = if trimmed.starts_with('[')
+        || trimmed.starts_with('{')
+    {
         // Array or inline table - parse the literal as TOML.
         vec![value.parse::<Value>().map_err(|e| {
             format!(
@@ -968,22 +985,25 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
         })?]
     } else {
         match existing {
-            Some(Value::Integer(_)) => vec![value
-                .parse::<i64>()
-                .map(Value::from)
-                .map_err(|_| format!("{key} is an integer; '{value}' is not"))?],
-            Some(Value::Boolean(_)) => vec![value
-                .parse::<bool>()
-                .map(Value::from)
-                .map_err(|_| format!("{key} is a boolean; '{value}' is not"))?],
-            Some(Value::Float(_)) => vec![value
-                .parse::<f64>()
-                .map(Value::from)
-                .map_err(|_| format!("{key} is a float; '{value}' is not"))?],
+            Some(Value::Integer(_)) => {
+                vec![value.parse::<i64>().map(Value::from).map_err(|_| {
+                    format!("{key} is an integer; '{value}' is not")
+                })?]
+            }
+            Some(Value::Boolean(_)) => {
+                vec![value.parse::<bool>().map(Value::from).map_err(|_| {
+                    format!("{key} is a boolean; '{value}' is not")
+                })?]
+            }
+            Some(Value::Float(_)) => {
+                vec![value.parse::<f64>().map(Value::from).map_err(|_| {
+                    format!("{key} is a float; '{value}' is not")
+                })?]
+            }
             Some(Value::Array(_)) | Some(Value::InlineTable(_)) => {
                 return Err(format!(
                     "{key} is a collection; pass a TOML array/table, e.g. '[\"g0\", \"g3\"]'"
-                ))
+                ));
             }
             Some(Value::String(_)) => vec![Value::from(value)],
             // Absent (or an exotic type): infer. A bare TOML scalar (int/bool/
@@ -1064,10 +1084,7 @@ mod tests {
             "expected an int, got: {out}"
         );
         assert_eq!(
-            VoxelConfig::from_toml(&out)
-                .unwrap()
-                .topology
-                .sled_memory_gb,
+            VoxelConfig::from_toml(&out).unwrap().topology.sled_memory_gb,
             7
         );
     }
@@ -1127,8 +1144,11 @@ mod tests {
         assert_eq!(t.sled_memory_gb, 8);
         assert_eq!(t.router_memory_gb, 4);
         assert_eq!(t.guest_memory_gb(), 44); // 4*8 + 3*4
-                                             // Shrinking per-sled RAM to fit a bigger rack.
-        let cfg = VoxelConfig::from_toml("[topology]\nsleds = 6\nsled_memory_gb = 6\n").unwrap();
+        // Shrinking per-sled RAM to fit a bigger rack.
+        let cfg = VoxelConfig::from_toml(
+            "[topology]\nsleds = 6\nsled_memory_gb = 6\n",
+        )
+        .unwrap();
         assert_eq!(cfg.topology.guest_memory_gb(), 48); // 6*6 + 3*4
         assert_eq!(cfg.topology.router_memory_gb, 4); // unset -> default
     }
@@ -1145,7 +1165,9 @@ mod tests {
     fn scrimlets_and_rss_auto_derive_from_sled_count() {
         // Unset -> scrimlets are first + last, all sleds in RSS - at any size.
         for n in [3usize, 4, 6, 10] {
-            let cfg = VoxelConfig::from_toml(&format!("[topology]\nsleds = {n}\n")).unwrap();
+            let cfg =
+                VoxelConfig::from_toml(&format!("[topology]\nsleds = {n}\n"))
+                    .unwrap();
             let s = cfg.sleds();
             assert!(s[0].scrimlet, "{n}: g0 scrimlet");
             assert!(s[n - 1].scrimlet, "{n}: g{} scrimlet", n - 1);
@@ -1166,7 +1188,9 @@ mod tests {
         )
         .unwrap();
         let s = cfg.sleds();
-        assert!(s[1].scrimlet && s[2].scrimlet && !s[0].scrimlet && !s[3].scrimlet);
+        assert!(
+            s[1].scrimlet && s[2].scrimlet && !s[0].scrimlet && !s[3].scrimlet
+        );
         assert_eq!(s.iter().filter(|x| x.rss).count(), 3);
     }
 
@@ -1176,7 +1200,9 @@ mod tests {
         let d = VoxelConfig::default();
         assert!(d.sp.emu.is_empty());
         assert!(
-            d.sp.emu_bin.is_none() && d.sp.sidecar_image.is_none() && d.sp.gimlet_image.is_none()
+            d.sp.emu_bin.is_none()
+                && d.sp.sidecar_image.is_none()
+                && d.sp.gimlet_image.is_none()
         );
         // Populated [sp] parses, and image_for routes by selector.
         let cfg = VoxelConfig::from_toml(
@@ -1236,19 +1262,13 @@ mod tests {
 
     #[test]
     fn two_racks_expand_with_per_rack_scrimlets_and_offset_addressing() {
-        let t = Topology {
-            racks: 2,
-            sleds: 3,
-            ..Topology::default()
-        };
+        let t = Topology { racks: 2, sleds: 3, ..Topology::default() };
         assert_eq!(t.total_sleds(), 6);
         let s = t.sleds();
         assert_eq!(s.len(), 6);
         // rackA = g0,g1,g2 (scrimlets g0,g2); rackB = g3,g4,g5 (scrimlets g3,g5).
-        let scr: Vec<(usize, &str, bool)> = s
-            .iter()
-            .map(|d| (d.rack, d.name.as_str(), d.scrimlet))
-            .collect();
+        let scr: Vec<(usize, &str, bool)> =
+            s.iter().map(|d| (d.rack, d.name.as_str(), d.scrimlet)).collect();
         assert_eq!(
             scr,
             vec![
@@ -1289,12 +1309,11 @@ mod tests {
 
         // 2 racks x 3 sleds -> scrimlets g0,g2 (rack0), g3,g5 (rack1). Full
         // cross-rack mesh: every rack-0 scrimlet <-> every rack-1 scrimlet.
-        let t = Topology {
-            racks: 2,
-            sleds: 3,
-            ..Topology::default()
-        };
-        assert_eq!(t.interconnect_pairs(), vec![(0, 3), (0, 5), (2, 3), (2, 5)]);
+        let t = Topology { racks: 2, sleds: 3, ..Topology::default() };
+        assert_eq!(
+            t.interconnect_pairs(),
+            vec![(0, 3), (0, 5), (2, 3), (2, 5)]
+        );
         // Each scrimlet is on (other-rack scrimlet count) = 2 links; g1 on none.
         assert_eq!(t.interconnect_count_for(0), 2);
         assert_eq!(t.interconnect_count_for(3), 2);
@@ -1365,7 +1384,9 @@ mod tests {
         // Router side: cr1 -> both scrimlets (.1, .5); cr2 -> both (.9, .13).
         // Default is plain static routes (no BFD, matching a4x2).
         let frr = cfg.to_frr();
-        let cr = |name: &str| frr.iter().find(|(n, _)| n == name).unwrap().1.render();
+        let cr = |name: &str| {
+            frr.iter().find(|(n, _)| n == name).unwrap().1.render()
+        };
         let cr1 = cr("cr1");
         assert!(cr1.contains("ip address 198.51.101.1/30"));
         assert!(cr1.contains("ip address 198.51.101.5/30"));
@@ -1382,13 +1403,8 @@ mod tests {
 
         // With transit_bfd on, routes are BFD-tracked and peers appear.
         cfg.network.transit_bfd = true;
-        let cr1b = cfg
-            .to_frr()
-            .iter()
-            .find(|(n, _)| n == "cr1")
-            .unwrap()
-            .1
-            .render();
+        let cr1b =
+            cfg.to_frr().iter().find(|(n, _)| n == "cr1").unwrap().1.render();
         assert!(cr1b.contains("ip route 198.51.100.0/24 198.51.101.2 bfd"));
         assert!(cr1b.contains("peer 198.51.101.2"));
     }
@@ -1400,25 +1416,25 @@ mod tests {
         let frr = cfg.to_frr();
         let cr1 = &frr.iter().find(|(n, _)| n == "cr1").unwrap().1;
         assert_eq!(cr1.asn, 65101);
-        let ifaces: Vec<&str> = cr1.neighbors.iter().map(|n| n.interface.as_str()).collect();
+        let ifaces: Vec<&str> =
+            cr1.neighbors.iter().map(|n| n.interface.as_str()).collect();
         assert_eq!(ifaces, vec!["enp0s8", "enp0s9", "enp0s10"]); // ce, g0, g3
         assert!(cr1.originate4.is_empty(), "transit originates nothing");
 
         // a3x2x2: cr1 peers ce + all 4 scrimlets (rack0 g0,g2; rack1 g3,g5).
-        let cfg = VoxelConfig::from_toml("[topology]\nracks = 2\nsleds = 3\n").unwrap();
+        let cfg = VoxelConfig::from_toml("[topology]\nracks = 2\nsleds = 3\n")
+            .unwrap();
         let frr = cfg.to_frr();
         let cr1 = &frr.iter().find(|(n, _)| n == "cr1").unwrap().1;
-        let ifaces: Vec<&str> = cr1.neighbors.iter().map(|n| n.interface.as_str()).collect();
+        let ifaces: Vec<&str> =
+            cr1.neighbors.iter().map(|n| n.interface.as_str()).collect();
         assert_eq!(
             ifaces,
             vec!["enp0s8", "enp0s9", "enp0s10", "enp0s11", "enp0s12"]
         );
         // Descriptions carry the rack/switch identity for each peered scrimlet.
-        let descs: Vec<&str> = cr1
-            .neighbors
-            .iter()
-            .map(|n| n.description.as_str())
-            .collect();
+        let descs: Vec<&str> =
+            cr1.neighbors.iter().map(|n| n.description.as_str()).collect();
         assert_eq!(descs[1], "to g0 (rack0 switch0)");
         assert_eq!(descs[2], "to g2 (rack0 switch1)");
         assert_eq!(descs[3], "to g3 (rack1 switch0)");
@@ -1439,18 +1455,16 @@ mod tests {
     fn bootstrap_addr_is_decimal_past_four_sleds() {
         // index 5 -> 2*5+1 = 11, which must render as decimal "11" (matching the
         // viona MAC byte sled-agent derives the address from), NOT hex "b".
-        let sleds = Topology {
-            sleds: 6,
-            ..Topology::default()
-        }
-        .sleds();
+        let sleds = Topology { sleds: 6, ..Topology::default() }.sleds();
         assert_eq!(sleds[5].bootstrap_addr(), "fdb0:a840:2500:11::1");
         assert_eq!(sleds[4].bootstrap_addr(), "fdb0:a840:2500:9::1");
     }
 
     #[test]
     fn three_node_drops_rss_membership() {
-        let cfg = VoxelConfig::from_toml("[topology]\nsleds = 4\nrss_sleds = 3\n").unwrap();
+        let cfg =
+            VoxelConfig::from_toml("[topology]\nsleds = 4\nrss_sleds = 3\n")
+                .unwrap();
         let rss: Vec<_> = cfg.sleds().into_iter().filter(|s| s.rss).collect();
         // Only the first 3 sleds join RSS; the 4th is dropped from the bootstrap set.
         assert_eq!(rss.len(), 3);

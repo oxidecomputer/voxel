@@ -5,7 +5,7 @@
 //! its upstream).
 
 use crate::sys::{capture, note, run, run_quiet, warn};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -22,12 +22,7 @@ pub fn bring_up() -> Result<()> {
     // apt-daily timers can wipe FRR state (disabled at bake; belt + braces).
     run(
         "systemctl",
-        &[
-            "disable",
-            "--now",
-            "apt-daily-upgrade.timer",
-            "apt-daily.timer",
-        ],
+        &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"],
     );
 
     // rp_filter drops the rack's asymmetric / unnumbered transit traffic.
@@ -61,7 +56,8 @@ fn apply_static_edge_ip() {
         warn("static edge IP: no uplink found");
         return;
     };
-    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
+    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc])
+        .unwrap_or_default();
     if cur
         .split_whitespace()
         .any(|t| t == ip || t.starts_with(&format!("{ip}/")))
@@ -97,7 +93,9 @@ fn ensure_unique_uplink_lease() {
     let cfg = format!(
         "[Match]\nName={ifc}\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\nRouteMetric=100\n"
     );
-    if let Err(e) = fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg) {
+    if let Err(e) =
+        fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg)
+    {
         warn(format!("unique-lease: write networkd config: {e}"));
         return;
     }
@@ -197,7 +195,9 @@ fn uplink_iface() -> Option<String> {
         }
     }
     for _ in 0..30 {
-        if let Some(line) = capture("ip", &["-o", "-4", "route", "show", "default"]) {
+        if let Some(line) =
+            capture("ip", &["-o", "-4", "route", "show", "default"])
+        {
             // "default via <gw> dev <iface> ..." - the iface is whitespace field 5.
             if let Some(dev) = line.split_whitespace().nth(4) {
                 if !dev.is_empty() {

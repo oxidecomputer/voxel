@@ -2,11 +2,13 @@
 //! cargo-bay staging that feeds it (generated sled/RSS/FRR/switch1 config +
 //! sprockets keys).
 
-use anyhow::{anyhow, Context};
-use libfalcon::{unit::gb, NodeRef, Runner, SmbiosType1Input};
+use anyhow::{Context, anyhow};
+use libfalcon::{NodeRef, Runner, SmbiosType1Input, unit::gb};
 use std::fs;
 use std::path::{Path, PathBuf};
-use voxel_config::{SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig};
+use voxel_config::{
+    SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig,
+};
 
 /// Gimlet board-serial prefix. The SMBIOS serial ([`populate_smbios`]) and the
 /// faux-mgs lookup serial (`sp_cmd::sp_serial`) both build `{prefix}{index+1}`
@@ -28,10 +30,7 @@ impl Topo {
             .find(|(s, _)| s.name == name)
             .map(|(_, n)| *n)
             .or_else(|| {
-                self.routers
-                    .iter()
-                    .find(|(r, _)| r == name)
-                    .map(|(_, n)| *n)
+                self.routers.iter().find(|(r, _)| r == name).map(|(_, n)| *n)
             })
     }
 
@@ -50,8 +49,9 @@ fn ext_interface(d: &mut Runner, n: NodeRef) -> anyhow::Result<()> {
     if let Ok(ifx) = std::env::var("EXT_INTERFACE") {
         d.ext_link(&ifx, n);
     } else {
-        d.default_ext_link(n)
-            .map_err(|e| anyhow!("failed to find default external interface: {e}"))?;
+        d.default_ext_link(n).map_err(|e| {
+            anyhow!("failed to find default external interface: {e}")
+        })?;
     }
     Ok(())
 }
@@ -81,7 +81,10 @@ fn populate_smbios(d: &mut Runner, x: NodeRef, index: usize) {
 /// Build the falcon topology from config. The link/softnpu ordering is
 /// significant: it determines the `enp0sN` interface names the generated
 /// `frr.conf` targets (see `VoxelConfig::to_frr`), so preserve it.
-pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> {
+pub(crate) fn build_topo(
+    cfg: &VoxelConfig,
+    name: &str,
+) -> anyhow::Result<Topo> {
     let cp_img = cfg.image.cp_image();
     let frr_img = cfg.image.frr_image();
 
@@ -106,11 +109,8 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         routers.push((r.clone(), n));
     }
 
-    let all_scrimlets: Vec<NodeRef> = sleds
-        .iter()
-        .filter(|(s, _)| s.scrimlet)
-        .map(|(_, n)| *n)
-        .collect();
+    let all_scrimlets: Vec<NodeRef> =
+        sleds.iter().filter(|(s, _)| s.scrimlet).map(|(_, n)| *n).collect();
     let ce = routers.iter().find(|(r, _)| r == "ce").map(|(_, n)| *n);
     let fabric_routers: Vec<(String, NodeRef)> =
         routers.iter().filter(|(r, _)| r != "ce").cloned().collect();
@@ -159,7 +159,9 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
     // scrimlet gains a viona NIC (which would shift the external vioif index and
     // break the gimlets' hardcoded DHCP interface).
     for (ai, bi) in cfg.topology.interconnect_pairs() {
-        let node = |idx: usize| sleds.iter().find(|(s, _)| s.index == idx).map(|(_, n)| *n);
+        let node = |idx: usize| {
+            sleds.iter().find(|(s, _)| s.index == idx).map(|(_, n)| *n)
+        };
         if let (Some(a), Some(b)) = (node(ai), node(bi)) {
             d.softnpu_links(a, b, Some(new_mac()), Some(new_mac()));
         }
@@ -176,11 +178,7 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
             .map_err(|e| anyhow!("mount_linux {r}: {e}"))?;
     }
 
-    Ok(Topo {
-        runner: d,
-        sleds,
-        routers,
-    })
+    Ok(Topo { runner: d, sleds, routers })
 }
 
 /// Host-side cargo-bay root (per-node staging dirs live under `<CARGO_BAY>/<node>`,
@@ -198,12 +196,14 @@ fn cargo_bay(node: &str) -> PathBuf {
 /// overwrite it - so voxel-init on g2 would find the stale file and start a
 /// pointless switch1 enforcer. Wiping first guarantees a clean, correct stage.
 pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
-    let mut nodes: Vec<String> = cfg.sleds().into_iter().map(|s| s.name).collect();
+    let mut nodes: Vec<String> =
+        cfg.sleds().into_iter().map(|s| s.name).collect();
     nodes.extend(cfg.topology.routers.iter().cloned());
     for node in nodes {
         let dir = cargo_bay(&node);
         if dir.exists() {
-            fs::remove_dir_all(&dir).with_context(|| format!("reset {}", dir.display()))?;
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("reset {}", dir.display()))?;
         }
         fs::create_dir_all(&dir)?;
     }
@@ -247,7 +247,9 @@ fn parse_disks(s: &str) -> Option<SledDisksSchema> {
 /// `voxel-image.toml`, which `image create` extracts to the host stub. Read them
 /// from there; an `[image]` override wins, and the oldest shapes are the fallback
 /// if the manifest is absent.
-fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
+fn detect_sled_schema(
+    cfg: &VoxelConfig,
+) -> (SledDataLinksSchema, SledDisksSchema) {
     let (m_dl, m_dk) = image_src_dir(cfg)
         .map(|d| d.join("voxel-image.toml"))
         .and_then(|p| fs::read_to_string(p).ok())
@@ -284,24 +286,27 @@ pub(crate) fn stage_config(
     // count (`topology.sleds`), not the deployment total. (For a single rack the
     // two are equal.) Fabric routers = every router except the customer edge `ce`.
     let num_sleds_per_rack = cfg.topology.sleds;
-    let num_fabric_routers = cfg
-        .topology
-        .routers
-        .iter()
-        .filter(|r| r.as_str() != "ce")
-        .count();
+    let num_fabric_routers =
+        cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
     // Auto-detect the sled-agent config shapes from the image's omicron (no
     // per-era operator knobs); an [image] override wins if set.
     let (data_links, disks) = detect_sled_schema(cfg);
-    eprintln!("[voxel] sled-agent config schema: data_links={data_links:?} disks={disks:?}");
+    eprintln!(
+        "[voxel] sled-agent config schema: data_links={data_links:?} disks={disks:?}"
+    );
     for s in &sleds {
         let dir = cargo_bay(&s.name);
         fs::create_dir_all(&dir)?;
         fs::write(
             dir.join("sled-config.toml"),
-            s.sled_config(num_sleds_per_rack, num_fabric_routers, data_links, disks)
-                .with_interconnects(cfg.topology.interconnect_count_for(s.index))
-                .render(),
+            s.sled_config(
+                num_sleds_per_rack,
+                num_fabric_routers,
+                data_links,
+                disks,
+            )
+            .with_interconnects(cfg.topology.interconnect_count_for(s.index))
+            .render(),
         )?;
     }
 
@@ -352,13 +357,12 @@ pub(crate) fn stage_config(
     // mgs/sp-sim). The SP fleet is built for THAT rack's gimlet global indices, so
     // identities (serial/sprockets) stay aligned with the sleds.
     for rack in 0..cfg.topology.racks() {
-        let rack_sleds: Vec<&SledDesc> = sleds.iter().filter(|s| s.rack == rack).collect();
-        let gimlet_indices: Vec<usize> = rack_sleds.iter().map(|s| s.index).collect();
-        let scrimlet_indices: Vec<usize> = rack_sleds
-            .iter()
-            .filter(|s| s.scrimlet)
-            .map(|s| s.index)
-            .collect();
+        let rack_sleds: Vec<&SledDesc> =
+            sleds.iter().filter(|s| s.rack == rack).collect();
+        let gimlet_indices: Vec<usize> =
+            rack_sleds.iter().map(|s| s.index).collect();
+        let scrimlet_indices: Vec<usize> =
+            rack_sleds.iter().filter(|s| s.scrimlet).map(|s| s.index).collect();
         // The SP fleet (sidecar + one SP per rack sled) is the shared MGS↔SP
         // contract; sim backend today, swappable to a real-firmware host.
         // `--emu`: every SP is real-firmware on sp-emu (voxel-init disables sp-sim
@@ -376,12 +380,19 @@ pub(crate) fn stage_config(
             fs::create_dir_all(&dir)?;
             fs::write(
                 dir.join(format!("mgs-config-switch{slot}.toml")),
-                voxel_config::mgs::switch_config(slot as u8, &fleet, &scrimlet_indices),
+                voxel_config::mgs::switch_config(
+                    slot as u8,
+                    &fleet,
+                    &scrimlet_indices,
+                ),
             )?;
             // Stage sp-sim's config only in the default path; under --emu sp-sim is
             // disabled, so don't stage one (and the enforcer leaves sp-sim alone).
             if !emu_sp {
-                fs::write(dir.join("sp-sim-config.toml"), fleet.sp_sim_config())?;
+                fs::write(
+                    dir.join("sp-sim-config.toml"),
+                    fleet.sp_sim_config(),
+                )?;
             }
             stage_sp_emu(cfg, &fleet, &dir, emu_rot)?;
         }
@@ -414,11 +425,8 @@ fn stage_sp_emu(
     // previously the only signal of --emu-rot; the baked path needs it explicit.)
     let mut manifest = format!("rot {}\n", if emu_rot { 1 } else { 0 });
     for sp in &emu {
-        let role = if sp.selector() == "sidecar" {
-            "sidecar"
-        } else {
-            "gimlet"
-        };
+        let role =
+            if sp.selector() == "sidecar" { "sidecar" } else { "gimlet" };
         manifest.push_str(&format!("{} {}\n", sp.base_port, role));
     }
     let ports_manifest = out.join("ports");
@@ -444,21 +452,17 @@ fn stage_sp_emu(
     // default: the two-core sidecar cannot answer MGS switch-id in time during
     // RSS, which wedges the nexus handoff - attach the bridge after bring-up.
     if emu_rot {
-        let rot =
-            cfg.sp.rot_image.as_deref().ok_or_else(|| {
-                anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
-            })?;
+        let rot = cfg.sp.rot_image.as_deref().ok_or_else(|| {
+            anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
+        })?;
         fs::copy(rot, out.join("rot.flash"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
     }
     for sp in emu {
         let sel = sp.selector();
         let image = cfg.sp.image_for(&sel).ok_or_else(|| {
-            let key = if sel == "sidecar" {
-                "sidecar_image"
-            } else {
-                "gimlet_image"
-            };
+            let key =
+                if sel == "sidecar" { "sidecar_image" } else { "gimlet_image" };
             anyhow!("[sp].emu includes {sel} but [sp].{key} is unset")
         })?;
         let flash = out.join(format!("{}.flash", sp.base_port));
@@ -468,7 +472,9 @@ fn stage_sp_emu(
             .status()
             .with_context(|| format!("run {emu_bin} flash for {sel}"))?;
         if !status.success() {
-            return Err(anyhow!("sp-emu flash failed for {sel} (image {image})"));
+            return Err(anyhow!(
+                "sp-emu flash failed for {sel} (image {image})"
+            ));
         }
     }
     Ok(())
@@ -502,8 +508,10 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
     // run a corpus); sled-agent only needs at least one measurement present, in a
     // file named test-sprockets-log.bin. Same constants a4x2 uses. The SP digest
     // is shared by the log and the corim's fake-sp entry; the fwid digest differs.
-    const SP_DIGEST: &str = "be4df4e085175f3de0c8ac4837e1c2c9a34e8983209dac6b549e94154f7cdd9c";
-    const FWID_DIGEST: &str = "72fa8f8ea84a42251031366002cbb36281d0131f78cd680436116a720cdd9de5";
+    const SP_DIGEST: &str =
+        "be4df4e085175f3de0c8ac4837e1c2c9a34e8983209dac6b549e94154f7cdd9c";
+    const FWID_DIGEST: &str =
+        "72fa8f8ea84a42251031366002cbb36281d0131f78cd680436116a720cdd9de5";
     let attest_log = attest_mock::log::mock(attest_mock::log::Document {
         measurements: vec![attest_mock::log::Measurement {
             algorithm: "sha3-256".into(),

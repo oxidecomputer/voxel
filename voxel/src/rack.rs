@@ -8,23 +8,26 @@ use std::process::Command;
 use voxel_config::VoxelConfig;
 
 use crate::net::{
-    node_external_ip, set_external_route, ssh_output, wait_external_reachable, zlogin,
+    node_external_ip, set_external_route, ssh_output, wait_external_reachable,
+    zlogin,
 };
 use crate::rss::watch_rss;
-use crate::topo::{build_topo, reset_node_cargo_bay, stage_config, stage_sprockets, Topo};
+use crate::topo::{
+    Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets,
+};
 
 /// A per-rack progress/label tag: `rackN` (1-based) when the deployment has more
 /// than one rack, else the single-rack fallback the caller passes ("rack",
 /// "rack-init", ...).
 fn rack_label(racks: usize, rack: usize, single: &str) -> String {
-    if racks > 1 {
-        format!("rack{}", rack + 1)
-    } else {
-        single.to_string()
-    }
+    if racks > 1 { format!("rack{}", rack + 1) } else { single.to_string() }
 }
 
-pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> anyhow::Result<()> {
+pub(crate) async fn cmd_route(
+    cfg: &VoxelConfig,
+    name: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let ce = topo
         .node_ref("ce")
@@ -88,7 +91,10 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
 /// Run `/opt/oxide/voxel-init <role>` on each given node concurrently, surfacing
 /// each node's `[voxel-init]` milestone lines (the raw `+ cmd` echoes stay in the
 /// guest's `/tmp/launch.log`).
-async fn run_voxel_init(d: &Runner, items: Vec<(NodeRef, &'static str, String)>) {
+async fn run_voxel_init(
+    d: &Runner,
+    items: Vec<(NodeRef, &'static str, String)>,
+) {
     let handles = items.into_iter().map(|(n, command, node)| async move {
         info!(d.log, "{node}: launch start");
         match d.exec(n, command).await {
@@ -153,7 +159,12 @@ async fn generate_rss_in_node(
 /// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port rss-gen
 /// emits for rack 0, so the cross-rack DDM underlay has a live link on both ends.
 /// No-op for a single rack (`interconnect_ports` is empty).
-async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack: usize) {
+async fn bring_up_interconnect(
+    d: &Runner,
+    topo: &Topo,
+    cfg: &VoxelConfig,
+    rack: usize,
+) {
     let ports = cfg.interconnect_ports(rack);
     if ports.is_empty() {
         return;
@@ -166,9 +177,8 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
         .map(|(s, n)| (*n, s.name.clone()))
         .collect();
     for (sw, port) in ports {
-        let Some(slot) = sw
-            .strip_prefix("switch")
-            .and_then(|s| s.parse::<usize>().ok())
+        let Some(slot) =
+            sw.strip_prefix("switch").and_then(|s| s.parse::<usize>().ok())
         else {
             continue;
         };
@@ -230,10 +240,8 @@ pub(crate) async fn cmd_launch(
         ));
     }
     for rack in 0..racks {
-        let scrimlets = sleds
-            .iter()
-            .filter(|s| s.rack == rack && s.scrimlet)
-            .count();
+        let scrimlets =
+            sleds.iter().filter(|s| s.rack == rack && s.scrimlet).count();
         if scrimlets != 2 {
             return Err(anyhow!(
                 "rack {rack} needs exactly 2 scrimlets for the dual-switch RSS->Nexus handoff; got {scrimlets}"
@@ -244,12 +252,8 @@ pub(crate) async fn cmd_launch(
     // interconnects. Guard against exceeding the sidecar's port budget (the full
     // cross-rack mesh grows with racks*switches).
     const MAX_FRONT_PORTS: usize = 128;
-    let n_cr = cfg
-        .topology
-        .routers
-        .iter()
-        .filter(|r| r.as_str() != "ce")
-        .count();
+    let n_cr =
+        cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
     for s in sleds.iter().filter(|s| s.scrimlet) {
         let front = n_cr + cfg.topology.interconnect_count_for(s.index);
         if front > MAX_FRONT_PORTS {
@@ -289,13 +293,19 @@ pub(crate) async fn cmd_launch(
                 topo = build_topo(cfg, name)?;
                 attempt += 1;
             }
-            Err(e) => return Err(anyhow!("launch failed after {attempt} attempts: {e}")),
+            Err(e) => {
+                return Err(anyhow!(
+                    "launch failed after {attempt} attempts: {e}"
+                ));
+            }
         }
     }
 
     // Run the in-guest agent, baked into the images at /opt/oxide/voxel-init.
-    const GIMLET_LAUNCH: &str = "/opt/oxide/voxel-init gimlet 2>&1 | tee /tmp/launch.log";
-    const ROUTER_LAUNCH: &str = "/opt/oxide/voxel-init router 2>&1 | tee /tmp/launch.log";
+    const GIMLET_LAUNCH: &str =
+        "/opt/oxide/voxel-init gimlet 2>&1 | tee /tmp/launch.log";
+    const ROUTER_LAUNCH: &str =
+        "/opt/oxide/voxel-init router 2>&1 | tee /tmp/launch.log";
     let d = &topo.runner;
 
     // Customer routers (the shared transit) first - quick, and must be up for
@@ -351,12 +361,20 @@ pub(crate) async fn cmd_launch(
                 bring_up_interconnect(d, &topo, cfg, rack).await;
                 // Stage this held rack's config-rss (for a future cluster-join)
                 // from its baked in-guest rss-gen.
-                if let Some((_, rn)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
+                if let Some((_, rn)) =
+                    topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
+                {
                     let staged = std::path::Path::new("multirack-staged")
                         .join(format!("rack{rack}"))
                         .join("config-rss.toml");
-                    if let Err(e) = generate_rss_in_node(d, *rn, rack, &staged).await {
-                        warn!(d.log, "rack{}: staging config-rss failed: {e}", rack + 1);
+                    if let Err(e) =
+                        generate_rss_in_node(d, *rn, rack, &staged).await
+                    {
+                        warn!(
+                            d.log,
+                            "rack{}: staging config-rss failed: {e}",
+                            rack + 1
+                        );
                     }
                 }
                 info!(
@@ -366,7 +384,9 @@ pub(crate) async fn cmd_launch(
                 );
                 continue;
             }
-            if let Some((s, n)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
+            if let Some((s, n)) =
+                topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
+            {
                 let tag = rack_label(racks, rack, "rack-init");
                 // --wicket-setup: nothing auto-inited (no staged config-rss), so
                 // drive RSS through wicketd (upload config + cert + recovery
@@ -379,7 +399,9 @@ pub(crate) async fn cmd_launch(
                         .join("config-rss.toml");
                     // wicketd suppresses auto-RSS, so config-rss isn't staged in
                     // the cargo-bay; produce it now from the baked in-guest rss-gen.
-                    if let Err(e) = generate_rss_in_node(d, *n, rack, &config_rss).await {
+                    if let Err(e) =
+                        generate_rss_in_node(d, *n, rack, &config_rss).await
+                    {
                         warn!(
                             d.log,
                             "{tag}: in-node rss-gen failed: {e}; rack will not initialize"
@@ -395,9 +417,15 @@ pub(crate) async fn cmd_launch(
                         .filter(|(s, _)| s.rack == rack)
                         .map(|(s, _)| s.index as u16)
                         .collect();
-                    if let Err(e) =
-                        crate::wicket_setup::drive(d, *n, &slots, &config_rss, &net.dns_zone, &tag)
-                            .await
+                    if let Err(e) = crate::wicket_setup::drive(
+                        d,
+                        *n,
+                        &slots,
+                        &config_rss,
+                        &net.dns_zone,
+                        &tag,
+                    )
+                    .await
                     {
                         warn!(
                             d.log,
@@ -435,7 +463,12 @@ pub(crate) async fn cmd_launch(
             }
             if !no_route {
                 if let Some(dns_ip) = net.external_dns_ips.first() {
-                    wait_external_reachable(&d.log, dns_ip, &net.dns_zone, &label);
+                    wait_external_reachable(
+                        &d.log,
+                        dns_ip,
+                        &net.dns_zone,
+                        &label,
+                    );
                 }
             }
         }
@@ -474,14 +507,12 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
         }
     }
 
-    let out = match Command::new("pgrep")
-        .args(["-f", "propolis-server"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        // pgrep exits non-zero when there are no matches - nothing to reap.
-        _ => return 0,
-    };
+    let out =
+        match Command::new("pgrep").args(["-f", "propolis-server"]).output() {
+            Ok(o) if o.status.success() => o.stdout,
+            // pgrep exits non-zero when there are no matches - nothing to reap.
+            _ => return 0,
+        };
     let needle = format!("/dev/net/{name}_");
     let mut reaped = 0;
     for line in String::from_utf8_lossy(&out).lines() {
@@ -502,7 +533,8 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
                 log,
                 "reaping orphaned propolis {pid} holding {name} resources (no falcon pid file)"
             );
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let _ =
+                Command::new("kill").args(["-9", &pid.to_string()]).status();
             reaped += 1;
         }
     }
@@ -579,10 +611,17 @@ pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
 /// rack needs. (`cmd_status` watches a running rack with no emu_sp context, so it
 /// passes `false`.)
 fn rss_watch_cap(emu_sp: bool, racks: usize) -> std::time::Duration {
-    std::time::Duration::from_secs(if emu_sp || racks > 1 { 3600 } else { 1800 })
+    std::time::Duration::from_secs(if emu_sp || racks > 1 {
+        3600
+    } else {
+        1800
+    })
 }
 
-pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_status(
+    cfg: &VoxelConfig,
+    name: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let racks = cfg.topology.racks();
     let rss_nodes = topo.rss_sleds();

@@ -14,7 +14,10 @@ mod sys;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "voxel-init", about = "In-guest bring-up agent for voxel racks")]
+#[command(
+    name = "voxel-init",
+    about = "In-guest bring-up agent for voxel racks"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

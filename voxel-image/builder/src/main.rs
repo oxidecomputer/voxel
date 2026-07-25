@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use clap::Args;
 use libfalcon::{
-    cli::{run_with_extra, RunMode},
-    unit::gb,
     Runner,
+    cli::{RunMode, run_with_extra},
+    unit::gb,
 };
 use slog::info;
 
@@ -25,7 +25,10 @@ use slog::info;
 #[derive(Args)]
 struct Extra {}
 
-async fn extra(_r: &mut Runner, _opts: Extra) -> Result<(), libfalcon::error::Error> {
+async fn extra(
+    _r: &mut Runner,
+    _opts: Extra,
+) -> Result<(), libfalcon::error::Error> {
     Ok(())
 }
 
@@ -33,17 +36,11 @@ const HELIOS_IMG: &str = "helios-3.0";
 const NODE: &str = "vbuild";
 
 fn env_u8(key: &str, default: u8) -> u8 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 #[tokio::main]
@@ -51,7 +48,8 @@ async fn main() -> Result<(), Error> {
     // Deployment name; must match DEPLOY in build-image.sh so the capture step
     // can find the node's zvol at <dataset>/topo/<name>/vbuild.
     // falcon deployment names must match ^[A-Za-z]?[A-Za-z0-9_]*$ (no hyphens).
-    let name = std::env::var("VOXEL_BUILD_NAME").unwrap_or_else(|_| "voxel_build".to_string());
+    let name = std::env::var("VOXEL_BUILD_NAME")
+        .unwrap_or_else(|_| "voxel_build".to_string());
     let mut d = Runner::new(&name);
 
     let cores = env_u8("VBUILD_CORES", 8);
@@ -61,7 +59,8 @@ async fn main() -> Result<(), Error> {
     // Base image to boot. Defaults to stock helios for an image BUILD; set
     // VBUILD_IMAGE=voxel-cp-<ver> to boot a node FROM a previously built image
     // (smoke test / validation).
-    let image = std::env::var("VBUILD_IMAGE").unwrap_or_else(|_| HELIOS_IMG.to_string());
+    let image = std::env::var("VBUILD_IMAGE")
+        .unwrap_or_else(|_| HELIOS_IMG.to_string());
     let vbuild = d.node(NODE, &image, cores, gb(mem_gb));
     d.reserve(vbuild, disk_gb);
 
@@ -69,18 +68,20 @@ async fn main() -> Result<(), Error> {
     if let Ok(ifx) = std::env::var("EXT_INTERFACE") {
         d.ext_link(&ifx, vbuild);
     } else {
-        d.default_ext_link(vbuild)
-            .map_err(|e| anyhow!("failed to find default external interface: {e}"))?;
+        d.default_ext_link(vbuild).map_err(|e| {
+            anyhow!("failed to find default external interface: {e}")
+        })?;
     }
 
     // Stage the install payload (the cargo-bay holding INSTALL_SCRIPT + any
     // artifacts it needs, e.g. omicron for install-cp.sh).
-    let cargo_bay =
-        std::env::var("VBUILD_CARGO_BAY").unwrap_or_else(|_| "./cargo-bay/vbuild".to_string());
+    let cargo_bay = std::env::var("VBUILD_CARGO_BAY")
+        .unwrap_or_else(|_| "./cargo-bay/vbuild".to_string());
     // illumos guests use mount(); linux guests need mount_linux() (the guest-side
     // share mechanism differs). Pick based on the base image.
-    let is_linux =
-        image.starts_with("debian") || image.starts_with("ubuntu") || image.starts_with("linux");
+    let is_linux = image.starts_with("debian")
+        || image.starts_with("ubuntu")
+        || image.starts_with("linux");
     let mounted = if is_linux {
         d.mount_linux(&cargo_bay, "/opt/cargo-bay", vbuild)
     } else {
@@ -94,11 +95,12 @@ async fn main() -> Result<(), Error> {
         if std::env::var("VBUILD_SKIP_INSTALL").is_ok() {
             info!(
                 d.log,
-                "VBUILD_SKIP_INSTALL set; booted from image {}, skipping install", image
+                "VBUILD_SKIP_INSTALL set; booted from image {}, skipping install",
+                image
             );
         } else {
-            let script =
-                std::env::var("INSTALL_SCRIPT").unwrap_or_else(|_| "install-cp.sh".to_string());
+            let script = std::env::var("INSTALL_SCRIPT")
+                .unwrap_or_else(|_| "install-cp.sh".to_string());
             // falcon `exec` buffers a command's output until it returns, so a long
             // install (the omicron build can be 30-45 min) shows nothing until the
             // end. Run it DETACHED (output to /tmp/install.log, exit code to
@@ -165,13 +167,19 @@ async fn main() -> Result<(), Error> {
                 if exit_code.is_some() {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(poll_secs))
+                    .await;
             }
             match exit_code.as_deref() {
-                Some("0") => info!(d.log, "install ({}) complete; node ready for capture", script),
+                Some("0") => info!(
+                    d.log,
+                    "install ({}) complete; node ready for capture", script
+                ),
                 Some(code) => info!(
                     d.log,
-                    "install ({}) exited {} (build-image.sh gates on the ready marker)", script, code
+                    "install ({}) exited {} (build-image.sh gates on the ready marker)",
+                    script,
+                    code
                 ),
                 None => info!(
                     d.log,

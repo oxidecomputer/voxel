@@ -22,23 +22,15 @@ const MGADM: &str = "/opt/oxide/mgd/bin/mgadm";
 
 /// The global switch index (`switchN`) for each scrimlet, in order.
 fn switches(cfg: &VoxelConfig) -> Vec<(usize, SledDesc)> {
-    cfg.sleds()
-        .into_iter()
-        .filter(|s| s.scrimlet)
-        .enumerate()
-        .collect()
+    cfg.sleds().into_iter().filter(|s| s.scrimlet).enumerate().collect()
 }
 
 // --- show ------------------------------------------------------------------
 
 pub(crate) fn show(cfg: &VoxelConfig) -> anyhow::Result<()> {
     let racks = cfg.topology.racks();
-    let nfr = cfg
-        .topology
-        .routers
-        .iter()
-        .filter(|r| r.as_str() != "ce")
-        .count();
+    let nfr =
+        cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
     println!(
         "network topology - {racks} rack{}",
         if racks == 1 { "" } else { "s" }
@@ -114,10 +106,13 @@ pub(crate) async fn link_up(
 ) -> anyhow::Result<()> {
     let (sw, ip) = switch_ip(cfg, name, switch).await?;
     let link = format!("{port}/0");
-    eprintln!("[voxel] {sw} ({ip}): bringing up link {link} ({speed}, fec {fec})");
-    let present = ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1")))
-        .map(|o| o.contains(port))
-        .unwrap_or(false);
+    eprintln!(
+        "[voxel] {sw} ({ip}): bringing up link {link} ({speed}, fec {fec})"
+    );
+    let present =
+        ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1")))
+            .map(|o| o.contains(port))
+            .unwrap_or(false);
     if present {
         eprintln!("[voxel] {link} already exists; (re)enabling");
     } else {
@@ -126,26 +121,35 @@ pub(crate) async fn link_up(
         ));
         let out = ssh_output(&ip, &create).unwrap_or_default();
         if !out.contains("CREATE_OK") {
-            return Err(anyhow!("link create {link} on {sw} failed: {}", out.trim()));
+            return Err(anyhow!(
+                "link create {link} on {sw} failed: {}",
+                out.trim()
+            ));
         }
     }
     let en = ssh_output(
         &ip,
-        &zlogin(&format!(
-            "{SWADM} link enable {link} 2>&1 && echo ENABLE_OK"
-        )),
+        &zlogin(&format!("{SWADM} link enable {link} 2>&1 && echo ENABLE_OK")),
     )
     .unwrap_or_default();
     if !en.contains("ENABLE_OK") {
-        return Err(anyhow!("link enable {link} on {sw} failed: {}", en.trim()));
+        return Err(anyhow!(
+            "link enable {link} on {sw} failed: {}",
+            en.trim()
+        ));
     }
     // Brief settle, then show the link state (Down until the peer end is up too).
     std::thread::sleep(std::time::Duration::from_secs(2));
     let st =
-        ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1"))).unwrap_or_default();
+        ssh_capture(&ip, &zlogin(&format!("{SWADM} link get {link} 2>&1")))
+            .unwrap_or_default();
     print!("{st}");
-    eprintln!("[voxel] {sw}: {link} created + enabled (reaches Up once the peer switch's {port} is also up)");
-    eprintln!("[voxel] ⚠️  transient: Nexus's reconciler will reap this manual link in ~30s - debug only; use the Oxide API to persist");
+    eprintln!(
+        "[voxel] {sw}: {link} created + enabled (reaches Up once the peer switch's {port} is also up)"
+    );
+    eprintln!(
+        "[voxel] ⚠️  transient: Nexus's reconciler will reap this manual link in ~30s - debug only; use the Oxide API to persist"
+    );
     Ok(())
 }
 
@@ -160,12 +164,11 @@ pub(crate) async fn link_down(
     let (sw, ip) = switch_ip(cfg, name, switch).await?;
     let link = format!("{port}/0");
     eprintln!("[voxel] {sw} ({ip}): taking down link {link}");
-    let _ = ssh_output(&ip, &zlogin(&format!("{SWADM} link disable {link} 2>&1")));
+    let _ =
+        ssh_output(&ip, &zlogin(&format!("{SWADM} link disable {link} 2>&1")));
     let out = ssh_output(
         &ip,
-        &zlogin(&format!(
-            "{SWADM} link delete {link} 2>&1 && echo DELETE_OK"
-        )),
+        &zlogin(&format!("{SWADM} link delete {link} 2>&1 && echo DELETE_OK")),
     )
     .unwrap_or_default();
     if out.contains("DELETE_OK") {
@@ -196,7 +199,11 @@ fn section(title: &str, body: &str) {
     }
 }
 
-pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> anyhow::Result<()> {
+pub(crate) async fn validate(
+    cfg: &VoxelConfig,
+    name: &str,
+    detail: bool,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let racks = cfg.topology.racks();
     println!(
@@ -214,7 +221,10 @@ pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> any
         };
         let asn = cfg.network.for_rack(s.rack).bgp_asn;
         println!("  switch {} ({ip}, rack{}):", s.name, s.rack + 1);
-        let zl = |c: String| ssh_capture(&ip, &format!("{} 2>&1", zlogin(&c))).unwrap_or_default();
+        let zl = |c: String| {
+            ssh_capture(&ip, &format!("{} 2>&1", zlogin(&c)))
+                .unwrap_or_default()
+        };
         let links = zl(format!("{SWADM} link ls"));
         let ports = zl(format!("{SWADM} switch-port ls"));
         let bgp = zl(format!("{MGADM} bgp status neighbors {asn}"));
@@ -226,14 +236,18 @@ pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> any
             section(&format!("bgp (mgadm bgp status neighbors {asn})"), &bgp);
             section("routes (swadm route list)", &routes);
         } else {
-            let (up, down) = (count_lines(&links, "Up"), count_lines(&links, "Down"));
+            let (up, down) =
+                (count_lines(&links, "Up"), count_lines(&links, "Down"));
             let nports = ports.lines().filter(|l| !l.trim().is_empty()).count();
-            println!("    links  : {up} up, {down} down  ({nports} switch ports)");
+            println!(
+                "    links  : {up} up, {down} down  ({nports} switch ports)"
+            );
             println!(
                 "    bgp    : {} established (asn {asn})",
                 count_lines(&bgp, "Established")
             );
-            let xrack = routes.lines().filter(|l| l.contains("198.51.10")).count();
+            let xrack =
+                routes.lines().filter(|l| l.contains("198.51.10")).count();
             println!(
                 "    routes : {} entries{}",
                 routes.lines().count(),

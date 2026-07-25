@@ -2,11 +2,11 @@
 //! global zones (`host`) and switch zones (`tp`).
 
 use anyhow::anyhow;
-use libfalcon::{cli::console, NodeRef};
+use libfalcon::{NodeRef, cli::console};
 use voxel_config::{SledDesc, VoxelConfig};
 
-use crate::net::{node_external_ip, ssh_output, zlogin, ZLOGIN};
-use crate::topo::{build_topo, Topo};
+use crate::net::{ZLOGIN, node_external_ip, ssh_output, zlogin};
+use crate::topo::{Topo, build_topo};
 
 /// `voxel host exec -c "<cmd>" <sled>` - run a command in a sled's global zone
 /// over ssh (the non-interactive `host login`) and print its output.
@@ -22,11 +22,12 @@ pub(crate) async fn cmd_host_exec(
         .iter()
         .find(|(s, _)| s.name == sled)
         .ok_or_else(|| anyhow!("no such sled: {sled}"))?;
-    let ip = node_external_ip(&topo.runner, *n, false)
-        .await
-        .map_err(|e| anyhow!("{e} - is the rack up? (`voxel serial {sled}` for the console)"))?;
-    let out = ssh_output(&ip, command)
-        .ok_or_else(|| anyhow!("couldn't ssh root@{ip} ({sled}) - is the rack up?"))?;
+    let ip = node_external_ip(&topo.runner, *n, false).await.map_err(|e| {
+        anyhow!("{e} - is the rack up? (`voxel serial {sled}` for the console)")
+    })?;
+    let out = ssh_output(&ip, command).ok_or_else(|| {
+        anyhow!("couldn't ssh root@{ip} ({sled}) - is the rack up?")
+    })?;
     print!("{out}");
     Ok(())
 }
@@ -42,21 +43,24 @@ pub(crate) async fn cmd_tp_exec(
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let (s, n) = resolve_switch(&topo, switch)?;
-    let ip = node_external_ip(&topo.runner, *n, false)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "{e} - is the rack up? (`voxel serial {}` for the console)",
-                s.name
-            )
-        })?;
-    let out = ssh_output(&ip, &zlogin(command))
-        .ok_or_else(|| anyhow!("couldn't reach oxz_switch on {} ({switch})", s.name))?;
+    let ip = node_external_ip(&topo.runner, *n, false).await.map_err(|e| {
+        anyhow!(
+            "{e} - is the rack up? (`voxel serial {}` for the console)",
+            s.name
+        )
+    })?;
+    let out = ssh_output(&ip, &zlogin(command)).ok_or_else(|| {
+        anyhow!("couldn't reach oxz_switch on {} ({switch})", s.name)
+    })?;
     print!("{out}");
     Ok(())
 }
 
-pub(crate) async fn cmd_serial(cfg: &VoxelConfig, name: &str, node: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_serial(
+    cfg: &VoxelConfig,
+    name: &str,
+    node: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     if topo.node_ref(node).is_none() {
         return Err(anyhow!("no such node: {node}"));
@@ -84,7 +88,10 @@ fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
     Err(anyhow!("could not exec ssh: {}", c.exec()))
 }
 
-pub(crate) async fn cmd_host_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_host_ls(
+    cfg: &VoxelConfig,
+    name: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     println!("{:<6}  {:<16}  {}", "NODE", "IP", "ROLE");
     for (s, n) in &topo.sleds {
@@ -108,9 +115,9 @@ pub(crate) async fn cmd_host_login(
         .iter()
         .find(|(s, _)| s.name == sled)
         .ok_or_else(|| anyhow!("no such sled: {sled}"))?;
-    let ip = node_external_ip(&topo.runner, *n, false)
-        .await
-        .map_err(|e| anyhow!("{e} - is the rack up? (`voxel serial {sled}` for the console)"))?;
+    let ip = node_external_ip(&topo.runner, *n, false).await.map_err(|e| {
+        anyhow!("{e} - is the rack up? (`voxel serial {sled}` for the console)")
+    })?;
     eprintln!("[voxel] ssh root@{ip}  ({sled} global zone)");
     ssh_exec(&ip, None)
 }
@@ -135,22 +142,22 @@ pub(crate) fn resolve_switch<'a>(
     if let Some((r, sw)) = switch.split_once('/') {
         if let (Some(rack), Some(slot)) = (
             r.strip_prefix("rack").and_then(|x| x.parse::<usize>().ok()),
-            sw.strip_prefix("switch")
-                .and_then(|x| x.parse::<usize>().ok()),
+            sw.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()),
         ) {
             let rack0 = rack.saturating_sub(1);
             let hit = scrimlets
                 .iter()
                 .filter(|(s, _)| s.rack == rack0)
                 .nth(slot)
-                .ok_or_else(|| anyhow!("no rack{rack}/switch{slot} in topology"))?;
+                .ok_or_else(|| {
+                    anyhow!("no rack{rack}/switch{slot} in topology")
+                })?;
             return Ok(hit);
         }
     }
     // Bare `switchN` - global Nth scrimlet.
-    if let Some(n) = switch
-        .strip_prefix("switch")
-        .and_then(|x| x.parse::<usize>().ok())
+    if let Some(n) =
+        switch.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok())
     {
         return scrimlets
             .into_iter()
@@ -162,7 +169,10 @@ pub(crate) fn resolve_switch<'a>(
     ))
 }
 
-pub(crate) async fn cmd_tp_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_tp_ls(
+    cfg: &VoxelConfig,
+    name: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     // Each rack has its own switch0/switch1, so number the switch slot PER RACK
     // and show which rack it's in (1-based, matching `voxel info`).
@@ -172,7 +182,8 @@ pub(crate) async fn cmd_tp_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<(
     } else {
         println!("{:<8}  {:<6}  {}", "SWITCH", "NODE", "IP");
     }
-    let mut per_rack: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut per_rack: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
     for (s, n) in topo.sleds.iter().filter(|(s, _)| s.scrimlet) {
         let slot = per_rack.entry(s.rack).or_insert(0);
         let ip = node_external_ip(&topo.runner, *n, false)
@@ -200,14 +211,12 @@ pub(crate) async fn cmd_tp_login(
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let (s, n) = resolve_switch(&topo, switch)?;
-    let ip = node_external_ip(&topo.runner, *n, false)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "{e} - is the rack up? (`voxel serial {}` for the console)",
-                s.name
-            )
-        })?;
+    let ip = node_external_ip(&topo.runner, *n, false).await.map_err(|e| {
+        anyhow!(
+            "{e} - is the rack up? (`voxel serial {}` for the console)",
+            s.name
+        )
+    })?;
     eprintln!("[voxel] ssh root@{ip} -> {ZLOGIN}  ({} {switch})", s.name);
     ssh_exec(&ip, Some(ZLOGIN))
 }

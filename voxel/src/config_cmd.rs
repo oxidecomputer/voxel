@@ -1,11 +1,11 @@
 //! `voxel config` - show / get / set / load the `voxel.toml`.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use std::fs;
 use std::path::Path;
-use voxel_config::{config as vcfg, VoxelConfig};
+use voxel_config::{VoxelConfig, config as vcfg};
 
-use crate::{config_text, load_config, ConfigCmd};
+use crate::{ConfigCmd, config_text, load_config};
 
 pub(crate) fn cmd_config(path: &Path, cmd: &ConfigCmd) -> anyhow::Result<()> {
     match cmd {
@@ -22,18 +22,22 @@ pub(crate) fn cmd_config(path: &Path, cmd: &ConfigCmd) -> anyhow::Result<()> {
         ConfigCmd::Set { key, value } => {
             // Seed the file with defaults if it doesn't exist yet, so edits stick.
             let text = config_text(path)?;
-            let updated = vcfg::set(&text, key, value).map_err(|e| anyhow!(e))?;
+            let updated =
+                vcfg::set(&text, key, value).map_err(|e| anyhow!(e))?;
             ensure_parent_dir(path)?;
-            fs::write(path, &updated).with_context(|| format!("write {}", path.display()))?;
+            fs::write(path, &updated)
+                .with_context(|| format!("write {}", path.display()))?;
             println!("{key} = {value}");
         }
         ConfigCmd::Load { file } => {
-            let text =
-                fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-            VoxelConfig::from_toml(&text)
-                .map_err(|e| anyhow!("invalid config {}: {e}", file.display()))?;
+            let text = fs::read_to_string(file)
+                .with_context(|| format!("read {}", file.display()))?;
+            VoxelConfig::from_toml(&text).map_err(|e| {
+                anyhow!("invalid config {}: {e}", file.display())
+            })?;
             ensure_parent_dir(path)?;
-            fs::write(path, &text).with_context(|| format!("write {}", path.display()))?;
+            fs::write(path, &text)
+                .with_context(|| format!("write {}", path.display()))?;
             println!("loaded {} -> {}", file.display(), path.display());
         }
     }
@@ -45,7 +49,8 @@ pub(crate) fn cmd_config(path: &Path, cmd: &ConfigCmd) -> anyhow::Result<()> {
 fn ensure_parent_dir(path: &Path) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+            fs::create_dir_all(dir)
+                .with_context(|| format!("create {}", dir.display()))?;
         }
     }
     Ok(())

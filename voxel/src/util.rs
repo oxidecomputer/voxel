@@ -13,7 +13,10 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// Locate a `voxel-image/<rel>` helper script: the `env_var` override first, else
 /// relative to the running binary (`<exe>/../../voxel-image/<rel>`), else
 /// `voxel-image/<rel>` under the CWD. Errors point at `env_var`.
-pub(crate) fn locate_script(env_var: &str, rel: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn locate_script(
+    env_var: &str,
+    rel: &str,
+) -> anyhow::Result<PathBuf> {
     if let Ok(p) = std::env::var(env_var) {
         return Ok(PathBuf::from(p));
     }
@@ -29,7 +32,5 @@ pub(crate) fn locate_script(env_var: &str, rel: &str) -> anyhow::Result<PathBuf>
     if cwd.exists() {
         return Ok(cwd);
     }
-    Err(anyhow::anyhow!(
-        "can't find {rel} - set {env_var} to its path"
-    ))
+    Err(anyhow::anyhow!("can't find {rel} - set {env_var} to its path"))
 }

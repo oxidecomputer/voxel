@@ -1,12 +1,12 @@
 //! `voxel image` - list / create / export / import / rm image bundles, plus the
 //! hidden `render-smf` build helper.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::util::{locate_script, shell_quote};
 use crate::ImageCmd;
+use crate::util::{locate_script, shell_quote};
 
 /// The resolved falcon dataset (set by `resolve_falcon_env`; else `rpool/falcon`).
 pub(crate) fn falcon_dataset() -> String {
@@ -106,7 +106,10 @@ fn create_from_src(src: &Path, label: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Result<()> {
+pub(crate) fn cmd_image(
+    cmd: &ImageCmd,
+    active: Option<String>,
+) -> anyhow::Result<()> {
     match cmd {
         ImageCmd::Ls => {
             // Image bundles are falcon base images at <dataset>/img/<name>@base.
@@ -142,10 +145,11 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             let mut bundles: Vec<String> = Vec::new();
             for line in text.lines() {
                 let mut f = line.split('\t');
-                let (name, used, creation, ty) = match (f.next(), f.next(), f.next(), f.next()) {
-                    (Some(n), Some(u), Some(c), Some(t)) => (n, u, c, t),
-                    _ => continue,
-                };
+                let (name, used, creation, ty) =
+                    match (f.next(), f.next(), f.next(), f.next()) {
+                        (Some(n), Some(u), Some(c), Some(t)) => (n, u, c, t),
+                        _ => continue,
+                    };
                 match ty {
                     "volume" => {
                         if let Some(short) = name.strip_prefix(&prefix) {
@@ -191,7 +195,10 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                         let mut f = line.split('\t');
                         if let (Some(n), Some(c)) = (f.next(), f.next()) {
                             if let Some(short) = n.strip_prefix(&prefix) {
-                                m.insert(short.to_string(), c.parse().unwrap_or(0));
+                                m.insert(
+                                    short.to_string(),
+                                    c.parse().unwrap_or(0),
+                                );
                             }
                         }
                     }
@@ -266,12 +273,7 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             }
             Ok(())
         }
-        ImageCmd::Create {
-            commit,
-            src,
-            contained,
-            persist_source,
-        } => {
+        ImageCmd::Create { commit, src, contained, persist_source } => {
             // `--src`: host build from an existing checkout, as-is (dev loop).
             if let Some(src) = src {
                 return create_from_src(src, commit.as_deref());
@@ -279,9 +281,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             // Default: in-place host build. `--contained`: build inside a
             // `voxel-builder` VM (no host git/omicron toolchain). (clap guarantees
             // `commit` is present when `--src` is absent.)
-            let commit = commit
-                .as_deref()
-                .ok_or_else(|| anyhow!("a <COMMIT> is required (or pass --src <path>)"))?;
+            let commit = commit.as_deref().ok_or_else(|| {
+                anyhow!("a <COMMIT> is required (or pass --src <path>)")
+            })?;
             let script = if *contained {
                 build_cp_vm_script()?
             } else {
@@ -312,7 +314,10 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         }
         ImageCmd::BuilderCreate { force } => {
             let script = build_builder_script()?;
-            eprintln!("[voxel] baking voxel-builder base image via {}", script.display());
+            eprintln!(
+                "[voxel] baking voxel-builder base image via {}",
+                script.display()
+            );
             let mut command = std::process::Command::new("bash");
             command.arg(&script);
             if *force {
@@ -381,10 +386,14 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| anyhow!("bad file path"))?;
             // Derive image name + decompressor from the extension.
-            let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst") {
+            let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst")
+            {
                 (
                     n.to_string(),
-                    format!("zstd -dc {}", shell_quote(&file.display().to_string())),
+                    format!(
+                        "zstd -dc {}",
+                        shell_quote(&file.display().to_string())
+                    ),
                 )
             } else if let Some(n) = fname.strip_suffix(".raw.xz") {
                 return Err(anyhow!(
@@ -408,7 +417,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                     "import failed (need zstd + zfs; {dst} must not already exist)"
                 ));
             }
-            println!("imported {dst}@base (use: voxel config set image.cp {name})");
+            println!(
+                "imported {dst}@base (use: voxel config set image.cp {name})"
+            );
             Ok(())
         }
         ImageCmd::Rm { name, yes } => {
@@ -439,12 +450,10 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         }
         // `image patch` needs the loaded config (for the default source image),
         // so it's dispatched in `main` before delegating the rest here.
-        ImageCmd::Patch { .. } => Err(anyhow!("internal: `image patch` is dispatched in main")),
-        ImageCmd::RenderSmf {
-            omicron_root,
-            gimlets,
-            out,
-        } => {
+        ImageCmd::Patch { .. } => {
+            Err(anyhow!("internal: `image patch` is dispatched in main"))
+        }
+        ImageCmd::RenderSmf { omicron_root, gimlets, out } => {
             // Bake switch0 for `gimlets` sleds with scrimlets at the first + last
             // sled (the convention the default topology follows). The launch-time
             // topology must keep scrimlets at those indices for the baked switch0
@@ -470,8 +479,10 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             for (rel, text) in writes {
                 let path = base.join(rel);
                 let dir = path.parent().expect("smf path has a parent");
-                fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
-                fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+                fs::create_dir_all(dir)
+                    .with_context(|| format!("mkdir {}", dir.display()))?;
+                fs::write(&path, text)
+                    .with_context(|| format!("write {}", path.display()))?;
                 println!("rendered {}", path.display());
             }
             Ok(())

@@ -85,8 +85,9 @@ pub(crate) async fn watch_rss(
     tag: &str,
     cap: Duration,
 ) {
-    let curl =
-        format!("curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null");
+    let curl = format!(
+        "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
+    );
     const POLL_INTERVAL: Duration = Duration::from_secs(8);
     const HEARTBEAT: Duration = Duration::from_secs(90); // re-affirm liveness this often
 
@@ -146,8 +147,11 @@ pub(crate) async fn watch_rss(
                 // node has crash-looped into MAINTENANCE, it never will - surface
                 // it (with the sled-agent log tail, the usual culprit: a config
                 // schema drift) and stop, instead of the 15-minute hang.
-                if last.is_empty() && start.elapsed() > Duration::from_secs(20) {
-                    if let Some(x) = crate::net::ssh_capture(&rss_ip, "svcs -x 2>/dev/null") {
+                if last.is_empty() && start.elapsed() > Duration::from_secs(20)
+                {
+                    if let Some(x) =
+                        crate::net::ssh_capture(&rss_ip, "svcs -x 2>/dev/null")
+                    {
                         if x.contains("maintenance") {
                             warn!(
                                 d.log,
@@ -160,7 +164,11 @@ pub(crate) async fn watch_rss(
                                 "tail -6 /var/svc/log/oxide-sled-agent:default.log 2>/dev/null",
                             ) {
                                 if !t.trim().is_empty() {
-                                    warn!(d.log, "{tag}: sled-agent log tail:\n{}", t.trim());
+                                    warn!(
+                                        d.log,
+                                        "{tag}: sled-agent log tail:\n{}",
+                                        t.trim()
+                                    );
                                 }
                             }
                             warn!(
@@ -180,7 +188,10 @@ pub(crate) async fn watch_rss(
                     } else {
                         format!("last seen: {}", rss_step_display(&last).1)
                     };
-                    info!(d.log, "{tag}: still watching, {mins}m elapsed - {where_}");
+                    info!(
+                        d.log,
+                        "{tag}: still watching, {mins}m elapsed - {where_}"
+                    );
                     last_emit = Instant::now();
                 }
                 continue;
@@ -191,7 +202,13 @@ pub(crate) async fn watch_rss(
                 let step = json_step(&out);
                 if !step.is_empty() && step != last {
                     let (idx, label) = rss_step_display(&step);
-                    info!(d.log, "{tag} [{}/{}]: {}", idx, RSS_STEPS.len(), label);
+                    info!(
+                        d.log,
+                        "{tag} [{}/{}]: {}",
+                        idx,
+                        RSS_STEPS.len(),
+                        label
+                    );
                     last = step;
                     last_emit = Instant::now();
                     step_start = Instant::now();
@@ -225,12 +242,19 @@ pub(crate) async fn watch_rss(
                          storage (the emulated vdevs must be wiped)."
                     );
                 } else {
-                    info!(d.log, "{tag}: complete - rack initialized (rack {id})");
+                    info!(
+                        d.log,
+                        "{tag}: complete - rack initialized (rack {id})"
+                    );
                 }
                 break;
             }
             "initialization_failed" => {
-                warn!(d.log, "{tag} FAILED: {}", json_str_field(&out, "message"));
+                warn!(
+                    d.log,
+                    "{tag} FAILED: {}",
+                    json_str_field(&out, "message")
+                );
                 break;
             }
             _ => {} // not serving yet / other - keep waiting
@@ -294,8 +318,7 @@ mod tests {
     #[test]
     fn strip_ansi_yields_clean_ip() {
         // ip(8) colorizes: ESC[36menp0s10ESC[0m ... ESC[35m192.168.68.171ESC[0m/22
-        let colored =
-            "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
+        let colored = "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
         let clean = strip_ansi(colored);
         let ip = clean
             .split_whitespace()
