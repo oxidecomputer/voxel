@@ -172,20 +172,21 @@ enum ImageCmd {
     Ls,
     /// Build a `voxel-cp` image for an omicron commit (from source).
     ///
-    /// By default the omicron build runs inside a `voxel-builder` VM (so the
-    /// host needs no git/toolchain); `voxel image builder-create` bakes that
-    /// base image once.
+    /// By default the omicron build runs on the host (needs git + the full
+    /// omicron toolchain). `--contained` runs it inside a `voxel-builder` VM
+    /// instead, so the host needs no git/toolchain (bake the base image once
+    /// with `voxel image builder-create`).
     Create {
         /// omicron git commit (or tag) to build and pin the image to.
         commit: String,
-        /// Keep the omicron source in the image and leave the builder VM up for
-        /// in-place edits (default: scrub the source + toolchain, destroy the VM).
+        /// Build inside a `voxel-builder` VM instead of on the host (no host
+        /// git/omicron toolchain required).
+        #[arg(long)]
+        contained: bool,
+        /// (contained builds only) Keep the omicron source in the image and leave
+        /// the builder VM up for in-place edits (default: scrub + destroy the VM).
         #[arg(long)]
         persist_source: bool,
-        /// Legacy: build on the host (needs git + the full omicron toolchain)
-        /// instead of inside a `voxel-builder` VM.
-        #[arg(long)]
-        host_build: bool,
     },
     /// Bake the reusable `voxel-builder` base image (helios + rust + omicron's
     /// builder prerequisites). One-time; `voxel image create` boots from it.

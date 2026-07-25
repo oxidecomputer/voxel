@@ -16,20 +16,19 @@ topology. Two image kinds, same machinery:
 
 ## Where the omicron build runs
 
-By default `voxel image create` runs the whole omicron build (git clone, cargo,
-`omicron-package`) INSIDE a `voxel-builder` VM, so the host needs no git / rust /
-omicron toolchain - only falcon/zfs/bhyve. Bake that base image once with
-`voxel image builder-create`. `--host-build` keeps the legacy in-place host build
-for boxes that already have the full toolchain.
+By default `voxel image create` runs the omicron build (git clone, cargo,
+`omicron-package`) in place ON THE HOST (needs git + rust + the omicron
+toolchain). `--contained` runs the whole build INSIDE a `voxel-builder` VM
+instead, so the host needs none of that - only falcon/zfs/bhyve; bake that base
+image once with `voxel image builder-create`.
 
-Two tiers:
-
-- **`voxel-builder`** (`build-builder.sh` / `provision-builder.sh`): stock helios
-  plus git + rustup + omicron's builder prerequisites and a warmed cargo target.
-  One-time; per-commit builds boot from it.
-- **`voxel-cp`** (`build-cp-vm.sh` / `build-cp-guest.sh`): boots `voxel-builder`,
-  builds + bakes the control plane, captures the disk. `build-cp.sh` is the
-  `--host-build` equivalent.
+- **host build** (`build-cp.sh`, the default): in-place on the box.
+- **contained build** (`--contained`): two tiers -
+  - `voxel-builder` (`build-builder.sh` / `provision-builder.sh`): stock helios
+    plus git + rustup + omicron's builder prerequisites and a warmed cargo target.
+    One-time; contained builds boot from it.
+  - `voxel-cp` (`build-cp-vm.sh` / `build-cp-guest.sh`): boots `voxel-builder`,
+    builds + bakes the control plane in-guest, captures the disk.
 
 ## What's baked vs applied at launch
 
@@ -81,10 +80,11 @@ on the box at launch.
   the schema manifest to the host stub, `KEEP_BUILDER=1` leaves the builder up.
 - `build-builder.sh` / `provision-builder.sh`: bake the `voxel-builder` base image
   (host driver / in-guest provisioner).
-- `build-cp-vm.sh` / `build-cp-guest.sh`: the default VM build (host driver stages
-  the cargo-bay + launches; guest clones/builds omicron, then calls install-cp.sh,
-  bakes rss-gen + manifest, and scrubs the source unless `PERSIST_SOURCE=1`).
-- `build-cp.sh`: the `--host-build` fallback (in-place host build).
+- `build-cp-vm.sh` / `build-cp-guest.sh`: the `--contained` VM build (host driver
+  stages the cargo-bay + launches; guest clones/builds omicron, then calls
+  install-cp.sh, bakes rss-gen + manifest, and scrubs the source unless
+  `PERSIST_SOURCE=1`).
+- `build-cp.sh`: the default in-place host build.
 - `gen-manifest.sh`: derive `voxel-image.toml` (schema shapes) from omicron source.
 - `patches/`: omicron source patches applied at build (`nexus-infra-lot-v6.py`,
   `smbios-gimlet.sh`).
@@ -94,19 +94,20 @@ on the box at launch.
 The one-shot path is the `voxel` CLI:
 
 ```sh
-voxel image builder-create            # one-time: bake the voxel-builder base image
-voxel image create <omicron-commit>   # build voxel-cp-<commit> in a builder VM
-voxel image create <commit> --persist-source   # keep source in image + VM up for edits
-voxel image create <commit> --host-build       # legacy in-place host build
+voxel image create <omicron-commit>              # default: in-place host build
+voxel image builder-create                       # one-time (contained): bake voxel-builder
+voxel image create <commit> --contained          # build in a voxel-builder VM (no host toolchain)
+voxel image create <commit> --contained --persist-source  # keep source in image + VM up
 ```
 
-By default `voxel image create` drives `build-cp-vm.sh`: it stages the small
-host-only inputs (guest scripts, patches, rendered smf configs, sidecar,
-voxel-init) into `cargo-bay/vbuild`, boots the `voxel-builder` VM running
-`build-cp-guest.sh` (clone + build + package + `install-cp.sh` bake + rss-gen +
-manifest, scrub), then `build-image.sh` captures the disk to
-`img/voxel-cp-<commit>@base` and mirrors the schema manifest to the host stub.
-`--host-build` drives `build-cp.sh` instead (same bake, built in-place on the host).
+By default `voxel image create` drives `build-cp.sh`: it builds omicron on the
+host and bakes `img/voxel-cp-<commit>@base` via `build-image.sh`. `--contained`
+drives `build-cp-vm.sh` instead: it stages the small host-only inputs (guest
+scripts, patches, rendered smf configs, sidecar, voxel-init) into
+`cargo-bay/vbuild`, boots the `voxel-builder` VM running `build-cp-guest.sh`
+(clone + build + package + `install-cp.sh` bake + rss-gen + manifest, scrub),
+then `build-image.sh` captures the disk and mirrors the schema manifest to the
+host stub. Both paths produce the same image.
 
 `build-image.sh` is the lower-level bake (stage, build builder, launch, verify
 marker, capture), usable standalone once `cargo-bay/vbuild/{omicron,sidecar}` is

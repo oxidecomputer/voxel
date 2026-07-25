@@ -211,9 +211,10 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
 }
 
 /// Host stub dir for the image's omicron: `<build_root>/omicron-<commit>/`.
-/// Mirrors `resolve_falcon_env`'s build-root default. For VM-built images only
-/// the tiny `voxel-image.toml` manifest lives here (the full source is in the
-/// image); `--host-build` also writes the manifest here.
+/// Mirrors `resolve_falcon_env`'s build-root default. A host build leaves the
+/// full checkout here; a `--contained` build leaves only the tiny
+/// `voxel-image.toml` manifest (the source stays in the image). Either way the
+/// manifest is read from here at launch.
 fn image_src_dir(cfg: &VoxelConfig) -> Option<PathBuf> {
     let commit = cfg.image.cp_commit()?;
     let build_root = std::env::var("BUILD_ROOT").unwrap_or_else(|_| {

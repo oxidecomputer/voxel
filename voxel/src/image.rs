@@ -33,13 +33,13 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Locate `voxel-image/build-cp.sh` (the `--host-build` fallback):
+/// Locate `voxel-image/build-cp.sh` (the default in-place host build):
 /// `VOXEL_BUILD_CP` override, else relative to the running binary, else CWD.
 fn build_cp_script() -> anyhow::Result<PathBuf> {
     locate_script("VOXEL_BUILD_CP", "build-cp.sh")
 }
 
-/// Locate `voxel-image/build-cp-vm.sh` (the default VM build driver).
+/// Locate `voxel-image/build-cp-vm.sh` (the `--contained` VM build driver).
 fn build_cp_vm_script() -> anyhow::Result<PathBuf> {
     locate_script("VOXEL_BUILD_CP_VM", "build-cp-vm.sh")
 }
@@ -211,15 +211,15 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         }
         ImageCmd::Create {
             commit,
+            contained,
             persist_source,
-            host_build,
         } => {
-            // Default: build inside a `voxel-builder` VM (no host toolchain).
-            // `--host-build`: legacy in-place host build.
-            let script = if *host_build {
-                build_cp_script()?
-            } else {
+            // Default: in-place host build. `--contained`: build inside a
+            // `voxel-builder` VM (no host git/omicron toolchain).
+            let script = if *contained {
                 build_cp_vm_script()?
+            } else {
+                build_cp_script()?
             };
             eprintln!(
                 "[voxel] building voxel-cp-{commit} via {}",
@@ -227,9 +227,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             );
             let mut command = std::process::Command::new("bash");
             command.arg(&script).arg(commit);
-            if *persist_source {
-                // Honored by the VM path (keep source in image + VM up); the host
-                // path always keeps its source on the box and ignores it.
+            if *contained && *persist_source {
+                // Only the contained (VM) path honors this (keep source in image +
+                // leave the builder VM up).
                 command.env("PERSIST_SOURCE", "1");
             }
             let status = command
