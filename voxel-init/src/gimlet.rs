@@ -279,7 +279,9 @@ fn generate_rss_config(effective: &str, out: &str) -> Result<()> {
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    note(format!("generating config-rss (rack {rack}) via baked rss-gen"));
+    note(format!(
+        "generating config-rss (rack {rack}) via baked rss-gen"
+    ));
     let ok = run(
         "/opt/oxide/voxel-rss-gen",
         &["generate", effective, out, "--rack", &rack.to_string()],

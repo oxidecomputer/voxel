@@ -135,7 +135,9 @@ async fn generate_rss_in_node(
         .map(|l| l.trim_end_matches('\r'))
         .collect();
     if body.is_empty() {
-        return Err(anyhow!("in-node rss-gen produced no config-rss (rack {rack})"));
+        return Err(anyhow!(
+            "in-node rss-gen produced no config-rss (rack {rack})"
+        ));
     }
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
@@ -378,7 +380,10 @@ pub(crate) async fn cmd_launch(
                     // wicketd suppresses auto-RSS, so config-rss isn't staged in
                     // the cargo-bay; produce it now from the baked in-guest rss-gen.
                     if let Err(e) = generate_rss_in_node(d, *n, rack, &config_rss).await {
-                        warn!(d.log, "{tag}: in-node rss-gen failed: {e}; rack will not initialize");
+                        warn!(
+                            d.log,
+                            "{tag}: in-node rss-gen failed: {e}; rack will not initialize"
+                        );
                     }
                     // wicketd's bootstrap_sleds must be THIS rack's cubby slots =
                     // its sleds' GLOBAL indices (rack 1 -> 3,4,5), matching what the

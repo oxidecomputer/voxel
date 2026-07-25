@@ -118,10 +118,14 @@ async fn main() -> Result<(), Error> {
             // Poll every 10s: print new log lines (fenced so the serial command
             // echo is ignored) until the wrapper records an exit code. Capped so a
             // hung build can't spin forever.
-            let poll_secs =
-                std::env::var("VBUILD_POLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10u64);
-            let max_minutes =
-                std::env::var("VBUILD_MAX_MINUTES").ok().and_then(|v| v.parse().ok()).unwrap_or(120u64);
+            let poll_secs = std::env::var("VBUILD_POLL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10u64);
+            let max_minutes = std::env::var("VBUILD_MAX_MINUTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120u64);
             let max_polls = (max_minutes * 60 / poll_secs.max(1)).max(1);
             let mut seen = 0usize;
             let mut exit_code: Option<String> = None;

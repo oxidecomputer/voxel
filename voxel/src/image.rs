@@ -236,17 +236,17 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .status()
                 .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
             if !status.success() {
-                return Err(anyhow!(
-                    "{} failed for commit {commit}",
-                    script.display()
-                ));
+                return Err(anyhow!("{} failed for commit {commit}", script.display()));
             }
             println!("built image voxel-cp-{commit}");
             Ok(())
         }
         ImageCmd::BuilderCreate { force } => {
             let script = build_builder_script()?;
-            eprintln!("[voxel] baking voxel-builder base image via {}", script.display());
+            eprintln!(
+                "[voxel] baking voxel-builder base image via {}",
+                script.display()
+            );
             let mut command = std::process::Command::new("bash");
             command.arg(&script);
             if *force {
