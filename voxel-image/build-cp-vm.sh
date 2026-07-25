@@ -33,6 +33,17 @@ export RUSTFLAGS="${RUSTFLAGS:---cfg svcadm_autoclear -C link-arg=-R/usr/platfor
 
 log() { echo "[build-cp-vm] $*"; }
 
+# Portable sha256 (illumos `digest`, else openssl / sha256sum).
+sha256_of() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        digest -a sha256 "$1"
+    fi
+}
+
 [[ "$(uname -s)" == "SunOS" ]] || { log "FATAL: run on the Helios box"; exit 1; }
 [[ -x "${VOXEL}" ]] || { log "FATAL: voxel binary not found at ${VOXEL} (set VOXEL=)"; exit 1; }
 
@@ -56,57 +67,72 @@ VERSION="${IMAGE_VERSION}"
 PERSIST_SOURCE="${PERSIST_SOURCE}"
 EOF
 
-# guest scripts + patches + manifest generator.
-cp "${HERE}/build-cp-guest.sh" "${HERE}/install-cp.sh" "${HERE}/gen-manifest.sh" "${CARGO_BAY}/"
-mkdir -p "${CARGO_BAY}/patches"
-cp "${HERE}/patches/nexus-infra-lot-v6.py" "${HERE}/patches/smbios-gimlet.sh" "${CARGO_BAY}/patches/"
-
-# build-time smf configs (rendered from voxel-config on the host; the guest drops
-# them into its checkout). `render-smf --out` ignores the positional root.
+# build-time smf configs (host-rendered from voxel-config; the guest drops them
+# into its checkout). `render-smf --out` ignores the positional root.
 log "rendering build-time smf configs (gimlets=${GIMLETS})"
 "${VOXEL}" image render-smf . --out "${CARGO_BAY}/smf-staging" --gimlets "${GIMLETS}"
-
-# Full voxel workspace for the in-guest rss-gen build. build-rss-gen.sh copies
-# voxel/rss-gen out and points it at voxel-config; voxel-config uses
-# workspace-inherited deps (serde.workspace = true), so it needs the workspace
-# root Cargo.toml + vendor/ (the [patch] path) present above it. Source only;
-# build/output dirs excluded.
-log "staging voxel workspace for rss-gen"
-rsync -a \
-    --exclude target --exclude .git --exclude cargo-bay --exclude .falcon --exclude out \
-    "${TESTBED}/" "${CARGO_BAY}/voxel-src/"
 
 # SoftNPU sidecar (buildomat; only the host can reach it).
 log "fetching SoftNPU sidecar"
 bash "${HERE}/fetch-sidecar.sh" "${CARGO_BAY}/sidecar"
 
-# In-guest bring-up agent (voxel's own crate, not the omicron toolchain). Build
-# FRESH when cargo is present so voxel-init edits always take effect - a stale
-# prebuilt silently ships an old agent; fall back to a prebuilt only where cargo
-# isn't available (voxel ships one).
-if command -v cargo >/dev/null 2>&1; then
-    log "building voxel-init (native illumos)"
-    ( cd "${TESTBED}" && cargo build -p voxel-init --release )
-    cp "${TESTBED}/target/release/voxel-init" "${CARGO_BAY}/voxel-init"
-elif [[ -x "${TESTBED}/target/release/voxel-init" ]]; then
-    log "using prebuilt voxel-init (no cargo on PATH)"
-    cp "${TESTBED}/target/release/voxel-init" "${CARGO_BAY}/voxel-init"
-else
-    log "FATAL: no cargo and no prebuilt target/release/voxel-init"; exit 1
-fi
-chmod +x "${CARGO_BAY}/voxel-init"
+# NB: the sp-emu fleet is NOT baked (runtime-only; see topo.rs stage_sp_emu). NB:
+# the guest scripts, patches, and the voxel-config/voxel-init/rss-gen crate SOURCE
+# are NOT host-staged - the guest downloads them in the voxel-helpers bundle below
+# and builds rss-gen + voxel-init from it. The host ships no repo to the guest.
 
-# NB: the sp-emu fleet is NOT baked here. Flashing hubris images is a runtime
-# concern: `voxel launch --emu-sp` stages + flashes the fleet per-scrimlet from
-# the [sp] config at bring-up (topo.rs stage_sp_emu / voxel-init setup_sp_emu).
-# This keeps the control-plane image decoupled from SP firmware.
+# --- serve the voxel-helpers bundle (dev artifact origin) ---------------------
+# Assemble the bundle from this checkout + serve it over HTTP on a guest-reachable
+# box IP. The guest (bootstrap.sh) downloads + checksum-verifies it. This is the
+# local stand-in for buildomat/TUF: same download code path, local origin.
+SERVE_DIR="${HERE}/cargo-bay/helpers-serve"
+rm -rf "${SERVE_DIR}"; mkdir -p "${SERVE_DIR}"
+log "assembling voxel-helpers bundle"
+read -r BUNDLE_TAR BUNDLE_SHA < <(bash "${HERE}/make-helpers-bundle.sh" "${TESTBED}" "${SERVE_DIR}")
+BUNDLE_NAME="$(basename "${BUNDLE_TAR}")"
+HOST_IP="${HELPERS_HOST_IP:-$(ipadm show-addr -p -o addr 2>/dev/null | sed 's#/.*##' | grep -E '^[0-9]+\.' | grep -v '^127\.' | head -1)}"
+PORT="${HELPERS_PORT:-8778}"
+# Clear any stale server squatting on the port (e.g. a leaked prior run), else
+# the bind fails and the guest 404s off the old one.
+pkill -f "http.server ${PORT} " 2>/dev/null || true
+sleep 1
+# pipenv-managed server when available (house pref); else plain python3 (the
+# server is stdlib-only, so there's nothing for pipenv to isolate).
+if command -v pipenv >/dev/null 2>&1; then
+    ( cd "${HERE}" && pipenv run python3 -m http.server "${PORT}" --bind "${HOST_IP}" --directory "${SERVE_DIR}" ) >/tmp/voxel-helpers-serve.log 2>&1 &
+else
+    python3 -m http.server "${PORT}" --bind "${HOST_IP}" --directory "${SERVE_DIR}" >/tmp/voxel-helpers-serve.log 2>&1 &
+fi
+SERVE_PID=$!
+trap 'kill ${SERVE_PID} 2>/dev/null || true' EXIT
+HELPERS_URL="http://${HOST_IP}:${PORT}/${BUNDLE_NAME}"
+
+# Verify the server actually serves the bundle before the ~10-min build, so a
+# bind failure / wrong dir fails fast here instead of via a guest download loop.
+sleep 1
+CHECK=/tmp/voxel-helpers-check.tar.gz
+if ! curl -fsS "${HELPERS_URL}" -o "${CHECK}" 2>/dev/null \
+   || [[ "$(sha256_of "${CHECK}")" != "${BUNDLE_SHA}" ]]; then
+    log "FATAL: helpers server not serving ${HELPERS_URL} correctly"
+    log "        (see /tmp/voxel-helpers-serve.log)"
+    rm -f "${CHECK}"
+    exit 1
+fi
+rm -f "${CHECK}"
+log "serving voxel-helpers at ${HELPERS_URL} (pid ${SERVE_PID}, sha ${BUNDLE_SHA})"
+cat >> "${CARGO_BAY}/build.env" <<EOF
+HELPERS_URL="${HELPERS_URL}"
+HELPERS_SHA256="${BUNDLE_SHA}"
+EOF
 
 # --- build + capture in the builder VM ----------------------------------------
+# INSTALL_SCRIPT=bootstrap.sh: the minimal entrypoint that downloads the bundle
+# and execs build-cp-guest.sh from it.
 mkdir -p "${STUB}"
 log "launching builder ${BUILDER_IMAGE} to build + bake ${IMAGE_NAME}"
 VERSION="${IMAGE_VERSION}" IMAGE_NAME="${IMAGE_NAME}" \
     FALCON_DATASET="${FALCON_DATASET}" CAPTURE_MODE=zfs \
-    BASE_IMAGE="${BUILDER_IMAGE}" INSTALL_SCRIPT="build-cp-guest.sh" \
+    BASE_IMAGE="${BUILDER_IMAGE}" INSTALL_SCRIPT="bootstrap.sh" \
     CARGO_BAY="${CARGO_BAY}" MANIFEST_OUT="${STUB}/voxel-image.toml" \
     KEEP_BUILDER="${PERSIST_SOURCE}" READY_MATCH="voxel-cp version=" \
     bash "${HERE}/build-image.sh"

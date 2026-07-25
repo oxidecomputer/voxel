@@ -9,17 +9,16 @@
 # image, bakes the commit-pinned voxel-rss-gen + schema manifest, and (unless
 # PERSIST_SOURCE) scrubs the source + cargo target before capture.
 #
-# Inputs (staged into /opt/cargo-bay by build-cp-vm.sh):
-#   build.env                 COMMIT / GIMLETS / VERSION / PERSIST_SOURCE
-#   install-cp.sh             the bake step (run at the end)
-#   patches/                  nexus-infra-lot-v6.py + smbios-gimlet.sh
-#   smf-staging/smf/          rendered build-time smf configs (voxel image render-smf)
-#   voxel-src/                voxel-image/build-rss-gen.sh + voxel/rss-gen + voxel-config
-#   sidecar/ voxel-init sp-emu/   host-staged bake inputs (install-cp.sh reads them)
+# Runs from the downloaded voxel-helpers bundle ($VOXEL_HELPERS), exec'd by
+# bootstrap.sh. Inputs:
+#   $VOXEL_HELPERS/voxel-image/   install-cp.sh, gen-manifest.sh, build-rss-gen.sh, patches/
+#   $VOXEL_HELPERS/{voxel/rss-gen,voxel-config,voxel-init}   crate source (built here)
+#   /opt/cargo-bay/               build.env + host-only inputs: smf-staging/, sidecar/
 #
 set -euo pipefail
 
 CARGO_BAY=/opt/cargo-bay
+VOXEL_HELPERS="${VOXEL_HELPERS:-/opt/voxel-helpers}"
 source "${CARGO_BAY}/build.env"
 
 COMMIT="${COMMIT:?build.env must set COMMIT}"
@@ -70,9 +69,9 @@ cd "${OMICRON_SRC}"
 
 # --- 2. voxel source patches (re-applied post-checkout) ------------------------
 log "patching sled-hardware baseboard (Pc -> Gimlet)"
-bash "${CARGO_BAY}/patches/smbios-gimlet.sh" "${OMICRON_SRC}"
+bash "${VOXEL_HELPERS}/voxel-image/patches/smbios-gimlet.sh" "${OMICRON_SRC}"
 log "patching nexus rack-init infra address lot (v6 block)"
-python3 "${CARGO_BAY}/patches/nexus-infra-lot-v6.py" "${OMICRON_SRC}"
+python3 "${VOXEL_HELPERS}/voxel-image/patches/nexus-infra-lot-v6.py" "${OMICRON_SRC}"
 grep -q 'voxel: add a v6 block' nexus/src/app/rack.rs \
     || { log "FATAL: nexus infra-lot v6 patch did not apply"; exit 1; }
 
@@ -105,14 +104,22 @@ log "omicron-package target create -p a4x2"
 log "omicron-package package (~11 min)"
 ./target/release/omicron-package package
 
-# --- 7. build the commit-pinned voxel-rss-gen ----------------------------------
+# --- 7. build the commit-pinned voxel-rss-gen (from the bundle) ----------------
 log "building commit-pinned voxel-rss-gen"
-bash "${CARGO_BAY}/voxel-src/voxel-image/build-rss-gen.sh" "${OMICRON_SRC}"
+bash "${VOXEL_HELPERS}/voxel-image/build-rss-gen.sh" "${OMICRON_SRC}"
 cp "${OMICRON_SRC}/target/debug/voxel-rss-gen" "${CARGO_BAY}/voxel-rss-gen"
 
 # --- 8. schema manifest --------------------------------------------------------
 log "generating voxel-image.toml manifest"
-COMMIT="${COMMIT}" bash "${CARGO_BAY}/gen-manifest.sh" "${OMICRON_SRC}" > "${CARGO_BAY}/voxel-image.toml"
+COMMIT="${COMMIT}" bash "${VOXEL_HELPERS}/voxel-image/gen-manifest.sh" "${OMICRON_SRC}" > "${CARGO_BAY}/voxel-image.toml"
+
+# --- 8b. build voxel-init from the bundle (baked by install-cp.sh) -------------
+# Light crate (no libfalcon); native illumos build. Target outside the bundle so
+# the bundle stays source-only. install-cp.sh bakes /opt/cargo-bay/voxel-init.
+log "building voxel-init from bundle"
+( cd "${VOXEL_HELPERS}/voxel-init" && CARGO_TARGET_DIR=/tmp/vinit-target cargo build --release )
+cp /tmp/vinit-target/release/voxel-init "${CARGO_BAY}/voxel-init"
+rm -rf /tmp/vinit-target
 
 # --- 9. stage the curated omicron dir for install-cp.sh ------------------------
 # install-cp.sh cd's into /opt/cargo-bay/omicron and bakes it (omicron CLI dir +
@@ -131,7 +138,7 @@ rsync -a tools out smf package-manifest.toml \
 # install-cp.sh cd's into the relative `omicron` dir, so run it from the cargo-bay
 # (where the curated omicron was staged above), matching the host-build flow.
 log "running install-cp.sh (unpack + bake)"
-( cd "${CARGO_BAY}" && VOXEL_CP_VERSION="${VERSION:-${COMMIT}}" bash ./install-cp.sh )
+( cd "${CARGO_BAY}" && VOXEL_CP_VERSION="${VERSION:-${COMMIT}}" bash "${VOXEL_HELPERS}/voxel-image/install-cp.sh" )
 
 # Everything above is baked into /opt/oxide now; drop the large build-time
 # cargo-bay artifacts so they aren't captured into the image (the staged rss-gen

@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Context};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::util::{locate_script, shell_quote};
 use crate::ImageCmd;
@@ -47,6 +47,63 @@ fn build_cp_vm_script() -> anyhow::Result<PathBuf> {
 /// Locate `voxel-image/build-builder.sh` (bakes the `voxel-builder` base image).
 fn build_builder_script() -> anyhow::Result<PathBuf> {
     locate_script("VOXEL_BUILD_BUILDER", "build-builder.sh")
+}
+
+/// The checkout's short HEAD sha (the default `--src` image label).
+fn head_short_sha(src: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .map_err(|e| anyhow!("run git in {}: {e}", src.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git rev-parse HEAD failed in {} (is it an omicron checkout?)",
+            src.display()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `--src`: host-build a voxel-cp image from an existing omicron checkout/worktree
+/// AS-IS (no clone/checkout), so a dev's working-tree edits are what gets built.
+/// The image is named `voxel-cp-<label>` (explicit `label`, else the HEAD sha).
+fn create_from_src(src: &Path, label: Option<&str>) -> anyhow::Result<()> {
+    let src = src
+        .canonicalize()
+        .with_context(|| format!("resolve --src {}", src.display()))?;
+    if !src.join("package-manifest.toml").exists() {
+        return Err(anyhow!(
+            "{} doesn't look like an omicron checkout (no package-manifest.toml)",
+            src.display()
+        ));
+    }
+    let label = match label {
+        Some(l) => l.to_string(),
+        None => head_short_sha(&src)?,
+    };
+    let script = build_cp_script()?; // host build path
+    eprintln!(
+        "[voxel] building voxel-cp-{label} from {} (as-is) via {}",
+        src.display(),
+        script.display()
+    );
+    // SRC_ASIS=1 tells build-cp.sh to skip clone/checkout and build OMICRON_SRC in
+    // place; IMAGE_VERSION names the image + the launch-time manifest stub.
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .arg(&label)
+        .env("OMICRON_SRC", &src)
+        .env("SRC_ASIS", "1")
+        .env("IMAGE_VERSION", &label)
+        .status()
+        .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
+    if !status.success() {
+        return Err(anyhow!("build from --src {} failed", src.display()));
+    }
+    println!("built image voxel-cp-{label}");
+    Ok(())
 }
 
 pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Result<()> {
@@ -211,11 +268,20 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         }
         ImageCmd::Create {
             commit,
+            src,
             contained,
             persist_source,
         } => {
+            // `--src`: host build from an existing checkout, as-is (dev loop).
+            if let Some(src) = src {
+                return create_from_src(src, commit.as_deref());
+            }
             // Default: in-place host build. `--contained`: build inside a
-            // `voxel-builder` VM (no host git/omicron toolchain).
+            // `voxel-builder` VM (no host git/omicron toolchain). (clap guarantees
+            // `commit` is present when `--src` is absent.)
+            let commit = commit
+                .as_deref()
+                .ok_or_else(|| anyhow!("a <COMMIT> is required (or pass --src <path>)"))?;
             let script = if *contained {
                 build_cp_vm_script()?
             } else {
@@ -236,17 +302,17 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .status()
                 .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
             if !status.success() {
-                return Err(anyhow!("{} failed for commit {commit}", script.display()));
+                return Err(anyhow!(
+                    "{} failed for commit {commit}",
+                    script.display()
+                ));
             }
             println!("built image voxel-cp-{commit}");
             Ok(())
         }
         ImageCmd::BuilderCreate { force } => {
             let script = build_builder_script()?;
-            eprintln!(
-                "[voxel] baking voxel-builder base image via {}",
-                script.display()
-            );
+            eprintln!("[voxel] baking voxel-builder base image via {}", script.display());
             let mut command = std::process::Command::new("bash");
             command.arg(&script);
             if *force {

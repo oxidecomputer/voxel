@@ -6,10 +6,13 @@ edition = "2021"
 # Pure-Rust topology config generation for Voxel (no libfalcon) - builds and
 # tests on any host, including macOS.
 
+# Concrete deps (not workspace-inherited) so this crate builds standalone in the
+# `voxel-helpers` bundle the builder guest downloads + compiles. Keep versions in
+# sync with the root workspace.
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 toml = "0.9"
-toml_edit = { workspace = true }
+toml_edit = "0.25"
 
 [dev-dependencies]
-expectorate.workspace = true
+expectorate = "1.2.0"

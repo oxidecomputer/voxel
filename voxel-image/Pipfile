@@ -1,0 +1,13 @@
+# Isolated env for the dev voxel-helpers artifact server (build-cp-vm.sh). The
+# server is stdlib-only (`python -m http.server`), so there are no packages - this
+# just pins the interpreter when pipenv is used. build-cp-vm.sh falls back to
+# plain python3 when pipenv isn't installed.
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+
+[requires]
+python_version = "3"

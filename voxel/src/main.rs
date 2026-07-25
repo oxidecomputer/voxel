@@ -175,10 +175,18 @@ enum ImageCmd {
     /// By default the omicron build runs on the host (needs git + the full
     /// omicron toolchain). `--contained` runs it inside a `voxel-builder` VM
     /// instead, so the host needs no git/toolchain (bake the base image once
-    /// with `voxel image builder-create`).
+    /// with `voxel image builder-create`). `--src <path>` builds an existing
+    /// checkout/worktree as-is (the dev loop: your edits, warm target).
     Create {
-        /// omicron git commit (or tag) to build and pin the image to.
-        commit: String,
+        /// omicron git commit (or tag) to build and pin the image to. With
+        /// `--src` this is an optional image label (default: the checkout's HEAD).
+        #[arg(required_unless_present = "src")]
+        commit: Option<String>,
+        /// Build from an existing omicron checkout/worktree AS-IS (host build,
+        /// for dev): skips clone + checkout so your working-tree edits are built.
+        /// Applies voxel's omicron patches + smf configs to that tree (idempotent).
+        #[arg(long, conflicts_with = "contained")]
+        src: Option<PathBuf>,
         /// Build inside a `voxel-builder` VM instead of on the host (no host
         /// git/omicron toolchain required).
         #[arg(long)]

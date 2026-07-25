@@ -13,8 +13,11 @@ edition = "2021"
 name = "voxel-init"
 path = "src/main.rs"
 
+# Concrete deps (not workspace-inherited) so this crate builds standalone in the
+# `voxel-helpers` bundle the builder guest downloads + compiles. Keep versions in
+# sync with the root workspace.
 [dependencies]
-anyhow = { workspace = true }
-clap = { workspace = true }
-toml_edit = { workspace = true }
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+toml_edit = "0.25"
 libc = "0.2"

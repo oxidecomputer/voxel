@@ -55,14 +55,21 @@ log() { echo "[build-cp] $*"; }
 [[ -x "${VOXEL}" ]] || { log "FATAL: voxel binary not found at ${VOXEL} (set VOXEL=)"; exit 1; }
 
 # --- 1. clone + checkout ------------------------------------------------------
-if [[ ! -d "${OMICRON_SRC}/.git" ]]; then
-    mkdir -p "${BUILD_ROOT}"
-    log "cloning omicron -> ${OMICRON_SRC}"
-    git clone "${OMICRON_REPO}" "${OMICRON_SRC}"
+# SRC_ASIS=1 (`voxel image create --src`): build OMICRON_SRC in place, do NOT
+# clone or checkout - the dev's working-tree edits are what we build.
+if [[ "${SRC_ASIS:-0}" == "1" ]]; then
+    [[ -d "${OMICRON_SRC}" ]] || { log "FATAL: --src ${OMICRON_SRC} not found"; exit 1; }
+    log "building ${OMICRON_SRC} as-is (--src; no clone/checkout)"
+else
+    if [[ ! -d "${OMICRON_SRC}/.git" ]]; then
+        mkdir -p "${BUILD_ROOT}"
+        log "cloning omicron -> ${OMICRON_SRC}"
+        git clone "${OMICRON_REPO}" "${OMICRON_SRC}"
+    fi
+    log "checking out ${COMMIT}"
+    git -C "${OMICRON_SRC}" fetch --all --tags -q || true
+    git -C "${OMICRON_SRC}" checkout -q "${COMMIT}"
 fi
-log "checking out ${COMMIT}"
-git -C "${OMICRON_SRC}" fetch --all --tags -q || true
-git -C "${OMICRON_SRC}" checkout -q "${COMMIT}"
 cd "${OMICRON_SRC}"
 
 # --- 1b. voxel patch: report a Gimlet baseboard (de-a4x2 wicket fix) -----------
@@ -86,10 +93,16 @@ grep -q 'new_gimlet(serial_number, product, 2)' sled-hardware/src/illumos/mod.rs
 # addrconf sidecar-interconnect ports can't reserve (handoff 400 "address not in
 # lot"). Add a v6 block so they reserve, matching BGP mode's :: lot. Re-applied
 # post-checkout (the checkout resets the tree).
-log "patching nexus rack-init: add v6 block to the infra address lot"
-python3 "${HERE}/patches/nexus-infra-lot-v6.py" "${OMICRON_SRC}"
-grep -q 'voxel: add a v6 block' nexus/src/app/rack.rs \
-    || { log "FATAL: nexus infra-lot v6 patch did not apply"; exit 1; }
+# Guard so re-running on a persistent --src tree doesn't insert the block twice
+# (the smbios perl above is already idempotent; this python insert is not).
+if grep -q 'voxel: add a v6 block' nexus/src/app/rack.rs; then
+    log "nexus infra-lot v6 patch already present"
+else
+    log "patching nexus rack-init: add v6 block to the infra address lot"
+    python3 "${HERE}/patches/nexus-infra-lot-v6.py" "${OMICRON_SRC}"
+    grep -q 'voxel: add a v6 block' nexus/src/app/rack.rs \
+        || { log "FATAL: nexus infra-lot v6 patch did not apply"; exit 1; }
+fi
 
 # --- 2. prerequisites + softnpu machinery -------------------------------------
 log "install_builder_prerequisites.sh -y"
@@ -150,9 +163,13 @@ log "building commit-pinned voxel-rss-gen"
 bash "${HERE}/build-rss-gen.sh" "${OMICRON_SRC}"
 cp "${OMICRON_SRC}/target/debug/voxel-rss-gen" "${CARGO_BAY}/voxel-rss-gen"
 log "generating voxel-image.toml manifest (baked + host stub)"
-mkdir -p "${OMICRON_SRC}"  # host stub dir already exists (this IS it)
-COMMIT="${COMMIT}" bash "${HERE}/gen-manifest.sh" "${OMICRON_SRC}" \
-    | tee "${CARGO_BAY}/voxel-image.toml" > "${OMICRON_SRC}/voxel-image.toml"
+# Host stub goes to <build_root>/omicron-<IMAGE_VERSION>/, where topo.rs
+# detect_sled_schema reads it at launch (keyed on the image label). For a normal
+# build that's the same dir as OMICRON_SRC; for --src it's a separate stub dir.
+STUB="${BUILD_ROOT}/omicron-${IMAGE_VERSION}"
+mkdir -p "${STUB}"
+COMMIT="${IMAGE_VERSION}" bash "${HERE}/gen-manifest.sh" "${OMICRON_SRC}" \
+    | tee "${CARGO_BAY}/voxel-image.toml" > "${STUB}/voxel-image.toml"
 
 # --- 8. bake the image --------------------------------------------------------
 log "baking ${IMAGE_NAME} via build-image.sh (CAPTURE_MODE=${CAPTURE_MODE})"
