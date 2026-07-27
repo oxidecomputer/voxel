@@ -1,6 +1,6 @@
 //! Rack lifecycle commands: launch, route, destroy, info, status.
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, bail};
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
 use std::collections::HashSet;
@@ -9,7 +9,8 @@ use voxel_config::VoxelConfig;
 
 use crate::isolated_external::{link_mtu, up as external_up};
 use crate::net::{
-    node_external_ip, set_external_route, ssh_capture, ssh_output, wait_external_reachable, zlogin,
+    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture, ssh_output,
+    wait_external_reachable, zlogin,
 };
 use crate::rss::watch_rss;
 use crate::topo::{Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets};
@@ -27,9 +28,7 @@ fn rack_label(racks: usize, rack: usize, single: &str) -> String {
 
 pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let ce = topo
-        .node_ref("ce")
-        .ok_or_else(|| anyhow!("no ce router in topology"))?;
+    let ce = topo.node_ref("ce").context("no ce router in topology")?;
     // One host route per rack's external prefix - all racks egress via the shared ce.
     let racks = cfg.topology.racks();
     for rack in 0..racks {
@@ -39,7 +38,7 @@ pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> a
             ce,
             &prefix,
             !dry_run,
-            cfg.topology.ce_external_ip.as_deref(),
+            ce_static_ip(cfg).as_deref(),
         )
         .await?;
     }
@@ -76,12 +75,12 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
     let vmm = (guest as f64 * 1.2).ceil() as u64;
     const RESERVE_GB: u64 = 22; // kernel (~14G observed) + minimal ARC (~8G)
     if vmm + RESERVE_GB > phys {
-        return Err(anyhow!(
+        bail!(
             "topology needs ~{vmm} GB guest RAM (VMM) + ~{RESERVE_GB} GB kernel/ARC headroom, \
              but this box has {phys} GB. Lower topology.sled_memory_gb (now {}) or the sled count \
              (or set VOXEL_SKIP_MEM_PREFLIGHT=1 to override).",
             cfg.topology.sled_memory_gb
-        ));
+        );
     }
     Ok(())
 }
@@ -118,12 +117,12 @@ fn lan_mtu_preflight() -> anyhow::Result<()> {
     };
     if let Some(mtu) = link_mtu(&link) {
         if mtu.parse::<u32>().is_ok_and(|m| m >= 9000) {
-            return Err(anyhow!(
+            bail!(
                 "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
                  iff they accept mtu=9000, so external NICs on a jumbo link are \
                  misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
                  link or use isolated mode (voxel config set external.mode isolated)."
-            ));
+            );
         }
     }
     Ok(())
@@ -177,7 +176,7 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
         let Some((n, sled)) = scrimlets.get(slot) else {
             continue;
         };
-        let ip = match node_external_ip(d, *n, false).await {
+        let ip = match resolve_external_ip(cfg, d, sled, *n, false).await {
             Ok(ip) => ip,
             Err(e) => {
                 warn!(
@@ -213,7 +212,9 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
             );
             let addr_present = ssh_capture(
                 &ip,
-                &zlogin(&format!("ipadm show-addr -po addrobj | grep tfport{port}_0")),
+                &zlogin(&format!(
+                    "ipadm show-addr -po addrobj | grep tfport{port}_0"
+                )),
             )
             .is_some();
             if addr_present {
@@ -259,10 +260,10 @@ pub(crate) async fn cmd_launch(
     let sleds = cfg.sleds();
     let racks = cfg.topology.racks();
     if cfg.topology.sleds < 3 {
-        return Err(anyhow!(
+        bail!(
             "each rack needs ≥3 sleds (Crucible 3x replication + Cockroach/trust-quorum quorum); got {} per rack",
             cfg.topology.sleds
-        ));
+        );
     }
     for rack in 0..racks {
         let scrimlets = sleds
@@ -270,9 +271,9 @@ pub(crate) async fn cmd_launch(
             .filter(|s| s.rack == rack && s.scrimlet)
             .count();
         if scrimlets != 2 {
-            return Err(anyhow!(
+            bail!(
                 "rack {rack} needs exactly 2 scrimlets for the dual-switch RSS->Nexus handoff; got {scrimlets}"
-            ));
+            );
         }
     }
     // Each scrimlet's SoftNPU front ports = fabric uplinks + cross-rack
@@ -288,11 +289,11 @@ pub(crate) async fn cmd_launch(
     for s in sleds.iter().filter(|s| s.scrimlet) {
         let front = n_cr + cfg.topology.interconnect_count_for(s.index);
         if front > MAX_FRONT_PORTS {
-            return Err(anyhow!(
+            bail!(
                 "scrimlet {} needs {front} SoftNPU front ports (> {MAX_FRONT_PORTS}); \
                  reduce racks or switches-per-rack",
                 s.name
-            ));
+            );
         }
     }
     // Fail fast if the configured images aren't built yet - a clear message
@@ -332,7 +333,7 @@ pub(crate) async fn cmd_launch(
                 topo = build_topo(cfg, name)?;
                 attempt += 1;
             }
-            Err(e) => return Err(anyhow!("launch failed after {attempt} attempts: {e}")),
+            Err(e) => bail!("launch failed after {attempt} attempts: {e}"),
         }
     }
 
@@ -420,9 +421,17 @@ pub(crate) async fn cmd_launch(
                         .filter(|(s, _)| s.rack == rack)
                         .map(|(s, _)| s.index as u16)
                         .collect();
-                    if let Err(e) =
-                        crate::wicket_setup::drive(d, *n, &slots, &config_rss, &net.dns_zone, &tag)
-                            .await
+                    if let Err(e) = crate::wicket_setup::drive(
+                        cfg,
+                        d,
+                        *n,
+                        &s.name,
+                        &slots,
+                        &config_rss,
+                        &net.dns_zone,
+                        &tag,
+                    )
+                    .await
                     {
                         warn!(
                             d.log,
@@ -466,7 +475,7 @@ pub(crate) async fn cmd_launch(
                 ce,
                 &net.infra_prefix,
                 !no_route,
-                cfg.topology.ce_external_ip.as_deref(),
+                ce_static_ip(cfg).as_deref(),
             )
             .await
             {
@@ -587,7 +596,7 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        _ => result.map_err(|e| anyhow!("destroy: {e}")),
+        _ => result.context("destroy"),
     }
 }
 
@@ -640,7 +649,7 @@ pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<
     let racks = cfg.topology.racks();
     let rss_nodes = topo.rss_sleds();
     if rss_nodes.is_empty() {
-        return Err(anyhow!("no RSS sled in topology"));
+        bail!("no RSS sled in topology");
     }
     let d = &topo.runner;
     // Multi-rack racks converge under each other's load - watch longer (matches

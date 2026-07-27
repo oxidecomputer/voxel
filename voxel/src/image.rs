@@ -1,7 +1,7 @@
 //! `voxel image` - list / create / export / import / rm image bundles, plus the
 //! hidden `render-smf` build helper.
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, bail};
 use std::fs;
 use std::path::PathBuf;
 
@@ -25,10 +25,10 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !present {
-        return Err(anyhow!(
+        bail!(
             "image '{image}' not found ({snap}) - build it with `voxel image create <commit>`, \
              or run `voxel image ls` to see what's available"
-        ));
+        );
     }
     Ok(())
 }
@@ -64,12 +64,12 @@ pub(crate) fn cmd_image(
                     &img,
                 ])
                 .output()
-                .map_err(|e| anyhow!("run zfs list: {e}"))?;
+                .context("run zfs list")?;
             if !out.status.success() {
-                return Err(anyhow!(
+                bail!(
                     "zfs list {img} failed - is FALCON_DATASET correct? ({})",
                     String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                );
             }
             let text = String::from_utf8_lossy(&out.stdout);
             let prefix = format!("{img}/");
@@ -220,9 +220,15 @@ pub(crate) fn cmd_image(
                 // build-image.sh writes this into the builder cargo-bay as
                 // `builder-net`, and the in-VM install-cp.sh / install-frr.sh
                 // apply it in place of DHCP.
-                if let Some(net) = x.builder_net() {
-                    build.env("VOXEL_BUILDER_NET", net);
-                }
+                let net = x.builder_net().with_context(|| {
+                    format!(
+                        "cannot derive a usable isolated builder address before host_ip '{}' \
+                         within subnet '{}'; choose a host_ip at least two addresses above \
+                         the subnet network",
+                        x.host_ip, x.subnet
+                    )
+                })?;
+                build.env("VOXEL_BUILDER_NET", net);
             }
             eprintln!(
                 "[voxel] building voxel-cp-{commit} via {}",
@@ -230,9 +236,9 @@ pub(crate) fn cmd_image(
             );
             let status = build
                 .status()
-                .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
+                .with_context(|| format!("run {}", script.display()))?;
             if !status.success() {
-                return Err(anyhow!("build-cp.sh failed for commit {commit}"));
+                bail!("build-cp.sh failed for commit {commit}");
             }
             println!("built image voxel-cp-{commit}");
             Ok(())
@@ -247,9 +253,7 @@ pub(crate) fn cmd_image(
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if !exists {
-                return Err(anyhow!(
-                    "no such image snapshot: {snap} (try `voxel image ls`)"
-                ));
+                bail!("no such image snapshot: {snap} (try `voxel image ls`)");
             }
             let (default_out, pipe) = if *raw {
                 // Portable raw disk image: dd the zvol through xz.
@@ -274,12 +278,12 @@ pub(crate) fn cmd_image(
                     shell_quote(&out.display().to_string())
                 ))
                 .status()
-                .map_err(|e| anyhow!("export: {e}"))?;
+                .context("export")?;
             if !status.success() {
-                return Err(anyhow!(
+                bail!(
                     "export failed (need {} on PATH)",
                     if *raw { "xz" } else { "zstd" }
-                ));
+                );
             }
             println!("exported {}", out.display());
             Ok(())
@@ -289,7 +293,7 @@ pub(crate) fn cmd_image(
             let fname = file
                 .file_name()
                 .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("bad file path"))?;
+                .context("bad file path")?;
             // Derive image name + decompressor from the extension.
             let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst") {
                 (
@@ -297,14 +301,12 @@ pub(crate) fn cmd_image(
                     format!("zstd -dc {}", shell_quote(&file.display().to_string())),
                 )
             } else if let Some(n) = fname.strip_suffix(".raw.xz") {
-                return Err(anyhow!(
+                bail!(
                     "raw import for {n} not wired here yet - use build-image.sh's \
                      streaming raw import (presized zvol). zfs streams (.zfs.zst) import directly."
-                ));
+                );
             } else {
-                return Err(anyhow!(
-                    "unrecognized extension on {fname} (want .zfs.zst or .raw.xz)"
-                ));
+                bail!("unrecognized extension on {fname} (want .zfs.zst or .raw.xz)");
             };
             let dst = format!("{dataset}/img/{name}");
             eprintln!("[voxel] importing {} -> {dst}", file.display());
@@ -312,11 +314,9 @@ pub(crate) fn cmd_image(
                 .arg("-c")
                 .arg(format!("{decomp} | zfs recv {dst}"))
                 .status()
-                .map_err(|e| anyhow!("import: {e}"))?;
+                .context("import")?;
             if !status.success() {
-                return Err(anyhow!(
-                    "import failed (need zstd + zfs; {dst} must not already exist)"
-                ));
+                bail!("import failed (need zstd + zfs; {dst} must not already exist)");
             }
             println!("imported {dst}@base (use: voxel config set image.cp {name})");
             Ok(())
@@ -338,18 +338,16 @@ pub(crate) fn cmd_image(
             let status = std::process::Command::new("zfs")
                 .args(["destroy", "-r", &ds])
                 .status()
-                .map_err(|e| anyhow!("zfs destroy: {e}"))?;
+                .context("zfs destroy")?;
             if !status.success() {
-                return Err(anyhow!(
-                    "zfs destroy {ds} failed (in use, or no such image?)"
-                ));
+                bail!("zfs destroy {ds} failed (in use, or no such image?)");
             }
             println!("removed {ds}");
             Ok(())
         }
         // `image patch` needs the loaded config (for the default source image),
         // so it's dispatched in `main` before delegating the rest here.
-        ImageCmd::Patch { .. } => Err(anyhow!("internal: `image patch` is dispatched in main")),
+        ImageCmd::Patch { .. } => bail!("internal: `image patch` is dispatched in main"),
         ImageCmd::RenderSmf {
             omicron_root,
             gimlets,

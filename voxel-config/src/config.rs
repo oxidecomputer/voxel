@@ -37,8 +37,10 @@ const TRANSIT_ASN_BASE: u32 = 65100;
 /// Slot 8 is not a falcon constant. Falcon starts its slot counter at 5 and
 /// spends one slot per p9fs mount, then two on the softnpu p9 and pci-port
 /// pair, before the first NIC, so 8 holds only while a router carries exactly
-/// one cargo-bay mount. Falcon also appends a node's external link after all
-/// of its point-to-point links, which is what puts the external NIC last
+/// one cargo-bay mount. That softnpu pair is spent on every node in a
+/// deployment that has any softnpu link at all, not just the switch nodes, so
+/// the routers pay for it too. Falcon also appends a node's external link after
+/// all of its point-to-point links, which is what puts the external NIC last
 /// regardless of `build_topo`'s call order.
 ///
 /// See `Deployment::nodes_preflight` and `Node::preflight` in falcon's
@@ -138,9 +140,9 @@ impl Default for External {
         Self {
             mode: ExternalMode::Lan,
             uplink: None,
-            subnet: "192.168.1.0/24".into(),
-            host_ip: "192.168.1.199".into(),
-            ip_start: "192.168.1.10".into(),
+            subnet: "172.30.199.0/24".into(),
+            host_ip: "172.30.199.199".into(),
+            ip_start: "172.30.199.10".into(),
             dns: vec!["1.1.1.1".into(), "9.9.9.9".into()],
             mtu: 1500,
         }
@@ -161,25 +163,51 @@ impl External {
 
     /// Prefix length parsed from `subnet` (`a.b.c.d/N`).
     ///
-    /// Returns `None` if `subnet` is not CIDR or the length exceeds 32.
+    /// Returns `None` if `subnet` is not parseable CIDR.
     pub fn prefix_length(&self) -> Option<u32> {
-        let n: u32 = self.subnet.split('/').nth(1)?.parse().ok()?;
-        (n <= 32).then_some(n)
+        Some(u32::from(self.subnet_net()?.width()))
+    }
+
+    /// `subnet` parsed as an `Ipv4Net`, or `None` if it is not CIDR.
+    fn subnet_net(&self) -> Option<oxnet::Ipv4Net> {
+        self.subnet.parse().ok()
+    }
+
+    /// Whether `ip` is a usable host address inside `subnet` (strictly between
+    /// its network and broadcast addresses). oxnet treats /31 and /32 as
+    /// all-host subnets (RFC 3021), but the segment needs distinct host,
+    /// builder, and node addresses, so those widths have no usable range here.
+    fn ip_is_usable(&self, ip: std::net::Ipv4Addr) -> bool {
+        self.subnet_net()
+            .is_some_and(|net| match (net.network(), net.broadcast()) {
+                (Some(network), Some(broadcast)) => {
+                    net.contains(ip) && ip != network && ip != broadcast
+                }
+                _ => false,
+            })
+    }
+
+    /// Whether `host_ip` parses and is a usable address inside `subnet`.
+    pub fn host_ip_is_usable(&self) -> bool {
+        self.host_ip.parse().is_ok_and(|ip| self.ip_is_usable(ip))
     }
 
     /// Static address for the `nth` node (0-based): `ip_start + nth`.
     ///
-    /// Returns `None` if the address would overflow past `.254`, collide with
-    /// `host_ip`, or if `ip_start` doesn't parse.
+    /// Returns `None` if the address would step past the subnet's broadcast,
+    /// land on the network or broadcast address, collide with `host_ip`, or
+    /// if `subnet`, `host_ip`, or `ip_start` are invalid.
     pub fn node_ip(&self, nth: usize) -> Option<String> {
         let start: std::net::Ipv4Addr = self.ip_start.parse().ok()?;
         let host: std::net::Ipv4Addr = self.host_ip.parse().ok()?;
+        if !self.ip_is_usable(host) {
+            return None;
+        }
         let base = u32::from(start).checked_add(nth as u32)?;
         let ip = std::net::Ipv4Addr::from(base);
-
-        // Refuse the network's broadcast tail—a rack that big should widen
-        // the subnet, not silently roll into a reserved address.
-        if ip.octets()[3] == 0xff {
+        // Refuse the network + broadcast boundaries and anything outside the
+        // subnet (an operator-set ip_start plus a large rack can overrun it).
+        if !self.ip_is_usable(ip) {
             return None;
         }
         if ip == host {
@@ -192,11 +220,18 @@ impl External {
     /// build path to give the builder a fixed static address on the isolated
     /// segment. Same prefix length as `subnet`.
     ///
-    /// Returns `None` if `host_ip` doesn't parse or would underflow.
+    /// Returns `None` if `host_ip` is not usable within `subnet`, or if the
+    /// derived builder address would underflow or land on a reserved boundary.
     pub fn builder_net(&self) -> Option<String> {
         let host: std::net::Ipv4Addr = self.host_ip.parse().ok()?;
+        if !self.ip_is_usable(host) {
+            return None;
+        }
         let prev = u32::from(host).checked_sub(1)?;
         let ip = std::net::Ipv4Addr::from(prev);
+        if !self.ip_is_usable(ip) {
+            return None;
+        }
         let prefix = self.prefix_length()?;
         Some(format!("{ip}/{prefix} {}", self.host_ip))
     }
@@ -967,29 +1002,32 @@ impl VoxelConfig {
         out
     }
 
-    /// Build each customer router's `frr.conf` as `(name, FrrRouter)` pairs.
-    /// `cr*` are the **shared transit**: each peers `ce` plus *every* scrimlet
-    /// across *all* racks, and originates nothing - eBGP (`no bgp
-    /// ebgp-requires-policy`) re-advertises each rack's customer prefix to the
-    /// other rack's switches, so a 2-rack deployment routes between
-    /// `198.51.100/24` and `198.51.101/24` with no extra config. `ce` originates
-    /// the default route toward the fabric. ASNs are `65100` (ce) and `65101 + i`
-    /// (cr`i`).
+    /// The `enp0sN` name of a router's external (host-LAN) NIC.
     ///
-    /// The `enp0sN` interface names mirror `build_topo`'s link-creation order:
-    /// `ce` links each fabric router (cr1=enp0s8, cr2=enp0s9, ...); each fabric
-    /// router links `ce` first (enp0s8) then every scrimlet in `sleds()` order
-    /// (enp0s9, enp0s10, ...).
+    /// This is derived rather than discovered, for two reasons: the consumer
+    /// needs the name before the node exists because `stage_config` writes it
+    /// into the router's cargo-bay `external-net` file at launch, so voxel-init
+    /// has an interface to place the static address on.
     ///
-    /// The `enp0sN` name of a router's external (host-LAN) NIC. Mirrors the
-    /// wiring in `build_topo`: `ce`'s falcon links go fabric-router first
-    /// (cr1=enp0s8, cr2=enp0s9, ...) then its external NIC, so `ce`'s
-    /// external NIC is `enp0s{FRR_IFACE_BASE + fabric_router_count}`. A
-    /// fabric router's falcon links go `ce` (enp0s8) then every scrimlet
-    /// across every rack in `sleds()` order (enp0s9, enp0s10, ...) then its
-    /// external NIC, so a fabric router's external NIC is
+    /// Isolated mode leaves the router with nothing to discover from, i.e., it
+    /// runs no DHCP server, so the default-route poll `lan` mode relies on
+    /// never resolves, and the sleds' jumbo probe (the underlay is MTU 9000,
+    /// the external NICs are not) has no router-side equivalent.
+    ///
+    /// The derivation mirrors the wiring in `build_topo`: `ce`'s falcon links
+    /// go fabric-router first (cr1=enp0s8, cr2=enp0s9, ...) then its external
+    /// NIC, so `ce`'s external NIC is
+    /// `enp0s{FRR_IFACE_BASE + fabric_router_count}`. A fabric router's falcon
+    /// links go `ce` (enp0s8) then every scrimlet across every rack in
+    /// `sleds()` order (enp0s9, enp0s10, ...) then its external NIC, so a
+    /// fabric router's external NIC is
     /// `enp0s{FRR_IFACE_BASE + 1 + total_scrimlet_count}`. Encoded here so it
-    /// cannot drift from `to_frr`'s link ordering.
+    /// cannot drift from `to_frr`'s link ordering. The residual risk is the
+    /// base itself: falcon assigns NIC slots sequentially after its fixed
+    /// pre-NIC devices, so a falcon change that adds a device ahead of the
+    /// NICs shifts every derived name (see the note on [`FRR_IFACE_BASE`]).
+    /// Nothing here can catch that, so `voxel-init` checks the staged name
+    /// against the router's actual links at bring-up and reports the mismatch.
     pub fn router_ext_iface(&self, router: &str) -> String {
         let fabric_router_count = self
             .topology
@@ -1006,6 +1044,19 @@ impl VoxelConfig {
         format!("enp0s{n}")
     }
 
+    /// Build each customer router's `frr.conf` as `(name, FrrRouter)` pairs.
+    /// `cr*` are the **shared transit**: each peers `ce` plus *every* scrimlet
+    /// across *all* racks, and originates nothing. eBGP (`no bgp
+    /// ebgp-requires-policy`) re-advertises each rack's customer prefix to the
+    /// other rack's switches, so a 2-rack deployment routes between
+    /// `198.51.100/24` and `198.51.101/24` with no extra config. `ce` originates
+    /// the default route toward the fabric. ASNs are `65100` (ce) and `65101 + i`
+    /// (cr`i`).
+    ///
+    /// The `enp0sN` interface names mirror `build_topo`'s link-creation order:
+    /// `ce` links each fabric router (cr1=enp0s8, cr2=enp0s9, ...); each fabric
+    /// router links `ce` first (enp0s8) then every scrimlet in `sleds()` order
+    /// (enp0s9, enp0s10, ...).
     pub fn to_frr(&self) -> Vec<(String, FrrRouter)> {
         // Fabric (transit) routers - everything except the customer edge `ce`.
         let fabric: Vec<&String> = self
@@ -1422,8 +1473,8 @@ mod tests {
         let cfg =
             VoxelConfig::from_toml("[external]\nmode = \"isolated\"\nuplink = \"igb0\"\n").unwrap();
         assert!(cfg.external.isolated());
-        assert_eq!(cfg.external.host_ip, "192.168.1.199");
-        assert_eq!(cfg.external.ip_start, "192.168.1.10");
+        assert_eq!(cfg.external.host_ip, "172.30.199.199");
+        assert_eq!(cfg.external.ip_start, "172.30.199.10");
         // `voxel config set` auto-creates the table and round-trips.
         let out = set(&d.to_toml(), "external.mode", "isolated").unwrap();
         let out = set(&out, "external.uplink", "igb0").unwrap();
@@ -1707,19 +1758,48 @@ mod tests {
     fn node_ip_arithmetic() {
         let x = External::default();
         assert_eq!(x.prefix_length(), Some(24));
-        assert_eq!(x.node_ip(0).as_deref(), Some("192.168.1.10"));
-        assert_eq!(x.node_ip(5).as_deref(), Some("192.168.1.15"));
+        assert_eq!(x.node_ip(0).as_deref(), Some("172.30.199.10"));
+        assert_eq!(x.node_ip(5).as_deref(), Some("172.30.199.15"));
         // Rolls past host_ip (.199) - skipped, not silently reused.
         let hit_host = External {
-            ip_start: "192.168.1.199".into(),
+            ip_start: "172.30.199.199".into(),
             ..External::default()
         };
         assert_eq!(hit_host.node_ip(0), None);
         let hit_bcast = External {
-            ip_start: "192.168.1.255".into(),
+            ip_start: "172.30.199.255".into(),
             ..External::default()
         };
         assert_eq!(hit_bcast.node_ip(0), None);
+    }
+
+    #[test]
+    fn external_addresses_stay_within_subnet() {
+        let x = External {
+            subnet: "10.20.0.0/16".into(),
+            host_ip: "10.20.1.1".into(),
+            ip_start: "10.20.0.255".into(),
+            ..External::default()
+        };
+        // Unlike the old last-octet check, .255 is usable in a /16.
+        assert_eq!(x.node_ip(0).as_deref(), Some("10.20.0.255"));
+
+        let outside_gateway = External {
+            host_ip: "10.21.1.1".into(),
+            ..x.clone()
+        };
+        assert!(!outside_gateway.host_ip_is_usable());
+        assert_eq!(outside_gateway.node_ip(0), None);
+
+        let small = External {
+            subnet: "192.0.2.0/29".into(),
+            host_ip: "192.0.2.6".into(),
+            ip_start: "192.0.2.2".into(),
+            ..External::default()
+        };
+        assert!(small.host_ip_is_usable());
+        assert_eq!(small.node_ip(0).as_deref(), Some("192.0.2.2"));
+        assert_eq!(small.node_ip(5), None); // 192.0.2.7 is broadcast.
     }
 
     #[test]
@@ -1728,13 +1808,13 @@ mod tests {
         let cfg = VoxelConfig::default();
         let ips = cfg.static_external_ips();
         let expected: Vec<(String, String)> = vec![
-            ("g0", "192.168.1.10"),
-            ("g1", "192.168.1.11"),
-            ("g2", "192.168.1.12"),
-            ("g3", "192.168.1.13"),
-            ("ce", "192.168.1.14"),
-            ("cr1", "192.168.1.15"),
-            ("cr2", "192.168.1.16"),
+            ("g0", "172.30.199.10"),
+            ("g1", "172.30.199.11"),
+            ("g2", "172.30.199.12"),
+            ("g3", "172.30.199.13"),
+            ("ce", "172.30.199.14"),
+            ("cr1", "172.30.199.15"),
+            ("cr2", "172.30.199.16"),
         ]
         .into_iter()
         .map(|(n, i)| (n.to_string(), i.to_string()))
@@ -1747,8 +1827,21 @@ mod tests {
         let x = External::default();
         assert_eq!(
             x.builder_net().as_deref(),
-            Some("192.168.1.198/24 192.168.1.199")
+            Some("172.30.199.198/24 172.30.199.199")
         );
+
+        let first_usable_gateway = External {
+            subnet: "192.0.2.0/24".into(),
+            host_ip: "192.0.2.1".into(),
+            ..External::default()
+        };
+        assert_eq!(first_usable_gateway.builder_net(), None);
+
+        let outside_gateway = External {
+            host_ip: "198.51.100.1".into(),
+            ..first_usable_gateway
+        };
+        assert_eq!(outside_gateway.builder_net(), None);
     }
 
     #[test]

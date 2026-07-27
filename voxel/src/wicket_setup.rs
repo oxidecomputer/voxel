@@ -18,7 +18,7 @@
 //! form -- the one fiddly bit is the flat-string serializations
 //! (`address = "addrconf"`, `addr = "unnumbered"`), validated against live wicketd.
 
-use crate::net::{SWITCH_ZONE_ROOT, node_external_ip, scp_to, ssh_capture, zlogin};
+use crate::net::{SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin};
 use anyhow::{Context, Result, anyhow};
 use libfalcon::{NodeRef, Runner};
 use slog::info;
@@ -289,15 +289,17 @@ fn wait_wicketd_ready(ip: &str, num_sleds: usize, log: &slog::Logger) -> Result<
 /// Drive the full wicketd setup for one rack, then return so the caller can
 /// `watch_rss` the wicketd-triggered bring-up.
 pub(crate) async fn drive(
+    cfg: &voxel_config::VoxelConfig,
     d: &Runner,
     scrimlet: NodeRef,
+    scrimlet_name: &str,
     bootstrap_slots: &[u16],
     config_rss_path: &Path,
     zone: &str,
     tag: &str,
 ) -> Result<()> {
     info!(d.log, "{tag}: driving rack setup through wicketd");
-    let ip = node_external_ip(d, scrimlet, false)
+    let ip = resolve_external_ip(cfg, d, scrimlet_name, scrimlet, false)
         .await
         .map_err(|e| anyhow!("find switch-zone scrimlet IP: {e}"))?;
     wait_wicketd_ready(&ip, bootstrap_slots.len(), &d.log)?;

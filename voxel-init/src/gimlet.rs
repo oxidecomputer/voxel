@@ -5,8 +5,8 @@
 //! switch1 identity for the 2nd scrimlet, then activates the control plane (which
 //! kicks RSS on the RSS node).
 
-use crate::sys::{note, read_external_net, run, run_env, run_quiet, warn};
-use anyhow::{Context, Result, anyhow};
+use crate::sys::{note, read_external_net, replace_in_file, run, run_env, run_quiet, warn};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -52,7 +52,7 @@ pub fn bring_up() -> Result<()> {
     // The omicron CLI tools are baked into the image at /opt/oxide/omicron, and
     // xtask/omicron-package run relative to that tree.
     if !Path::new(OMICRON).exists() {
-        return Err(anyhow!("{OMICRON} not baked into the image"));
+        bail!("{OMICRON} not baked into the image");
     }
     std::env::set_current_dir(OMICRON).with_context(|| format!("cd {OMICRON}"))?;
     let xtask_bin = format!("{OMICRON}/xtask");
@@ -115,22 +115,6 @@ fn setup_ssh() {
         ],
     );
     run("svcadm", &["restart", "svc:/network/ssh:default"]);
-}
-
-fn replace_in_file(path: &str, subs: &[(&str, &str)]) {
-    let mut text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => {
-            warn(format!("read {path}: {e}"));
-            return;
-        }
-    };
-    for (from, to) in subs {
-        text = text.replace(from, to);
-    }
-    if let Err(e) = fs::write(path, text) {
-        warn(format!("write {path}: {e}"));
-    }
 }
 
 fn crash_dump() {
@@ -233,6 +217,12 @@ fn setup_external_networking(other: &[String]) {
 
         match other.iter().find(|ifc| ifc.as_str() != "vioif0") {
             Some(ifc) => {
+                // Falcon keeps the sled disk across destroy/relaunch, so a
+                // prior launch's static address persists in /etc/ipadm/. `ipadm
+                // create-addr` refuses to add over an existing addrobj, so wipe
+                // any leftover /v4 addr before staging the current one. Silent
+                // on absence (first launch, or a manual pre-wipe).
+                run_quiet("ipadm", &["delete-addr", &format!("{ifc}/v4")]);
                 run(
                     "ipadm",
                     &[
@@ -244,7 +234,16 @@ fn setup_external_networking(other: &[String]) {
                         &format!("{ifc}/v4"),
                     ],
                 );
-                run("route", &["add", "default", &ext.gateway]);
+                // Persist the route (-p). voxel-init runs at launch, not at
+                // boot, so a plain `route add` is lost if the sled VM reboots
+                // mid-run while the static addr above survives via
+                // /etc/ipadm/.
+                //
+                // We clear prior persistent defaults first so that a relaunch
+                // (or a gateway change) does not stack or strand entries in
+                // /etc/inet/static_routes.
+                clear_persistent_defaults();
+                run("route", &["-p", "add", "default", &ext.gateway]);
             }
             None => warn("external-net staged but no external NIC candidate found"),
         }
@@ -253,14 +252,39 @@ fn setup_external_networking(other: &[String]) {
     if let Err(e) = fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n") {
         warn(format!("resolv.conf: {e}"));
     }
+    // A prior isolated run's persistent default would otherwise sit alongside
+    // the DHCP default and can win out.
+    clear_persistent_defaults();
     for ifc in other {
         if ifc == "vioif0" {
             continue;
         }
+        // Wipe any leftover /v4 addrobj (same reason as the isolated branch:
+        // a prior isolated run's static address persists across relaunches
+        // and blocks the `-T dhcp` create). Silent on absence.
+        run_quiet("ipadm", &["delete-addr", &format!("{ifc}/v4")]);
         run(
             "ipadm",
             &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")],
         );
+    }
+}
+
+/// Delete every persistent default route, not just the one via the current
+/// gateway. The sled disk survives destroy/relaunch, so a gateway change (or
+/// an isolated to lan switch) would otherwise strand a stale default in
+/// /etc/inet/static_routes pointing at a dead gateway.
+fn clear_persistent_defaults() {
+    let Ok(out) = Command::new("route").args(["-p", "show"]).output() else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // Lines look like: "persistent: route add default 172.30.199.199".
+        let mut toks = line.split_whitespace().skip_while(|t| *t != "default");
+        let (Some(_), Some(gw)) = (toks.next(), toks.next()) else {
+            continue;
+        };
+        run_quiet("route", &["-p", "delete", "default", gw]);
     }
 }
 

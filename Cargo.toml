@@ -21,6 +21,7 @@ expectorate = "1.2.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
 libfalcon = { git = "https://github.com/oxidecomputer/falcon", branch = "main" }
 futures = "0.3"
+oxnet = "0.1"
 slog = "2.7"
 serde = "1"
 camino = { version = "1.2.2", features = ["serde1"] }

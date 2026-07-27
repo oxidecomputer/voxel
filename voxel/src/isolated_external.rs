@@ -24,7 +24,8 @@
 //!
 //! [how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
+use oxnet::Ipv4Net;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use voxel_config::External;
@@ -94,6 +95,23 @@ fn run(dry_run: bool, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a temporary static address `addr` on `addrobj` via `ipadm`.
+fn create_addr(dry_run: bool, addrobj: &str, addr: &str) -> anyhow::Result<()> {
+    run(
+        dry_run,
+        &[
+            "ipadm",
+            "create-addr",
+            "-t",
+            "-T",
+            "static",
+            "--address",
+            addr,
+            addrobj,
+        ],
+    )
+}
+
 /// The uplink's `dladm show-phys` state, or `None` when the link is absent.
 fn uplink_state(link: &str) -> Option<String> {
     probe_out("dladm", &["show-phys", "-p", "-o", "state", link]).map(|s| s.trim().to_string())
@@ -108,6 +126,56 @@ pub(crate) fn link_mtu(link: &str) -> Option<String> {
         &["show-linkprop", "-c", "-p", "mtu", "-o", "value", link],
     )
     .map(|s| s.trim().to_string())
+}
+
+/// Every host IPv4 address currently plumbed, minus the segment's own VNIC
+/// (so `up` stays idempotent), loopback, and link-local. `ipadm show-addr -p
+/// -o addrobj,addr` prints one entry per line, e.g. `igb0/dhcp:172.20.0.5/24`,
+/// or `tun0/v4:100.121.38.79->100.121.38.79` for point-to-point interfaces.
+fn host_v4_addrs() -> Vec<Ipv4Net> {
+    let Some(out) = probe_out("ipadm", &["show-addr", "-p", "-o", "addrobj,addr"]) else {
+        return Vec::new();
+    };
+    let own = format!("{VNIC}/");
+    out.lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(addrobj, _)| !addrobj.starts_with(&own))
+        .filter_map(|(_, addr)| parse_host_addr(addr))
+        .filter(|net| !net.addr().is_loopback() && !net.addr().is_link_local())
+        .collect()
+}
+
+/// Parse one `ipadm` address column entry. Point-to-point entries (VPN and
+/// tunnel interfaces) print as `local->peer` with no prefix length and would
+/// otherwise fail the CIDR parse and silently vanish from the overlap check.
+/// The local side is what the host owns, so treat it as a /32.
+fn parse_host_addr(addr: &str) -> Option<Ipv4Net> {
+    match addr.split_once("->") {
+        Some((local, _)) => {
+            let local = local.split_once('/').map_or(local, |(ip, _)| ip);
+            Ipv4Net::new(local.parse().ok()?, 32).ok()
+        }
+        None => addr.parse().ok(),
+    }
+}
+
+/// Refuse an `external.subnet` that overlaps an address the host already owns.
+/// A collision would either steal traffic from an existing network or make
+/// the segment unreachable via the wrong route. Either way, no automatic
+/// recovery.
+fn assert_subnet_disjoint(subnet: &str) -> anyhow::Result<()> {
+    let cfg: Ipv4Net = subnet
+        .parse()
+        .with_context(|| format!("external.subnet '{subnet}' must be CIDR (a.b.c.d/len)"))?;
+    for host in host_v4_addrs() {
+        if cfg.overlaps(&host) {
+            bail!(
+                "external.subnet '{subnet}' overlaps host address {host}; \
+                 pick a subnet off the host's LANs (voxel config set external.subnet <cidr>)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Refuse to NAT out a link that isn't up.
@@ -175,20 +243,26 @@ fn load_nat(uplink: &str, subnet: &str, dry_run: bool) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Fails when `uplink` is unset or not up, when `mtu` reaches the jumbo
-/// threshold, when `subnet` is not CIDR, or when a plumbing command fails.
+/// threshold, when `subnet` is not CIDR or overlaps a host-owned address, or
+/// when one of the underlying `dladm`/`ipadm`/`routeadm`/`ipnat` commands
+/// fails.
 pub(crate) fn up(x: &External, dry_run: bool) -> anyhow::Result<()> {
-    let uplink = x.uplink.as_deref().ok_or_else(|| {
-        anyhow!(
-            "external.uplink must be set in isolated mode (voxel config set external.uplink <link>)"
-        )
-    })?;
+    let uplink = x.uplink.as_deref().context(
+        "external.uplink must be set in isolated mode (voxel config set external.uplink <link>)",
+    )?;
     assert_uplink_up(uplink)?;
     assert_mtu_classifiable(x.mtu)?;
+    assert_subnet_disjoint(&x.subnet)?;
+    if !x.host_ip_is_usable() {
+        bail!(
+            "external.host_ip '{}' must be a usable address within external.subnet '{}'",
+            x.host_ip,
+            x.subnet
+        );
+    }
     let prefix = x
-        .subnet
-        .split('/')
-        .nth(1)
-        .ok_or_else(|| anyhow!("external.subnet '{}' must be CIDR (a.b.c.d/len)", x.subnet))?;
+        .prefix_length()
+        .with_context(|| format!("external.subnet '{}' must be CIDR (a.b.c.d/len)", x.subnet))?;
 
     eprintln!(
         "[voxel] external: bringing up isolated segment ({} via {uplink})",
@@ -214,26 +288,26 @@ pub(crate) fn up(x: &External, dry_run: bool) -> anyhow::Result<()> {
     if !probe("ipadm", &["show-if", VNIC]) {
         run(dry_run, &["ipadm", "create-if", "-t", VNIC])?;
     }
-    if !probe("ipadm", &["show-addr", ADDROBJ]) {
-        let addr = format!("{}/{prefix}", x.host_ip);
-        run(
-            dry_run,
-            &[
-                "ipadm",
-                "create-addr",
-                "-t",
-                "-T",
-                "static",
-                "--address",
-                &addr,
-                ADDROBJ,
-            ],
-        )
-        .with_context(|| {
-            format!(
-                "creating {ADDROBJ} ({addr}): another link already holding the address blocks this"
-            )
-        })?;
+    let desired_addr = format!("{}/{prefix}", x.host_ip);
+    let live_addr = probe_out("ipadm", &["show-addr", "-p", "-o", "addr", ADDROBJ])
+        .map(|s| s.trim().to_string());
+    match live_addr.as_deref() {
+        Some(a) if a == desired_addr => {}
+        Some(_) => {
+            // Same addrobj, different address. Falls out when `host_ip` or the
+            // subnet prefix changes across `up` invocations. Delete and
+            // re-create so nodes staged with the new gateway can reach us.
+            run(dry_run, &["ipadm", "delete-addr", ADDROBJ])?;
+            create_addr(dry_run, ADDROBJ, &desired_addr)?;
+        }
+        None => {
+            create_addr(dry_run, ADDROBJ, &desired_addr).with_context(|| {
+                format!(
+                    "creating {ADDROBJ} ({desired_addr}): another link already holding \
+                     the address blocks this"
+                )
+            })?;
+        }
     }
     if !probe_out("routeadm", &["-p", "ipv4-forwarding"])
         .is_some_and(|s| s.contains("current=enabled"))
@@ -329,10 +403,16 @@ pub(crate) fn check(x: &External) -> anyhow::Result<()> {
         probe("dladm", &["show-vnic", VNIC]),
         &format!("vnic {VNIC}"),
     );
-    item(
-        probe("ipadm", &["show-addr", ADDROBJ]),
-        &format!("addr {ADDROBJ} ({})", x.host_ip),
-    );
+    // Match on the exact address, not just addrobj existence: a stale addr
+    // from a prior host_ip / subnet-prefix config would otherwise pass.
+    let expected = x
+        .prefix_length()
+        .map(|p| format!("{}/{p}", x.host_ip))
+        .unwrap_or_else(|| x.host_ip.clone());
+    let live_ok = probe_out("ipadm", &["show-addr", "-p", "-o", "addr", ADDROBJ])
+        .map(|s| s.trim().to_string())
+        == Some(expected.clone());
+    item(live_ok, &format!("addr {ADDROBJ} ({expected})"));
     item(
         probe_out("routeadm", &["-p", "ipv4-forwarding"])
             .is_some_and(|s| s.contains("current=enabled")),
@@ -347,6 +427,6 @@ pub(crate) fn check(x: &External) -> anyhow::Result<()> {
         println!("check: PASS");
         Ok(())
     } else {
-        Err(anyhow!("check: FAIL"))
+        bail!("check: FAIL")
     }
 }

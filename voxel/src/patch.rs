@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use voxel_config::VoxelConfig;
 
-use crate::net::{SWITCH_ZONE_ROOT, node_external_ip, scp_to, ssh_capture, zlogin};
+use crate::net::{
+    SERIAL_RESOLVE_TIMEOUT, SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin,
+};
 use crate::topo::{Topo, build_topo};
 use crate::util::{locate_script, shell_quote as q};
 
@@ -340,12 +342,13 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<PathBuf> {
 // --- rack patch (live nodes) -----------------------------------------------
 
 /// Resolve a node's host-LAN IP, bounded so a wedged serial console fails fast.
-async fn node_ip(d: &Runner, n: NodeRef) -> anyhow::Result<String> {
-    tokio::time::timeout(Duration::from_secs(20), node_external_ip(d, n, false))
-        .await
-        .map_err(|_| {
-            anyhow!("timed out resolving node IP over the serial console (is the rack up?)")
-        })?
+async fn node_ip(cfg: &VoxelConfig, d: &Runner, node: &str, n: NodeRef) -> anyhow::Result<String> {
+    tokio::time::timeout(
+        SERIAL_RESOLVE_TIMEOUT,
+        resolve_external_ip(cfg, d, node, n, false),
+    )
+    .await
+    .context("timed out resolving node IP over the serial console (is the rack up?)")?
 }
 
 /// The target `(name, NodeRef)` set for a component.
@@ -535,7 +538,7 @@ pub(crate) async fn cmd_rack_patch(
         .ok_or_else(|| anyhow!("non-utf8 tarball path"))?;
 
     for (node, n) in nodes {
-        let ip = match node_ip(d, n).await {
+        let ip = match node_ip(cfg, d, &node, n).await {
             Ok(ip) => ip,
             Err(e) => {
                 warn!(d.log, "{node}: {e}");

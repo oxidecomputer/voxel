@@ -13,7 +13,7 @@
 //! startup that anchors voxel to its project root; the commands themselves live
 //! in the topic modules below.
 
-use anyhow::{Context, Error, anyhow};
+use anyhow::{Context, Error};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -437,10 +437,10 @@ enum SpCmd {
 enum HostCmd {
     /// List sleds and their external IPs.
     Ls,
-    /// SSH into a sled's global zone: `voxel host login g1`.
+    /// SSH into a sled's global zone or a router: `voxel host login g1`.
     Login {
         #[arg(default_value = "g0")]
-        sled: String,
+        node: String,
     },
     /// Run a command in a sled's global zone: `voxel host exec -c "svcs -x" g1`.
     Exec {
@@ -490,7 +490,7 @@ fn config_text(path: &Path) -> anyhow::Result<String> {
 
 fn load_config(path: &Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    VoxelConfig::from_toml(&text).map_err(|e| anyhow!("parse {}: {e}", path.display()))
+    VoxelConfig::from_toml(&text).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Make a path absolute against the current directory.
@@ -606,7 +606,7 @@ fn anchor_workdir(cli: &Cli, cfg: Option<&VoxelConfig>, config_path: &Path) -> a
     if let Some(root) = root {
         if root.is_dir() {
             std::env::set_current_dir(&root)
-                .map_err(|e| anyhow!("chdir to workdir {}: {e}", root.display()))?;
+                .with_context(|| format!("chdir to workdir {}", root.display()))?;
         }
     }
     Ok(())
@@ -713,11 +713,11 @@ async fn main() -> Result<(), Error> {
                     patch::list();
                     Ok(())
                 } else {
-                    let component = component.as_deref().ok_or_else(|| {
-                        anyhow!("missing component (try `voxel rack patch --list`)")
-                    })?;
-                    let reference = reference.as_deref().ok_or_else(|| {
-                        anyhow!("missing ref (usage: voxel rack patch {component} <ref>)")
+                    let component = component
+                        .as_deref()
+                        .context("missing component (try `voxel rack patch --list`)")?;
+                    let reference = reference.as_deref().with_context(|| {
+                        format!("missing ref (usage: voxel rack patch {component} <ref>)")
                     })?;
                     patch::cmd_rack_patch(
                         &load_config(&config_path)?,
@@ -733,8 +733,8 @@ async fn main() -> Result<(), Error> {
         Cmd::Sp { cmd } => sp_cmd::cmd_sp(&load_config(&config_path)?, &cli.name, cmd).await,
         Cmd::Host { cmd } => match cmd {
             HostCmd::Ls => access::cmd_host_ls(&load_config(&config_path)?, &cli.name).await,
-            HostCmd::Login { sled } => {
-                access::cmd_host_login(&load_config(&config_path)?, &cli.name, sled).await
+            HostCmd::Login { node } => {
+                access::cmd_host_login(&load_config(&config_path)?, &cli.name, node).await
             }
             HostCmd::Exec { command, sled } => {
                 access::cmd_host_exec(&load_config(&config_path)?, &cli.name, sled, command).await

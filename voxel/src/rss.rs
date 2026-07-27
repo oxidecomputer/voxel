@@ -121,7 +121,7 @@ async fn discover_rss_ip(d: &Runner, rss: NodeRef, tag: &str) -> Option<String> 
     let ip_deadline = Instant::now() + Duration::from_secs(60);
     let rss_ip = loop {
         match tokio::time::timeout(
-            Duration::from_secs(15),
+            crate::net::SERIAL_RESOLVE_TIMEOUT,
             crate::net::node_external_ip(d, rss, false),
         )
         .await

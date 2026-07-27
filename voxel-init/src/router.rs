@@ -4,13 +4,17 @@
 //! out to the host LAN (the RSS time-sync path - the boundary NTP zone must reach
 //! its upstream).
 
-use crate::sys::{ExternalNet, capture, note, read_external_net, run, run_quiet, warn};
-use anyhow::{Context, Result, anyhow};
+use crate::sys::{
+    ExternalNet, capture, note, read_external_net, replace_in_file, run, run_quiet, warn,
+};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
 pub fn bring_up() -> Result<()> {
+    setup_ssh();
+
     // Give the host-LAN uplink a UNIQUE DHCP lease before NAT depends on it.
     ensure_unique_uplink_lease();
 
@@ -41,6 +45,48 @@ pub fn bring_up() -> Result<()> {
 
     note("router bring-up complete");
     Ok(())
+}
+
+/// SSH convenience for `voxel host login <router>`, the router-role counterpart
+/// of the gimlet agent's `setup_ssh`. `openssh-server` is already in the image
+/// (install-frr.sh), so this only appends any staged operator key and relaxes
+/// sshd_config: voxel authenticates as root with the rack's empty password, and
+/// Debian's stock `PermitRootLogin prohibit-password` refuses that.
+fn setup_ssh() {
+    let authorized = "/opt/cargo-bay/root_authorized_keys";
+    if Path::new(authorized).exists() {
+        let _ = fs::create_dir_all("/root/.ssh");
+        if let Ok(keys) = fs::read(authorized) {
+            use std::io::Write;
+            match fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/root/.ssh/authorized_keys")
+            {
+                Ok(mut f) => {
+                    if let Err(e) = f.write_all(&keys) {
+                        warn(format!("authorized_keys: {e}"));
+                    }
+                }
+                Err(e) => warn(format!("authorized_keys: {e}")),
+            }
+        }
+    }
+
+    // Debian's stock sshd_config keeps PasswordAuthentication yes but defaults
+    // PermitRootLogin to prohibit-password. Flip it so serial-first debugging
+    // (blank root password) still lets you in over SSH.
+    replace_in_file(
+        "/etc/ssh/sshd_config",
+        &[
+            ("#PasswordAuthentication yes", "PasswordAuthentication yes"),
+            ("#PermitEmptyPasswords no", "PermitEmptyPasswords yes"),
+            ("#PermitRootLogin prohibit-password", "PermitRootLogin yes"),
+            ("PermitRootLogin prohibit-password", "PermitRootLogin yes"),
+        ],
+    );
+    run("systemctl", &["enable", "--now", "ssh"]);
+    run("systemctl", &["restart", "ssh"]);
 }
 
 /// If a static customer-edge address is staged (voxel `[topology].ce_external_ip`,
@@ -91,6 +137,13 @@ fn apply_static_edge_ip() {
 /// gets a distinct lease. Scoped to the uplink interface only, leaving the
 /// FRR-managed transit links untouched.
 fn ensure_unique_uplink_lease() {
+    // Isolated mode stages a static address and runs no DHCP server, so there
+    // is no lease to dedupe. Keep networkd's DHCP client off the uplink that
+    // `apply_static_external` configures by hand.
+    if read_external_net().is_some() {
+        note("isolated mode: static external address, skipping DHCP lease pinning");
+        return;
+    }
     let Some(ifc) = uplink_iface() else {
         warn("unique-lease: no host-LAN uplink found; skipping");
         return;
@@ -211,6 +264,14 @@ fn apply_static_external() {
         warn("external-net staged without an iface line; router bring-up needs it");
         return;
     };
+
+    if !link_exists(&ifc) {
+        warn(format!(
+            "external-net names {ifc}, which this router does not have; present links: {}",
+            link_names().join(" ")
+        ));
+        return;
+    }
     run("ip", &["link", "set", &ifc, "up"]);
     let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
     let already = cur.split_whitespace().any(|t| t == ip_cidr);
@@ -236,6 +297,26 @@ fn apply_static_external() {
     note(format!("static external {ip_cidr} on {ifc} (gw {gateway})"));
 }
 
+/// Whether the kernel has `ifc`.
+///
+/// The staged external name is derived from falcon's link-creation order
+/// (`VoxelConfig::router_ext_iface`), so a change to that order surfaces as a device
+/// this router does not have.
+fn link_exists(ifc: &str) -> bool {
+    capture("ip", &["-o", "link", "show", "dev", ifc]).is_some()
+}
+
+/// Every link name the kernel reports, for naming what is present when a staged
+/// interface is not.
+fn link_names() -> Vec<String> {
+    capture("ip", &["-o", "link", "show"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|n| n.trim_end_matches(':').to_string())
+        .collect()
+}
+
 fn uplink_iface() -> Option<String> {
     if let Ok(v) = std::env::var("UPSTREAM_IFACE") {
         if !v.is_empty() {
@@ -244,10 +325,12 @@ fn uplink_iface() -> Option<String> {
     }
     // Isolated mode dictates the uplink up front (no DHCP to poll for).
     //
-    // We handle it before the `lan`-mode default-route poll.
+    // We handle it before the `lan`-mode default-route poll, yielding nothing when
+    // the device is absent: a NAT rule against it would never match, and
+    // `apply_static_external` has already reported it.
     if let Some(ext) = read_external_net() {
         if let Some(ifc) = ext.iface {
-            return Some(ifc);
+            return link_exists(&ifc).then_some(ifc);
         }
     }
     for _ in 0..30 {
@@ -279,7 +362,7 @@ fn uplink_subnet(ifc: &str) -> Option<String> {
 fn apply_frr() -> Result<()> {
     let src = "/opt/cargo-bay/frr.conf";
     if !Path::new(src).exists() {
-        return Err(anyhow!("{src} not staged"));
+        bail!("{src} not staged");
     }
     fs::copy(src, "/etc/frr/frr.conf").context("apply frr.conf")?;
     run("systemctl", &["restart", "frr"]);

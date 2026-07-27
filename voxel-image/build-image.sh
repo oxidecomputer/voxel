@@ -91,6 +91,11 @@ chmod +x "${CARGO_BAY}/${INSTALL_SCRIPT}"
 if [[ -n "${VOXEL_BUILDER_NET:-}" ]]; then
     log "staging builder-net (${VOXEL_BUILDER_NET}) into ${CARGO_BAY}"
     printf '%s\n' "${VOXEL_BUILDER_NET}" > "${CARGO_BAY}/builder-net"
+else
+    # A prior isolated build leaves builder-net in the reused cargo-bay. Left
+    # in place, a subsequent LAN build's installer would apply the isolated
+    # static address to its DHCP-serving VNIC and lose package/DNS access.
+    rm -f "${CARGO_BAY}/builder-net"
 fi
 
 # --- 2. build + launch builder (boots BASE_IMAGE, runs INSTALL_SCRIPT) ---------

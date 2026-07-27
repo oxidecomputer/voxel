@@ -45,7 +45,7 @@ systemctl disable --now apt-daily-upgrade.timer apt-daily.timer 2>/dev/null || t
 
 # --- install FRR (baked) ------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
-install_pkgs() { apt-get update -y && apt-get install -y frr frr-pythontools jq; }
+install_pkgs() { apt-get update -y && apt-get install -y frr frr-pythontools jq openssh-server; }
 n=0
 until install_pkgs; do
     n=$((n + 1))
@@ -67,6 +67,7 @@ EOF
 sysctl -p /etc/sysctl.d/99-voxel-frr.conf || true
 
 systemctl enable frr 2>/dev/null || true
+systemctl enable ssh 2>/dev/null || true
 
 # --- in-guest bring-up agent (replaces router-launch.sh) ----------------------
 # The static linux-musl voxel-init, staged into the builder cargo-bay by

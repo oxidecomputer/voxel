@@ -11,10 +11,10 @@
 //!                 states (`swadm link ls`), BGP sessions (`mgadm bgp status`),
 //!                 and programmed routes (`swadm route list`), plus the host route.
 
-use anyhow::anyhow;
+use anyhow::{Context, bail};
 use voxel_config::{SledDesc, VoxelConfig};
 
-use crate::net::{node_external_ip, ssh_capture, ssh_output, zlogin};
+use crate::net::{resolve_external_ip, ssh_capture, ssh_output, zlogin};
 use crate::topo::build_topo;
 
 const SWADM: &str = "/opt/oxide/dendrite/bin/swadm";
@@ -92,9 +92,9 @@ async fn switch_ip(
         let (sd, nr) = crate::access::resolve_switch(&topo, switch)?;
         (sd.name.clone(), *nr)
     };
-    let ip = node_external_ip(&topo.runner, n, false)
+    let ip = resolve_external_ip(cfg, &topo.runner, &sw, n, false)
         .await
-        .map_err(|e| anyhow!("{e} - is the rack up? (`voxel status`)"))?;
+        .context("is the rack up? (`voxel status`)")?;
     Ok((sw, ip))
 }
 
@@ -119,16 +119,18 @@ pub(crate) fn enable_link(
         ));
         let out = ssh_output(ip, &create).unwrap_or_default();
         if !out.contains("CREATE_OK") {
-            return Err(anyhow!("link create {link} on {sw} failed: {}", out.trim()));
+            bail!("link create {link} on {sw} failed: {}", out.trim());
         }
     }
     let en = ssh_output(
         ip,
-        &zlogin(&format!("{SWADM} link enable {link} 2>&1 && echo ENABLE_OK")),
+        &zlogin(&format!(
+            "{SWADM} link enable {link} 2>&1 && echo ENABLE_OK"
+        )),
     )
     .unwrap_or_default();
     if !en.contains("ENABLE_OK") {
-        return Err(anyhow!("link enable {link} on {sw} failed: {}", en.trim()));
+        bail!("link enable {link} on {sw} failed: {}", en.trim());
     }
     Ok(())
 }
@@ -188,7 +190,7 @@ pub(crate) async fn link_down(
         println!("{sw}: link {link} disabled + deleted");
         Ok(())
     } else {
-        Err(anyhow!("link delete {link} on {sw} failed: {}", out.trim()))
+        bail!("link delete {link} on {sw} failed: {}", out.trim())
     }
 }
 
@@ -221,7 +223,7 @@ pub(crate) async fn validate(cfg: &VoxelConfig, name: &str, detail: bool) -> any
     );
 
     for (s, n) in topo.sleds.iter().filter(|(s, _)| s.scrimlet) {
-        let ip = match node_external_ip(&topo.runner, *n, false).await {
+        let ip = match resolve_external_ip(cfg, &topo.runner, &s.name, *n, false).await {
             Ok(ip) => ip,
             Err(e) => {
                 println!("  switch {} : UNREACHABLE ({e})", s.name);

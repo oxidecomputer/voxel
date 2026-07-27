@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 /// probe).
 #[derive(Debug, Default, Clone)]
 pub struct ExternalNet {
-    /// `<addr>/<prefixlen>` (e.g. `192.168.1.10/24`).
+    /// `<addr>/<prefixlen>` (e.g. `172.30.199.10/24`).
     pub ip_cidr: String,
     /// Default gateway (the host VNIC's address on the etherstub).
     pub gateway: String,
@@ -69,6 +69,26 @@ pub fn note(msg: impl AsRef<str>) {
 /// A non-fatal warning (mirrors the scripts' `echo WARN: ...`).
 pub fn warn(msg: impl AsRef<str>) {
     println!("[voxel-init] WARN: {}", msg.as_ref());
+}
+
+/// Apply literal `(from, to)` substitutions to `path` in one rewrite. Both role
+/// agents use it to relax sshd_config, where the patterns are the distro's
+/// shipped lines, commented or not. A pattern that does not match is silently a
+/// no-op, which is what keeps the per-distro pattern lists safe to over-specify.
+pub fn replace_in_file(path: &str, subs: &[(&str, &str)]) {
+    let mut text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            warn(format!("read {path}: {e}"));
+            return;
+        }
+    };
+    for (from, to) in subs {
+        text = text.replace(from, to);
+    }
+    if let Err(e) = std::fs::write(path, text) {
+        warn(format!("write {path}: {e}"));
+    }
 }
 
 /// Run a command with inherited stdio, echoing it first (the `set -x` effect).

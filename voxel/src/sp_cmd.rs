@@ -12,14 +12,14 @@
 
 use anyhow::anyhow;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use voxel_config::VoxelConfig;
 use voxel_config::sp::{PORT_STRIDE, SP_PORT_BASE, Sp, SpBackend, SpFleet, SpRole};
 
 use crate::SpCmd;
 use crate::access::resolve_switch;
 use crate::net::{
-    SWITCH_ZONE_ROOT, node_external_ip, scp_from, scp_to, ssh_capture, ssh_output, zlogin,
+    SERIAL_RESOLVE_TIMEOUT, SWITCH_ZONE_ROOT, resolve_external_ip, scp_from, scp_to, ssh_capture,
+    ssh_output, zlogin,
 };
 use crate::topo::{GIMLET_SERIAL_PREFIX, Topo, build_topo};
 use crate::util::shell_quote;
@@ -243,14 +243,18 @@ fn faux_on(
 /// wedges under RSS/console load; ssh to the cached IP is unaffected). The first
 /// lookup is bounded so a wedged console fails fast instead of hanging; a stale
 /// cache (after a relaunch) is cleared on the next ssh miss by the callers.
-async fn switch_ip(topo: &Topo, switch: &str) -> anyhow::Result<(SpFleet, String, String)> {
+async fn switch_ip(
+    cfg: &VoxelConfig,
+    topo: &Topo,
+    switch: &str,
+) -> anyhow::Result<(SpFleet, String, String)> {
     let (fleet, node, sw) = switch_fleet(topo, switch)?;
     if let Some(ip) = read_cached_ip(&sw) {
         return Ok((fleet, ip, sw));
     }
     let ip = tokio::time::timeout(
-        Duration::from_secs(15),
-        node_external_ip(&topo.runner, node, false),
+        SERIAL_RESOLVE_TIMEOUT,
+        resolve_external_ip(cfg, &topo.runner, &sw, node, false),
     )
     .await
     .map_err(|_| {
@@ -293,7 +297,7 @@ async fn sp_faux(
     args: &[&str],
 ) -> anyhow::Result<String> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     let port = resolve_port(&fleet, target)?;
     // An ssh miss usually means a stale cached IP (rack was relaunched) - drop it
     // so the next call re-resolves.
@@ -328,7 +332,7 @@ async fn sp_reflash(
         .to_str()
         .ok_or_else(|| anyhow!("non-utf8 image path"))?;
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     // The baked sp-emu fleet must be present - reflash is meaningless on a
     // sp-sim rack (there's no flash file / voxel-sp-emu service to swap).
     let have = ssh_capture(&ip, &format!("test -x {SP_EMU_ZONE}/sp-emu && echo ok"))
@@ -434,7 +438,7 @@ async fn sp_debug(
     off: bool,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     let port = resolve_port(&fleet, target)?;
     let fmri = format!("svc:/oxide/voxel-sp-emu:sp{port}");
 
@@ -545,7 +549,7 @@ async fn sp_ipcc(
         ));
     }
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     let port = resolve_port(&fleet, target)?;
     // The probe is the host sp-emu binary (it carries the `ipcc` subcommand); the
     // baked in-zone sp-emu already handles SP_EMU_HOST_UART on the SP side.
@@ -651,7 +655,7 @@ async fn sp_dump(
     ringbuf: bool,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     let port = resolve_port(&fleet, target)?;
     let selector = fleet
         .sps
@@ -821,7 +825,7 @@ async fn sp_dump(
 /// `voxel sp ls` - enumerate every SP via the switch zone, pilot-style table.
 async fn sp_ls(cfg: &VoxelConfig, name: &str, switch: &str) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(&topo, switch).await?;
+    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     if let Err(e) = ensure_faux(&ip, cfg.sp.faux_mgs.as_deref()) {
         clear_cached_ip(&sw);
         return Err(e);

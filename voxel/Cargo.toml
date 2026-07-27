@@ -18,6 +18,7 @@ slog.workspace = true
 futures.workspace = true
 clap.workspace = true
 camino.workspace = true
+oxnet.workspace = true
 voxel-config = { path = "../voxel-config" }
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).
