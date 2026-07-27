@@ -26,7 +26,7 @@ use sled_agent_types::early_networking::{
     LldpPortConfig, MaxPathConfig, PortConfig, RackNetworkConfig, RouteConfig,
     RouterLifetimeConfig, RouterPeerType, SwitchSlot, UplinkAddress, UplinkAddressConfig,
 };
-use sled_hardware_types::Baseboard;
+use sled_hardware_types::BaseboardId;
 
 // Newer omicron wraps the uplink port list in a non-empty `UplinkPorts` newtype;
 // v20-era omicron uses a bare `Vec<PortConfig>`. build.rs sets `has_uplink_ports`
@@ -193,11 +193,14 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
         .collect::<std::result::Result<_, _>>()
         .context("bootstrap addrs")?;
 
-    let trust_quorum_peers: Vec<Baseboard> = cfg
+    let trust_quorum_peers: Vec<BaseboardId> = cfg
         .sleds()
         .iter()
         .filter(|s| s.rss && s.rack == rack)
-        .map(|s| Baseboard::new_pc(s.serial_number.clone(), s.part_number.clone()))
+        .map(|s| BaseboardId {
+            serial_number: s.serial_number.clone(),
+            part_number: s.part_number.clone(),
+        })
         .collect();
 
     let pool = ip_range(&n.service_pool_first, &n.service_pool_last)?;
