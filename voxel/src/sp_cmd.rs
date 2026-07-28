@@ -174,15 +174,14 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
     }
     // Preferred: scp it straight from the configured host binary - the proven path,
     // independent of in-zone 9p visibility of the cargo-bay copy.
-    if let Some(faux) = host_faux {
-        if Path::new(faux).exists()
-            && scp_to(ip, faux, &faux_gz)
-            && ssh_capture(ip, &format!("chmod +x {faux_gz} && echo ok"))
-                .map(|o| o.contains("ok"))
-                .unwrap_or(false)
-        {
-            return Ok(());
-        }
+    if let Some(faux) = host_faux
+        && Path::new(faux).exists()
+        && scp_to(ip, faux, &faux_gz)
+        && ssh_capture(ip, &format!("chmod +x {faux_gz} && echo ok"))
+            .map(|o| o.contains("ok"))
+            .unwrap_or(false)
+    {
+        return Ok(());
     }
     // Fallback: copy from a scrimlet-local binary - the baked image copy (the
     // self-contained path) or the pre-staged cargo-bay copy (if 9p exposes it).
@@ -305,19 +304,17 @@ async fn sp_faux(
         clear_cached_ip(&sw);
         return Err(e);
     }
-    faux_on(&ip, port, args, 5, 15000).map_err(|e| {
-        clear_cached_ip(&sw);
-        e
-    })
+    faux_on(&ip, port, args, 5, 15000).inspect_err(|_| clear_cached_ip(&sw))
 }
 
 /// `voxel sp reflash <target> <image>` - re-flash a live SP (or the shared RoT)
 /// and restart its sp-emu service: the firmware counterpart to `voxel rack
 /// patch`. Flashes in-zone with the BAKED `sp-emu` (so it works on a
-/// self-contained image with no `[sp]` paths set), then verifies over MGS. Live
-/// + ephemeral - a clean relaunch reverts to the image; bake it via `build-cp.sh`
-/// to persist. `target == "rot"` swaps the shared raw `rot.flash` (every RoT
-/// bridge serves it) and restarts them all; otherwise it's a single SP.
+/// self-contained image with no `[sp]` paths set), then verifies over MGS.
+/// Live + ephemeral - a clean relaunch reverts to the image; bake it via
+/// `build-cp.sh` to persist. `target == "rot"` swaps the shared raw
+/// `rot.flash` (every RoT bridge serves it) and restarts them all; otherwise
+/// it's a single SP.
 async fn sp_reflash(
     cfg: &VoxelConfig,
     name: &str,
@@ -642,11 +639,12 @@ exit 1
 /// `<SP_EMU_DUMP_DIR>/.trigger` appears it dumps RAM (flash comes from the archive)
 /// and swaps in `.done` (src/mem.rs `write_hydrate_dump`). We arm the SP's service
 /// with that dir + its archive id (a one-time ~30s restart if not already armed),
-/// touch the trigger in-zone, pull the zip to the host, and run `humility hydrate`
-/// + `tasks`/`ringbuf` against the SP's hubris archive - all where humility + the
-/// archive live (the debug listeners are in-zone loopback, so a probe-based dump
-/// would need a tunnel; this needs none). Live + ephemeral: the arming reverts on
-/// a clean relaunch. Emu-only (sp-sim never faults / has no dump dir).
+/// touch the trigger in-zone, pull the zip to the host, and run `humility
+/// hydrate` + `tasks`/`ringbuf` against the SP's hubris archive - all where
+/// humility + the archive live (the debug listeners are in-zone loopback, so a
+/// probe-based dump would need a tunnel; this needs none). Live + ephemeral:
+/// the arming reverts on a clean relaunch. Emu-only (sp-sim never faults / has
+/// no dump dir).
 async fn sp_dump(
     cfg: &VoxelConfig,
     name: &str,
@@ -832,8 +830,8 @@ async fn sp_ls(cfg: &VoxelConfig, name: &str, switch: &str) -> anyhow::Result<()
     }
     println!("SPs via {sw} (oxz_switch, [::1]):");
     println!(
-        "{:<8}  {:<5}  {:<8}  {:<12}  {:<6}  {}",
-        "SP", "PORT", "TYPE", "SERIAL", "POWER", "ARCHIVE"
+        "{:<8}  {:<5}  {:<8}  {:<12}  {:<6}  ARCHIVE",
+        "SP", "PORT", "TYPE", "SERIAL", "POWER"
     );
     // Probe every SP in ONE ssh: a single zlogin runs faux-mgs for each port
     // in-zone, back to back. Doing 5 separate ssh+zlogin calls (sequential OR

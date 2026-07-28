@@ -398,13 +398,12 @@ fn staged_switch_slot() -> Option<u8> {
     for entry in fs::read_dir(CARGO_BAY).ok()?.flatten() {
         let name = entry.file_name();
         let name = name.to_str()?;
-        if let Some(rest) = name.strip_prefix("mgs-config-switch") {
-            if let Some(slot) = rest
+        if let Some(rest) = name.strip_prefix("mgs-config-switch")
+            && let Some(slot) = rest
                 .strip_suffix(".toml")
                 .and_then(|d| d.parse::<u8>().ok())
-            {
-                return Some(slot);
-            }
+        {
+            return Some(slot);
         }
     }
     None

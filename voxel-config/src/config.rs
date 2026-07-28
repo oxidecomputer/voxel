@@ -1251,10 +1251,10 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
             // float) first, then a string fallback - validation picks the winner.
             _ => {
                 let mut c = Vec::new();
-                if let Ok(v) = value.parse::<Value>() {
-                    if !matches!(v, Value::Array(_) | Value::InlineTable(_)) {
-                        c.push(v);
-                    }
+                if let Ok(v) = value.parse::<Value>()
+                    && !matches!(v, Value::Array(_) | Value::InlineTable(_))
+                {
+                    c.push(v);
                 }
                 c.push(Value::from(value));
                 c
@@ -1501,8 +1501,10 @@ mod tests {
 
     #[test]
     fn cp_commit_strips_prefix_and_variant_suffix() {
-        let mut img = Image::default();
-        img.cp = Some("voxel-cp-43bb5af-rd".into());
+        let mut img = Image {
+            cp: Some("voxel-cp-43bb5af-rd".into()),
+            ..Default::default()
+        };
         assert_eq!(img.cp_commit().as_deref(), Some("43bb5af"));
         img.cp = Some("voxel-cp-99a0aec".into());
         assert_eq!(img.cp_commit().as_deref(), Some("99a0aec"));

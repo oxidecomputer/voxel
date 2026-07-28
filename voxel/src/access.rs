@@ -86,7 +86,7 @@ fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
 
 pub(crate) async fn cmd_host_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    println!("{:<6}  {:<16}  {}", "NODE", "IP", "ROLE");
+    println!("{:<6}  {:<16}  ROLE", "NODE", "IP");
     for (s, n) in &topo.sleds {
         let ip = resolve_external_ip(cfg, &topo.runner, &s.name, *n, false)
             .await
@@ -144,20 +144,20 @@ pub(crate) fn resolve_switch<'a>(
         return Ok(hit);
     }
     // Rack-qualified `rackR/switchS` (R 1-based).
-    if let Some((r, sw)) = switch.split_once('/') {
-        if let (Some(rack), Some(slot)) = (
+    if let Some((r, sw)) = switch.split_once('/')
+        && let (Some(rack), Some(slot)) = (
             r.strip_prefix("rack").and_then(|x| x.parse::<usize>().ok()),
             sw.strip_prefix("switch")
                 .and_then(|x| x.parse::<usize>().ok()),
-        ) {
-            let rack0 = rack.saturating_sub(1);
-            let hit = scrimlets
-                .iter()
-                .filter(|(s, _)| s.rack == rack0)
-                .nth(slot)
-                .with_context(|| format!("no rack{rack}/switch{slot} in topology"))?;
-            return Ok(hit);
-        }
+        )
+    {
+        let rack0 = rack.saturating_sub(1);
+        let hit = scrimlets
+            .iter()
+            .filter(|(s, _)| s.rack == rack0)
+            .nth(slot)
+            .with_context(|| format!("no rack{rack}/switch{slot} in topology"))?;
+        return Ok(hit);
     }
     // Bare `switchN` - global Nth scrimlet.
     if let Some(n) = switch
@@ -178,9 +178,9 @@ pub(crate) async fn cmd_tp_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<(
     // and show which rack it's in (1-based, matching `voxel info`).
     let multi = cfg.topology.racks() > 1;
     if multi {
-        println!("{:<6}  {:<8}  {:<6}  {}", "RACK", "SWITCH", "NODE", "IP");
+        println!("{:<6}  {:<8}  {:<6}  IP", "RACK", "SWITCH", "NODE");
     } else {
-        println!("{:<8}  {:<6}  {}", "SWITCH", "NODE", "IP");
+        println!("{:<8}  {:<6}  IP", "SWITCH", "NODE");
     }
     let mut per_rack: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for (s, n) in topo.sleds.iter().filter(|(s, _)| s.scrimlet) {

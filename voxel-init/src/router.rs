@@ -177,8 +177,8 @@ fn nat_rack_egress() {
         Some(ifc) => {
             // Skip NAT for the connected customer subnet (the external-service
             // reply path) before masquerading the internet-bound rest (NTP).
-            if let Some(subnet) = uplink_subnet(&ifc) {
-                if !run_quiet(
+            if let Some(subnet) = uplink_subnet(&ifc)
+                && !run_quiet(
                     "iptables",
                     &[
                         "-t",
@@ -192,24 +192,24 @@ fn nat_rack_egress() {
                         "-j",
                         "RETURN",
                     ],
-                ) {
-                    run(
-                        "iptables",
-                        &[
-                            "-t",
-                            "nat",
-                            "-I",
-                            "POSTROUTING",
-                            "1",
-                            "-o",
-                            &ifc,
-                            "-d",
-                            &subnet,
-                            "-j",
-                            "RETURN",
-                        ],
-                    );
-                }
+                )
+            {
+                run(
+                    "iptables",
+                    &[
+                        "-t",
+                        "nat",
+                        "-I",
+                        "POSTROUTING",
+                        "1",
+                        "-o",
+                        &ifc,
+                        "-d",
+                        &subnet,
+                        "-j",
+                        "RETURN",
+                    ],
+                );
             }
             if !run_quiet(
                 "iptables",
@@ -318,28 +318,28 @@ fn link_names() -> Vec<String> {
 }
 
 fn uplink_iface() -> Option<String> {
-    if let Ok(v) = std::env::var("UPSTREAM_IFACE") {
-        if !v.is_empty() {
-            return Some(v);
-        }
+    if let Ok(v) = std::env::var("UPSTREAM_IFACE")
+        && !v.is_empty()
+    {
+        return Some(v);
     }
     // Isolated mode dictates the uplink up front (no DHCP to poll for).
     //
     // We handle it before the `lan`-mode default-route poll, yielding nothing when
     // the device is absent: a NAT rule against it would never match, and
     // `apply_static_external` has already reported it.
-    if let Some(ext) = read_external_net() {
-        if let Some(ifc) = ext.iface {
-            return link_exists(&ifc).then_some(ifc);
-        }
+    if let Some(ext) = read_external_net()
+        && let Some(ifc) = ext.iface
+    {
+        return link_exists(&ifc).then_some(ifc);
     }
     for _ in 0..30 {
         if let Some(line) = capture("ip", &["-o", "-4", "route", "show", "default"]) {
             // "default via <gw> dev <iface> ...", so the iface is whitespace field 5.
-            if let Some(dev) = line.split_whitespace().nth(4) {
-                if !dev.is_empty() {
-                    return Some(dev.to_string());
-                }
+            if let Some(dev) = line.split_whitespace().nth(4)
+                && !dev.is_empty()
+            {
+                return Some(dev.to_string());
             }
         }
         std::thread::sleep(Duration::from_secs(1));

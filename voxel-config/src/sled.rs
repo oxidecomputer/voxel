@@ -29,9 +29,9 @@ pub struct SledAgentConfig {
     pub sprockets_dir: String,
     /// Total sleds in the rack. Each scrimlet's SoftNPU gets one sled-facing
     /// (rear) port per sled (voxel topo wires `softnpu_link` scrimlet->every
-    /// sled), so the rear-port count + the `tfportrear` list must scale with it
-    /// - otherwise sleds past the 4th land in the front/uplink port range and
-    /// fall off the underlay (the >4-sled bug).
+    /// sled), so the rear-port count + the `tfportrear` list must scale with
+    /// it. Otherwise, sleds past the 4th land in the front/uplink port range
+    /// and fall off the underlay (the >4-sled bug).
     pub num_sleds: usize,
     /// Fabric (transit) routers - the scrimlet's uplink (front) port count
     /// (`softnpu_link` scrimlet->every fabric router).

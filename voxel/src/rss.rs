@@ -170,7 +170,7 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
             );
             break;
         }
-        let out = match crate::net::ssh_capture(&rss_ip, &curl) {
+        let out = match crate::net::ssh_capture(&rss_ip, curl) {
             Some(s) if !s.trim().is_empty() => s,
             // ssh failed, or the agent isn't answering yet - retry. Heartbeat so a
             // quiet stretch still shows the watcher is alive.
@@ -179,30 +179,29 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
                 // node has crash-looped into MAINTENANCE, it never will - surface
                 // it (with the sled-agent log tail, the usual culprit: a config
                 // schema drift) and stop, instead of the 15-minute hang.
-                if last.is_empty() && start.elapsed() > Duration::from_secs(20) {
-                    if let Some(x) = crate::net::ssh_capture(&rss_ip, "svcs -x 2>/dev/null") {
-                        if x.contains("maintenance") {
-                            warn!(
-                                d.log,
-                                "{tag}: RSS will not start - a service on the RSS node is in \
-                                 MAINTENANCE. `svcs -x`:\n{}",
-                                x.trim()
-                            );
-                            if let Some(t) = crate::net::ssh_capture(
-                                &rss_ip,
-                                "tail -6 /var/svc/log/oxide-sled-agent:default.log 2>/dev/null",
-                            ) {
-                                if !t.trim().is_empty() {
-                                    warn!(d.log, "{tag}: sled-agent log tail:\n{}", t.trim());
-                                }
-                            }
-                            warn!(
-                                d.log,
-                                "{tag}: not waiting further - fix the service above, then relaunch."
-                            );
-                            break;
-                        }
+                if last.is_empty()
+                    && start.elapsed() > Duration::from_secs(20)
+                    && let Some(x) = crate::net::ssh_capture(&rss_ip, "svcs -x 2>/dev/null")
+                    && x.contains("maintenance")
+                {
+                    warn!(
+                        d.log,
+                        "{tag}: RSS will not start - a service on the RSS node is in \
+                         MAINTENANCE. `svcs -x`:\n{}",
+                        x.trim()
+                    );
+                    if let Some(t) = crate::net::ssh_capture(
+                        &rss_ip,
+                        "tail -6 /var/svc/log/oxide-sled-agent:default.log 2>/dev/null",
+                    ) && !t.trim().is_empty()
+                    {
+                        warn!(d.log, "{tag}: sled-agent log tail:\n{}", t.trim());
                     }
+                    warn!(
+                        d.log,
+                        "{tag}: not waiting further - fix the service above, then relaunch."
+                    );
+                    break;
                 }
                 if last_emit.elapsed() >= HEARTBEAT {
                     // Can't know if the step advanced - report total watch time +

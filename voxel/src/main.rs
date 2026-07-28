@@ -516,10 +516,10 @@ fn discover_config(explicit: Option<&Path>) -> PathBuf {
     let user = std::env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join(".config/voxel/voxel.toml"));
-    if let Some(cand) = &user {
-        if cand.is_file() {
-            return cand.clone();
-        }
+    if let Some(cand) = &user
+        && cand.is_file()
+    {
+        return cand.clone();
     }
     let etc = PathBuf::from("/etc/voxel/voxel.toml");
     if etc.is_file() {
@@ -603,11 +603,11 @@ fn anchor_workdir(cli: &Cli, cfg: Option<&VoxelConfig>, config_path: &Path) -> a
                 .map(PathBuf::from)
         })
         .or_else(|| config_path.parent().map(Path::to_path_buf));
-    if let Some(root) = root {
-        if root.is_dir() {
-            std::env::set_current_dir(&root)
-                .with_context(|| format!("chdir to workdir {}", root.display()))?;
-        }
+    if let Some(root) = root
+        && root.is_dir()
+    {
+        std::env::set_current_dir(&root)
+            .with_context(|| format!("chdir to workdir {}", root.display()))?;
     }
     Ok(())
 }

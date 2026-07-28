@@ -355,13 +355,13 @@ pub(crate) fn down(x: &External, dry_run: bool) -> anyhow::Result<()> {
             )
         })?;
     }
-    if let Some(uplink) = x.uplink.as_deref() {
-        if nat_loaded(uplink, &x.subnet) {
-            eprintln!(
-                "[voxel] external: leaving ipnat rule + ipv4-forwarding in place \
-                 (ipnat has no single-rule delete; flushing would drop unrelated rules)"
-            );
-        }
+    if let Some(uplink) = x.uplink.as_deref()
+        && nat_loaded(uplink, &x.subnet)
+    {
+        eprintln!(
+            "[voxel] external: leaving ipnat rule + ipv4-forwarding in place \
+             (ipnat has no single-rule delete; flushing would drop unrelated rules)"
+        );
     }
     Ok(())
 }

@@ -210,8 +210,8 @@ fn lookup(name: &str) -> anyhow::Result<Component> {
 /// Print the component registry (`voxel rack patch --list`).
 pub(crate) fn list() {
     println!(
-        "{:<10}  {:<10}  {:<16}  {:<10}  {}",
-        "COMPONENT", "REPO", "PKG", "TARGETS", "KIND"
+        "{:<10}  {:<10}  {:<16}  {:<10}  KIND",
+        "COMPONENT", "REPO", "PKG", "TARGETS"
     );
     for c in registry() {
         let (targets, kind) = (
@@ -352,7 +352,7 @@ async fn node_ip(cfg: &VoxelConfig, d: &Runner, node: &str, n: NodeRef) -> anyho
 }
 
 /// The target `(name, NodeRef)` set for a component.
-fn targets<'a>(topo: &'a Topo, comp: &Component) -> Vec<(String, NodeRef)> {
+fn targets(topo: &Topo, comp: &Component) -> Vec<(String, NodeRef)> {
     topo.sleds
         .iter()
         .filter(|(s, _)| match comp.targets {

@@ -94,12 +94,11 @@ pub(crate) fn cmd_image(
                     }
                     // A `<name>@base` snapshot is what makes <name> a bundle.
                     "snapshot" => {
-                        if let Some((path, "base")) = name.rsplit_once('@') {
-                            if let Some(short) = path.strip_prefix(&prefix) {
-                                if short.starts_with("voxel-") {
-                                    bundles.push(short.to_string());
-                                }
-                            }
+                        if let Some((path, "base")) = name.rsplit_once('@')
+                            && let Some(short) = path.strip_prefix(&prefix)
+                            && short.starts_with("voxel-")
+                        {
+                            bundles.push(short.to_string());
                         }
                     }
                     _ => {}
@@ -126,10 +125,10 @@ pub(crate) fn cmd_image(
                 {
                     for line in String::from_utf8_lossy(&o.stdout).lines() {
                         let mut f = line.split('\t');
-                        if let (Some(n), Some(c)) = (f.next(), f.next()) {
-                            if let Some(short) = n.strip_prefix(&prefix) {
-                                m.insert(short.to_string(), c.parse().unwrap_or(0));
-                            }
+                        if let (Some(n), Some(c)) = (f.next(), f.next())
+                            && let Some(short) = n.strip_prefix(&prefix)
+                        {
+                            m.insert(short.to_string(), c.parse().unwrap_or(0));
                         }
                     }
                 }

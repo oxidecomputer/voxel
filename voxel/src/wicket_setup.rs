@@ -286,18 +286,39 @@ fn wait_wicketd_ready(ip: &str, num_sleds: usize, log: &slog::Logger) -> Result<
     }
 }
 
+/// The per-rack inputs `drive` needs (distinct from the ambient config and
+/// falcon runner).
+pub(crate) struct RackSetup<'a> {
+    /// The scrimlet whose switch zone hosts wicketd.
+    pub scrimlet: NodeRef,
+    pub scrimlet_name: &'a str,
+    /// Global cubby slots of this rack's sleds, reported by wicketd as
+    /// `bootstrap_sleds`.
+    pub bootstrap_slots: &'a [u16],
+    /// The `config-rss.toml` to reshape into the wicketd config body. Generated
+    /// outside the cargo-bay so voxel-init cannot auto-init from it.
+    pub config_rss_path: &'a Path,
+    /// External DNS zone, the common name of the self-signed cert.
+    pub zone: &'a str,
+    /// Log prefix identifying the rack.
+    pub tag: &'a str,
+}
+
 /// Drive the full wicketd setup for one rack, then return so the caller can
 /// `watch_rss` the wicketd-triggered bring-up.
 pub(crate) async fn drive(
     cfg: &voxel_config::VoxelConfig,
     d: &Runner,
-    scrimlet: NodeRef,
-    scrimlet_name: &str,
-    bootstrap_slots: &[u16],
-    config_rss_path: &Path,
-    zone: &str,
-    tag: &str,
+    rack: RackSetup<'_>,
 ) -> Result<()> {
+    let RackSetup {
+        scrimlet,
+        scrimlet_name,
+        bootstrap_slots,
+        config_rss_path,
+        zone,
+        tag,
+    } = rack;
     info!(d.log, "{tag}: driving rack setup through wicketd");
     let ip = resolve_external_ip(cfg, d, scrimlet_name, scrimlet, false)
         .await

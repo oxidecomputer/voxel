@@ -45,14 +45,13 @@ pub(crate) async fn resolve_external_ip(
     n: NodeRef,
     is_router: bool,
 ) -> anyhow::Result<String> {
-    if cfg.external.isolated() {
-        if let Some((_, ip)) = cfg
+    if cfg.external.isolated()
+        && let Some((_, ip)) = cfg
             .static_external_ips()
             .into_iter()
             .find(|(name, _)| name == node)
-        {
-            return Ok(ip);
-        }
+    {
+        return Ok(ip);
     }
     node_external_ip(d, n, is_router).await
 }

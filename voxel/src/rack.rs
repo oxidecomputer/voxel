@@ -115,15 +115,15 @@ fn lan_mtu_preflight() -> anyhow::Result<()> {
             None => return Ok(()),
         },
     };
-    if let Some(mtu) = link_mtu(&link) {
-        if mtu.parse::<u32>().is_ok_and(|m| m >= 9000) {
-            bail!(
-                "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
-                 iff they accept mtu=9000, so external NICs on a jumbo link are \
-                 misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
-                 link or use isolated mode (voxel config set external.mode isolated)."
-            );
-        }
+    if let Some(mtu) = link_mtu(&link)
+        && mtu.parse::<u32>().is_ok_and(|m| m >= 9000)
+    {
+        bail!(
+            "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
+             iff they accept mtu=9000, so external NICs on a jumbo link are \
+             misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
+             link or use isolated mode (voxel config set external.mode isolated)."
+        );
     }
     Ok(())
 }
@@ -424,12 +424,14 @@ pub(crate) async fn cmd_launch(
                     if let Err(e) = crate::wicket_setup::drive(
                         cfg,
                         d,
-                        *n,
-                        &s.name,
-                        &slots,
-                        &config_rss,
-                        &net.dns_zone,
-                        &tag,
+                        crate::wicket_setup::RackSetup {
+                            scrimlet: *n,
+                            scrimlet_name: &s.name,
+                            bootstrap_slots: &slots,
+                            config_rss_path: &config_rss,
+                            zone: &net.dns_zone,
+                            tag: &tag,
+                        },
                     )
                     .await
                     {
@@ -482,10 +484,8 @@ pub(crate) async fn cmd_launch(
                 warn!(d.log, "{label} external route: {e}");
                 continue;
             }
-            if !no_route {
-                if let Some(dns_ip) = net.external_dns_ips.first() {
-                    wait_external_reachable(&d.log, dns_ip, &net.dns_zone, &label);
-                }
+            if !no_route && let Some(dns_ip) = net.external_dns_ips.first() {
+                wait_external_reachable(&d.log, dns_ip, &net.dns_zone, &label);
             }
         }
     }
@@ -522,12 +522,11 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
     if let Ok(entries) = std::fs::read_dir(".falcon") {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("pid") {
-                if let Ok(s) = std::fs::read_to_string(&p) {
-                    if let Ok(pid) = s.trim().parse::<i32>() {
-                        tracked.insert(pid);
-                    }
-                }
+            if p.extension().and_then(|x| x.to_str()) == Some("pid")
+                && let Ok(s) = std::fs::read_to_string(&p)
+                && let Ok(pid) = s.trim().parse::<i32>()
+            {
+                tracked.insert(pid);
             }
         }
     }

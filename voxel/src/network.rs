@@ -1,15 +1,15 @@
 //! `voxel network` - show the network topology and validate live networking.
 //!
-//!  - `show`     : render the per-rack network projection + switches + the auto
-//!                 cross-rack sidecar interconnect mesh (config-derived, rack-down).
-//!  - `link-up` / `link-down` : ⚠️ TRANSIENT/DEBUG - create+enable / disable+delete
-//!                 a switch port's link directly via `swadm`. Nexus's switch-port
-//!                 reconciler reaps manual `swadm`/`mgadm` changes (~30s), so these
-//!                 do NOT persist; persistent switch config must go through the
-//!                 Oxide API. Useful for a quick poke / proving a link comes up.
-//!  - `validate` : live checks against a running rack - per switch zone the link
-//!                 states (`swadm link ls`), BGP sessions (`mgadm bgp status`),
-//!                 and programmed routes (`swadm route list`), plus the host route.
+//! - `show`: render the per-rack network projection + switches + the auto
+//!   cross-rack sidecar interconnect mesh (config-derived, rack-down).
+//! - `link-up` / `link-down`: transient/debug - create+enable / disable+delete
+//!   a switch port's link directly via `swadm`. Nexus's switch-port reconciler
+//!   reaps manual `swadm`/`mgadm` changes (~30s), so these do not persist;
+//!   persistent switch config must go through the Oxide API. Useful for a quick
+//!   poke / proving a link comes up.
+//! - `validate`: live checks against a running rack - per switch zone the link
+//!   states (`swadm link ls`), BGP sessions (`mgadm bgp status`), and programmed
+//!   routes (`swadm route list`), plus the host route.
 
 use anyhow::{Context, bail};
 use voxel_config::{SledDesc, VoxelConfig};
@@ -57,10 +57,8 @@ pub(crate) fn show(cfg: &VoxelConfig) -> anyhow::Result<()> {
         println!("  external DNS    : {}", net.external_dns_ips.join(", "));
         println!("  rack subnet     : {}", net.rack_subnet);
         println!("  BGP ASN         : {}", net.bgp_asn);
-        let mut slot = 0;
-        for (gidx, s) in sw.iter().filter(|(_, s)| s.rack == rack) {
+        for (slot, (gidx, s)) in sw.iter().filter(|(_, s)| s.rack == rack).enumerate() {
             println!("  switch{slot:<9} {} (global switch{gidx})", s.name);
-            slot += 1;
         }
     }
 
