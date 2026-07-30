@@ -149,7 +149,7 @@ dependencies = [
 [[package]]
 name = "attest-data"
 version = "0.5.0"
-source = "git+https://github.com/oxidecomputer/dice-util?rev=43a8b1fab3d48866b83c4f49cf5f7196ec289c8c#43a8b1fab3d48866b83c4f49cf5f7196ec289c8c"
+source = "git+https://github.com/oxidecomputer/dice-util?rev=4a39ef08d81e5177edee0bddb1146032aa21074d#4a39ef08d81e5177edee0bddb1146032aa21074d"
 dependencies = [
  "const-oid",
  "der",
@@ -168,7 +168,7 @@ dependencies = [
 [[package]]
 name = "attest-mock"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/dice-util?rev=43a8b1fab3d48866b83c4f49cf5f7196ec289c8c#43a8b1fab3d48866b83c4f49cf5f7196ec289c8c"
+source = "git+https://github.com/oxidecomputer/dice-util?rev=4a39ef08d81e5177edee0bddb1146032aa21074d#4a39ef08d81e5177edee0bddb1146032aa21074d"
 dependencies = [
  "anyhow",
  "attest-data",
