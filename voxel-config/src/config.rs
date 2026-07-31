@@ -628,8 +628,10 @@ pub enum SledDataLinksSchema {
 }
 
 /// The shape of sled-agent's disk config, which changed across omicron versions:
-/// the flat `vdevs = [...]` list became a tagged `external_disks` enum. Selected
-/// independently of [`SledDataLinksSchema`] (they drifted at different commits).
+/// the flat `vdevs = [...]` list became a tagged `external_disks` enum, whose
+/// emulated-disk variant was later renamed `virtual` -> `hardcoded` (with a raw
+/// `disks` injection list) in omicron#10948. Selected independently of
+/// [`SledDataLinksSchema`] (they drifted at different commits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SledDisksSchema {
@@ -637,9 +639,12 @@ pub enum SledDisksSchema {
     /// `vdevs = ["m2_g0_0.vdev", ...]`.
     #[default]
     Vdevs,
-    /// omicron main (the `ExternalDisks` enum, `#[serde(tag = "kind")]`):
+    /// Post-rename, pre-omicron#10948 (the `ExternalDisks::Virtual` era):
     /// `external_disks = { kind = "virtual", vdevs = ["m2_g0_0.vdev", ...] }`.
     ExternalDisks,
+    /// omicron main since omicron#10948 (`ExternalDisks::Hardcoded`):
+    /// `external_disks = { kind = "hardcoded", vdevs = [...], disks = [] }`.
+    ExternalDisksHardcoded,
 }
 
 impl Image {

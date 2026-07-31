@@ -154,6 +154,21 @@ impl SledAgentConfig {
                 )
                 .unwrap();
             }
+            crate::config::SledDisksSchema::ExternalDisksHardcoded => {
+                // omicron#10948 renamed the variant `virtual` -> `hardcoded` and
+                // added a raw-disk injection list. `disks` has no serde default,
+                // so it must be emitted (empty) explicitly.
+                let list = vdevs
+                    .iter()
+                    .map(|v| format!("\"{v}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    o,
+                    "external_disks = {{ kind = \"hardcoded\", vdevs = [{list}], disks = [] }}"
+                )
+                .unwrap();
+            }
         }
         writeln!(o).unwrap();
 
@@ -351,5 +366,20 @@ mod tests {
         assert!(ext.get("vdevs").is_none(), "flat vdevs must be gone");
         assert_eq!(ext["external_disks"]["kind"].as_str(), Some("virtual"));
         assert_eq!(ext["external_disks"]["vdevs"].as_array().unwrap().len(), 7);
+        // ExternalDisksHardcoded renders the omicron#10948 shape, including an
+        // explicit empty `disks` list (no serde default upstream).
+        let hard = parse(
+            &SledAgentConfig::new(0, false)
+                .with_disks_schema(SledDisksSchema::ExternalDisksHardcoded)
+                .render(),
+        );
+        assert_eq!(hard["external_disks"]["kind"].as_str(), Some("hardcoded"));
+        assert_eq!(hard["external_disks"]["vdevs"].as_array().unwrap().len(), 7);
+        assert!(
+            hard["external_disks"]["disks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

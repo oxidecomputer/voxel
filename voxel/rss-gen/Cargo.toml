@@ -23,6 +23,8 @@ sled-hardware-types = { path = "/opt/omicron/sled-hardware/types" }
 omicron-common = { path = "/opt/omicron/common" }
 omicron-passwords = { path = "/opt/omicron/passwords" }
 oxnet = "0.1.4"
+# IdOrdMap for service_ip_pools (post omicron#10941 eras).
+iddqd = "0.4"
 toml = "0.8"
 anyhow = "1"
 voxel-config = { path = "../../voxel-config" }

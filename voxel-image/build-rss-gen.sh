@@ -39,16 +39,28 @@ sed -i "s#path = \"../../voxel-config\"#path = \"${TESTBED}/voxel-config\"#" "${
 # Plain `cargo build` (not --locked) keeps these pins and adds rss-gen's extras.
 cp "${OMICRON_SRC}/Cargo.lock" "${RSS_GEN_DIR}/Cargo.lock"
 
-# Detect this omicron era's uplink-ports shape: newer wraps the port list in a
-# non-empty `UplinkPorts` newtype; v20-era uses a bare Vec. rss-gen's build.rs
-# keys off this env to `#[cfg]` the right construction, so one source builds for
-# any commit (no per-era edits).
+# Detect this omicron era's uplink-ports shape: omicron#10651 wraps the port
+# list in a non-empty `UplinkPorts` newtype, while v20-era uses a bare Vec.
+# rss-gen's build.rs keys off this env to `#[cfg]` the right construction, so
+# one source builds for any commit (no per-era edits).
 if grep -rq "struct UplinkPorts" "${OMICRON_SRC}/sled-agent/types" 2>/dev/null; then
     export VOXEL_HAS_UPLINK_PORTS=1
     echo "[build-rss-gen] omicron has UplinkPorts newtype -> has_uplink_ports"
 else
     unset VOXEL_HAS_UPLINK_PORTS
     echo "[build-rss-gen] omicron uses bare Vec ports (v20-era)"
+fi
+
+# Detect which service-pool layout this era defines: omicron#10941 takes named
+# `service_ip_pools` (ServiceIpPoolConfig) at RSS in place of the bare
+# `internal_services_ip_pool_ranges` range list.
+if grep -rq "struct ServiceIpPoolConfig" \
+    "${OMICRON_SRC}/sled-agent/bootstrap-agent-lockstep-types" 2>/dev/null; then
+    export VOXEL_HAS_SERVICE_IP_POOLS=1
+    echo "[build-rss-gen] omicron takes named service_ip_pools -> has_service_ip_pools"
+else
+    unset VOXEL_HAS_SERVICE_IP_POOLS
+    echo "[build-rss-gen] omicron uses internal_services_ip_pool_ranges"
 fi
 
 echo "[build-rss-gen] building against ${OMICRON_SRC}/target"

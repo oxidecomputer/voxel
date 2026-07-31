@@ -36,7 +36,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching `voxel-rss-gen` is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
-| `disks_schema` | enum | unset | `vdevs` or `external_disks`. Unset auto-detects from the image. |
+| `disks_schema` | enum | unset | `vdevs`, `external_disks`, or `external_disks_hardcoded` (omicron#10948). Unset auto-detects from the image. |
 
 ## [network]
 

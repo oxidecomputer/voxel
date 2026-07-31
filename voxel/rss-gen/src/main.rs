@@ -28,11 +28,16 @@ use sled_agent_types::early_networking::{
 };
 use sled_hardware_types::BaseboardId;
 
-// Newer omicron wraps the uplink port list in a non-empty `UplinkPorts` newtype;
+// omicron#10651 wraps the uplink port list in a non-empty `UplinkPorts` newtype;
 // v20-era omicron uses a bare `Vec<PortConfig>`. build.rs sets `has_uplink_ports`
 // when the type exists in the pinned omicron, so one source builds for any era.
 #[cfg(has_uplink_ports)]
 use sled_agent_types::early_networking::UplinkPorts;
+// omicron#10941 replaces the bare `internal_services_ip_pool_ranges` range list
+// with named `service_ip_pools` (ServiceIpPoolConfig) at RSS. build.rs sets
+// `has_service_ip_pools` when the type exists in the pinned omicron.
+#[cfg(has_service_ip_pools)]
+use bootstrap_agent_lockstep_types::ServiceIpPoolConfig;
 use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
 
 fn switch_slot(s: &str) -> SwitchSlot {
@@ -66,6 +71,19 @@ fn ip_range(first: &str, last: &str) -> Result<IpRange> {
         )),
         _ => bail!("pool first/last must be the same address family"),
     }
+}
+
+/// Single named service pool over the topology's external range, matching
+/// omicron's non-gimlet config-rss example pool.
+#[cfg(has_service_ip_pools)]
+fn service_ip_pools(pool: IpRange) -> Result<iddqd::IdOrdMap<ServiceIpPoolConfig>> {
+    let pool = ServiceIpPoolConfig::new(
+        "oxide-service-pool-v4".parse().map_err(|e| anyhow::anyhow!("pool name: {e}"))?,
+        "IPv4 IP Pool for Oxide Services".to_string(),
+        vec![pool],
+    )
+    .context("service pool")?;
+    iddqd::IdOrdMap::from_iter_unique([pool]).context("service pools")
 }
 
 /// One uplink port toward a single fabric router (`UplinkPort` carries the
@@ -302,7 +320,10 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
         },
         ntp_servers: n.ntp_servers.clone(),
         dns_servers,
+        #[cfg(not(has_service_ip_pools))]
         internal_services_ip_pool_ranges: vec![pool],
+        #[cfg(has_service_ip_pools)]
+        service_ip_pools: service_ip_pools(pool)?,
         external_dns_ips,
         external_dns_zone_name: n.dns_zone.clone(),
         external_certificates: vec![],

@@ -276,19 +276,27 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
 /// This is the "schema changelog", automated: instead of a hand-maintained
 /// commits->requirements table, voxel reads what the commit itself declares.
 fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
-    let src = std::env::var("VOXEL_RSS_GEN")
+    let root = std::env::var("VOXEL_RSS_GEN")
         .ok()
-        .and_then(|g| {
-            Path::new(&g)
-                .ancestors()
-                .nth(3)
-                .map(|p| p.join("sled-agent/src/config.rs"))
-        })
-        .and_then(|p| fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    // `pub external_disks: ExternalDisks` (main) vs `pub vdevs: ...` (older).
+        .and_then(|g| Path::new(&g).ancestors().nth(3).map(Path::to_path_buf));
+    let read = |rel: &str| {
+        root.as_ref()
+            .and_then(|r| fs::read_to_string(r.join(rel)).ok())
+            .unwrap_or_default()
+    };
+    let src = read("sled-agent/src/config.rs");
+    // `pub external_disks: ExternalDisks` (post-rename) vs `pub vdevs: ...`
+    // (older). Within the post-rename eras, omicron#10948 renamed the
+    // emulated-disk variant `Virtual` -> `Hardcoded`; that enum lives in
+    // sled-hardware, so key the era split off its declaration. The match must
+    // include the brace: the Virtual era also declared a `HardcodedPhysical`
+    // variant, so a bare "Hardcoded" matches both eras.
     let disks = if src.contains("pub external_disks") {
-        SledDisksSchema::ExternalDisks
+        if read("sled-hardware/src/lib.rs").contains("Hardcoded {") {
+            SledDisksSchema::ExternalDisksHardcoded
+        } else {
+            SledDisksSchema::ExternalDisks
+        }
     } else {
         SledDisksSchema::Vdevs
     };
