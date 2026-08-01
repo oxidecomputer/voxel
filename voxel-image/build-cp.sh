@@ -93,6 +93,18 @@ perl -pi -e 's/Some\(Baseboard::new_pc\(serial_number, product\)\)/Some(Baseboar
 grep -q 'new_gimlet(serial_number, product, 2)' sled-hardware/src/illumos/mod.rs \
     || { log "FATAL: smbios baseboard patch did not apply"; exit 1; }
 
+# sp-sim's gimlet SpStateV2 hardcodes revision 0, which breaks the same
+# wicketd baseboard correlation as above when the default sp-sim (not the
+# emulated SP) backs the rack. Align it with the revision sled-agent now
+# reports (and the emulated SP's VPD `002`).
+log "patching sp-sim gimlet SP state: revision 0 -> 2"
+perl -pi -e 's/revision: 0,/revision: 2,/' sp-sim/src/gimlet.rs
+# Require the old pattern gone too, so a moved anchor cannot pass on a
+# pre-existing `revision: 2,` elsewhere in the file.
+grep -q 'revision: 2,' sp-sim/src/gimlet.rs \
+    && ! grep -q 'revision: 0,' sp-sim/src/gimlet.rs \
+    || { log "FATAL: sp-sim revision patch did not apply"; exit 1; }
+
 # --- 1c. voxel patch: v6 block in the infra address lot ------------------------
 # Nexus rack-init lot-validates every switch-port address against the single-block
 # infra lot. In Static mode that lot is v4 (numbered uplinks), so voxel's v6
@@ -103,6 +115,11 @@ log "patching nexus rack-init: add v6 block to the infra address lot"
 python3 "${HERE}/patches/nexus-infra-lot-v6.py" "${OMICRON_SRC}"
 grep -q 'voxel: add a v6 block' nexus/src/app/rack.rs \
     || { log "FATAL: nexus infra-lot v6 patch did not apply"; exit 1; }
+# The preparation crate postdates older supported pins, so only verify the
+# block-selection patch where the crate exists.
+[ ! -f nexus/switch-config/preparation/src/lib.rs ] \
+    || grep -q 'voxel: prefer the IPv4 block' nexus/switch-config/preparation/src/lib.rs \
+    || { log "FATAL: nexus infra-lot block-selection patch did not apply"; exit 1; }
 
 # --- 2. prerequisites + softnpu machinery -------------------------------------
 log "install_builder_prerequisites.sh -y"
