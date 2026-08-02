@@ -26,6 +26,8 @@ use sled_agent_types::early_networking::{
     LldpPortConfig, MaxPathConfig, PortConfig, RackNetworkConfig, RouteConfig,
     RouterLifetimeConfig, RouterPeerType, SwitchSlot, UplinkAddress, UplinkAddressConfig,
 };
+use sled_hardware_types::BaseboardId;
+
 // Newer omicron wraps the uplink port list in a non-empty `UplinkPorts` newtype;
 // v20-era omicron uses a bare `Vec<PortConfig>`. build.rs sets `has_uplink_ports`
 // when the type exists in the pinned omicron, so one source builds for any era.
@@ -56,12 +58,12 @@ fn ip_range(first: &str, last: &str) -> Result<IpRange> {
     let f: IpAddr = first.parse().context("pool first")?;
     let l: IpAddr = last.parse().context("pool last")?;
     match (f, l) {
-        (IpAddr::V4(a), IpAddr::V4(b)) => {
-            Ok(IpRange::V4(Ipv4Range::new(a, b).map_err(|e| anyhow::anyhow!("pool: {e}"))?))
-        }
-        (IpAddr::V6(a), IpAddr::V6(b)) => {
-            Ok(IpRange::V6(Ipv6Range::new(a, b).map_err(|e| anyhow::anyhow!("pool: {e}"))?))
-        }
+        (IpAddr::V4(a), IpAddr::V4(b)) => Ok(IpRange::V4(
+            Ipv4Range::new(a, b).map_err(|e| anyhow::anyhow!("pool: {e}"))?,
+        )),
+        (IpAddr::V6(a), IpAddr::V6(b)) => Ok(IpRange::V6(
+            Ipv6Range::new(a, b).map_err(|e| anyhow::anyhow!("pool: {e}"))?,
+        )),
         _ => bail!("pool first/last must be the same address family"),
     }
 }
@@ -73,7 +75,10 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
     let (routes, addresses, bgp_peers) = match mode {
         RouterMode::Bgp => (
             vec![],
-            vec![UplinkAddressConfig { address: UplinkAddress::AddrConf, vlan_id: None }],
+            vec![UplinkAddressConfig {
+                address: UplinkAddress::AddrConf,
+                vlan_id: None,
+            }],
             vec![BgpPeerConfig {
                 asn: p.peer_asn,
                 port: p.port.clone(),
@@ -150,7 +155,10 @@ fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
         // interconnect. Nexus lot-validates this against the infra lot; the v6
         // block added to that lot (nexus rack.rs, build-cp patch 1c) lets it
         // reserve in Static mode as it already does in BGP mode.
-        addresses: vec![UplinkAddressConfig { address: UplinkAddress::AddrConf, vlan_id: None }],
+        addresses: vec![UplinkAddressConfig {
+            address: UplinkAddress::AddrConf,
+            vlan_id: None,
+        }],
         switch: switch_slot(switch),
         port: port.to_string(),
         uplink_port_speed: link_speed("100G"),
@@ -184,6 +192,16 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
         .map(|s| s.bootstrap_addr().parse())
         .collect::<std::result::Result<_, _>>()
         .context("bootstrap addrs")?;
+
+    let trust_quorum_peers: Vec<BaseboardId> = cfg
+        .sleds()
+        .iter()
+        .filter(|s| s.rss && s.rack == rack)
+        .map(|s| BaseboardId {
+            serial_number: s.serial_number.clone(),
+            part_number: s.part_number.clone(),
+        })
+        .collect();
 
     let pool = ip_range(&n.service_pool_first, &n.service_pool_last)?;
 
@@ -278,8 +296,10 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
 
     let silo = &cfg.recovery_silo;
     Ok(RackInitializeRequest {
-        trust_quorum_peers: None,
-        bootstrap_discovery: BootstrapAddressDiscovery::OnlyThese { addrs: bootstrap_addrs },
+        trust_quorum_peers: Some(trust_quorum_peers),
+        bootstrap_discovery: BootstrapAddressDiscovery::OnlyThese {
+            addrs: bootstrap_addrs,
+        },
         ntp_servers: n.ntp_servers.clone(),
         dns_servers,
         internal_services_ip_pool_ranges: vec![pool],
@@ -287,8 +307,14 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
         external_dns_zone_name: n.dns_zone.clone(),
         external_certificates: vec![],
         recovery_silo: RecoverySiloConfig {
-            silo_name: silo.silo_name.parse().map_err(|e| anyhow::anyhow!("silo_name: {e}"))?,
-            user_name: silo.user_name.parse().map_err(|e| anyhow::anyhow!("user_name: {e}"))?,
+            silo_name: silo
+                .silo_name
+                .parse()
+                .map_err(|e| anyhow::anyhow!("silo_name: {e}"))?,
+            user_name: silo
+                .user_name
+                .parse()
+                .map_err(|e| anyhow::anyhow!("user_name: {e}"))?,
             user_password_hash: silo
                 .user_password_hash
                 .parse()
@@ -340,7 +366,9 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("validate") => {
-            let path = args.next().context("usage: voxel-rss-gen validate <config-rss.toml>")?;
+            let path = args
+                .next()
+                .context("usage: voxel-rss-gen validate <config-rss.toml>")?;
             validate(&path)
         }
         Some("generate") => {
@@ -361,7 +389,9 @@ fn main() -> Result<()> {
             generate(cfg, positional.get(1).map(String::as_str), rack)
         }
         Some("canon") => {
-            let path = args.next().context("usage: voxel-rss-gen canon <config-rss.toml>")?;
+            let path = args
+                .next()
+                .context("usage: voxel-rss-gen canon <config-rss.toml>")?;
             canon(&path)
         }
         other => {

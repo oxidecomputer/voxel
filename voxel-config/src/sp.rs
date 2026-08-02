@@ -230,9 +230,10 @@ impl SpFleet {
             let role = SpRole::Gimlet(i);
             sps.push(Sp {
                 role,
-                // Matches the SMBIOS serial `voxel` bakes (`2{index:07}`); for
-                // i < 10 this is byte-identical to the old `2000000{i}`.
-                serial: format!("2{i:07}"),
+                // TODO: Use the Serial number from the sled-topo
+                // This matches what is configured in the SMBIOS and PlatformIds
+                // in sprockets certs.
+                serial: format!("2FAKE{i:03}"),
                 part_number: Some(GIMLET_PART_NUMBER.to_string()),
                 root_cert_seed: ROOT_SEED.to_string(),
                 device_id_seed: device_seed(i + 1),

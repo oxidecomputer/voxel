@@ -48,6 +48,17 @@ const TRANSIT_ASN_BASE: u32 = 65100;
 /// so `voxel-init` checks the staged name against the node's actual links.
 const FRR_IFACE_BASE: usize = 8;
 
+// This is a proper V2 serial-number prefix
+//
+// All serial numbers must be 8 characters and start with the number '2' in
+// ascii. We use a 7 character prefix to allow appending a numeral. If we ever
+// require more than 9 sleds in a deployment we can change our generation to
+// take into account the last two 0s here.
+pub const SLED_SERIAL_PREFIX: &str = "2FAKE00";
+
+/// A hardcoded part number for all fake sleds
+pub const SLED_PART_NUMBER: &str = "913-0000019";
+
 /// Top-level Voxel configuration (`voxel.toml`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -476,12 +487,16 @@ impl Topology {
             for local in 0..self.sleds {
                 let index = rack * self.sleds + local;
                 let name = format!("g{index}");
+                let serial_number = format!("{SLED_SERIAL_PREFIX}{}", index);
+                let part_number = SLED_PART_NUMBER.to_string();
                 out.push(SledDesc {
                     rack,
                     scrimlet: scrimlets.iter().any(|s| s == &name),
                     rss: local < rss,
                     name,
                     index,
+                    part_number,
+                    serial_number,
                 });
             }
         }
@@ -529,6 +544,10 @@ pub struct SledDesc {
     pub scrimlet: bool,
     /// Participates in its rack's RSS bootstrap discovery.
     pub rss: bool,
+    /// Part number of a given `BaseboardId`
+    pub part_number: String,
+    /// Serial number of a given `BaseboardId`
+    pub serial_number: String,
 }
 
 impl SledDesc {

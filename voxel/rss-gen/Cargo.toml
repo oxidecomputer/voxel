@@ -19,6 +19,7 @@ edition = "2024"
 [dependencies]
 bootstrap-agent-lockstep-types = { path = "/opt/omicron/sled-agent/bootstrap-agent-lockstep-types" }
 sled-agent-types = { path = "/opt/omicron/sled-agent/types" }
+sled-hardware-types = { path = "/opt/omicron/sled-hardware/types" }
 omicron-common = { path = "/opt/omicron/common" }
 omicron-passwords = { path = "/opt/omicron/passwords" }
 oxnet = "0.1.4"

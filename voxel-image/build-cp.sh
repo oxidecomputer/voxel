@@ -85,7 +85,7 @@ cd "${OMICRON_SRC}"
 # never equal a Gimlet, so every sled shows "bootstrap address UNKNOWN". Patch it
 # to return a Gimlet (revision 2, matching the emulated SP VPD `0XV2:...:002:`) so
 # the two baseboards correlate. `populate_smbios` (voxel topo.rs) bakes manufacturer
-# `a4x2` + serial `BRM4422000{i}` so this path is taken and the strings match the
+# `a4x2` + serial `2FAKE00{i}` so this path is taken and the strings match the
 # SP. The checkout above resets the tree each build, so this re-applies every time.
 log "patching sled-hardware parse_smbios_output: Pc -> Gimlet baseboard"
 perl -pi -e 's/Some\(Baseboard::new_pc\(serial_number, product\)\)/Some(Baseboard::new_gimlet(serial_number, product, 2))/' \
