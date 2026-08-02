@@ -3,17 +3,11 @@
 //! sprockets keys).
 
 use anyhow::{anyhow, Context};
+use attest_mock::MockData;
 use libfalcon::{unit::gb, NodeRef, Runner, SmbiosType1Input};
 use std::fs;
 use std::path::{Path, PathBuf};
 use voxel_config::{SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig};
-
-/// Gimlet board-serial prefix. The SMBIOS serial ([`populate_smbios`]) and the
-/// faux-mgs lookup serial (`sp_cmd::sp_serial`) both build `{prefix}{index+1}`
-/// from this, so they can't drift; it BYTE-MATCHES the emulated SP's VPD. Swapping
-/// to a mfg-allocated serial is a coordinated edit here + sp-emu `build_vpd_eeprom`
-/// + the vendored sprockets `platform_id` (see the de-a4x2 handoff notes).
-pub(crate) const GIMLET_SERIAL_PREFIX: &str = "BRM4422000";
 
 pub(crate) struct Topo {
     pub(crate) runner: Runner,
@@ -56,23 +50,35 @@ fn ext_interface(d: &mut Runner, n: NodeRef) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SMBIOS type-1 for sled `index`. Manufacturer is `a4x2` — the ONLY string
-/// omicron's `sled-hardware` recognises to read identity from SMBIOS instead of
-/// falling back to the hostname. Serial `BRM4422000{index+1}` and revision `2`
-/// BYTE-MATCH the emulated SP's VPD (sp-emu builds `BRM4422000{(port-33300)/10}`,
-/// i.e. `index+1`, barcode rev `002`) and model `913-0000019`. Paired with the
-/// omicron `parse_smbios_output` Pc->Gimlet patch (applied in build-cp.sh),
-/// sled-agent then reports the SAME `Gimlet` baseboard the SP reports via MGS, so
+/// Fill in the SMBIOS type-1 for a given sled. The manufacturer must currently
+/// always be `a4x2` — the ONLY string omicron's `sled-hardware` recognises to
+/// read identity from SMBIOS instead of falling back to the hostname. We can change
+/// this in Omicron to allow more strings, such as "voxel" in the future.
+///
+/// We must ensure the reported SMBIOS info used to populate the `BaseboardId`
+/// in an emulated hardware environments matches what is reported by MGS for
+/// simulated and emulated SPs.
+///
+/// TODO: eliminate any need to patch as described below. This should come soon
+/// with the changes in https://github.com/oxidecomputer/omicron/pull/10518
+/// that remove a lot of the reliance on `Baseboard` and use `BaseboardId` more
+/// broadly instead.
+///
+///  Serial `2FAKE00{index+1}` and revision `2` BYTE-MATCH the emulated
+/// SP's VPD (sp-emu builds `2FAKE00{(port-33300)/10}`, i.e. `index+1`,
+/// barcode rev `002`) and model `913-0000019`. Paired with the omicron
+/// `parse_smbios_output` Pc->Gimlet patch (applied in build-cp.sh), sled-agent
+/// then reports the SAME `Gimlet` baseboard the SP reports via MGS, so
 /// wicketd's RACK SETUP correlates each sled's bootstrap address instead of
-/// showing UNKNOWN. (Without the patch sled-agent returns a `Pc` baseboard, which
-/// can never equal the SP's `Gimlet` in wicketd's lookup.)
-fn populate_smbios(d: &mut Runner, x: NodeRef, index: usize) {
+/// showing UNKNOWN. (Without the patch sled-agent returns a `Pc` baseboard,
+/// which can never equal the SP's `Gimlet` in wicketd's lookup.)
+fn populate_smbios(d: &mut Runner, x: NodeRef, sled: &SledDesc) {
     d.set_smbios_type1(
         x,
         SmbiosType1Input {
             manufacturer: "a4x2".to_string(),
-            product_name: "913-0000019".to_string(),
-            serial_number: format!("{GIMLET_SERIAL_PREFIX}{}", index + 1),
+            product_name: sled.part_number.clone(),
+            serial_number: sled.serial_number.clone(),
             version: 2,
         },
     );
@@ -167,7 +173,7 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
 
     // SMBIOS + cargo-bay mounts.
     for (s, n) in &sleds {
-        populate_smbios(&mut d, *n, s.index);
+        populate_smbios(&mut d, *n, s);
         d.mount(format!("{CARGO_BAY}/{}", s.name), "/opt/cargo-bay", *n)
             .map_err(|e| anyhow!("mount {}: {e}", s.name))?;
     }
@@ -528,14 +534,17 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
     // is shared by the log and the corim's fake-sp entry; the fwid digest differs.
     const SP_DIGEST: &str = "be4df4e085175f3de0c8ac4837e1c2c9a34e8983209dac6b549e94154f7cdd9c";
     const FWID_DIGEST: &str = "72fa8f8ea84a42251031366002cbb36281d0131f78cd680436116a720cdd9de5";
-    let attest_log = attest_mock::log::mock(attest_mock::log::Document {
+    let attest_log = attest_mock::MockLog::from_document(attest_mock::log::Document {
         measurements: vec![attest_mock::log::Measurement {
             algorithm: "sha3-256".into(),
             digest: SP_DIGEST.into(),
         }],
     })
-    .map_err(|e| anyhow!("attest log: {e}"))?;
-    let corim = attest_mock::corim::mock(attest_mock::corim::Document {
+    .map_err(|e| anyhow!("attest log: {e}"))?
+    .to_bytes()
+    .map_err(|e| anyhow!("attest log serialization failed: {e}"))?;
+
+    let corim = attest_mock::MockCorim::from_document(attest_mock::corim::Document {
         vendor: "Test Bed".into(),
         tag_id: "test-v0.0.99999".into(),
         id: "corim-test-v0.0.99999".into(),
@@ -552,7 +561,9 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
             },
         ],
     })
-    .map_err(|e| anyhow!("corim: {e}"))?;
+    .map_err(|e| anyhow!("corim: {e}"))?
+    .to_bytes()
+    .map_err(|e| anyhow!("corim serialization failed: {e}"))?;
 
     // Distribute each sled's own identity index into its cargo-bay.
     for s in &sleds {

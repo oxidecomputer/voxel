@@ -14,13 +14,13 @@ use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use voxel_config::sp::{Sp, SpBackend, SpFleet, SpRole, PORT_STRIDE, SP_PORT_BASE};
-use voxel_config::VoxelConfig;
+use voxel_config::{VoxelConfig, SLED_SERIAL_PREFIX};
 
 use crate::access::resolve_switch;
 use crate::net::{
     node_external_ip, scp_from, scp_to, ssh_capture, ssh_output, zlogin, SWITCH_ZONE_ROOT,
 };
-use crate::topo::{build_topo, Topo, GIMLET_SERIAL_PREFIX};
+use crate::topo::{build_topo, Topo};
 use crate::util::shell_quote;
 use crate::SpCmd;
 
@@ -122,7 +122,7 @@ fn switch_fleet(
 }
 
 /// The MGS loopback port for an SP target. Accepts (in order): a node selector
-/// (`sidecar` | `g0` | `g1` ...), a board serial (e.g. `BRM44220001`), or a raw
+/// (`sidecar` | `g0` | `g1` ...), a board serial (e.g. `2FAKE001`), or a raw
 /// sim address (`[::1]:33310` | `33310`).
 fn resolve_port(fleet: &SpFleet, target: &str) -> anyhow::Result<u16> {
     if let Some(sp) = fleet.sps.iter().find(|sp| sp.selector() == target) {
@@ -139,20 +139,20 @@ fn resolve_port(fleet: &SpFleet, target: &str) -> anyhow::Result<u16> {
         return Ok(p);
     }
     Err(anyhow!(
-        "unknown SP target {target:?}: expected a serial (e.g. BRM44220001), a node \
+        "unknown SP target {target:?}: expected a serial (e.g. 2FAKE001), a node \
          (sidecar | g0 | g1 ...), or a sim addr ([::1]:33310 | 33310)"
     ))
 }
 
 /// The board serial an emu SP reports, mirroring sp-emu's `build_vpd_eeprom`:
-/// the sidecar is fixed; gimlets are port-derived `BRM4422000<idx>` where
+/// the sidecar is fixed; gimlets are port-derived `2FAKE00<idx>` where
 /// idx = (base_port - 33300) / 10.
 fn sp_serial(sp: &Sp) -> String {
     match sp.role {
-        SpRole::Sidecar => "BRM42220001".to_string(),
+        SpRole::Sidecar => "FAKE-SWITCH".to_string(),
         SpRole::Gimlet(_) => {
             format!(
-                "{GIMLET_SERIAL_PREFIX}{}",
+                "{SLED_SERIAL_PREFIX}{}",
                 (sp.base_port - SP_PORT_BASE) / PORT_STRIDE
             )
         }
