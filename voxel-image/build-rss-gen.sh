@@ -53,8 +53,10 @@ fi
 
 # Detect which service-pool layout this era defines: omicron#10941 takes named
 # `service_ip_pools` (ServiceIpPoolConfig) at RSS in place of the bare
-# `internal_services_ip_pool_ranges` range list.
-if grep -rq "struct ServiceIpPoolConfig" \
+# `internal_services_ip_pool_ranges` range list. Match the bare name, not
+# `struct ServiceIpPoolConfig`: omicron#10956 moved the definition to
+# wicketd-commission-types and left only a re-export here.
+if grep -rq "ServiceIpPoolConfig" \
     "${OMICRON_SRC}/sled-agent/bootstrap-agent-lockstep-types" 2>/dev/null; then
     export VOXEL_HAS_SERVICE_IP_POOLS=1
     echo "[build-rss-gen] omicron takes named service_ip_pools -> has_service_ip_pools"

@@ -19,7 +19,7 @@
 //! (`address = "addrconf"`, `addr = "unnumbered"`), validated against live wicketd.
 
 use crate::net::{SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use libfalcon::{NodeRef, Runner};
 use slog::info;
 use std::path::Path;
@@ -106,11 +106,10 @@ fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, St
         .map(|a| toml_to_json(a.clone()))
         .unwrap_or_else(|| serde_json::json!({"allow": "any"}));
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "bootstrap_sleds": bootstrap_slots,
         "ntp_servers": arr("ntp_servers"),
         "dns_servers": arr("dns_servers"),
-        "internal_services_ip_pool_ranges": arr("internal_services_ip_pool_ranges"),
         "external_dns_ips": arr("external_dns_ips"),
         "external_dns_zone_name": v.get("external_dns_zone_name").and_then(|x| x.as_str()).unwrap_or(""),
         // Enable the fleet-wide jumbo-frames opt-in for voxel racks set up via
@@ -119,6 +118,26 @@ fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, St
         "allowed_source_ips": allowed_source_ips,
         "rack_network_config": rack_network_config,
     });
+
+    // Emit whichever pool key the pinned rss-gen rendered into config-rss:
+    // omicron#10941/#10956 replaced `internal_services_ip_pool_ranges` with
+    // named `service_ip_pools`, and wicketd of each era accepts only its own.
+    // A file with neither key would fail wicketd setup either way, so refuse
+    // it here with a pointer at the actual problem.
+    let obj = body.as_object_mut().unwrap();
+    if let Some(pools) = v.get("service_ip_pools") {
+        obj.insert("service_ip_pools".into(), toml_to_json(pools.clone()));
+    } else if let Some(ranges) = v.get("internal_services_ip_pool_ranges") {
+        obj.insert(
+            "internal_services_ip_pool_ranges".into(),
+            toml_to_json(ranges.clone()),
+        );
+    } else {
+        bail!(
+            "config-rss has neither service_ip_pools nor \
+             internal_services_ip_pool_ranges"
+        );
+    }
 
     let pw_hash = v
         .get("recovery_silo")

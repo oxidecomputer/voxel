@@ -693,7 +693,8 @@ pub struct Network {
     pub dns_servers: Vec<String>,
     /// IPv6 `/56`. Empty -> not emitted.
     pub rack_subnet: String,
-    /// `internal_services_ip_pool_ranges` (single range).
+    /// Service IP pool (single range). Renders as `service_ip_pools` or
+    /// `internal_services_ip_pool_ranges` per the pinned omicron era.
     pub service_pool_first: String,
     pub service_pool_last: String,
     pub bgp_asn: u32,
