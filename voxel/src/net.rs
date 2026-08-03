@@ -1,7 +1,7 @@
 //! Host-LAN networking: discover a node's external IPv4 and (re)point the host
 //! route at the rack's external network.
 
-use anyhow::anyhow;
+use anyhow::Context;
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
 use std::time::Duration;
@@ -24,6 +24,53 @@ pub(crate) fn zlogin(cmd: &str) -> String {
     format!("{ZLOGIN} {cmd}")
 }
 
+/// Bound on a serial-console IP resolution. The exec itself completes in a few
+/// seconds, so this only matters when the console is wedged, where callers
+/// should fail fast instead of hanging.
+pub(crate) const SERIAL_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Resolve a node's external IPv4 without entering the guest when possible.
+/// Isolated mode numbers every node deterministically
+/// ([`VoxelConfig::static_external_ips`]), so we return the staged address
+/// directly. The fallback, [`node_external_ip`], execs over the falcon serial
+/// console, which wedges permanently if a prior exec was cancelled mid-flight
+/// (see [`ssh_output`]). Prefer this resolver wherever the config and node
+/// name are in hand.
+///
+/// [`VoxelConfig::static_external_ips`]: voxel_config::VoxelConfig::static_external_ips
+pub(crate) async fn resolve_external_ip(
+    cfg: &voxel_config::VoxelConfig,
+    d: &Runner,
+    node: &str,
+    n: NodeRef,
+    is_router: bool,
+) -> anyhow::Result<String> {
+    if cfg.external.isolated()
+        && let Some((_, ip)) = cfg
+            .static_external_ips()
+            .into_iter()
+            .find(|(name, _)| name == node)
+    {
+        return Ok(ip);
+    }
+    node_external_ip(d, n, is_router).await
+}
+
+/// ce's stable nexthop, when one is known without touching the guest. An
+/// explicit `[topology].ce_external_ip` wins, otherwise isolated mode's static
+/// numbering supplies it.
+pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
+    if let Some(ip) = &cfg.topology.ce_external_ip {
+        return Some(ip.clone());
+    }
+    if !cfg.external.isolated() {
+        return None;
+    }
+    cfg.static_external_ips()
+        .into_iter()
+        .find_map(|(name, ip)| (name == "ce").then_some(ip))
+}
+
 /// A node's external (host-LAN) IPv4 - the address `voxel route` points at and
 /// `voxel host`/`tp` SSH to. Every node's only non-loopback IPv4 is its host-LAN
 /// DHCP lease (the underlay/cr links are IPv6), so we just take the first one.
@@ -38,10 +85,7 @@ pub(crate) async fn node_external_ip(
     } else {
         "ipadm show-addr -p -o addr 2>/dev/null"
     };
-    let raw = d
-        .exec(n, cmd)
-        .await
-        .map_err(|e| anyhow!("read external IP: {e}"))?;
+    let raw = d.exec(n, cmd).await.context("read external IP")?;
     let out = strip_ansi(&raw);
     out.split_whitespace()
         .filter_map(|t| t.split('/').next()) // drop any CIDR suffix
@@ -51,7 +95,7 @@ pub(crate) async fn node_external_ip(
                 && !t.starts_with("127.")
         })
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("no external IPv4 found (got {out:?})"))
+        .with_context(|| format!("no external IPv4 found (got {out:?})"))
 }
 
 /// Run `ssh root@<ip> <remote>` non-interactively and capture stdout, using the
@@ -89,7 +133,7 @@ const PASSWORD_AUTH_OPTS: &[&str] = &[
 
 /// Materialize the SSH_ASKPASS helper that supplies the rack's empty root password
 /// (a script that prints a blank line), returning its path. `None` if it can't be
-/// written / made executable. Shared by [`ssh_exec`] and [`scp_to`].
+/// written / made executable. Shared by `ssh_exec` and `scp_to`.
 fn ensure_askpass() -> Option<std::path::PathBuf> {
     let askpass = std::env::temp_dir().join("voxel-empty-askpass.sh");
     if !askpass.exists() {
@@ -128,8 +172,8 @@ pub(crate) fn ssh_output(ip: &str, remote: &str) -> Option<String> {
 }
 
 /// Run a non-interactive ssh command (empty root password via a forced
-/// SSH_ASKPASS) and return its raw [`Output`]. Shared by [`ssh_capture`] (gates
-/// on exit status) and [`ssh_output`] (keeps output regardless of status).
+/// SSH_ASKPASS) and return its raw `Output`. Shared by `ssh_capture` (gates
+/// on exit status) and `ssh_output` (keeps output regardless of status).
 fn ssh_exec(ip: &str, remote: &str) -> Option<std::process::Output> {
     // ssh needs a non-interactive way to supply the (empty) password: point
     // SSH_ASKPASS at a script that prints an empty line, and force its use.
@@ -298,9 +342,7 @@ pub(crate) async fn set_external_route(
     // lookup. Otherwise read ce's DHCP lease as before.
     let ip = match static_ip {
         Some(s) => s.to_string(),
-        None => node_external_ip(d, ce, true)
-            .await
-            .map_err(|e| anyhow!("ce: {e}"))?,
+        None => node_external_ip(d, ce, true).await.context("ce")?,
     };
 
     if !apply {
@@ -339,7 +381,7 @@ pub(crate) async fn set_external_route(
     let add = std::process::Command::new("route")
         .args(["add", prefix, &ip])
         .output()
-        .map_err(|e| anyhow!("route add: {e}"))?;
+        .context("route add")?;
     let resolves = std::process::Command::new("route")
         .args(["-n", "get", dest])
         .output()

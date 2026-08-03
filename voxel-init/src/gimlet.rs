@@ -1,12 +1,12 @@
-//! Gimlet (sled) bring-up - replaces `gimlet-launch.sh`. Runs in the voxel-cp
+//! Gimlet (sled) bring-up—replaces `gimlet-launch.sh`. Runs in the voxel-cp
 //! helios guest. The control plane is already installed (`/opt/oxide`); this
 //! applies the per-launch / topology bits that can't be baked: ephemeral virtual
 //! hardware, the detected underlay NICs, the generated sled + RSS configs, the
 //! switch1 identity for the 2nd scrimlet, then activates the control plane (which
 //! kicks RSS on the RSS node).
 
-use crate::sys::{note, run, run_quiet, warn};
-use anyhow::{anyhow, Context, Result};
+use crate::sys::{note, read_external_net, replace_in_file, run, run_env, run_quiet, warn};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -52,14 +52,11 @@ pub fn bring_up() -> Result<()> {
     // The omicron CLI tools are baked into the image at /opt/oxide/omicron, and
     // xtask/omicron-package run relative to that tree.
     if !Path::new(OMICRON).exists() {
-        return Err(anyhow!("{OMICRON} not baked into the image"));
+        bail!("{OMICRON} not baked into the image");
     }
-    std::env::set_var("XTASK_BIN", format!("{OMICRON}/xtask"));
-    std::env::set_var(
-        "XTASK_DOWNLOADER_BIN",
-        format!("{OMICRON}/xtask-downloader"),
-    );
     std::env::set_current_dir(OMICRON).with_context(|| format!("cd {OMICRON}"))?;
+    let xtask_bin = format!("{OMICRON}/xtask");
+    let xtask_dl = format!("{OMICRON}/xtask-downloader");
 
     let (underlay, other) = detect_underlay();
     patch_sled_config(&underlay)?;
@@ -70,7 +67,15 @@ pub fn bring_up() -> Result<()> {
     maybe_start_switch_enforcer()?;
 
     // Activate the (already-unpacked) control plane. On the RSS node this kicks RSS.
-    if !run("./omicron-package", &["activate"]) {
+    // omicron-package reads XTASK_BIN / XTASK_DOWNLOADER_BIN from the environment.
+    if !run_env(
+        "./omicron-package",
+        &["activate"],
+        &[
+            ("XTASK_BIN", &xtask_bin),
+            ("XTASK_DOWNLOADER_BIN", &xtask_dl),
+        ],
+    ) {
         warn("omicron-package activate failed");
     }
     note("gimlet bring-up complete");
@@ -92,7 +97,9 @@ fn setup_ssh() {
                 .open("/root/.ssh/authorized_keys")
             {
                 Ok(mut f) => {
-                    let _ = f.write_all(&keys);
+                    if let Err(e) = f.write_all(&keys) {
+                        warn(format!("authorized_keys: {e}"));
+                    }
                 }
                 Err(e) => warn(format!("authorized_keys: {e}")),
             }
@@ -110,29 +117,13 @@ fn setup_ssh() {
     run("svcadm", &["restart", "svc:/network/ssh:default"]);
 }
 
-fn replace_in_file(path: &str, subs: &[(&str, &str)]) {
-    let mut text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => {
-            warn(format!("read {path}: {e}"));
-            return;
-        }
-    };
-    for (from, to) in subs {
-        text = text.replace(from, to);
-    }
-    if let Err(e) = fs::write(path, text) {
-        warn(format!("write {path}: {e}"));
-    }
-}
-
 fn crash_dump() {
     run("zfs", &["create", "-p", "-V", "8G", "rpool/dump"]);
     run("dumpadm", &["-d", "/dev/zvol/dsk/rpool/dump"]);
 }
 
 /// Scrimlets load the baked SoftNPU sidecar P4 program. Gimlets have no softnpu
-/// device, so `scadm propolis load-program` would fail there - gate on sled_mode.
+/// device, so `scadm propolis load-program` would fail there—gate on sled_mode.
 fn maybe_load_sidecar() {
     let scrimlet = fs::read_to_string(SLED_CFG)
         .map(|s| s.contains(r#"sled_mode = "scrimlet""#))
@@ -151,7 +142,7 @@ fn maybe_load_sidecar() {
 
 /// The Oxide underlay is jumbo (MTU 9000). The guest vioif ordering is
 /// topology-dependent (scrimlet vs gimlet, sled count), so we can't hardcode
-/// names: probe `vioif0..7` - the ones that accept MTU 9000 are the underlay, the
+/// names: probe `vioif0..7`—the ones that accept MTU 9000 are the underlay, the
 /// rest are ext / host-LAN candidates.
 fn detect_underlay() -> (Vec<String>, Vec<String>) {
     let mut underlay = Vec::new();
@@ -176,7 +167,7 @@ fn detect_underlay() -> (Vec<String>, Vec<String>) {
 /// Patch this sled's config to the detected underlay links (the generated config
 /// ships placeholders), write the patched copy to /tmp, and seed the xtask
 /// WORKSPACE config (`smf/sled-agent/non-gimlet/config.toml`) that
-/// virtual-hardware reads. Uses `toml_edit` - no `sed`.
+/// virtual-hardware reads. Uses `toml_edit`—no `sed`.
 fn patch_sled_config(underlay: &[String]) -> Result<()> {
     let text = fs::read_to_string(SLED_CFG).with_context(|| format!("read {SLED_CFG}"))?;
     let mut doc: toml_edit::DocumentMut =
@@ -205,17 +196,73 @@ fn patch_sled_config(underlay: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// DHCP the non-underlay NICs that reach the host LAN - but never vioif0, the
-/// SoftNPU packet source the switch zone must claim (plumbing it in the GZ makes
-/// oxz_switch fail "interface used in the global zone").
+/// Bring up the non-underlay NICs that reach the host LAN—but never vioif0,
+/// the SoftNPU packet source the switch zone must claim (plumbing it in the GZ
+/// makes oxz_switch fail "interface used in the global zone").
+///
+/// Isolated mode (voxel-managed segment) stages a static address in
+/// `/opt/cargo-bay/ external-net`, applying it to the first non-vioif0 NIC and
+/// using the staged DNS list. `lan` mode falls back to DHCP + a hardcoded
+/// resolver.
 fn setup_external_networking(other: &[String]) {
+    if let Some(ext) = read_external_net() {
+        let resolv: String = ext
+            .dns
+            .iter()
+            .map(|s| format!("nameserver {s}\n"))
+            .collect();
+        if let Err(e) = fs::write("/etc/resolv.conf", resolv) {
+            warn(format!("resolv.conf: {e}"));
+        }
+
+        match other.iter().find(|ifc| ifc.as_str() != "vioif0") {
+            Some(ifc) => {
+                // Falcon keeps the sled disk across destroy/relaunch, so a
+                // prior launch's static address persists in /etc/ipadm/. `ipadm
+                // create-addr` refuses to add over an existing addrobj, so wipe
+                // any leftover /v4 addr before staging the current one. Silent
+                // on absence (first launch, or a manual pre-wipe).
+                run_quiet("ipadm", &["delete-addr", &format!("{ifc}/v4")]);
+                run(
+                    "ipadm",
+                    &[
+                        "create-addr",
+                        "-T",
+                        "static",
+                        "-a",
+                        &ext.ip_cidr,
+                        &format!("{ifc}/v4"),
+                    ],
+                );
+                // Persist the route (-p). voxel-init runs at launch, not at
+                // boot, so a plain `route add` is lost if the sled VM reboots
+                // mid-run while the static addr above survives via
+                // /etc/ipadm/.
+                //
+                // We clear prior persistent defaults first so that a relaunch
+                // (or a gateway change) does not stack or strand entries in
+                // /etc/inet/static_routes.
+                clear_persistent_defaults();
+                run("route", &["-p", "add", "default", &ext.gateway]);
+            }
+            None => warn("external-net staged but no external NIC candidate found"),
+        }
+        return;
+    }
     if let Err(e) = fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n") {
         warn(format!("resolv.conf: {e}"));
     }
+    // A prior isolated run's persistent default would otherwise sit alongside
+    // the DHCP default and can win out.
+    clear_persistent_defaults();
     for ifc in other {
         if ifc == "vioif0" {
             continue;
         }
+        // Wipe any leftover /v4 addrobj (same reason as the isolated branch:
+        // a prior isolated run's static address persists across relaunches
+        // and blocks the `-T dhcp` create). Silent on absence.
+        run_quiet("ipadm", &["delete-addr", &format!("{ifc}/v4")]);
         run(
             "ipadm",
             &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")],
@@ -223,16 +270,34 @@ fn setup_external_networking(other: &[String]) {
     }
 }
 
+/// Delete every persistent default route, not just the one via the current
+/// gateway. The sled disk survives destroy/relaunch, so a gateway change (or
+/// an isolated to lan switch) would otherwise strand a stale default in
+/// /etc/inet/static_routes pointing at a dead gateway.
+fn clear_persistent_defaults() {
+    let Ok(out) = Command::new("route").args(["-p", "show"]).output() else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // Lines look like: "persistent: route add default 172.30.199.199".
+        let mut toks = line.split_whitespace().skip_while(|t| *t != "default");
+        let (Some(_), Some(gw)) = (toks.next(), toks.next()) else {
+            continue;
+        };
+        run_quiet("route", &["-p", "delete", "default", gw]);
+    }
+}
+
 /// Ephemeral emulated U.2/M.2 (deliberately not baked). Wipe any vdevs from a
-/// prior launch first - falcon keeps the sled disk across destroy/relaunch, so
+/// prior launch first—falcon keeps the sled disk across destroy/relaunch, so
 /// stale vdevs carry the OLD rack's trust-quorum ledger + crucible/cockroach
 /// data; reusing them makes a fresh launch falsely report "initialized". A clean
 /// launch must start from fresh storage.
 fn setup_virtual_hardware() {
-    std::env::set_var("SOFTNPU_MODE", "propolis");
-    run("./xtask", &["virtual-hardware", "destroy"]);
+    let softnpu = [("SOFTNPU_MODE", "propolis")];
+    run_env("./xtask", &["virtual-hardware", "destroy"], &softnpu);
     wipe_vdevs();
-    if !run("./xtask", &["virtual-hardware", "create"]) {
+    if !run_env("./xtask", &["virtual-hardware", "create"], &softnpu) {
         warn("virtual-hardware create failed");
     }
 }
@@ -263,7 +328,7 @@ fn inject_runtime_configs() -> Result<()> {
     Ok(())
 }
 
-/// Force vioif0 (the SoftNPU pkt_source) unplumbed in the GZ - the switch zone
+/// Force vioif0 (the SoftNPU pkt_source) unplumbed in the GZ—the switch zone
 /// must claim it, but the softnpu fabric / DHCP keeps grabbing it. Harmless on
 /// gimlets (vioif0 unused there).
 fn unplumb_softnpu_source() {
@@ -297,7 +362,7 @@ const SIDECAR_SP_PORT: u16 = 33300;
 /// swaps them into the switch zone (+ bounces the services) as soon as it
 /// extracts. Detached into its own session with stdio to a log so it doesn't hold
 /// `voxel launch`'s exec pipe open. Runs on every scrimlet (slot from the staged
-/// filename) - but it's a no-op when the baked configs already match (see
+/// filename)—but it's a no-op when the baked configs already match (see
 /// `switch_enforcer`), so a matched-count launch behaves exactly as before.
 fn maybe_start_switch_enforcer() -> Result<()> {
     let Some(slot) = staged_switch_slot() else {
@@ -312,7 +377,7 @@ fn maybe_start_switch_enforcer() -> Result<()> {
         .stdout(log.try_clone()?)
         .stderr(log);
     // New session so it survives this exec returning (no SIGHUP) and so its own
-    // fds - not the launch pipe - are all that hold its stdio.
+    // fds—not the launch pipe—are all that hold its stdio.
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -328,18 +393,17 @@ fn maybe_start_switch_enforcer() -> Result<()> {
 }
 
 /// This node's switch slot, from the `mgs-config-switch{N}.toml` `stage_config`
-/// dropped into its cargo-bay - or `None` if it isn't a scrimlet.
+/// dropped into its cargo-bay—or `None` if it isn't a scrimlet.
 fn staged_switch_slot() -> Option<u8> {
     for entry in fs::read_dir(CARGO_BAY).ok()?.flatten() {
         let name = entry.file_name();
         let name = name.to_str()?;
-        if let Some(rest) = name.strip_prefix("mgs-config-switch") {
-            if let Some(slot) = rest
+        if let Some(rest) = name.strip_prefix("mgs-config-switch")
+            && let Some(slot) = rest
                 .strip_suffix(".toml")
                 .and_then(|d| d.parse::<u8>().ok())
-            {
-                return Some(slot);
-            }
+        {
+            return Some(slot);
         }
     }
     None
@@ -349,7 +413,7 @@ fn staged_switch_slot() -> Option<u8> {
 /// this scrimlet's launch-count MGS (switch{slot}) + sp-sim configs into the
 /// switch zone the moment it extracts, restarting each service, until the live
 /// files match what we staged. Uses content-equality so it's a **no-op when the
-/// baked configs already match the launch count** - only a true count/slot
+/// baked configs already match the launch count**—only a true count/slot
 /// mismatch triggers a swap + restart. Output -> /tmp/switch-enforcer.log.
 pub fn switch_enforcer(slot: u8) {
     let mgs_staged = format!("{CARGO_BAY}/mgs-config-switch{slot}.toml");
@@ -611,12 +675,14 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         s.push_str(&format!(
             "            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"
         ));
-        s.push_str(&format!("            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"));
+        s.push_str(&format!(
+            "            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"
+        ));
         s.push_str(&format!(
             "            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"
         ));
         // Point the SP at ITS OWN rot-serve (one RoT per SP): single-core SP +
-        // out-of-process RoT, live from boot through RSS - no two-core wedge.
+        // out-of-process RoT, live from boot through RSS—no two-core wedge.
         if rot {
             let rport = port - SP_EMU_ROT_PORT_OFFSET;
             s.push_str(&format!(
@@ -637,10 +703,10 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
     s
 }
 
-/// SMF-service entry point - the baked `svc:/oxide/voxel-switch-enforcer`, run on
+/// SMF-service entry point—the baked `svc:/oxide/voxel-switch-enforcer`, run on
 /// **every boot**. This is the reboot/restart-safe path: the one-shot detached
 /// enforcer (`maybe_start_switch_enforcer`) is lost if the sled is restarted or
-/// its process is killed under load mid-bring-up - and then the scrimlet silently
+/// its process is killed under load mid-bring-up—and then the scrimlet silently
 /// reverts to the baked switch0, which wedges that rack's Nexus handoff
 /// ("switch-port qsfp0 not found"). As an SMF service, startd re-runs it at every
 /// boot and restarts it if it dies, so the slot identity can't be silently lost.

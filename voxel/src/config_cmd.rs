@@ -1,11 +1,11 @@
 //! `voxel config` - show / get / set / load the `voxel.toml`.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use std::fs;
 use std::path::Path;
-use voxel_config::{config as vcfg, VoxelConfig};
+use voxel_config::{VoxelConfig, config as vcfg};
 
-use crate::{config_text, load_config, ConfigCmd};
+use crate::{ConfigCmd, config_text, load_config};
 
 pub(crate) fn cmd_config(path: &Path, cmd: &ConfigCmd) -> anyhow::Result<()> {
     match cmd {
@@ -43,10 +43,10 @@ pub(crate) fn cmd_config(path: &Path, cmd: &ConfigCmd) -> anyhow::Result<()> {
 /// Create the config file's parent directory if needed - the default lives at
 /// `~/.config/voxel/voxel.toml`, whose directory may not exist on a fresh box.
 fn ensure_parent_dir(path: &Path) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        }
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     Ok(())
 }

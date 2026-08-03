@@ -4,8 +4,7 @@
 rack deployments on a single Helios host.
 
 Voxel emulates an Oxide rack's control plane;
-[omicron](https://github.com/oxidecomputer/omicron) software on
-[falcon](https://github.com/oxidecomputer/falcon)-managed propolis VMs, with
+[omicron] software on [falcon]-managed propolis VMs, with
 SoftNPU switches and FRR routers. Pick a platform version and a topology
 (sled count, multi-rack, BGP/static) and launch. It succeeds the `a4x2`
 testbed topology, reworked around a first-class CLI and on-the-fly config
@@ -17,9 +16,9 @@ generation.
   - **`voxel/rss-gen/`**: typed, release-pinned `config-rss.toml` generator, built
     against the image's omicron source (path dependency).
 - **`voxel-config/`**: the `VoxelConfig` model (`voxel.toml`) and all per-topology
-  config generation (sled-agent, RSS, FRR, MGS/SP-sim). 
+  config generation (sled-agent, RSS, FRR, MGS/SP-sim).
 - **`voxel-init/`**: the in-guest bring-up agent baked into the images (gimlet/router
-  roles). 
+  roles).
 - **`voxel-image/`**: image build machinery (`voxel image create`) and the install
   scripts that bake a control-plane image from an omicron commit.
 
@@ -54,15 +53,86 @@ voxel config set image.frr voxel-frr-proto
 A few notes: by default, this will all happen under $HOME. If you don't like that or need
 to improve performance by using a separate disk, there are some knobs set via `voxel config set`:
 
-* falcon.dataset: Location for built control plane snapshots
-* falcon.build_root: Location where omicron will clone and compile for new images
+* falcon.dataset: Location for built control plane snapshots, exported as
+  `FALCON_DATASET`, with images and topo zvols under `<ds>/img/...`
+* falcon.build_root: Location where omicron will clone and compile for new images,
+  exported as `BUILD_ROOT`, holding the omicron checkout and the rss-gen build
 * falcon.workdir: Location where voxel will do its configuration and setup for new launches
 
-## OPTIONAL, Emulated SPs and RoTs (sp-emu)
+## Isolated external network (optional)
+
+By default (`[external] mode = "lan"`), every node's external NIC lands on the
+host's default-route interface (or `$EXT_INTERFACE`) and leases an address from
+whatever DHCP serves the network that link attaches to. That is option 1 ("an
+existing IPv4 network") of omicron's [how-to-run external networking].
+On a host without such a network, voxel can instead build the whole external
+segment itself, option 2 ("an external network that only exists on your test
+machine") of the same doc, which a4x2 required the user to plumb by hand.
+
+```
+voxel config set external.mode isolated
+voxel config set external.uplink igb0   # physical NAT uplink for the segment
+```
+
+`launch` (and `image create`) then stand up the segment with an
+etherstub (`voxel_ext_stub0`, capped at `[external].mtu`, which defaults to 1500
+like a physical external network so that voxel-init's jumbo probe classifies the
+nodes' external NICs correctly), a host VNIC `voxel_ext0` holding the gateway
+address (`[external].host_ip`, default `172.30.199.199`), and IPv4 forwarding
+plus an ipnat rule out `uplink`.
+Node addresses are static because voxel numbers every sled and router
+deterministically from `[external].ip_start` (default `172.30.199.10`) and stages
+`<addr>/<prefix>` + gateway + DNS into that node's cargo-bay (`external-net`).
+
+The in-guest agent (`voxel-init`) applies the staged address on both sleds and
+routers. No DHCP server runs on the segment. The nodes' addresses stay in use
+after bring-up (RSS progress is polled over SSH to them, each router NATs rack
+egress out its own external address, and the host route to each rack points at
+the customer-edge router, `ce`), which is why the segment must exist before
+boot.
+
+Operator commands (the same code paths launch uses):
+
+```
+voxel network external up      # stand the segment up (--dry-run to preview)
+voxel network external check   # PASS/FAIL per item (uplink, links, NAT)
+voxel network external down    # remove VNIC + etherstub
+```
+
+Notes:
+- `down` leaves the ipnat rule and ipv4-forwarding in place: ipnat has no
+  single-rule delete, and flushing would drop unrelated rules.
+- Unlike the how-to-run recipe, voxel never persists the NAT rules to
+  `/etc/ipf/ipnat.conf`: they are loaded at runtime only, so voxel doesn't
+  own a shared system file. They don't survive a reboot, and the next
+  `launch` (or `up`) reloads them.
+- `[external].mtu` must stay below 9000: voxel-init classifies a sled NIC as
+  underlay iff it accepts mtu=9000, so the external link has to reject jumbo
+  for classification to work. Isolated mode needs the explicit cap because an
+  etherstub comes up at MTU 9000, the same as the underlay links; `lan` mode
+  inherits a sub-9000 MTU from the physical link for free (launch still
+  refuses a >=9000 external link). Raising the mtu (e.g. to 8900) exercises
+  jumbo external ingress, which only matters for external-to-external
+  forwarding through the switch, whereas guest delivery is capped by the VPC MTU
+  regardless.
+- If you set `[topology].ce_external_ip`, keep it outside the static node
+  range (sleds count up from `ip_start`, then routers in `topology.routers`
+  order).
+- The manually-run `build-frr.sh` doesn't read the config, so on an isolated
+  box export `EXT_INTERFACE=voxel_ext_stub0` and
+  `VOXEL_BUILDER_NET="172.30.199.198/24 172.30.199.199"` (the builder gets
+  `host_ip - 1`) when baking the FRR image. Export `FALCON_DATASET` to match
+  `falcon.dataset` for the same reason; otherwise, the bake registers the image
+  under falcon's default dataset, `launch` keeps using the old one, and
+  nothing reports an error.
+- A manually plumbed fake network (`fake_external0` etc.) can coexist because
+  voxel's link names are distinct, and `$EXT_INTERFACE` always wins.
+
+## Emulated SPs and RoTs (sp-emu, optional)
 
 By default voxel backs each SP with omicron's `sp-sim`. To run real SP and RoT
-firmware, voxel uses [sp-emu](https://github.com/oxidecomputer/sp-emu), which boots
-unmodified Hubris on emulated STM32H7 and LPC55 cores. sp-emu is a separate binary
+firmware, voxel uses [sp-emu], which boots unmodified Hubris on emulated
+STM32H7 and LPC55 cores. sp-emu is a separate binary
 run inside the switch zone, not a Cargo dependency, so build it and point voxel at it.
 
 1. Build sp-emu:
@@ -94,3 +164,13 @@ run inside the switch zone, not a Cargo dependency, so build it and point voxel 
 
    `--wicket-setup` runs rack setup through wicketd instead of the file-based
    sled-agent auto-init.
+
+When you build a cp image, voxel bakes the sp-emu binary and per-role firmware into
+the image from `[sp]`, so a launched rack is self-contained and `emu_bin` can be
+left unset at launch. Setting `emu_bin` at launch stages it on the fly instead,
+which is useful for iterating on sp-emu without rebaking.
+
+[omicron]: https://github.com/oxidecomputer/omicron
+[falcon]: https://github.com/oxidecomputer/falcon
+[how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
+[sp-emu]: https://github.com/oxidecomputer/sp-emu

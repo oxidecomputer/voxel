@@ -18,8 +18,8 @@
 //! form -- the one fiddly bit is the flat-string serializations
 //! (`address = "addrconf"`, `addr = "unnumbered"`), validated against live wicketd.
 
-use crate::net::{node_external_ip, scp_to, ssh_capture, zlogin, SWITCH_ZONE_ROOT};
-use anyhow::{anyhow, Context, Result};
+use crate::net::{SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin};
+use anyhow::{Context, Result, anyhow};
 use libfalcon::{NodeRef, Runner};
 use slog::info;
 use std::path::Path;
@@ -286,18 +286,41 @@ fn wait_wicketd_ready(ip: &str, num_sleds: usize, log: &slog::Logger) -> Result<
     }
 }
 
+/// The per-rack inputs `drive` needs (distinct from the ambient config and
+/// falcon runner).
+pub(crate) struct RackSetup<'a> {
+    /// The scrimlet whose switch zone hosts wicketd.
+    pub scrimlet: NodeRef,
+    pub scrimlet_name: &'a str,
+    /// Global cubby slots of this rack's sleds, reported by wicketd as
+    /// `bootstrap_sleds`.
+    pub bootstrap_slots: &'a [u16],
+    /// The `config-rss.toml` to reshape into the wicketd config body. Generated
+    /// outside the cargo-bay so voxel-init cannot auto-init from it.
+    pub config_rss_path: &'a Path,
+    /// External DNS zone, the common name of the self-signed cert.
+    pub zone: &'a str,
+    /// Log prefix identifying the rack.
+    pub tag: &'a str,
+}
+
 /// Drive the full wicketd setup for one rack, then return so the caller can
 /// `watch_rss` the wicketd-triggered bring-up.
 pub(crate) async fn drive(
+    cfg: &voxel_config::VoxelConfig,
     d: &Runner,
-    scrimlet: NodeRef,
-    bootstrap_slots: &[u16],
-    config_rss_path: &Path,
-    zone: &str,
-    tag: &str,
+    rack: RackSetup<'_>,
 ) -> Result<()> {
+    let RackSetup {
+        scrimlet,
+        scrimlet_name,
+        bootstrap_slots,
+        config_rss_path,
+        zone,
+        tag,
+    } = rack;
     info!(d.log, "{tag}: driving rack setup through wicketd");
-    let ip = node_external_ip(d, scrimlet, false)
+    let ip = resolve_external_ip(cfg, d, scrimlet_name, scrimlet, false)
         .await
         .map_err(|e| anyhow!("find switch-zone scrimlet IP: {e}"))?;
     wait_wicketd_ready(&ip, bootstrap_slots.len(), &d.log)?;
@@ -326,7 +349,10 @@ pub(crate) async fn drive(
         if put_config == 204 {
             break;
         }
-        info!(d.log, "{tag}: PUT /rack-setup/config -> HTTP {put_config} (attempt {attempt}/{CONFIG_PUT_ATTEMPTS}); wicketd still settling, retrying in 6s");
+        info!(
+            d.log,
+            "{tag}: PUT /rack-setup/config -> HTTP {put_config} (attempt {attempt}/{CONFIG_PUT_ATTEMPTS}); wicketd still settling, retrying in 6s"
+        );
         std::thread::sleep(Duration::from_secs(6));
     }
     if put_config != 204 {

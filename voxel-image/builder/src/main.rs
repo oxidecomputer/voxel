@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use clap::Args;
 use libfalcon::{
-    cli::{run_with_extra, RunMode},
-    unit::gb,
     Runner,
+    cli::{RunMode, run_with_extra},
+    unit::gb,
 };
 use slog::info;
 

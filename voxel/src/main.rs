@@ -13,7 +13,7 @@
 //! startup that anchors voxel to its project root; the commands themselves live
 //! in the topic modules below.
 
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error};
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ use voxel_config::VoxelConfig;
 mod access;
 mod config_cmd;
 mod image;
+mod isolated_external;
 mod net;
 mod network;
 mod patch;
@@ -264,6 +265,30 @@ enum NetworkCmd {
         #[arg(long)]
         detail: bool,
     },
+    /// Manage the isolated ("fake") external segment (`[external] mode = "isolated"`).
+    External {
+        #[command(subcommand)]
+        cmd: ExternalCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExternalCmd {
+    /// Stand the segment up (the same path `launch` uses).
+    Up {
+        /// Print the host commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Tear the segment down (VNIC + etherstub ~ the ipnat rule and
+    /// ipv4-forwarding stay).
+    Down {
+        /// Print the host commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Assert the whole path is live (uplink, links, NAT); PASS/FAIL per item.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -412,10 +437,10 @@ enum SpCmd {
 enum HostCmd {
     /// List sleds and their external IPs.
     Ls,
-    /// SSH into a sled's global zone: `voxel host login g1`.
+    /// SSH into a sled's global zone or a router: `voxel host login g1`.
     Login {
         #[arg(default_value = "g0")]
-        sled: String,
+        node: String,
     },
     /// Run a command in a sled's global zone: `voxel host exec -c "svcs -x" g1`.
     Exec {
@@ -465,7 +490,7 @@ fn config_text(path: &Path) -> anyhow::Result<String> {
 
 fn load_config(path: &Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    VoxelConfig::from_toml(&text).map_err(|e| anyhow!("parse {}: {e}", path.display()))
+    VoxelConfig::from_toml(&text).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Make a path absolute against the current directory.
@@ -491,10 +516,10 @@ fn discover_config(explicit: Option<&Path>) -> PathBuf {
     let user = std::env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join(".config/voxel/voxel.toml"));
-    if let Some(cand) = &user {
-        if cand.is_file() {
-            return cand.clone();
-        }
+    if let Some(cand) = &user
+        && cand.is_file()
+    {
+        return cand.clone();
     }
     let etc = PathBuf::from("/etc/voxel/voxel.toml");
     if etc.is_file() {
@@ -517,7 +542,12 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .or_else(|| cfg.and_then(|c| c.falcon.dataset.clone()))
         .or_else(|| std::env::var("FALCON_DATASET").ok());
     if let Some(d) = dataset {
-        std::env::set_var("FALCON_DATASET", d);
+        // SAFETY: runs before the tokio runtime spawns any worker, while the
+        // process is still single-threaded, so no concurrent getenv (from
+        // Rust or C) can race the write.
+        unsafe {
+            std::env::set_var("FALCON_DATASET", d);
+        }
     }
     // Resolve the build root first (cli > config > env), since the rss-gen path is
     // derived from it below. Export it as-is; apply the default only for our derive.
@@ -528,7 +558,10 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .or_else(|| cfg.and_then(|c| c.falcon.build_root.clone()))
         .or_else(|| std::env::var("BUILD_ROOT").ok());
     if let Some(b) = &build_root {
-        std::env::set_var("BUILD_ROOT", b);
+        // SAFETY: same single-threaded argument as FALCON_DATASET above.
+        unsafe {
+            std::env::set_var("BUILD_ROOT", b);
+        }
     }
     let build_root_eff = build_root.unwrap_or_else(|| {
         format!(
@@ -550,7 +583,10 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
             })
         });
     if let Some(r) = rss {
-        std::env::set_var("VOXEL_RSS_GEN", r);
+        // SAFETY: same single-threaded argument as FALCON_DATASET above.
+        unsafe {
+            std::env::set_var("VOXEL_RSS_GEN", r);
+        }
     }
 }
 
@@ -567,11 +603,11 @@ fn anchor_workdir(cli: &Cli, cfg: Option<&VoxelConfig>, config_path: &Path) -> a
                 .map(PathBuf::from)
         })
         .or_else(|| config_path.parent().map(Path::to_path_buf));
-    if let Some(root) = root {
-        if root.is_dir() {
-            std::env::set_current_dir(&root)
-                .map_err(|e| anyhow!("chdir to workdir {}: {e}", root.display()))?;
-        }
+    if let Some(root) = root
+        && root.is_dir()
+    {
+        std::env::set_current_dir(&root)
+            .with_context(|| format!("chdir to workdir {}", root.display()))?;
     }
     Ok(())
 }
@@ -625,7 +661,11 @@ async fn main() -> Result<(), Error> {
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
             }
-            other => image::cmd_image(other, cfg.as_ref().map(|c| c.image.cp_image())),
+            other => image::cmd_image(
+                other,
+                cfg.as_ref().map(|c| c.image.cp_image()),
+                cfg.as_ref().map(|c| &c.external),
+            ),
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
@@ -651,6 +691,16 @@ async fn main() -> Result<(), Error> {
             NetworkCmd::Validate { detail } => {
                 network::validate(&load_config(&config_path)?, &cli.name, *detail).await
             }
+            NetworkCmd::External { cmd } => {
+                let cfg = load_config(&config_path)?;
+                match cmd {
+                    ExternalCmd::Up { dry_run } => isolated_external::up(&cfg.external, *dry_run),
+                    ExternalCmd::Down { dry_run } => {
+                        isolated_external::down(&cfg.external, *dry_run)
+                    }
+                    ExternalCmd::Check => isolated_external::check(&cfg.external),
+                }
+            }
         },
         Cmd::Rack { cmd } => match cmd {
             RackCmd::Patch {
@@ -663,11 +713,11 @@ async fn main() -> Result<(), Error> {
                     patch::list();
                     Ok(())
                 } else {
-                    let component = component.as_deref().ok_or_else(|| {
-                        anyhow!("missing component (try `voxel rack patch --list`)")
-                    })?;
-                    let reference = reference.as_deref().ok_or_else(|| {
-                        anyhow!("missing ref (usage: voxel rack patch {component} <ref>)")
+                    let component = component
+                        .as_deref()
+                        .context("missing component (try `voxel rack patch --list`)")?;
+                    let reference = reference.as_deref().with_context(|| {
+                        format!("missing ref (usage: voxel rack patch {component} <ref>)")
                     })?;
                     patch::cmd_rack_patch(
                         &load_config(&config_path)?,
@@ -683,8 +733,8 @@ async fn main() -> Result<(), Error> {
         Cmd::Sp { cmd } => sp_cmd::cmd_sp(&load_config(&config_path)?, &cli.name, cmd).await,
         Cmd::Host { cmd } => match cmd {
             HostCmd::Ls => access::cmd_host_ls(&load_config(&config_path)?, &cli.name).await,
-            HostCmd::Login { sled } => {
-                access::cmd_host_login(&load_config(&config_path)?, &cli.name, sled).await
+            HostCmd::Login { node } => {
+                access::cmd_host_login(&load_config(&config_path)?, &cli.name, node).await
             }
             HostCmd::Exec { command, sled } => {
                 access::cmd_host_exec(&load_config(&config_path)?, &cli.name, sled, command).await

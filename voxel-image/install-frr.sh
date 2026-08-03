@@ -15,7 +15,23 @@ READY_MARKER=/var/voxel-image-ready
 log() { echo "[install-frr] $*"; }
 
 # --- reach apt ----------------------------------------------------------------
-# falcon's default ext link gives the node a DHCP NIC; just make sure DNS works.
+# falcon's default ext link normally gives the node a DHCP NIC. Isolated mode
+# runs no DHCP server on the segment, so if VOXEL_BUILDER_NET was staged as
+# builder-net, apply "<cidr> <gw>" as a static address on the first ethernet
+# NIC instead.
+if [[ -f /opt/cargo-bay/builder-net ]]; then
+    read -r BUILDER_CIDR BUILDER_GW < /opt/cargo-bay/builder-net
+    BUILDER_IF="$(ip -o link 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}')"
+    log "static builder net: ${BUILDER_CIDR} via ${BUILDER_GW} on ${BUILDER_IF}"
+    ip link set "${BUILDER_IF}" up || true
+    ip addr add "${BUILDER_CIDR}" dev "${BUILDER_IF}" || true
+    ip route add default via "${BUILDER_GW}" || true
+fi
+# /etc/resolv.conf is a symlink to systemd-resolved's placeholder ("No DNS
+# servers known") in isolated mode—no DHCP populated systemd-networkd, so
+# the target file stays empty. Replace the symlink with a static file so our
+# nameserver line actually sticks for apt.
+rm -f /etc/resolv.conf
 echo 'nameserver 1.1.1.1' > /etc/resolv.conf
 log "waiting for DNS..."
 for _ in $(seq 1 15); do
@@ -29,7 +45,7 @@ systemctl disable --now apt-daily-upgrade.timer apt-daily.timer 2>/dev/null || t
 
 # --- install FRR (baked) ------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
-install_pkgs() { apt-get update -y && apt-get install -y frr frr-pythontools jq; }
+install_pkgs() { apt-get update -y && apt-get install -y frr frr-pythontools jq openssh-server; }
 n=0
 until install_pkgs; do
     n=$((n + 1))
@@ -51,6 +67,7 @@ EOF
 sysctl -p /etc/sysctl.d/99-voxel-frr.conf || true
 
 systemctl enable frr 2>/dev/null || true
+systemctl enable ssh 2>/dev/null || true
 
 # --- in-guest bring-up agent (replaces router-launch.sh) ----------------------
 # The static linux-musl voxel-init, staged into the builder cargo-bay by
@@ -64,6 +81,17 @@ if [[ -f /opt/cargo-bay/voxel-init ]]; then
 else
     log "FATAL: voxel-init not staged at /opt/cargo-bay/voxel-init"; exit 1
 fi
+
+# --- scrub the builder VM's identity ------------------------------------------
+# The builder may have leased its address over DHCP during this image build
+# (LAN mode). A dhclient.leases carried into the image makes every router
+# clone re-request the builder's old address at boot, conflicting with other
+# routers on the LAN. We wipe the lease DB and reset machine-id (an empty
+# file regenerates on first boot) so each clone builds a fresh DHCP identity.
+# Isolated mode doesn't DHCP, but the scrubbing is harmless there.
+rm -f /var/lib/dhcp/dhclient*.leases
+: > /etc/machine-id
+rm -f /var/lib/dbus/machine-id
 
 # --- mark ready ---------------------------------------------------------------
 sync

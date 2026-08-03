@@ -103,7 +103,9 @@ FALCON_DATASET=testbed/falcon CAPTURE_MODE=zfs VBUILD_DISK_GB=20 \
   takes a node name.
 - **Override the external NIC if DHCP fails.** A single-ext-link helios node exposes
   `vioif0`, which `install-cp.sh` auto-detects. Set `EXT_IF`/`EXT_INTERFACE` to
-  override.
+  override. On voxel's isolated segment (no DHCP), export
+  `VOXEL_BUILDER_NET="<cidr> <gw>"` and the installer applies it as a static
+  address instead.
 - **Capture avoids `falcon snapshot`.** That command re-snapshots `source@base`
   instead of creating `img/<name>@base` (`lib/src/cli.rs:498`; a one-line
   `source`/`dest` fix would enable it). Capture instead uses `zfs send/recv`

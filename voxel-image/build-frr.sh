@@ -9,11 +9,29 @@
 #
 # RUN ON THE HELIOS BOX. ~10 min (apt install + capture; no omicron build).
 #
+# On a box using voxel's isolated external segment (no LAN DHCP), export
+#   EXT_INTERFACE=voxel_ext_stub0
+#   VOXEL_BUILDER_NET="172.30.199.198/24 172.30.199.199"
+# before running (adjust for your [external] subnet/host_ip). build-image.sh
+# stages that as `builder-net` in the cargo-bay, and install-frr.sh applies it
+# as a static address on the builder VM in place of DHCP.
+#
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
 VERSION="${1:-${VOXEL_FRR_VERSION:-proto}}"
 IMAGE_NAME="${IMAGE_NAME:-voxel-frr-${VERSION}}"
+# falcon's own default is rpool/falcon, but voxel launches from whatever
+# `falcon.dataset` names it. Baking into the wrong one still succeeds and
+# registers an image that `launch` will never read. Therefore, we ask voxel
+# when the caller has not chosen.
+if [[ -z "${FALCON_DATASET:-}" ]]; then
+    for vx in voxel "${HERE}/../target/debug/voxel" "${HERE}/../target/release/voxel"; do
+        command -v "${vx}" >/dev/null 2>&1 || continue
+        FALCON_DATASET="$("${vx}" config get falcon.dataset 2>/dev/null | tr -d '"')"
+        [[ -n "${FALCON_DATASET}" ]] && break
+    done
+fi
 FALCON_DATASET="${FALCON_DATASET:-rpool/falcon}"
 CAPTURE_MODE="${CAPTURE_MODE:-zfs}"
 CARGO_BAY="${HERE}/cargo-bay/vbuild-frr"

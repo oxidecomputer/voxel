@@ -198,12 +198,12 @@ pub fn switch_config(slot: u8, fleet: &SpFleet, scrimlets: &[usize]) -> String {
         // Each simulated SP listens on per-switch ports; the trailing digit of
         // the port is the switch instance. Bump it on the address lines.
         let trimmed = rewritten.trim_start();
-        if trimmed.starts_with("addr =") || trimmed.starts_with("ereport-addr =") {
-            if let Some(close) = rewritten.rfind('"') {
-                if close >= 1 && rewritten.as_bytes()[close - 1].is_ascii_digit() {
-                    rewritten.replace_range(close - 1..close, &digit.to_string());
-                }
-            }
+        if (trimmed.starts_with("addr =") || trimmed.starts_with("ereport-addr ="))
+            && let Some(close) = rewritten.rfind('"')
+            && close >= 1
+            && rewritten.as_bytes()[close - 1].is_ascii_digit()
+        {
+            rewritten.replace_range(close - 1..close, &digit.to_string());
         }
         out.push_str(&rewritten);
         out.push('\n');

@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(g[0].base_port, 33340); // 33300 + 10*(3+1)
         assert_eq!(g[2].fake_interface, "fake-sled5");
         assert!(g[0].device_id_seed.ends_with("04")); // device_seed(3+1)
-                                                      // The SP slot (location) is the global index - rack 1 sits in cubbies 3,4,5.
+        // The SP slot (location) is the global index - rack 1 sits in cubbies 3,4,5.
         assert_eq!(
             g[0].mgs_location(),
             "{ switch0 = [\"sled\", 3], switch1 = [\"sled\", 3] }"

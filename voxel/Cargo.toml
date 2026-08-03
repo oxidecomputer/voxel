@@ -1,7 +1,7 @@
 [package]
 name = "voxel"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # The Voxel topology tool: launches an image-backed virtual rack and applies
 # on-the-fly generated config. libfalcon -> builds/runs on Helios only.
@@ -18,6 +18,7 @@ slog.workspace = true
 futures.workspace = true
 clap.workspace = true
 camino.workspace = true
+oxnet.workspace = true
 voxel-config = { path = "../voxel-config" }
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).

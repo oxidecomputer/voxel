@@ -1,17 +1,19 @@
 //! Rack lifecycle commands: launch, route, destroy, info, status.
 
-use anyhow::anyhow;
+use anyhow::{Context, bail};
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
 use std::collections::HashSet;
 use std::process::Command;
 use voxel_config::VoxelConfig;
 
+use crate::isolated_external::{link_mtu, up as external_up};
 use crate::net::{
-    node_external_ip, set_external_route, ssh_output, wait_external_reachable, zlogin,
+    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture, ssh_output,
+    wait_external_reachable, zlogin,
 };
 use crate::rss::watch_rss;
-use crate::topo::{build_topo, reset_node_cargo_bay, stage_config, stage_sprockets, Topo};
+use crate::topo::{Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets};
 
 /// A per-rack progress/label tag: `rackN` (1-based) when the deployment has more
 /// than one rack, else the single-rack fallback the caller passes ("rack",
@@ -26,9 +28,7 @@ fn rack_label(racks: usize, rack: usize, single: &str) -> String {
 
 pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let ce = topo
-        .node_ref("ce")
-        .ok_or_else(|| anyhow!("no ce router in topology"))?;
+    let ce = topo.node_ref("ce").context("no ce router in topology")?;
     // One host route per rack's external prefix - all racks egress via the shared ce.
     let racks = cfg.topology.racks();
     for rack in 0..racks {
@@ -38,7 +38,7 @@ pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> a
             ce,
             &prefix,
             !dry_run,
-            cfg.topology.ce_external_ip.as_deref(),
+            ce_static_ip(cfg).as_deref(),
         )
         .await?;
     }
@@ -75,12 +75,55 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
     let vmm = (guest as f64 * 1.2).ceil() as u64;
     const RESERVE_GB: u64 = 22; // kernel (~14G observed) + minimal ARC (~8G)
     if vmm + RESERVE_GB > phys {
-        return Err(anyhow!(
+        bail!(
             "topology needs ~{vmm} GB guest RAM (VMM) + ~{RESERVE_GB} GB kernel/ARC headroom, \
              but this box has {phys} GB. Lower topology.sled_memory_gb (now {}) or the sled count \
              (or set VOXEL_SKIP_MEM_PREFLIGHT=1 to override).",
             cfg.topology.sled_memory_gb
-        ));
+        );
+    }
+    Ok(())
+}
+
+/// The host's default-route interface via `route -n get default`, or `None`
+/// when there is no default route (falcon reports that on its own).
+fn default_route_iface() -> Option<String> {
+    let out = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface:"))
+        .map(|s| s.trim().to_string())
+}
+
+/// Refuse a `lan`-mode launch whose external link is jumbo. voxel-init classifies
+/// a sled NIC as underlay iff it accepts mtu=9000. Guest VNICs on a jumbo link
+/// all pass that probe, so the sleds' external NICs get misclassified as
+/// underlay and never come up. Anything below 9000 is fine. Best-effort: if
+/// the link or its MTU can't be read we skip and let falcon surface the
+/// problem.
+fn lan_mtu_preflight() -> anyhow::Result<()> {
+    let link = match std::env::var("EXT_INTERFACE") {
+        Ok(l) => l,
+        Err(_) => match default_route_iface() {
+            Some(l) => l,
+            None => return Ok(()),
+        },
+    };
+    if let Some(mtu) = link_mtu(&link)
+        && mtu.parse::<u32>().is_ok_and(|m| m >= 9000)
+    {
+        bail!(
+            "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
+             iff they accept mtu=9000, so external NICs on a jumbo link are \
+             misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
+             link or use isolated mode (voxel config set external.mode isolated)."
+        );
     }
     Ok(())
 }
@@ -133,7 +176,7 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
         let Some((n, sled)) = scrimlets.get(slot) else {
             continue;
         };
-        let ip = match node_external_ip(d, *n, false).await {
+        let ip = match resolve_external_ip(cfg, d, sled, *n, false).await {
             Ok(ip) => ip,
             Err(e) => {
                 warn!(
@@ -144,24 +187,59 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
                 continue;
             }
         };
-        // Create the front-port link and plumb its link-local. A re-run errors
-        // harmlessly ("already exists"); the addr create is guarded so it stays
-        // idempotent.
-        let cmd = format!(
-            "/opt/oxide/dendrite/bin/swadm link create -s 100G --fec none {port}; \
-             ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
-        );
-        match ssh_output(&ip, &zlogin(&cmd)) {
-            Some(_) => info!(
+        // Create + enable the link via the same path as `voxel network link-up`
+        // (`enable_link` checks the CREATE_OK/ENABLE_OK markers and errors on a
+        // dropped swadm call), retrying through the transient switch-zone exec
+        // flakiness. Then plumb the link-local DDM binds to and confirm it landed
+        // before declaring the port up. Runs at end of launch, so the switch is
+        // past its startup dendrite restart and these runtime links aren't wiped.
+        let mut ok = false;
+        for attempt in 1..=5 {
+            if let Err(e) = crate::network::enable_link(&ip, sled, &port, "100G", "none") {
+                warn!(
+                    d.log,
+                    "rack{}: interconnect {sled}:{port} attempt {attempt}/5: {e}",
+                    rack + 1
+                );
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                continue;
+            }
+            let _ = ssh_output(
+                &ip,
+                &zlogin(&format!(
+                    "ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
+                )),
+            );
+            let addr_present = ssh_capture(
+                &ip,
+                &zlogin(&format!(
+                    "ipadm show-addr -po addrobj | grep tfport{port}_0"
+                )),
+            )
+            .is_some();
+            if addr_present {
+                ok = true;
+                break;
+            }
+            warn!(
+                d.log,
+                "rack{}: interconnect {sled}:{port} attempt {attempt}/5: enabled but no link-local yet",
+                rack + 1
+            );
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        if ok {
+            info!(
                 d.log,
                 "rack{}: interconnect {sled}:{port} up (link-local)",
                 rack + 1
-            ),
-            None => warn!(
+            );
+        } else {
+            warn!(
                 d.log,
-                "rack{}: interconnect {sled}:{port}: switch-zone exec failed",
+                "rack{}: interconnect {sled}:{port}: did not come up after 5 tries",
                 rack + 1
-            ),
+            );
         }
     }
 }
@@ -182,10 +260,10 @@ pub(crate) async fn cmd_launch(
     let sleds = cfg.sleds();
     let racks = cfg.topology.racks();
     if cfg.topology.sleds < 3 {
-        return Err(anyhow!(
+        bail!(
             "each rack needs ≥3 sleds (Crucible 3x replication + Cockroach/trust-quorum quorum); got {} per rack",
             cfg.topology.sleds
-        ));
+        );
     }
     for rack in 0..racks {
         let scrimlets = sleds
@@ -193,9 +271,9 @@ pub(crate) async fn cmd_launch(
             .filter(|s| s.rack == rack && s.scrimlet)
             .count();
         if scrimlets != 2 {
-            return Err(anyhow!(
+            bail!(
                 "rack {rack} needs exactly 2 scrimlets for the dual-switch RSS->Nexus handoff; got {scrimlets}"
-            ));
+            );
         }
     }
     // Each scrimlet's SoftNPU front ports = fabric uplinks + cross-rack
@@ -211,11 +289,11 @@ pub(crate) async fn cmd_launch(
     for s in sleds.iter().filter(|s| s.scrimlet) {
         let front = n_cr + cfg.topology.interconnect_count_for(s.index);
         if front > MAX_FRONT_PORTS {
-            return Err(anyhow!(
+            bail!(
                 "scrimlet {} needs {front} SoftNPU front ports (> {MAX_FRONT_PORTS}); \
                  reduce racks or switches-per-rack",
                 s.name
-            ));
+            );
         }
     }
     // Fail fast if the configured images aren't built yet - a clear message
@@ -223,6 +301,14 @@ pub(crate) async fn cmd_launch(
     crate::image::ensure_image(&cfg.image.cp_image())?;
     crate::image::ensure_image(&cfg.image.frr_image())?;
     memory_preflight(cfg)?;
+    // The isolated external segment must exist before any node boots, as the
+    // nodes' static addresses (staged into each cargo-bay) stay in use after
+    // bring-up (RSS watch, router NAT, host route to ce).
+    if cfg.external.isolated() {
+        external_up(&cfg.external, false).context("bringing up the isolated external segment")?;
+    } else {
+        lan_mtu_preflight()?;
+    }
     reset_node_cargo_bay(cfg)?;
     stage_config(cfg, emu_sp, emu_rot, wicket_setup)?;
     stage_sprockets(cfg)?;
@@ -247,7 +333,7 @@ pub(crate) async fn cmd_launch(
                 topo = build_topo(cfg, name)?;
                 attempt += 1;
             }
-            Err(e) => return Err(anyhow!("launch failed after {attempt} attempts: {e}")),
+            Err(e) => bail!("launch failed after {attempt} attempts: {e}"),
         }
     }
 
@@ -304,9 +390,9 @@ pub(crate) async fn cmd_launch(
             // join racks into one AZ yet, so we stage it and stop here.
             if rack > 0 {
                 // RSS won't run here, so early networking never configures this
-                // rack's switch front ports. Bring up the interconnect ports by
-                // hand so the cross-rack DDM underlay has a live link on both ends.
-                bring_up_interconnect(d, &topo, cfg, rack).await;
+                // rack's switch front ports; its interconnect ports are brought up
+                // at the end of launch (see below), after the switch zone has
+                // settled past its startup dendrite restart.
                 info!(
                     d.log,
                     "rack{}: booted, left pre-RSS (unclaimed - multirack join not yet supported)",
@@ -335,9 +421,19 @@ pub(crate) async fn cmd_launch(
                         .filter(|(s, _)| s.rack == rack)
                         .map(|(s, _)| s.index as u16)
                         .collect();
-                    if let Err(e) =
-                        crate::wicket_setup::drive(d, *n, &slots, &config_rss, &net.dns_zone, &tag)
-                            .await
+                    if let Err(e) = crate::wicket_setup::drive(
+                        cfg,
+                        d,
+                        crate::wicket_setup::RackSetup {
+                            scrimlet: *n,
+                            scrimlet_name: &s.name,
+                            bootstrap_slots: &slots,
+                            config_rss_path: &config_rss,
+                            zone: &net.dns_zone,
+                            tag: &tag,
+                        },
+                    )
+                    .await
                     {
                         warn!(
                             d.log,
@@ -346,7 +442,15 @@ pub(crate) async fn cmd_launch(
                     }
                 }
                 let watch_cap = rss_watch_cap(emu_sp, racks);
-                watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap).await;
+                let known_ip = if cfg.external.isolated() {
+                    cfg.static_external_ips()
+                        .into_iter()
+                        .find(|(name, _)| name == &s.name)
+                        .map(|(_, ip)| ip)
+                } else {
+                    None
+                };
+                watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap, known_ip).await;
             }
         }
         info!(d.log, "launch complete");
@@ -359,6 +463,13 @@ pub(crate) async fn cmd_launch(
     // rack's path as the second rack joins).
     if let Some(ce) = topo.node_ref("ce") {
         for rack in 0..racks {
+            // Held racks (rack > 0) never run RSS, so they have no external
+            // services or DNS - there's nothing to route to or wait on, and the
+            // reachability probe would just burn its full timeout on a rack that
+            // never converges. Skip them (their interconnect comes up below).
+            if rack > 0 {
+                continue;
+            }
             let net = cfg.network.for_rack(rack);
             let label = rack_label(racks, rack, "rack");
             if let Err(e) = set_external_route(
@@ -366,19 +477,26 @@ pub(crate) async fn cmd_launch(
                 ce,
                 &net.infra_prefix,
                 !no_route,
-                cfg.topology.ce_external_ip.as_deref(),
+                ce_static_ip(cfg).as_deref(),
             )
             .await
             {
                 warn!(d.log, "{label} external route: {e}");
                 continue;
             }
-            if !no_route {
-                if let Some(dns_ip) = net.external_dns_ips.first() {
-                    wait_external_reachable(&d.log, dns_ip, &net.dns_zone, &label);
-                }
+            if !no_route && let Some(dns_ip) = net.external_dns_ips.first() {
+                wait_external_reachable(&d.log, dns_ip, &net.dns_zone, &label);
             }
         }
+    }
+
+    // Held racks (rack > 0) never run RSS, so early networking never configures
+    // their switch front ports. Bring up their cross-rack interconnect ports here,
+    // at the end of launch: by now the switch zones are past their startup dendrite
+    // restart (which would otherwise wipe these runtime `swadm` links) and off the
+    // zone-init load, so the create/enable/addr stick.
+    for rack in 1..racks {
+        bring_up_interconnect(d, &topo, cfg, rack).await;
     }
 
     // --emu-rot: nothing to attach here anymore. voxel-init stands up a shared
@@ -404,12 +522,11 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
     if let Ok(entries) = std::fs::read_dir(".falcon") {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("pid") {
-                if let Ok(s) = std::fs::read_to_string(&p) {
-                    if let Ok(pid) = s.trim().parse::<i32>() {
-                        tracked.insert(pid);
-                    }
-                }
+            if p.extension().and_then(|x| x.to_str()) == Some("pid")
+                && let Ok(s) = std::fs::read_to_string(&p)
+                && let Ok(pid) = s.trim().parse::<i32>()
+            {
+                tracked.insert(pid);
             }
         }
     }
@@ -478,13 +595,17 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        _ => result.map_err(|e| anyhow!("destroy: {e}")),
+        _ => result.context("destroy"),
     }
 }
 
 pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    teardown(&topo.runner, name)
+    teardown(&topo.runner, name)?;
+    // Isolated mode's segment stays up (per-host, reused by the next launch);
+    // node addresses are static and staged fresh at each launch, so there's
+    // nothing to reset on destroy.
+    Ok(())
 }
 
 pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
@@ -527,16 +648,25 @@ pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<
     let racks = cfg.topology.racks();
     let rss_nodes = topo.rss_sleds();
     if rss_nodes.is_empty() {
-        return Err(anyhow!("no RSS sled in topology"));
+        bail!("no RSS sled in topology");
     }
     let d = &topo.runner;
     // Multi-rack racks converge under each other's load - watch longer (matches
     // cmd_launch). Duration is Copy, so each watcher closure gets its own.
     let watch_cap = rss_watch_cap(false, racks);
+    let ips = if cfg.external.isolated() {
+        cfg.static_external_ips()
+    } else {
+        Vec::new()
+    };
     let watchers = rss_nodes.into_iter().map(|(s, n)| {
         let tag = rack_label(racks, s.rack, "rack-init");
         let addr = s.bootstrap_addr();
-        async move { watch_rss(d, *n, &addr, &tag, watch_cap).await }
+        let known_ip = ips
+            .iter()
+            .find(|(name, _)| name == &s.name)
+            .map(|(_, ip)| ip.clone());
+        async move { watch_rss(d, *n, &addr, &tag, watch_cap, known_ip).await }
     });
     futures::future::join_all(watchers).await;
     Ok(())

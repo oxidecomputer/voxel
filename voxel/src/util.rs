@@ -17,12 +17,12 @@ pub(crate) fn locate_script(env_var: &str, rel: &str) -> anyhow::Result<PathBuf>
     if let Ok(p) = std::env::var(env_var) {
         return Ok(PathBuf::from(p));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join(format!("../../voxel-image/{rel}"));
-            if cand.exists() {
-                return Ok(cand);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(format!("../../voxel-image/{rel}"));
+        if candidate.exists() {
+            return Ok(candidate);
         }
     }
     let cwd = PathBuf::from(format!("voxel-image/{rel}"));

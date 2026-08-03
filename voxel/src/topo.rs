@@ -2,9 +2,9 @@
 //! cargo-bay staging that feeds it (generated sled/RSS/FRR/switch1 config +
 //! sprockets keys).
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use attest_mock::MockData;
-use libfalcon::{unit::gb, NodeRef, Runner, SmbiosType1Input};
+use libfalcon::{NodeRef, Runner, SmbiosType1Input, unit::gb};
 use std::fs;
 use std::path::{Path, PathBuf};
 use voxel_config::{SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig};
@@ -40,9 +40,14 @@ impl Topo {
     }
 }
 
-fn ext_interface(d: &mut Runner, n: NodeRef) -> anyhow::Result<()> {
+/// Wire a node's external NIC. Precedence: `$EXT_INTERFACE` env, then the
+/// config-driven link (the voxel-managed stub in isolated mode), then falcon's
+/// default (the host's default-route interface).
+fn ext_interface(d: &mut Runner, n: NodeRef, cfg_link: Option<&str>) -> anyhow::Result<()> {
     if let Ok(ifx) = std::env::var("EXT_INTERFACE") {
         d.ext_link(&ifx, n);
+    } else if let Some(ifx) = cfg_link {
+        d.ext_link(ifx, n);
     } else {
         d.default_ext_link(n)
             .map_err(|e| anyhow!("failed to find default external interface: {e}"))?;
@@ -112,6 +117,13 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         routers.push((r.clone(), n));
     }
 
+    // Isolated mode wires every external NIC onto the voxel-managed etherstub
+    // instead of the host LAN ($EXT_INTERFACE still wins inside ext_interface).
+    let ext_if = cfg
+        .external
+        .isolated()
+        .then_some(crate::isolated_external::STUB);
+
     let all_scrimlets: Vec<NodeRef> = sleds
         .iter()
         .filter(|(s, _)| s.scrimlet)
@@ -126,7 +138,7 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         for (_, r) in &fabric_routers {
             d.link(ce, *r);
         }
-        ext_interface(&mut d, ce)?;
+        ext_interface(&mut d, ce, ext_if)?;
     }
 
     // SoftNPU fabric. Each sled links ONLY its own rack's scrimlets - the
@@ -148,13 +160,13 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
         {
             d.softnpu_link(sc, *n, Some(new_mac()), None);
         }
-        ext_interface(&mut d, *n)?;
+        ext_interface(&mut d, *n, ext_if)?;
     }
     for (_, n) in &fabric_routers {
         for sc in &all_scrimlets {
             d.softnpu_link(*sc, *n, Some(new_mac()), None);
         }
-        ext_interface(&mut d, *n)?;
+        ext_interface(&mut d, *n, ext_if)?;
     }
 
     // Cross-rack sidecar interconnects: a direct sidecar<->sidecar link per
@@ -222,7 +234,7 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
 /// to a hand-rolled renderer. Point `VOXEL_RSS_GEN` at the binary if it isn't
 /// at the default path.
 fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Result<()> {
-    let gen = std::env::var("VOXEL_RSS_GEN")
+    let rss_gen_bin = std::env::var("VOXEL_RSS_GEN")
         .unwrap_or_else(|_| "/opt/omicron/target/debug/voxel-rss-gen".to_string());
     let effective = dir.join("voxel-effective.toml");
     // Write the *resolved* config (derived scrimlets/rss_sleds made explicit) -
@@ -231,17 +243,19 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
     // request at least one peer"). rss-gen projects it to a single rack via
     // `--rack` (filters the bootstrap set + offsets the customer network).
     fs::write(&effective, cfg.to_resolved_toml())?;
-    let status = std::process::Command::new(&gen)
+    let status = std::process::Command::new(&rss_gen_bin)
         .arg("generate")
         .arg(&effective)
         .arg(dir.join("config-rss.toml"))
         .arg("--rack")
         .arg(rack.to_string())
         .status()
-        .map_err(|e| anyhow!("run {gen}: {e} - build voxel/rss-gen or set VOXEL_RSS_GEN"))?;
+        .map_err(|e| {
+            anyhow!("run {rss_gen_bin}: {e} - build voxel/rss-gen or set VOXEL_RSS_GEN")
+        })?;
     if !status.success() {
         return Err(anyhow!(
-            "{gen} generate failed. If the error above is a TOML 'unknown field', \
+            "{rss_gen_bin} generate failed. If the error above is a TOML 'unknown field', \
              voxel-rss-gen is STALE for the current voxel-config (it's built separately and \
              pins voxel-config at build time) - rebuild it: \
              `voxel-image/build-rss-gen.sh <omicron-src>`, or run `voxel image create <commit>` \
@@ -371,6 +385,45 @@ pub(crate) fn stage_config(
         let dir = cargo_bay("ce");
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("ce-external-ip"), ip)?;
+    }
+
+    // Isolated mode: no DHCP server; instead stage each node's assigned static
+    // address into its cargo-bay. voxel-init picks it up on both sled and router
+    // roles. The router role also needs the interface name (routers can't jumbo-
+    // probe their way to it the way sleds do); sleds self-classify.
+    if cfg.external.isolated() {
+        let prefix = cfg.external.prefix_length().ok_or_else(|| {
+            anyhow!(
+                "[external].subnet '{}' must be CIDR (a.b.c.d/len)",
+                cfg.external.subnet
+            )
+        })?;
+        let dns = cfg.external.dns.join(" ");
+        let router_names: std::collections::HashSet<&str> =
+            cfg.topology.routers.iter().map(String::as_str).collect();
+        let assignments = cfg.static_external_ips();
+        let expected = sleds.len() + cfg.topology.routers.len();
+        if assignments.len() != expected {
+            return Err(anyhow!(
+                "[external].subnet too small: only {} static addresses fit from ip_start '{}' \
+                 (need {}). Widen the subnet or lower the node count.",
+                assignments.len(),
+                cfg.external.ip_start,
+                expected
+            ));
+        }
+        for (node, ip) in assignments {
+            let dir = cargo_bay(&node);
+            fs::create_dir_all(&dir)?;
+            let mut body = format!(
+                "ip {ip}/{prefix}\ngateway {}\ndns {dns}\n",
+                cfg.external.host_ip
+            );
+            if router_names.contains(node.as_str()) {
+                body.push_str(&format!("iface {}\n", cfg.router_ext_iface(&node)));
+            }
+            fs::write(dir.join("external-net"), body)?;
+        }
     }
 
     // Bake-once, PER RACK: the image bakes switch0 + sp-sim for a FIXED gimlet
