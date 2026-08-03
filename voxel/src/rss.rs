@@ -212,20 +212,23 @@ pub(crate) async fn watch_rss(
                 }
             }
             "initialized" => {
-                // A real init returns the rack's id; a null id means the
-                // bootstrap-agent is reporting a stale/leftover "initialized"
-                // ledger (e.g. emulated vdevs not wiped on relaunch) - not a real
-                // bring-up. Don't celebrate it.
-                let id = json_str_field(&out, "id");
-                if id.is_empty() {
+                // `RackInitUuid` identifies the RSS run, not the rack; the rack
+                // uuid is Nexus-only. A null id is a stale "initialized" ledger,
+                // not a real bring-up.
+                let init_id = json_str_field(&out, "id");
+                if init_id.is_empty() {
                     warn!(
                         d.log,
-                        "{tag}: status=initialized but rack id is null - stale \
+                        "{tag}: status=initialized but init id is null - stale \
                          sled state, NOT a real init. Destroy and relaunch from clean \
                          storage (the emulated vdevs must be wiped)."
                     );
                 } else {
-                    info!(d.log, "{tag}: complete - rack initialized (rack {id})");
+                    info!(
+                        d.log,
+                        "{tag}: complete - rack initialized (RSS run {init_id}; \
+                         rack uuid via `omdb db rack list`)"
+                    );
                 }
                 break;
             }
