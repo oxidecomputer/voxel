@@ -1,0 +1,28 @@
+# Typed config-rss validator/generator. NOT a workspace member: it depends on
+# omicron's OWN config types, built against the IMAGE's omicron source (per
+# publish - see docs/voxel-roadmap.md). On the box that's a path dep to
+# /opt/omicron; for a real publish it'd be a git dep pinned to the image's rev.
+#
+# Build against the warm omicron target to avoid a cold dep compile:
+#   cd voxel/rss-gen
+#   CARGO_TARGET_DIR=/opt/omicron/target cargo build
+#   /opt/omicron/target/debug/voxel-rss-gen <config-rss.toml>   # validates
+[package]
+name = "voxel-rss-gen"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone: this crate is excluded from the testbed workspace and pulls its
+# omicron path deps from /opt/omicron, so it must be its own workspace root.
+[workspace]
+
+[dependencies]
+bootstrap-agent-lockstep-types = { path = "/opt/omicron/sled-agent/bootstrap-agent-lockstep-types" }
+sled-agent-types = { path = "/opt/omicron/sled-agent/types" }
+sled-hardware-types = { path = "/opt/omicron/sled-hardware/types" }
+omicron-common = { path = "/opt/omicron/common" }
+omicron-passwords = { path = "/opt/omicron/passwords" }
+oxnet = "0.1.4"
+toml = "0.8"
+anyhow = "1"
+voxel-config = { path = "../../voxel-config" }

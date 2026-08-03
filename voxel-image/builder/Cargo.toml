@@ -1,0 +1,15 @@
+[package]
+name = "voxel-image-builder"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "voxel-image-builder"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+libfalcon.workspace = true
+anyhow.workspace = true
+slog.workspace = true
+clap.workspace = true
