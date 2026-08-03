@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use voxel_config::VoxelConfig;
 
 mod access;
+mod commtest;
 mod config_cmd;
 mod image;
 mod isolated_external;
@@ -155,6 +156,47 @@ enum Cmd {
     Tp {
         #[command(subcommand)]
         cmd: TpCmd,
+    },
+    /// Build and run Omicron's commit-matched end-to-end connectivity test.
+    ///
+    /// Arguments after `--` are passed directly to commtest. If no command is
+    /// supplied, defaults to `run`; Voxel supplies the rack API and a test IP
+    /// pool unless those are explicitly overridden.
+    Commtest {
+        /// Omicron commit/tag to test, or `main` for the latest upstream.
+        /// Omit to use the commit encoded in the configured control-plane image.
+        #[arg(value_name = "COMMIT")]
+        reference: Option<String>,
+
+        /// Use an existing Omicron checkout without fetching or changing it.
+        #[arg(long, value_name = "PATH", conflicts_with = "reference")]
+        source: Option<PathBuf>,
+
+        /// Rack to target (1-based).
+        #[arg(long, default_value_t = 1)]
+        rack: usize,
+
+        /// Override the derived Nexus API URL.
+        #[arg(long, value_name = "URL")]
+        api: Option<String>,
+
+        /// Connectivity phase to run (`uni` and `multi` are accepted aliases).
+        #[arg(long, value_enum, default_value_t = commtest::Traffic::Unicast)]
+        traffic: commtest::Traffic,
+
+        /// Run an already-built commtest binary.
+        #[arg(long)]
+        no_build: bool,
+
+        /// Permit running with effective uid 0. Build artifacts and reports
+        /// under the build root become root-owned, which later unprivileged
+        /// runs may trip over.
+        #[arg(long)]
+        allow_root: bool,
+
+        /// Arguments passed to Omicron commtest (place them after `--`).
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -649,6 +691,32 @@ async fn main() -> Result<(), Error> {
         }
         Cmd::Info => rack::cmd_info(&load_config(&config_path)?, &cli.name),
         Cmd::Status => rack::cmd_status(&load_config(&config_path)?, &cli.name).await,
+        Cmd::Commtest {
+            reference,
+            source,
+            rack,
+            api,
+            traffic,
+            no_build,
+            allow_root,
+            args,
+        } => commtest::run(
+            &load_config(&config_path)?,
+            commtest::Options {
+                // clap rejects <COMMIT> together with --source (conflicts_with).
+                source: match (source.as_deref(), reference.as_deref()) {
+                    (Some(path), _) => commtest::Source::Local(path),
+                    (None, Some(r)) => commtest::Source::Reference(r),
+                    (None, None) => commtest::Source::Image,
+                },
+                rack: *rack,
+                api_override: api.as_deref(),
+                traffic: *traffic,
+                no_build: *no_build,
+                allow_root: *allow_root,
+                passthrough: args,
+            },
+        ),
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
             ImageCmd::Patch {

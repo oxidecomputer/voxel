@@ -59,6 +59,89 @@ to improve performance by using a separate disk, there are some knobs set via `v
   exported as `BUILD_ROOT`, holding the omicron checkout and the rss-gen build
 * falcon.workdir: Location where voxel will do its configuration and setup for new launches
 
+## Privileges
+
+Voxel commands need different privileges:
+
+- `voxel launch`, `voxel destroy`, and image builds run under `pfexec`. They
+  manage zfs datasets, data links, and zones, so they need full root.
+- `voxel network external ...` runs unprivileged. Voxel escalates each
+  mutating host command through `pfexec` itself, and `--dry-run` prints those
+  as `+ pfexec ...` lines.
+- `voxel commtest` runs as your login user, with the `net_icmpaccess`
+  privilege described below. It refuses effective uid 0 so a root run cannot
+  leave root-owned files in the build worktrees and reports. `--allow-root`
+  overrides that where a per-user grant is impractical, at the cost of
+  root-owned artifacts under the build root.
+
+## omicron commtest
+
+`voxel commtest` builds and runs omicron's `commtest` binary against a launched
+rack. The source is the omicron checkout matching the configured control-plane
+image, an explicit commit or tag, or the latest upstream `main`. Voxel derives
+the selected rack's Nexus API address and takes a test IP pool from the range
+directly above the configured service pool.
+
+```sh
+# Configured image's omicron commit (unicast is the default).
+voxel commtest
+
+# A specific commit (older unicast-only versions are supported).
+voxel commtest 43bb5af --traffic unicast
+
+# Latest origin/main.
+voxel commtest main --traffic unicast
+
+# Run both phases from a local multicast-capable checkout, unmodified.
+voxel commtest --source /oxide/workspace/omicron --traffic both
+
+# Pass commit-specific commtest arguments after `--` (the default multicast
+# group is 239.1.1.1 when no --mcast-group is supplied).
+voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
+  --test-duration 5m --mcast-group 239.10.0.1
+
+# Cleanup resources created by that commit's commtest.
+voxel commtest 43bb5af -- cleanup
+```
+
+`--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. Voxel
+detects whether the selected commit supports multicast and refuses the
+multicast modes on older, unicast-only versions. `--api URL` overrides the
+derived Nexus API address, and `--no-build` runs an existing
+`<omicron>/target/debug/commtest`.
+
+Voxel only injects the arguments commtest has no default for, so everything
+after `--` reaches it unchanged:
+
+- `--ip-pool-begin` and `--ip-pool-end` override the derived pool. Pass both.
+  Passing one alone is refused, because the half voxel derives would overlap
+  the service pool.
+- `--mcast-group` (repeatable, `GROUP[@SRC,...]`) replaces voxel's default group
+  of `239.1.1.1`. `--mcast-deny-group` on its own, the source-filter negative
+  test, also runs the multicast phase, so voxel adds no default group when it
+  is present.
+- `--test-duration`, `--warmup`, `--packet-rate`, and `--icmp-loss-tolerance`
+  keep commtest's defaults of `100s`, `0s`, `10`, and `0`.
+- `--api-timeout` (default `60m`) is a top-level argument, so it goes before
+  the `run` subcommand.
+
+commtest opens raw ICMP sockets, so it needs `net_icmpaccess` as an effective
+privilege. On a dedicated development system, an administrator can add it to a
+user's default privileges:
+
+```sh
+pfexec usermod -K defaultpriv=basic,net_icmpaccess "$USER"
+```
+
+Start a new login session afterward and confirm that `ppriv $$` lists
+`net_icmpaccess` in the effective set.
+
+Voxel keeps its omicron mirror under `$BUILD_ROOT/commtest` (or
+`~/voxel-builds/commtest`) and checks each commit out into a detached
+[Git worktree][Git worktrees], so the checkouts, Cargo output, and commtest
+reports stay owned by the invoking user. `--source` builds the given checkout
+in place, without fetching or changing its Git state.
+
 ## Isolated external network (optional)
 
 By default (`[external] mode = "lan"`), every node's external NIC lands on the
@@ -174,3 +257,4 @@ which is useful for iterating on sp-emu without rebaking.
 [falcon]: https://github.com/oxidecomputer/falcon
 [how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
 [sp-emu]: https://github.com/oxidecomputer/sp-emu
+[Git worktrees]: https://git-scm.com/docs/git-worktree
