@@ -54,19 +54,6 @@ log() { echo "[build-cp] $*"; }
 [[ "$(uname -s)" == "SunOS" ]] || { log "FATAL: run on the Helios box"; exit 1; }
 [[ -x "${VOXEL}" ]] || { log "FATAL: voxel binary not found at ${VOXEL} (set VOXEL=)"; exit 1; }
 
-# --- sp-emu config gate (fail early, before the ~11-min build) ----------------
-# If the emulated SP/RoT fleet is configured ([sp].emu_bin), faux_mgs is REQUIRED:
-# build-cp.sh bakes it into the image, and without it the rack has no MGS-readiness
-# gate or `voxel sp` operator commands, making the image useless. Fail now rather
-# than 11 minutes in (or baking a broken image).
-if [[ -n "$("${VOXEL}" config get sp.emu_bin 2>/dev/null)" \
-   && -z "$("${VOXEL}" config get sp.faux_mgs 2>/dev/null)" ]]; then
-    log "FATAL: using sp-emu ([sp].emu_bin set) but [sp].faux_mgs is not set."
-    log "         Set it first:  voxel config set sp.faux_mgs <path-to-faux-mgs>"
-    log "         (required for the MGS-readiness gate and 'voxel sp' operator commands)"
-    exit 1
-fi
-
 # --- 1. clone + checkout ------------------------------------------------------
 # SRC_ASIS=1 (`voxel image create --src`): build OMICRON_SRC in place, do NOT
 # clone or checkout - the dev's working-tree edits are what we build. The patches
@@ -157,39 +144,10 @@ log "building voxel-init (native illumos) for the gimlet image"
 cp "${HERE}/../target/release/voxel-init" "${CARGO_BAY}/voxel-init"
 chmod +x "${CARGO_BAY}/voxel-init"
 
-# --- 7c. stage the emulated SP/RoT fleet into the cargo-bay (de-a4x2 bake-in) --
-# Bake the sp-emu binary + per-role firmware flashes so a launched rack runs its
-# emulated SPs/RoTs self-contained - no sp-emu sources or [sp] image paths needed
-# on the box at launch. Reads the [sp] paths from voxel-config; skipped if
-# [sp].emu_bin is unset (the image then falls back to launch-time staging, the dev
-# path). install-cp.sh copies these to /opt/oxide/sp-emu; voxel-init's setup_sp_emu
-# stages them into oxz_switch at bring-up (staged cargo-bay copies still win, so a
-# dev [sp].emu_bin override needs no rebake). The gimlet flashes are identical (the
-# per-SP serial is set at runtime from the base port), so one baked gimlet.flash
-# serves every gimlet SP; 33300 -> sidecar.flash.
-cfgval() { "${VOXEL}" config get "$1" 2>/dev/null | sed 's/^"//; s/"$//' || true; }
-SP_EMU_BIN="$(cfgval sp.emu_bin)"
-if [[ -n "${SP_EMU_BIN}" && -x "${SP_EMU_BIN}" ]]; then
-    SP_OUT="${CARGO_BAY}/sp-emu"
-    log "staging sp-emu fleet -> ${SP_OUT} (from [sp] images)"
-    rm -rf "${SP_OUT}"; mkdir -p "${SP_OUT}"
-    cp "${SP_EMU_BIN}" "${SP_OUT}/sp-emu"; chmod +x "${SP_OUT}/sp-emu"
-    SP_FAUX="$(cfgval sp.faux_mgs)"
-    if [[ -n "${SP_FAUX}" && -f "${SP_FAUX}" ]]; then
-        cp "${SP_FAUX}" "${SP_OUT}/faux-mgs"; chmod +x "${SP_OUT}/faux-mgs"
-    fi
-    # Flash each per-role hubris image into a baked <role>.flash via sp-emu itself.
-    SP_GIMLET="$(cfgval sp.gimlet_image)"
-    SP_SIDECAR="$(cfgval sp.sidecar_image)"
-    [[ -n "${SP_GIMLET}" ]] && SP_EMU_FLASH="${SP_OUT}/gimlet.flash" "${SP_OUT}/sp-emu" flash a "${SP_GIMLET}"
-    [[ -n "${SP_SIDECAR}" ]] && SP_EMU_FLASH="${SP_OUT}/sidecar.flash" "${SP_OUT}/sp-emu" flash a "${SP_SIDECAR}"
-    # The oxide-rot-1 image (raw flash) for --emu-rot.
-    SP_ROT="$(cfgval sp.rot_image)"
-    [[ -n "${SP_ROT}" && -f "${SP_ROT}" ]] && cp "${SP_ROT}" "${SP_OUT}/rot.flash"
-    log "sp-emu fleet staged: $(ls "${SP_OUT}" | tr '\n' ' ')"
-else
-    log "no [sp].emu_bin configured; image relies on launch-time sp-emu staging"
-fi
+# NB: the sp-emu fleet is NOT baked here. Flashing hubris images is a runtime
+# concern: `voxel launch --emu-sp` stages + flashes the fleet per-scrimlet from
+# the [sp] config, so an image build needs no hubris / sp-emu checkouts on the
+# host. --emu-sp therefore REQUIRES [sp] config at launch (no baked fallback).
 
 # --- 8. bake the image --------------------------------------------------------
 log "baking ${IMAGE_NAME} via build-image.sh (CAPTURE_MODE=${CAPTURE_MODE})"
