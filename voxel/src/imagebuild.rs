@@ -78,6 +78,16 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 
     stage_builder_net(o.cargo_bay, o.builder_net)?;
 
+    // ★ The builder MUST NOT share a falcon workspace with a running rack.
+    // falcon keeps per-node pid/uuid files in `.falcon/` relative to the cwd,
+    // and tearing the builder down destroys that whole directory - so building
+    // an image from voxel's workdir would wipe a live rack's pid files, orphan
+    // its propolis processes, and leave its VNICs busy. build-image.sh avoided
+    // this by `cd`-ing to voxel-image/ first; do the same.
+    let workspace = repo_root()?.join("voxel-image");
+    std::env::set_current_dir(&workspace)
+        .with_context(|| format!("cd {}", workspace.display()))?;
+
     let mut d = Runner::new(o.deploy);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
     d.reserve(node, o.disk_gb as usize);
