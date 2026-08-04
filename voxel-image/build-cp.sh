@@ -32,7 +32,6 @@ OMICRON_REPO="${OMICRON_REPO:-https://github.com/oxidecomputer/omicron}"
 BUILD_ROOT="${BUILD_ROOT:-${HOME}/voxel-builds}"
 OMICRON_SRC="${OMICRON_SRC:-${BUILD_ROOT}/omicron-${COMMIT}}"
 FALCON_DATASET="${FALCON_DATASET:-rpool/falcon}"
-CAPTURE_MODE="${CAPTURE_MODE:-zfs}"
 IMAGE_VERSION="${IMAGE_VERSION:-${COMMIT}}"
 IMAGE_NAME="${IMAGE_NAME:-voxel-cp-${IMAGE_VERSION}}"
 GIMLETS="${GIMLETS:-4}"
@@ -150,11 +149,9 @@ chmod +x "${CARGO_BAY}/voxel-init"
 # host. --emu-sp therefore REQUIRES [sp] config at launch (no baked fallback).
 
 # --- 8. bake the image --------------------------------------------------------
-log "baking ${IMAGE_NAME} via build-image.sh (CAPTURE_MODE=${CAPTURE_MODE})"
-VERSION="${IMAGE_VERSION}" IMAGE_NAME="${IMAGE_NAME}" \
-    FALCON_DATASET="${FALCON_DATASET}" CAPTURE_MODE="${CAPTURE_MODE}" \
-    CARGO_BAY="${CARGO_BAY}" \
-    bash "${HERE}/build-image.sh"
+log "baking ${IMAGE_NAME} via voxel image bake"
+FALCON_DATASET="${FALCON_DATASET}" pfexec "${VOXEL}" image bake "${IMAGE_NAME}" \
+    --base helios-3.0 --role cp --cargo-bay "${CARGO_BAY}"
 
 # --- 9. commit-pinned voxel-rss-gen -------------------------------------------
 if [[ "${BUILD_RSS_GEN}" == "1" ]]; then

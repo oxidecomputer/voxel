@@ -3887,17 +3887,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "voxel-image-builder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libfalcon",
- "slog",
- "tokio",
-]
-
-[[package]]
 name = "voxel-init"
 version = "0.1.0"
 dependencies = [

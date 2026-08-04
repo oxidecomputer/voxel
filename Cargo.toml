@@ -2,7 +2,6 @@
 resolver = "2"
 
 members = [
-    "voxel-image/builder",
     "voxel-config",
     "voxel",
     "voxel-init",

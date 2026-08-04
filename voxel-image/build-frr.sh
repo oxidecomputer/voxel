@@ -33,7 +33,7 @@ if [[ -z "${FALCON_DATASET:-}" ]]; then
     done
 fi
 FALCON_DATASET="${FALCON_DATASET:-rpool/falcon}"
-CAPTURE_MODE="${CAPTURE_MODE:-zfs}"
+VOXEL="${VOXEL:-${HERE}/../target/debug/voxel}"
 CARGO_BAY="${HERE}/cargo-bay/vbuild-frr"
 TARGET="x86_64-unknown-linux-musl"
 
@@ -54,12 +54,10 @@ cp "${HERE}/../target/${TARGET}/release/voxel-init" "${CARGO_BAY}/voxel-init"
 chmod +x "${CARGO_BAY}/voxel-init"
 
 # --- 3. bake the image --------------------------------------------------------
-log "baking ${IMAGE_NAME} via build-image.sh (CAPTURE_MODE=${CAPTURE_MODE})"
-VERSION="${VERSION}" IMAGE_NAME="${IMAGE_NAME}" \
-    BASE_IMAGE="debian-13.2" INSTALL_SCRIPT="install-frr.sh" \
-    FALCON_DATASET="${FALCON_DATASET}" CAPTURE_MODE="${CAPTURE_MODE}" \
-    CARGO_BAY="${CARGO_BAY}" VBUILD_DISK_GB="20" \
-    bash "${HERE}/build-image.sh"
+log "baking ${IMAGE_NAME} via voxel image bake"
+[[ -x "${VOXEL}" ]] || { log "FATAL: voxel binary not found at ${VOXEL} (set VOXEL=)"; exit 1; }
+FALCON_DATASET="${FALCON_DATASET}" pfexec "${VOXEL}" image bake "${IMAGE_NAME}" \
+    --base debian-13.2 --role frr --cargo-bay "${CARGO_BAY}" --disk-gb 20
 
 log "done: ${IMAGE_NAME}"
 log "use it: voxel config set image.frr ${IMAGE_NAME} && voxel launch"

@@ -23,6 +23,7 @@ mod access;
 mod commtest;
 mod config_cmd;
 mod image;
+mod imagebuild;
 mod isolated_external;
 mod net;
 mod network;
@@ -274,6 +275,40 @@ enum ImageCmd {
         /// New image name (default: <src>-<component>-<shortref>).
         #[arg(long)]
         out: Option<String>,
+    },
+    /// (build helper) Bake an image: boot a one-node builder, run the in-guest
+    /// agent's install role, capture the disk. Used by build-cp.sh/build-frr.sh.
+    #[command(hide = true)]
+    Bake {
+        /// Registered image name (captured to `<dataset>/img/<name>@base`).
+        name: String,
+        /// Base image the builder boots.
+        #[arg(long, default_value = "helios-3.0")]
+        base: String,
+        /// Agent install role (`cp` | `frr`).
+        #[arg(long)]
+        role: Option<String>,
+        /// An in-guest command to run instead of an agent role
+        /// (boot-modify-capture, used by `image patch`). With neither, the
+        /// builder just boots, smoke-testing that the image comes up.
+        #[arg(long, conflicts_with = "role")]
+        exec: Option<String>,
+        /// Host dir mounted at `/opt/cargo-bay` in the guest.
+        #[arg(long, default_value = "./cargo-bay/vbuild")]
+        cargo_bay: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        cores: u8,
+        #[arg(long, default_value_t = 16)]
+        mem_gb: u64,
+        #[arg(long, default_value_t = 100)]
+        disk_gb: u64,
+        /// falcon deployment name for the builder topology.
+        #[arg(long, default_value = "voxel_build")]
+        deploy: String,
+        /// Host link the builder reaches the package repos through (default:
+        /// falcon's default external interface).
+        #[arg(long)]
+        ext_interface: Option<String>,
     },
     /// (build helper) Render the build-time smf configs (mgs-sim, sp-sim,
     /// sled-agent) into an omicron checkout. Used by build-cp.sh.
@@ -738,6 +773,35 @@ async fn main() -> Result<(), Error> {
                 let cfg = load_config(&config_path)?;
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
+            }
+            ImageCmd::Bake {
+                name,
+                base,
+                role,
+                exec,
+                cargo_bay,
+                cores,
+                mem_gb,
+                disk_gb,
+                deploy,
+                ext_interface,
+            } => {
+                let bay = cargo_bay.display().to_string();
+                let dataset = image::falcon_dataset();
+                imagebuild::bake(imagebuild::BakeOpts {
+                    base_image: base,
+                    role: role.as_deref(),
+                    exec: exec.as_deref(),
+                    cargo_bay: &bay,
+                    image_name: name,
+                    dataset: &dataset,
+                    deploy,
+                    disk_gb: *disk_gb,
+                    mem_gb: *mem_gb,
+                    cores: *cores,
+                    ext_interface: ext_interface.as_deref(),
+                })
+                .await
             }
             other => image::cmd_image(
                 other,

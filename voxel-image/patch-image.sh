@@ -101,17 +101,15 @@ cleanup() {
 trap cleanup EXIT
 
 log "boot-modify-capture: ${SRC_IMAGE} -> ${OUT_IMAGE} (${COMPONENT} @ ${REF})"
-VERSION="patch-${COMPONENT}-${REF}" \
-FALCON_DATASET="${FALCON_DATASET}" \
-BASE_IMAGE="${SRC_IMAGE}" \
-INSTALL_SCRIPT=".voxel-patch-place.sh" \
-IMAGE_NAME="${OUT_IMAGE}" \
-CAPTURE_MODE="zfs" \
-VOXEL_BUILD_NAME="voxel_patch" \
-CARGO_BAY="${STAGE}" \
-VBUILD_MEM_GB="${VBUILD_MEM_GB:-6}" \
-VBUILD_CORES="${VBUILD_CORES:-4}" \
-VBUILD_DISK_GB="${VBUILD_DISK_GB:-100}" \
-    bash "${HERE}/build-image.sh"
+VOXEL="${VOXEL:-${HERE}/../target/debug/voxel}"
+[[ -x "${VOXEL}" ]] || { log "FATAL: voxel binary not found at ${VOXEL} (set VOXEL=)"; exit 1; }
+FALCON_DATASET="${FALCON_DATASET}" pfexec "${VOXEL}" image bake "${OUT_IMAGE}" \
+    --base "${SRC_IMAGE}" \
+    --exec "cd /opt/cargo-bay && bash ./.voxel-patch-place.sh" \
+    --cargo-bay "${STAGE}" \
+    --deploy voxel_patch \
+    --mem-gb "${VBUILD_MEM_GB:-6}" \
+    --cores "${VBUILD_CORES:-4}" \
+    --disk-gb "${VBUILD_DISK_GB:-100}"
 
 log "done: ${FALCON_DATASET}/img/${OUT_IMAGE}@base  (use: voxel config set image.cp ${OUT_IMAGE})"
