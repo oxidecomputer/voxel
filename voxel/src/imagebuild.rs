@@ -41,6 +41,33 @@ pub(crate) struct BakeOpts<'a> {
     /// Host link the builder reaches the package repos through. `None` uses
     /// falcon's default external interface.
     pub ext_interface: Option<&'a str>,
+    /// `"<cidr> <gateway>"` for an isolated-mode build, staged as `builder-net`.
+    pub builder_net: Option<&'a str>,
+}
+
+/// Prepare the host side of an isolated-mode image build: stand the segment up
+/// and return `(ext_interface, builder_net)` for the builder.
+///
+/// The builder normally DHCPs an external NIC to reach the package repos. In
+/// isolated mode that network is the voxel-managed segment, which runs no DHCP,
+/// so the builder gets the stub plus a static address derived from `host_ip - 1`.
+/// Returns `(None, None)` in lan mode, where falcon's default link and DHCP work.
+pub(crate) fn isolated_builder(
+    external: Option<&voxel_config::External>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(x) = external.filter(|x| x.isolated()) else {
+        return Ok((None, None));
+    };
+    crate::isolated_external::up(x, false)
+        .context("bringing up the isolated external segment for the builder")?;
+    let net = x.builder_net().with_context(|| {
+        format!(
+            "cannot derive a usable isolated builder address below host_ip '{}' within \
+             subnet '{}'; choose a host_ip at least two addresses above the subnet network",
+            x.host_ip, x.subnet
+        )
+    })?;
+    Ok((Some(crate::isolated_external::STUB.to_string()), Some(net)))
 }
 
 /// Bring up the builder, install, quiesce, capture, tear down.
@@ -49,7 +76,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         bail!("cargo-bay {} not found", o.cargo_bay);
     }
 
-    stage_builder_net(o.cargo_bay)?;
+    stage_builder_net(o.cargo_bay, o.builder_net)?;
 
     let mut d = Runner::new(o.deploy);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
@@ -138,8 +165,13 @@ const FRR_TARGET: &str = "x86_64-unknown-linux-musl";
 /// host. That is unchanged from the script, but it is the remaining host
 /// dependency in the way of a fully self-contained `voxel` - a prebuilt agent
 /// embedded in the binary would close it.
-pub(crate) async fn create_frr(version: &str, dataset: &str) -> Result<()> {
+pub(crate) async fn create_frr(
+    version: &str,
+    dataset: &str,
+    external: Option<&voxel_config::External>,
+) -> Result<()> {
     let root = repo_root()?;
+    let (ext_if, builder_net) = isolated_builder(external)?;
     let image_name = format!("voxel-frr-{version}");
     let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-frr");
 
@@ -183,7 +215,8 @@ pub(crate) async fn create_frr(version: &str, dataset: &str) -> Result<()> {
         disk_gb: 20,
         mem_gb: 16,
         cores: 8,
-        ext_interface: None,
+        ext_interface: ext_if.as_deref(),
+        builder_net: builder_net.as_deref(),
     })
     .await?;
     println!("built image {image_name}");
@@ -194,7 +227,7 @@ pub(crate) async fn create_frr(version: &str, dataset: &str) -> Result<()> {
 /// falcon need it), which drops `~/.cargo/bin` from PATH - the shell scripts
 /// papered over this by prepending it. Prefer an explicit override, then the
 /// rustup install, then PATH.
-fn toolchain_bin(name: &str) -> std::path::PathBuf {
+pub(crate) fn toolchain_bin(name: &str) -> std::path::PathBuf {
     if let Ok(p) = std::env::var(name.to_uppercase()) {
         return std::path::PathBuf::from(p);
     }
@@ -212,7 +245,7 @@ fn toolchain_bin(name: &str) -> std::path::PathBuf {
 
 /// voxel's own source tree, derived the same way `locate_script` finds
 /// `voxel-image/`: next to the binary, else the cwd.
-fn repo_root() -> Result<std::path::PathBuf> {
+pub(crate) fn repo_root() -> Result<std::path::PathBuf> {
     if let Ok(root) = std::env::var("VOXEL_REPO_ROOT") {
         return Ok(std::path::PathBuf::from(root));
     }
@@ -239,10 +272,11 @@ fn repo_root() -> Result<std::path::PathBuf> {
 /// builds, and a leftover `builder-net` makes a later LAN build apply the
 /// isolated static address to its DHCP-serving VNIC, losing package and DNS
 /// access.
-fn stage_builder_net(cargo_bay: &str) -> Result<()> {
+fn stage_builder_net(cargo_bay: &str, explicit: Option<&str>) -> Result<()> {
     let path = Path::new(cargo_bay).join("builder-net");
-    match std::env::var("VOXEL_BUILDER_NET") {
-        Ok(net) if !net.trim().is_empty() => {
+    let from_env = std::env::var("VOXEL_BUILDER_NET").ok();
+    match explicit.map(str::to_string).or(from_env) {
+        Some(net) if !net.trim().is_empty() => {
             eprintln!("[voxel] staging builder-net ({net}) into {cargo_bay}");
             std::fs::write(&path, format!("{}\n", net.trim()))
                 .with_context(|| format!("write {}", path.display()))?;

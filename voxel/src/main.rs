@@ -22,6 +22,7 @@ use voxel_config::VoxelConfig;
 mod access;
 mod commtest;
 mod config_cmd;
+mod cpbuild;
 mod image;
 mod imagebuild;
 mod isolated_external;
@@ -780,8 +781,22 @@ async fn main() -> Result<(), Error> {
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
             }
+            ImageCmd::Create { commit, src } => {
+                cpbuild::create(
+                    commit.as_deref(),
+                    src.as_deref(),
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
+                )
+                .await
+            }
             ImageCmd::CreateFrr { version } => {
-                imagebuild::create_frr(version, &image::falcon_dataset()).await
+                imagebuild::create_frr(
+                    version,
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
+                )
+                .await
             }
             ImageCmd::Bake {
                 name,
@@ -809,14 +824,11 @@ async fn main() -> Result<(), Error> {
                     mem_gb: *mem_gb,
                     cores: *cores,
                     ext_interface: ext_interface.as_deref(),
+                    builder_net: None,
                 })
                 .await
             }
-            other => image::cmd_image(
-                other,
-                cfg.as_ref().map(|c| c.image.cp_image()),
-                cfg.as_ref().map(|c| &c.external),
-            ),
+            other => image::cmd_image(other, cfg.as_ref().map(|c| c.image.cp_image())),
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),

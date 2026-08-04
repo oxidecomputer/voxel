@@ -1,0 +1,395 @@
+//! `voxel image create` - the per-commit control-plane build. Replaces
+//! `build-cp.sh` and `fetch-sidecar.sh`.
+//!
+//! TUF can't be used here: its control-plane.tar.gz carries only the service
+//! zones, not the i86pc global-zone software (sled-agent/switch/opte/mgs), so
+//! the GZ half has to be a real i86pc omicron build.
+
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::imagebuild::{BakeOpts, bake, isolated_builder, repo_root, toolchain_bin};
+
+/// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
+const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
+const SIDECAR_URL: &str =
+    "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
+
+/// Build flags matching the validated recipe for building omicron on Helios.
+/// pg_config (libpq) comes from /opt/ooce/bin, added to PATH below.
+const OMICRON_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
+     -C link-arg=-R/usr/platform/oxide/lib/amd64 \
+     -C link-arg=-Wl,-znocompstrtab --cfg tokio_unstable";
+
+pub(crate) struct CpBuild<'a> {
+    /// Image label; the image is named `voxel-cp-<label>`.
+    pub label: &'a str,
+    /// The omicron checkout to build.
+    pub omicron_src: PathBuf,
+    /// `--src`: build the checkout in place, no clone or checkout, so a dev's
+    /// working-tree edits are what gets built.
+    pub as_is: bool,
+    /// Commit/tag to check out when not `as_is`.
+    pub commit: Option<&'a str>,
+    /// Gimlet SP count baked into the build-time smf configs.
+    pub gimlets: usize,
+    pub dataset: &'a str,
+    pub build_rss_gen: bool,
+    pub external: Option<&'a voxel_config::External>,
+}
+
+/// `voxel image create`: resolve where the omicron source is and what the image
+/// is called, then build. `--src <path>` builds that checkout as-is with
+/// `commit` reinterpreted as an optional image label; otherwise the commit names
+/// both the checkout under the build root and the image.
+pub(crate) async fn create(
+    commit: Option<&str>,
+    src: Option<&Path>,
+    dataset: &str,
+    external: Option<&voxel_config::External>,
+) -> Result<()> {
+    let (label, omicron_src, as_is) = match src {
+        Some(s) => {
+            let s = s
+                .canonicalize()
+                .with_context(|| format!("resolve --src {}", s.display()))?;
+            if !s.join("package-manifest.toml").exists() {
+                bail!(
+                    "{} doesn't look like an omicron checkout (no package-manifest.toml)",
+                    s.display()
+                );
+            }
+            let label = match commit {
+                Some(l) => l.to_string(),
+                None => crate::image::head_short_sha(&s)?,
+            };
+            (label, s, true)
+        }
+        None => {
+            let commit = commit.context("a <COMMIT> is required (or pass --src <path>)")?;
+            let build_root = std::env::var("BUILD_ROOT").unwrap_or_else(|_| {
+                format!(
+                    "{}/voxel-builds",
+                    std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+                )
+            });
+            let src = PathBuf::from(build_root).join(format!("omicron-{commit}"));
+            (commit.to_string(), src, false)
+        }
+    };
+    let gimlets = std::env::var("GIMLETS")
+        .ok()
+        .and_then(|g| g.parse().ok())
+        .unwrap_or(4);
+    let build_rss_gen = std::env::var("BUILD_RSS_GEN").as_deref() != Ok("0");
+    create_cp(CpBuild {
+        label: &label,
+        omicron_src,
+        as_is,
+        commit: if as_is { None } else { Some(&label) },
+        gimlets,
+        dataset,
+        build_rss_gen,
+        external,
+    })
+    .await
+}
+
+pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
+    if std::env::consts::OS != "solaris" && !cfg!(target_os = "illumos") {
+        // Belt and braces: the omicron build and falcon are Helios-only.
+        eprintln!("[voxel] warning: control-plane builds are Helios-only");
+    }
+    let root = repo_root()?;
+    let voxel_image = root.join("voxel-image");
+    let cargo_bay = voxel_image.join("cargo-bay/vbuild");
+    let src = &b.omicron_src;
+    let image_name = format!("voxel-cp-{}", b.label);
+
+    // --- 1. clone + checkout --------------------------------------------------
+    if b.as_is {
+        if !src.exists() {
+            bail!("--src {} not found", src.display());
+        }
+        eprintln!(
+            "[voxel] building {} as-is (--src; no clone/checkout)",
+            src.display()
+        );
+    } else {
+        let commit = b.commit.context("a commit is required without --src")?;
+        if !src.join(".git").exists() {
+            if let Some(parent) = src.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            eprintln!("[voxel] cloning omicron -> {}", src.display());
+            let repo = std::env::var("OMICRON_REPO")
+                .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
+            run(Command::new("git").arg("clone").arg(&repo).arg(src), "git clone omicron")?;
+        }
+        eprintln!("[voxel] checking out {commit}");
+        // A fetch failure is tolerable: the commit may already be local.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(src)
+            .args(["fetch", "--all", "--tags", "-q"])
+            .status();
+        run(
+            Command::new("git").arg("-C").arg(src).args(["checkout", "-q", commit]),
+            "git checkout",
+        )?;
+    }
+
+    apply_patches(&voxel_image, src)?;
+
+    // --- 2. prerequisites + softnpu machinery --------------------------------
+    eprintln!("[voxel] install_builder_prerequisites.sh -y");
+    run(omicron_cmd(src, "./tools/install_builder_prerequisites.sh").arg("-y"),
+        "install_builder_prerequisites")?;
+    eprintln!("[voxel] ci_download_softnpu_machinery (out/npuzone)");
+    run(&mut omicron_cmd(src, "./tools/ci_download_softnpu_machinery"),
+        "ci_download_softnpu_machinery")?;
+
+    // --- 3. build the package tools ------------------------------------------
+    eprintln!("[voxel] cargo build --release omicron-package xtask xtask-downloader");
+    run(
+        omicron_cmd(src, toolchain_bin("cargo").to_str().unwrap_or("cargo")).args([
+            "build",
+            "--release",
+            "-p",
+            "omicron-package",
+            "-p",
+            "xtask",
+            "-p",
+            "xtask-downloader",
+        ]),
+        "cargo build omicron package tools",
+    )?;
+
+    // --- 4. render build-time smf configs ------------------------------------
+    eprintln!(
+        "[voxel] rendering build-time smf configs from voxel-config (gimlets={})",
+        b.gimlets
+    );
+    crate::image::render_smf(src, b.gimlets)?;
+
+    // --- 5. package the control plane ----------------------------------------
+    // NB: `-p a4x2` is OMICRON's own package preset (a build target in its
+    // package-manifest), NOT the removed a4x2 testbed crate. Leave it as-is.
+    eprintln!("[voxel] omicron-package target create -p a4x2");
+    run(
+        omicron_cmd(src, "./target/release/omicron-package")
+            .args(["-t", "default", "target", "create", "-p", "a4x2"]),
+        "omicron-package target create",
+    )?;
+    eprintln!("[voxel] omicron-package package (~11 min)");
+    run(
+        omicron_cmd(src, "./target/release/omicron-package").arg("package"),
+        "omicron-package package",
+    )?;
+
+    // --- 6. fetch the SoftNPU sidecar ----------------------------------------
+    fetch_sidecar(&voxel_image, &cargo_bay.join("sidecar"))?;
+
+    // --- 7. stage the curated omicron dir into the builder cargo-bay ---------
+    let stage = cargo_bay.join("omicron");
+    eprintln!("[voxel] staging omicron build -> {}", stage.display());
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).with_context(|| format!("mkdir {}", stage.display()))?;
+    let mut rsync = omicron_cmd(src, "rsync");
+    rsync.args([
+        "-a",
+        "tools",
+        "out",
+        "smf",
+        "package-manifest.toml",
+        "target/release/omicron-package",
+        "target/release/xtask",
+        "target/release/xtask-downloader",
+    ]);
+    // out/ holds host-side downloads the image doesn't need; the zones are
+    // already unpacked in-guest from the tarballs we do keep.
+    for ex in [
+        "out/downloads",
+        "out/clickhouse",
+        "out/cockroachdb",
+        "out/dendrite-stub",
+        "out/mgd",
+        "out/transceiver-control",
+        "out/console-assets",
+    ] {
+        rsync.arg("--exclude").arg(ex);
+    }
+    rsync.arg(format!("{}/", stage.display()));
+    run(&mut rsync, "rsync omicron -> cargo-bay")?;
+
+    // --- 7b. build + stage the in-guest agent --------------------------------
+    // Native illumos build: this box is the gimlet's OS.
+    eprintln!("[voxel] building voxel-init (native illumos) for the gimlet image");
+    run(
+        Command::new(toolchain_bin("cargo"))
+            .current_dir(&root)
+            .args(["build", "-p", "voxel-init", "--release"]),
+        "cargo build voxel-init",
+    )?;
+    let agent = cargo_bay.join("voxel-init");
+    std::fs::copy(root.join("target/release/voxel-init"), &agent)
+        .context("stage voxel-init into the cargo-bay")?;
+    let _ = Command::new("chmod").arg("+x").arg(&agent).status();
+
+    // --- 8. bake -------------------------------------------------------------
+    let (ext_if, builder_net) = isolated_builder(b.external)?;
+    bake(BakeOpts {
+        base_image: "helios-3.0",
+        role: Some("cp"),
+        exec: None,
+        cargo_bay: &cargo_bay.display().to_string(),
+        image_name: &image_name,
+        dataset: b.dataset,
+        deploy: "voxel_build",
+        disk_gb: 100,
+        mem_gb: 16,
+        cores: 8,
+        ext_interface: ext_if.as_deref(),
+        builder_net: builder_net.as_deref(),
+    })
+    .await?;
+
+    // --- 9. the commit-pinned voxel-rss-gen ----------------------------------
+    // Non-fatal: the IMAGE is built and usable; only the typed RSS renderer
+    // needs a schema update before launch.
+    if b.build_rss_gen {
+        eprintln!("[voxel] building commit-pinned voxel-rss-gen");
+        let script = voxel_image.join("build-rss-gen.sh");
+        let ok = Command::new("bash")
+            .arg(&script)
+            .arg(src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            eprintln!(
+                "[voxel] rss-gen ready: {}/target/debug/voxel-rss-gen",
+                src.display()
+            );
+        } else {
+            eprintln!(
+                "[voxel] WARN: voxel-rss-gen didn't build; {image_name} is usable, \
+                 but the RSS renderer needs a schema update before launch"
+            );
+        }
+    }
+
+    println!("built image {image_name}");
+    Ok(())
+}
+
+/// voxel's two omicron source patches, re-applied after every checkout (which
+/// resets the tree). Both verify they landed: a silent no-op here surfaces much
+/// later as a mis-built image.
+fn apply_patches(voxel_image: &Path, src: &Path) -> Result<()> {
+    // sled-hardware returns a *Pc* baseboard for i86pc sleds, but wicketd
+    // correlates bootstrap addresses by matching the SP's *Gimlet* baseboard, so
+    // every sled shows "bootstrap address UNKNOWN". Revision 2 matches the
+    // emulated SP VPD.
+    eprintln!("[voxel] patching sled-hardware parse_smbios_output: Pc -> Gimlet baseboard");
+    let smbios = src.join("sled-hardware/src/illumos/mod.rs");
+    run(
+        Command::new("perl").args([
+            "-pi",
+            "-e",
+            "s/Some\\(Baseboard::new_pc\\(serial_number, product\\)\\)/\
+             Some(Baseboard::new_gimlet(serial_number, product, 2))/",
+        ])
+        .arg(&smbios),
+        "perl smbios baseboard patch",
+    )?;
+    if !file_contains(&smbios, "new_gimlet(serial_number, product, 2)") {
+        bail!("smbios baseboard patch did not apply");
+    }
+
+    // Nexus lot-validates every switch-port address against the single-block
+    // infra lot. In Static mode that lot is v4, so voxel's v6 addrconf
+    // interconnect ports can't reserve (handoff 400 "address not in lot").
+    eprintln!("[voxel] patching nexus rack-init: add v6 block to the infra address lot");
+    run(
+        Command::new("python3")
+            .arg(voxel_image.join("patches/nexus-infra-lot-v6.py"))
+            .arg(src),
+        "nexus infra-lot v6 patch",
+    )?;
+    if !file_contains(&src.join("nexus/src/app/rack.rs"), "voxel: add a v6 block") {
+        bail!("nexus infra-lot v6 patch did not apply");
+    }
+    Ok(())
+}
+
+/// Fetch sidecar-lite's scadm + libsidecar_lite.so, via a rev-keyed cache, and
+/// stage them for the image. The builder VM may not reach buildomat.eng - only
+/// the host does - so this happens here rather than in-guest.
+fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
+    let rev =
+        std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
+    let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
+    std::fs::create_dir_all(&cache).with_context(|| format!("mkdir {}", cache.display()))?;
+    std::fs::create_dir_all(dest).with_context(|| format!("mkdir {}", dest.display()))?;
+    for artifact in ["scadm", "libsidecar_lite.so"] {
+        let cached = cache.join(artifact);
+        if std::fs::metadata(&cached).map(|m| m.len() == 0).unwrap_or(true) {
+            eprintln!("[voxel] fetching {artifact} @ {rev}");
+            run(
+                Command::new("curl")
+                    .args(["-sSfL", "--retry", "10", "-o"])
+                    .arg(&cached)
+                    .arg(format!("{SIDECAR_URL}/{rev}/{artifact}")),
+                "fetch sidecar artifact",
+            )?;
+        }
+        let _ = Command::new("chmod").arg("+x").arg(&cached).status();
+        std::fs::copy(&cached, dest.join(artifact))
+            .with_context(|| format!("stage {artifact}"))?;
+    }
+    eprintln!(
+        "[voxel] staged scadm + libsidecar_lite.so -> {}",
+        dest.display()
+    );
+    Ok(())
+}
+
+/// A command run inside the omicron checkout, with the PATH and RUSTFLAGS the
+/// omicron build needs. `install_builder_prerequisites.sh` ci-downloads
+/// cockroach/clickhouse/dpd into `out/` and then fails unless they are on PATH -
+/// a check that passes in an interactive dev shell but not a fresh one - so
+/// those go on up front.
+fn omicron_cmd(src: &Path, program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.current_dir(src);
+    let s = src.display();
+    let existing = std::env::var("PATH").unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    c.env(
+        "PATH",
+        format!(
+            "{s}/out/cockroachdb/bin:{s}/out/clickhouse:{s}/out/dendrite-stub/bin:\
+             {home}/.cargo/bin:/opt/ooce/bin:{existing}"
+        ),
+    );
+    if std::env::var("RUSTFLAGS").is_err() {
+        c.env("RUSTFLAGS", OMICRON_RUSTFLAGS);
+    }
+    c
+}
+
+fn file_contains(path: &Path, needle: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.contains(needle))
+        .unwrap_or(false)
+}
+
+fn run(cmd: &mut Command, what: &str) -> Result<()> {
+    let status = cmd.status().with_context(|| format!("run {what}"))?;
+    if !status.success() {
+        bail!("{what} failed");
+    }
+    Ok(())
+}
