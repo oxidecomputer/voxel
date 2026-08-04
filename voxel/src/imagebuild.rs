@@ -49,6 +49,8 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         bail!("cargo-bay {} not found", o.cargo_bay);
     }
 
+    stage_builder_net(o.cargo_bay)?;
+
     let mut d = Runner::new(o.deploy);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
     d.reserve(node, o.disk_gb as usize);
@@ -122,6 +124,30 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         "[voxel] registered base image {}/img/{}@base",
         o.dataset, o.image_name
     );
+    Ok(())
+}
+
+/// Stage the builder's static address for an isolated-mode build, or clear a
+/// stale one.
+///
+/// The isolated segment runs no DHCP server, so `voxel image create` passes
+/// `VOXEL_BUILDER_NET="<cidr> <gw>"` and the in-guest installer applies it in
+/// place of DHCP. Clearing matters just as much: the cargo-bay is reused across
+/// builds, and a leftover `builder-net` makes a later LAN build apply the
+/// isolated static address to its DHCP-serving VNIC, losing package and DNS
+/// access.
+fn stage_builder_net(cargo_bay: &str) -> Result<()> {
+    let path = Path::new(cargo_bay).join("builder-net");
+    match std::env::var("VOXEL_BUILDER_NET") {
+        Ok(net) if !net.trim().is_empty() => {
+            eprintln!("[voxel] staging builder-net ({net}) into {cargo_bay}");
+            std::fs::write(&path, format!("{}\n", net.trim()))
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        _ => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     Ok(())
 }
 
