@@ -258,8 +258,7 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
                 } else {
                     info!(
                         d.log,
-                        "{tag}: complete - rack initialized (RSS run {init_id}; \
-                         rack uuid via `omdb db rack list`)"
+                        "{tag}: complete - rack initialized (RSS run {init_id})"
                     );
                 }
                 break;
