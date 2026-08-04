@@ -276,6 +276,12 @@ enum ImageCmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Build a `voxel-frr` customer-router image.
+    CreateFrr {
+        /// Image label; the image is named `voxel-frr-<version>`.
+        #[arg(default_value = "proto")]
+        version: String,
+    },
     /// (build helper) Bake an image: boot a one-node builder, run the in-guest
     /// agent's install role, capture the disk. Used by build-cp.sh/build-frr.sh.
     #[command(hide = true)]
@@ -773,6 +779,9 @@ async fn main() -> Result<(), Error> {
                 let cfg = load_config(&config_path)?;
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
+            }
+            ImageCmd::CreateFrr { version } => {
+                imagebuild::create_frr(version, &image::falcon_dataset()).await
             }
             ImageCmd::Bake {
                 name,

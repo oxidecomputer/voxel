@@ -414,6 +414,7 @@ pub(crate) fn cmd_image(
         // so it's dispatched in `main` before delegating the rest here.
         ImageCmd::Patch { .. } => bail!("internal: `image patch` is dispatched in main"),
         ImageCmd::Bake { .. } => bail!("internal: `image bake` is dispatched in main"),
+        ImageCmd::CreateFrr { .. } => bail!("internal: `image create-frr` is dispatched in main"),
         ImageCmd::RenderSmf {
             omicron_root,
             gimlets,

@@ -127,6 +127,109 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The musl target the Debian router guest needs. Static, so the router gets one
+/// self-contained binary with no glibc or dynamic-linking dependency.
+const FRR_TARGET: &str = "x86_64-unknown-linux-musl";
+
+/// Build a `voxel-frr` router image: cross-compile the agent for the Debian
+/// guest, stage it, bake. Replaces `build-frr.sh`.
+///
+/// Cross-compiling needs voxel's own source tree and a Rust toolchain on the
+/// host. That is unchanged from the script, but it is the remaining host
+/// dependency in the way of a fully self-contained `voxel` - a prebuilt agent
+/// embedded in the binary would close it.
+pub(crate) async fn create_frr(version: &str, dataset: &str) -> Result<()> {
+    let root = repo_root()?;
+    let image_name = format!("voxel-frr-{version}");
+    let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-frr");
+
+    eprintln!("[voxel] cross-compiling voxel-init for {FRR_TARGET} (static)");
+    // Best-effort: already-installed targets exit nonzero on some rustup versions.
+    let _ = Command::new(toolchain_bin("rustup"))
+        .args(["target", "add", FRR_TARGET])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let built = Command::new(toolchain_bin("cargo"))
+        .current_dir(&root)
+        .args(["build", "-p", "voxel-init", "--release", "--target", FRR_TARGET])
+        .env(
+            "RUSTFLAGS",
+            "-C linker=rust-lld -C link-self-contained=yes",
+        )
+        .status()
+        .context("run cargo build -p voxel-init")?;
+    if !built.success() {
+        bail!("cross-compiling voxel-init for {FRR_TARGET} failed");
+    }
+
+    std::fs::create_dir_all(&cargo_bay)
+        .with_context(|| format!("mkdir {}", cargo_bay.display()))?;
+    let agent_src = root.join(format!("target/{FRR_TARGET}/release/voxel-init"));
+    let agent_dst = cargo_bay.join("voxel-init");
+    std::fs::copy(&agent_src, &agent_dst)
+        .with_context(|| format!("stage agent {}", agent_src.display()))?;
+    // The 9p mount drops the exec bit in-guest anyway, but keep it host-side.
+    let _ = Command::new("chmod").args(["+x"]).arg(&agent_dst).status();
+
+    bake(BakeOpts {
+        base_image: "debian-13.2",
+        role: Some("frr"),
+        exec: None,
+        cargo_bay: &cargo_bay.display().to_string(),
+        image_name: &image_name,
+        dataset,
+        deploy: "voxel_build",
+        disk_gb: 20,
+        mem_gb: 16,
+        cores: 8,
+        ext_interface: None,
+    })
+    .await?;
+    println!("built image {image_name}");
+    Ok(())
+}
+
+/// Resolve a rust toolchain binary. `image bake` runs under `pfexec` (zfs +
+/// falcon need it), which drops `~/.cargo/bin` from PATH - the shell scripts
+/// papered over this by prepending it. Prefer an explicit override, then the
+/// rustup install, then PATH.
+fn toolchain_bin(name: &str) -> std::path::PathBuf {
+    if let Ok(p) = std::env::var(name.to_uppercase()) {
+        return std::path::PathBuf::from(p);
+    }
+    for home in [std::env::var("HOME").ok(), Some("/root".into())]
+        .into_iter()
+        .flatten()
+    {
+        let candidate = std::path::PathBuf::from(home).join(".cargo/bin").join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from(name)
+}
+
+/// voxel's own source tree, derived the same way `locate_script` finds
+/// `voxel-image/`: next to the binary, else the cwd.
+fn repo_root() -> Result<std::path::PathBuf> {
+    if let Ok(root) = std::env::var("VOXEL_REPO_ROOT") {
+        return Ok(std::path::PathBuf::from(root));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("../..");
+        if candidate.join("voxel-image").exists() {
+            return Ok(candidate);
+        }
+    }
+    if Path::new("voxel-image").exists() {
+        return Ok(std::path::PathBuf::from("."));
+    }
+    bail!("can't find voxel's source tree - set VOXEL_REPO_ROOT")
+}
+
 /// Stage the builder's static address for an isolated-mode build, or clear a
 /// stale one.
 ///
