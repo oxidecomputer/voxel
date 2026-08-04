@@ -68,14 +68,22 @@ if [[ -n "$("${VOXEL}" config get sp.emu_bin 2>/dev/null)" \
 fi
 
 # --- 1. clone + checkout ------------------------------------------------------
-if [[ ! -d "${OMICRON_SRC}/.git" ]]; then
-    mkdir -p "${BUILD_ROOT}"
-    log "cloning omicron -> ${OMICRON_SRC}"
-    git clone "${OMICRON_REPO}" "${OMICRON_SRC}"
+# SRC_ASIS=1 (`voxel image create --src`): build OMICRON_SRC in place, do NOT
+# clone or checkout - the dev's working-tree edits are what we build. The patches
+# and smf renders below still apply (they are idempotent).
+if [[ "${SRC_ASIS:-0}" == "1" ]]; then
+    [[ -d "${OMICRON_SRC}" ]] || { log "FATAL: --src ${OMICRON_SRC} not found"; exit 1; }
+    log "building ${OMICRON_SRC} as-is (--src; no clone/checkout)"
+else
+    if [[ ! -d "${OMICRON_SRC}/.git" ]]; then
+        mkdir -p "${BUILD_ROOT}"
+        log "cloning omicron -> ${OMICRON_SRC}"
+        git clone "${OMICRON_REPO}" "${OMICRON_SRC}"
+    fi
+    log "checking out ${COMMIT}"
+    git -C "${OMICRON_SRC}" fetch --all --tags -q || true
+    git -C "${OMICRON_SRC}" checkout -q "${COMMIT}"
 fi
-log "checking out ${COMMIT}"
-git -C "${OMICRON_SRC}" fetch --all --tags -q || true
-git -C "${OMICRON_SRC}" checkout -q "${COMMIT}"
 cd "${OMICRON_SRC}"
 
 # --- 1b. voxel patch: report a Gimlet baseboard (de-a4x2 wicket fix) -----------

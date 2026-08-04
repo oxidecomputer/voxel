@@ -218,9 +218,19 @@ enum ImageCmd {
     #[command(visible_alias = "list")]
     Ls,
     /// Build a `voxel-cp` image for an omicron commit (from source).
+    ///
+    /// `--src <path>` instead builds an existing omicron checkout/worktree AS-IS
+    /// (the dev loop: your working-tree edits, warm target).
     Create {
-        /// omicron git commit (or tag) to build and pin the image to.
-        commit: String,
+        /// omicron git commit (or tag) to build and pin the image to. With
+        /// `--src` this is an optional image label (default: the checkout's HEAD).
+        #[arg(required_unless_present = "src")]
+        commit: Option<String>,
+        /// Build from an existing omicron checkout/worktree AS-IS (host build,
+        /// for dev): skips clone + checkout so your working-tree edits are built.
+        /// Applies voxel's omicron patches + smf configs to that tree (idempotent).
+        #[arg(long)]
+        src: Option<PathBuf>,
     },
     /// Export an image bundle to a file for distribution.
     ///

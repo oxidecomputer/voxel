@@ -3,7 +3,7 @@
 
 use anyhow::{Context, bail};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ImageCmd;
 use crate::util::{locate_script, shell_quote};
@@ -37,6 +37,64 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
 /// the running binary, else CWD.
 fn build_cp_script() -> anyhow::Result<PathBuf> {
     locate_script("VOXEL_BUILD_CP", "build-cp.sh")
+}
+
+/// The checkout's short HEAD sha (the default `--src` image label).
+fn head_short_sha(src: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .with_context(|| format!("run git in {}", src.display()))?;
+    if !out.status.success() {
+        bail!(
+            "git rev-parse HEAD failed in {} (is it an omicron checkout?)",
+            src.display()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `--src`: host-build a voxel-cp image from an existing omicron checkout or
+/// worktree AS-IS (no clone/checkout), so a dev's working-tree edits are what gets
+/// built. The image is named `voxel-cp-<label>` (explicit `label`, else HEAD's sha).
+/// voxel's omicron patches + smf renders still apply; they are idempotent.
+fn create_from_src(src: &Path, label: Option<&str>) -> anyhow::Result<()> {
+    let src = src
+        .canonicalize()
+        .with_context(|| format!("resolve --src {}", src.display()))?;
+    if !src.join("package-manifest.toml").exists() {
+        bail!(
+            "{} doesn't look like an omicron checkout (no package-manifest.toml)",
+            src.display()
+        );
+    }
+    let label = match label {
+        Some(l) => l.to_string(),
+        None => head_short_sha(&src)?,
+    };
+    let script = build_cp_script()?;
+    eprintln!(
+        "[voxel] building voxel-cp-{label} from {} (as-is) via {}",
+        src.display(),
+        script.display()
+    );
+    // SRC_ASIS=1 tells build-cp.sh to skip clone/checkout and build OMICRON_SRC in
+    // place; IMAGE_VERSION names the image + the launch-time manifest stub.
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .arg(&label)
+        .env("OMICRON_SRC", &src)
+        .env("SRC_ASIS", "1")
+        .env("IMAGE_VERSION", &label)
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        bail!("build from --src {} failed", src.display());
+    }
+    println!("built image voxel-cp-{label}");
+    Ok(())
 }
 
 pub(crate) fn cmd_image(
@@ -202,7 +260,15 @@ pub(crate) fn cmd_image(
             }
             Ok(())
         }
-        ImageCmd::Create { commit } => {
+        ImageCmd::Create { commit, src } => {
+            // `--src`: host build from an existing checkout, as-is (the dev loop).
+            if let Some(src) = src {
+                return create_from_src(src, commit.as_deref());
+            }
+            // clap enforces this via `required_unless_present = "src"`.
+            let Some(commit) = commit.as_deref() else {
+                bail!("a <COMMIT> is required (or pass --src <path>)");
+            };
             let script = build_cp_script()?;
             let mut build = std::process::Command::new("bash");
             build.arg(&script).arg(commit);
