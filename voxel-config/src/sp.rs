@@ -360,8 +360,8 @@ mod tests {
 
         let gimlets = v["simulated_sps"]["gimlet"].as_array().unwrap();
         assert_eq!(gimlets.len(), 4);
-        assert_eq!(gimlets[0]["serial_number"].as_str(), Some("20000000"));
-        assert_eq!(gimlets[3]["serial_number"].as_str(), Some("20000003"));
+        assert_eq!(gimlets[0]["serial_number"].as_str(), Some("2FAKE000"));
+        assert_eq!(gimlets[3]["serial_number"].as_str(), Some("2FAKE003"));
     }
 
     #[test]
@@ -389,8 +389,8 @@ mod tests {
         let g = f.gimlets();
         assert_eq!(g.len(), 3);
         // Identity-bearing fields use the GLOBAL index (aligned with SMBIOS/sprockets).
-        assert_eq!(g[0].serial, "20000003");
-        assert_eq!(g[2].serial, "20000005");
+        assert_eq!(g[0].serial, "2FAKE003");
+        assert_eq!(g[2].serial, "2FAKE005");
         assert_eq!(g[0].base_port, 33340); // 33300 + 10*(3+1)
         assert_eq!(g[2].fake_interface, "fake-sled5");
         assert!(g[0].device_id_seed.ends_with("04")); // device_seed(3+1)
