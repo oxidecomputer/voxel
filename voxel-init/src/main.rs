@@ -8,10 +8,11 @@
 //! only the role selected at runtime differs.
 
 mod gimlet;
+mod install;
 mod router;
 mod sys;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "voxel-init", about = "In-guest bring-up agent for voxel racks")]
@@ -26,6 +27,13 @@ enum Cmd {
     Gimlet,
     /// Bring up a customer router/edge from a voxel-frr image (linux / debian).
     Router,
+    /// Image-BUILD-time install, run inside the builder guest by build-image.sh.
+    /// Installs baked software only; applies no topology configuration.
+    Install {
+        /// Which image is being baked.
+        #[arg(long, value_enum)]
+        role: InstallRole,
+    },
     /// Internal: the detached switch-config enforcer for a scrimlet's slot
     /// (spawned by `gimlet`)—swaps the launch-count MGS + sp-sim configs in.
     #[command(hide = true)]
@@ -37,10 +45,24 @@ enum Cmd {
     SwitchEnforcerSvc,
 }
 
+/// Which image `install` is baking. Both arms build for both guest OSes; the
+/// role picks the implementation at runtime, as with `gimlet` / `router`.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum InstallRole {
+    /// voxel-cp control-plane image (illumos / helios).
+    Cp,
+    /// voxel-frr router image (linux / debian).
+    Frr,
+}
+
 fn main() {
     let result = match Cli::parse().cmd {
         Cmd::Gimlet => gimlet::bring_up(),
         Cmd::Router => router::bring_up(),
+        Cmd::Install { role } => match role {
+            InstallRole::Cp => install::cp(),
+            InstallRole::Frr => install::frr(),
+        },
         Cmd::SwitchEnforcer { slot } => {
             gimlet::switch_enforcer(slot);
             Ok(())
