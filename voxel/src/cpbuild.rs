@@ -187,7 +187,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
     // --- 4. render build-time smf configs ------------------------------------
     eprintln!("[voxel] rendering smf configs, gimlets={}", b.gimlets);
-    crate::image::render_smf(src, b.gimlets)?;
+    crate::image::render_smf(src, b.gimlets, b.cfg)?;
 
     // --- 5. package the control plane ----------------------------------------
     // NB: `-p a4x2` is OMICRON's own package preset (a build target in its

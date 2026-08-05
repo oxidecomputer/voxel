@@ -257,7 +257,7 @@ fn generate_rss_config(
 /// commits to requirements table, voxel reads what the commit itself declares.
 /// It is the only place voxel consults an omicron checkout, and it is
 /// advisory. A rack whose source is absent still launches.
-fn detect_sled_schema(
+pub(crate) fn detect_sled_schema(
     cfg: &VoxelConfig,
     src_root: Option<&Path>,
 ) -> (SledDataLinksSchema, SledDisksSchema) {

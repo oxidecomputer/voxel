@@ -57,7 +57,26 @@ pub(crate) fn head_short_sha(src: &Path) -> anyhow::Result<String> {
 /// the generated switch1. One SP fleet drives both the MGS port table and
 /// sp-sim's side, so they agree by construction; baked images use the sim
 /// backend.
-pub(crate) fn render_smf(omicron_root: &Path, gimlets: usize) -> anyhow::Result<()> {
+///
+/// The sled-agent config shapes are detected from `omicron_root`, the checkout
+/// being packaged, so the baked file matches the sled-agent that will read it.
+/// voxel-init overwrites this file with the per-sled config at boot, but an
+/// image whose baked config its own sled-agent would reject is a trap.
+pub(crate) fn render_smf(
+    omicron_root: &Path,
+    gimlets: usize,
+    cfg: Option<&voxel_config::VoxelConfig>,
+) -> anyhow::Result<()> {
+    let owned;
+    let schema_cfg = match cfg {
+        Some(c) => c,
+        None => {
+            owned = voxel_config::VoxelConfig::default();
+            &owned
+        }
+    };
+    let (data_links, disks) = crate::topo::detect_sled_schema(schema_cfg, Some(omicron_root));
+    eprintln!("[voxel] baked sled-agent schema: data_links={data_links:?} disks={disks:?}");
     let scrimlets = [0usize, gimlets.saturating_sub(1)];
     let fleet = voxel_config::sp::SpFleet::sim(gimlets);
     let writes = [
@@ -68,7 +87,10 @@ pub(crate) fn render_smf(omicron_root: &Path, gimlets: usize) -> anyhow::Result<
         ("smf/sp-sim/config.toml", fleet.sp_sim_config()),
         (
             "smf/sled-agent/non-gimlet/config.toml",
-            voxel_config::sled::SledAgentConfig::new(0, true).render(),
+            voxel_config::sled::SledAgentConfig::new(0, true)
+                .with_data_links_schema(data_links)
+                .with_disks_schema(disks)
+                .render(),
         ),
     ];
     for (rel, text) in writes {
@@ -351,6 +373,6 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         ImageCmd::RenderSmf {
             omicron_root,
             gimlets,
-        } => render_smf(omicron_root, *gimlets)
+        } => render_smf(omicron_root, *gimlets, None),
     }
 }
