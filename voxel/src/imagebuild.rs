@@ -175,13 +175,23 @@ const FRR_TARGET: &str = "x86_64-unknown-linux-musl";
 /// host. That is unchanged from the script, but it is the remaining host
 /// dependency in the way of a fully self-contained `voxel` - a prebuilt agent
 /// embedded in the binary would close it.
+/// Report a finished image. The `config set` line is the exact command to adopt
+/// it, printed only when the active config doesn't already select it, so a
+/// rebuild of the current image stays quiet.
+pub(crate) fn report_built(image_name: &str, key: &str, current: Option<String>) {
+    println!("built image {image_name}");
+    if current.as_deref() != Some(image_name) {
+        println!("voxel config set {key} {image_name}");
+    }
+}
+
 pub(crate) async fn create_frr(
     version: &str,
     dataset: &str,
-    external: Option<&voxel_config::External>,
+    cfg: Option<&voxel_config::VoxelConfig>,
 ) -> Result<()> {
     let root = repo_root()?;
-    let (ext_if, builder_net) = isolated_builder(external)?;
+    let (ext_if, builder_net) = isolated_builder(cfg.map(|c| &c.external))?;
     let image_name = format!("voxel-frr-{version}");
     let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-frr");
 
@@ -229,7 +239,7 @@ pub(crate) async fn create_frr(
         builder_net: builder_net.as_deref(),
     })
     .await?;
-    println!("built image {image_name}");
+    report_built(&image_name, "image.frr", cfg.map(|c| c.image.frr_image()));
     Ok(())
 }
 

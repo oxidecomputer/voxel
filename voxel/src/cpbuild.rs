@@ -121,7 +121,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
             eprintln!("[voxel] cloning omicron -> {}", src.display());
             let repo = std::env::var("OMICRON_REPO")
                 .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
-            run(Command::new("git").arg("clone").arg(&repo).arg(src), "git clone omicron")?;
+            run(
+                Command::new("git").arg("clone").arg(&repo).arg(src),
+                "git clone omicron",
+            )?;
         }
         eprintln!("[voxel] checking out {commit}");
         // A fetch failure is tolerable: the commit may already be local.
@@ -131,7 +134,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
             .args(["fetch", "--all", "--tags", "-q"])
             .status();
         run(
-            Command::new("git").arg("-C").arg(src).args(["checkout", "-q", commit]),
+            Command::new("git")
+                .arg("-C")
+                .arg(src)
+                .args(["checkout", "-q", commit]),
             "git checkout",
         )?;
     }
@@ -153,11 +159,15 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
     // --- 2. prerequisites + softnpu machinery --------------------------------
     eprintln!("[voxel] install_builder_prerequisites.sh -y");
-    run(omicron_cmd(src, "./tools/install_builder_prerequisites.sh").arg("-y"),
-        "install_builder_prerequisites")?;
+    run(
+        omicron_cmd(src, "./tools/install_builder_prerequisites.sh").arg("-y"),
+        "install_builder_prerequisites",
+    )?;
     eprintln!("[voxel] ci_download_softnpu_machinery");
-    run(&mut omicron_cmd(src, "./tools/ci_download_softnpu_machinery"),
-        "ci_download_softnpu_machinery")?;
+    run(
+        &mut omicron_cmd(src, "./tools/ci_download_softnpu_machinery"),
+        "ci_download_softnpu_machinery",
+    )?;
 
     // --- 3. build the package tools ------------------------------------------
     eprintln!("[voxel] cargo build --release omicron-package xtask xtask-downloader");
@@ -261,7 +271,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     })
     .await?;
 
-    println!("built image {image_name}");
+    crate::imagebuild::report_built(&image_name, "image.cp", b.cfg.map(|c| c.image.cp_image()));
     Ok(())
 }
 
@@ -340,14 +350,16 @@ fn apply_nexus_infra_lot_patch(rack_rs: &Path) -> Result<()> {
 /// stage them for the image. The builder VM may not reach buildomat.eng - only
 /// the host does - so this happens here rather than in-guest.
 fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
-    let rev =
-        std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
+    let rev = std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
     let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
     std::fs::create_dir_all(&cache).with_context(|| format!("mkdir {}", cache.display()))?;
     std::fs::create_dir_all(dest).with_context(|| format!("mkdir {}", dest.display()))?;
     for artifact in ["scadm", "libsidecar_lite.so"] {
         let cached = cache.join(artifact);
-        if std::fs::metadata(&cached).map(|m| m.len() == 0).unwrap_or(true) {
+        if std::fs::metadata(&cached)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+        {
             eprintln!("[voxel] fetching {artifact} @ {rev}");
             run(
                 Command::new("curl")
@@ -358,8 +370,7 @@ fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
             )?;
         }
         let _ = Command::new("chmod").arg("+x").arg(&cached).status();
-        std::fs::copy(&cached, dest.join(artifact))
-            .with_context(|| format!("stage {artifact}"))?;
+        std::fs::copy(&cached, dest.join(artifact)).with_context(|| format!("stage {artifact}"))?;
     }
     eprintln!(
         "[voxel] staged scadm + libsidecar_lite.so -> {}",

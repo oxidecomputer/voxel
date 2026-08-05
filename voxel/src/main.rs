@@ -782,12 +782,7 @@ async fn main() -> Result<(), Error> {
                 .await
             }
             ImageCmd::CreateFrr { version } => {
-                imagebuild::create_frr(
-                    version,
-                    &image::falcon_dataset(),
-                    cfg.as_ref().map(|c| &c.external),
-                )
-                .await
+                imagebuild::create_frr(version, &image::falcon_dataset(), cfg.as_ref()).await
             }
             ImageCmd::Bake {
                 name,
