@@ -1,20 +1,19 @@
-//! `voxel image bake` - build an image by booting a one-node builder, running
-//! the in-guest agent's install mode, and capturing the disk.
+//! `voxel image bake` - build an image by booting a one-node builder, running a
+//! step inside it, and capturing its disk as a registered falcon base image.
 //!
-//! Replaces `voxel-image/build-image.sh` plus the `voxel-image-builder` crate:
-//! voxel owns the falcon topology directly instead of shelling to a script that
-//! shells to another binary. The build scripts that still exist (build-cp.sh,
-//! build-frr.sh) call this instead of build-image.sh.
+//! `image create`, `image create-frr` and `image patch` all build through here.
 
+use crate::isolated_external;
 use anyhow::{Context, Result, bail};
 use libfalcon::{Runner, unit::gb};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
-/// The builder node name. `build-image.sh` used the same, so the falcon workdir
-/// layout (`.falcon/vbuild.pid`) is unchanged. The DEPLOYMENT name is a
-/// parameter: `image patch` runs its boot-modify-capture under `voxel_patch` so
-/// it cannot collide with an image build.
+/// The builder node name, which fixes the falcon workdir layout
+/// (`.falcon/vbuild.pid`). The DEPLOYMENT name is a parameter instead, so
+/// `image patch` can run its boot-modify-capture under `voxel_patch` without
+/// colliding with an image build.
 const NODE: &str = "vbuild";
 
 pub(crate) struct BakeOpts<'a> {
@@ -38,36 +37,45 @@ pub(crate) struct BakeOpts<'a> {
     pub disk_gb: u64,
     pub mem_gb: u64,
     pub cores: u8,
-    /// Host link the builder reaches the package repos through. `None` uses
-    /// falcon's default external interface.
-    pub ext_interface: Option<&'a str>,
-    /// `"<cidr> <gateway>"` for an isolated-mode build, staged as `builder-net`.
-    pub builder_net: Option<&'a str>,
+    /// How the builder reaches the package repos.
+    pub network: &'a BuilderNetwork,
 }
 
-/// Prepare the host side of an isolated-mode image build: stand the segment up
-/// and return `(ext_interface, builder_net)` for the builder.
+/// How the builder reaches the package repos.
+#[derive(Default)]
+pub(crate) struct BuilderNetwork {
+    /// Host link to attach the builder's external NIC to. `None` uses falcon's
+    /// default external interface.
+    pub interface: Option<String>,
+    /// `"<cidr> <gateway>"` staged as `builder-net` for the guest to apply.
+    /// `None` where the segment has DHCP and the guest can lease an address.
+    pub static_address: Option<String>,
+}
+
+/// Prepare the host side of an image build's network.
 ///
-/// The builder normally DHCPs an external NIC to reach the package repos. In
-/// isolated mode that network is the voxel-managed segment, which runs no DHCP,
-/// so the builder gets the stub plus a static address derived from `host_ip - 1`.
-/// Returns `(None, None)` in lan mode, where falcon's default link and DHCP work.
-pub(crate) fn isolated_builder(
-    external: Option<&voxel_config::External>,
-) -> Result<(Option<String>, Option<String>)> {
+/// The builder normally DHCPs an external NIC. In isolated mode that network is
+/// the voxel-managed segment, which runs no DHCP, so the segment is brought up
+/// here and the builder gets the stub plus a static address derived from
+/// `host_ip - 1`. In lan mode falcon's default link and DHCP already work, so
+/// this is empty.
+pub(crate) fn builder_network(external: Option<&voxel_config::External>) -> Result<BuilderNetwork> {
     let Some(x) = external.filter(|x| x.isolated()) else {
-        return Ok((None, None));
+        return Ok(BuilderNetwork::default());
     };
-    crate::isolated_external::up(x, false)
+    isolated_external::up(x, isolated_external::DryRun::No)
         .context("bringing up the isolated external segment for the builder")?;
-    let net = x.builder_net().with_context(|| {
+    let address = x.builder_net().with_context(|| {
         format!(
             "cannot derive a usable isolated builder address below host_ip '{}' within \
              subnet '{}'; choose a host_ip at least two addresses above the subnet network",
             x.host_ip, x.subnet
         )
     })?;
-    Ok((Some(crate::isolated_external::STUB.to_string()), Some(net)))
+    Ok(BuilderNetwork {
+        interface: Some(isolated_external::STUB.to_string()),
+        static_address: Some(address),
+    })
 }
 
 /// Bring up the builder, install, quiesce, capture, tear down.
@@ -76,23 +84,21 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         bail!("cargo-bay {} not found", o.cargo_bay);
     }
 
-    stage_builder_net(o.cargo_bay, o.builder_net)?;
+    stage_builder_net(o.cargo_bay, o.network.static_address.as_deref())?;
 
     // ★ The builder MUST NOT share a falcon workspace with a running rack.
     // falcon keeps per-node pid/uuid files in `.falcon/` relative to the cwd,
     // and tearing the builder down destroys that whole directory - so building
     // an image from voxel's workdir would wipe a live rack's pid files, orphan
-    // its propolis processes, and leave its VNICs busy. build-image.sh avoided
-    // this by `cd`-ing to voxel-image/ first; do the same.
+    // its propolis processes, and leave its VNICs busy.
     let workspace = repo_root()?.join("voxel-image");
-    std::env::set_current_dir(&workspace)
-        .with_context(|| format!("cd {}", workspace.display()))?;
+    std::env::set_current_dir(&workspace).with_context(|| format!("cd {}", workspace.display()))?;
 
     let mut d = Runner::new(o.deploy);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
     d.reserve(node, o.disk_gb as usize);
 
-    match o.ext_interface {
+    match o.network.interface.as_deref() {
         Some(ifx) => d.ext_link(ifx, node),
         None => d
             .default_ext_link(node)
@@ -112,18 +118,17 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     mounted.map_err(|e| anyhow::anyhow!("mount cargo-bay ({}): {e}", o.cargo_bay))?;
 
     eprintln!(
-        "[voxel] booting builder ({}), installing role {}",
+        "[voxel] booting builder {}, role {}",
         o.base_image,
-        o.role.unwrap_or("<none>")
+        o.role.unwrap_or("none")
     );
     d.launch()
         .await
         .map_err(|e| anyhow::anyhow!("launch builder: {e}"))?;
 
     // An agent role, or an arbitrary command, or neither (boot-only smoke test).
-    // The 9p cargo-bay mount drops the exec bit, so the agent is copied to local
-    // disk before running. (build-image.sh needed a shell shim for that; driving
-    // the exec ourselves lets us inline it.)
+    // The cargo-bay arrives without the exec bit, so the agent is copied to
+    // local disk before running.
     let step = match (o.role, o.exec) {
         (Some(role), _) => Some((
             format!("install --role {role}"),
@@ -169,19 +174,19 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 const FRR_TARGET: &str = "x86_64-unknown-linux-musl";
 
 /// Build a `voxel-frr` router image: cross-compile the agent for the Debian
-/// guest, stage it, bake. Replaces `build-frr.sh`.
+/// guest, stage it, bake.
 ///
 /// Cross-compiling needs voxel's own source tree and a Rust toolchain on the
-/// host. That is unchanged from the script, but it is the remaining host
-/// dependency in the way of a fully self-contained `voxel` - a prebuilt agent
-/// embedded in the binary would close it.
+/// host. That is the remaining host dependency in the way of a fully
+/// self-contained `voxel`; embedding a prebuilt agent in the binary would close
+/// it.
 pub(crate) async fn create_frr(
     version: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
     let root = repo_root()?;
-    let (ext_if, builder_net) = isolated_builder(external)?;
+    let network = builder_network(external)?;
     let image_name = format!("voxel-frr-{version}");
     let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-frr");
 
@@ -194,11 +199,15 @@ pub(crate) async fn create_frr(
         .status();
     let built = Command::new(toolchain_bin("cargo"))
         .current_dir(&root)
-        .args(["build", "-p", "voxel-init", "--release", "--target", FRR_TARGET])
-        .env(
-            "RUSTFLAGS",
-            "-C linker=rust-lld -C link-self-contained=yes",
-        )
+        .args([
+            "build",
+            "-p",
+            "voxel-init",
+            "--release",
+            "--target",
+            FRR_TARGET,
+        ])
+        .env("RUSTFLAGS", "-C linker=rust-lld -C link-self-contained=yes")
         .status()
         .context("run cargo build -p voxel-init")?;
     if !built.success() {
@@ -225,8 +234,7 @@ pub(crate) async fn create_frr(
         disk_gb: 20,
         mem_gb: 16,
         cores: 8,
-        ext_interface: ext_if.as_deref(),
-        builder_net: builder_net.as_deref(),
+        network: &network,
     })
     .await?;
     println!("built image {image_name}");
@@ -306,34 +314,77 @@ fn stage_builder_net(cargo_bay: &str, explicit: Option<&str>) -> Result<()> {
 /// propolis has to flush the removal to the zvol or the last write is lost.
 /// devfsadmd is stopped first so it cannot re-create the map.
 async fn quiesce(d: &Runner, node: libfalcon::NodeRef) {
-    eprintln!("[voxel] clearing device-instance map + clean halt (flush to disk)");
+    eprintln!("[voxel] clearing device-instance map, halting");
     let _ = d
         .exec(
             node,
             "pkill -x devfsadmd 2>/dev/null; rm -f /etc/path_to_inst; sync; sync; (sleep 1; halt) &",
         )
         .await;
-    eprintln!("[voxel] waiting for clean shutdown to flush...");
-    std::thread::sleep(std::time::Duration::from_secs(25));
-    eprintln!("[voxel] stopping hypervisor (cleanup)");
+    wait_for_propolis_exit(NODE, Duration::from_secs(25));
+    eprintln!("[voxel] stopping hypervisor");
     hyperstop(NODE);
+}
+
+/// Wait for propolis to exit after the guest halts, polling rather than sleeping
+/// a fixed interval. Returning as soon as it is down keeps a fast halt fast, and
+/// the timeout is not fatal: `hyperstop` takes the VM down either way.
+fn wait_for_propolis_exit(name: &str, timeout: Duration) {
+    let Some(pid) = read_pidfile(name) else {
+        return;
+    };
+    eprintln!("[voxel] waiting up to {}s for shutdown", timeout.as_secs());
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        // Signal 0 tests for existence without delivering anything.
+        let alive = Command::new("pfexec")
+            .args(["kill", "-0", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    eprintln!(
+        "[voxel] still running after {}s; forcing it down",
+        timeout.as_secs()
+    );
+}
+
+/// The falcon workdir for the current deployment. `bake` has already `cd`-ed
+/// here, so this is always the builder's own workspace and never a rack's.
+fn falcon_dir() -> &'static Path {
+    Path::new(".falcon")
+}
+
+/// Read a node's propolis pid, rejecting anything that is not a plain number so
+/// a stray or truncated pidfile cannot turn into a `kill` against something
+/// unrelated.
+fn read_pidfile(name: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(falcon_dir().join(format!("{name}.pid"))).ok()?;
+    let pid = raw.trim();
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(pid.to_string())
 }
 
 /// falcon's `hyperstop`, which is private to its CLI: SIGKILL the propolis
 /// process from the pidfile, then destroy the bhyve VM by instance uuid.
 fn hyperstop(name: &str) {
-    let dir = Path::new(".falcon");
+    let dir = falcon_dir();
     let pidfile = dir.join(format!("{name}.pid"));
-    if let Ok(pid) = std::fs::read_to_string(&pidfile) {
-        let pid = pid.trim();
-        if !pid.is_empty() {
-            let _ = Command::new("pfexec")
-                .args(["kill", "-9", pid])
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        let _ = std::fs::remove_file(&pidfile);
+    if let Some(pid) = read_pidfile(name) {
+        let _ = Command::new("pfexec")
+            .args(["kill", "-9", &pid])
+            .stderr(std::process::Stdio::null())
+            .status();
     }
+    let _ = std::fs::remove_file(&pidfile);
     // The clean halt above usually already tore the VM down, so bhyvectl's
     // "could not be opened" is the normal case, not an error worth printing.
     if let Ok(uuid) = std::fs::read_to_string(dir.join(format!("{name}.uuid"))) {
@@ -352,56 +403,109 @@ fn hyperstop(name: &str) {
 /// incremental) `zfs send` is self-contained, so the image carries no dependency
 /// on the base it was cloned from; only allocated blocks move.
 fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
-    let node_ds = format!("{dataset}/topo/{deploy}/{NODE}");
-    let zvol = format!("/dev/zvol/rdsk/{node_ds}");
+    let node = Dataset::new(format!("{dataset}/topo/{deploy}/{NODE}"))?;
+    let zvol = format!("/dev/zvol/rdsk/{}", node.as_str());
     if !Path::new(&zvol).exists() {
         bail!("node zvol not found at {zvol}");
     }
-    let img_ds = format!("{dataset}/img/{image_name}");
-    eprintln!("[voxel] capturing (zfs send/recv) {node_ds} -> {img_ds}@base");
+    let image = Dataset::new(format!("{dataset}/img/{image_name}"))?;
+    eprintln!(
+        "[voxel] capturing {} -> {}@base",
+        node.as_str(),
+        image.as_str()
+    );
 
-    // Best-effort: a prior run's snapshot / image usually does NOT exist, so
-    // silence these - their "does not exist" noise reads like a real failure.
-    zfs_quiet(&["destroy", "-r", &format!("{node_ds}@base")]);
-    zfs_quiet(&["destroy", "-r", &img_ds]);
-    zfs(&["snapshot", &format!("{node_ds}@base")])
-        .context("snapshot the builder disk")?;
+    // A prior run's snapshot and image usually do not exist yet.
+    destroy_recursive_if_present(&node.snapshot("base"))?;
+    destroy_recursive_if_present(image.as_str())?;
+    snapshot(&node, "base")?;
+    send_recv(&node.snapshot("base"), &image)
+}
 
-    // `zfs send | zfs recv`, both under pfexec.
-    let send = Command::new("pfexec")
-        .args(["zfs", "send", &format!("{node_ds}@base")])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .context("spawn zfs send")?;
-    let recv = Command::new("pfexec")
-        .args(["zfs", "recv", &img_ds])
-        .stdin(send.stdout.ok_or_else(|| anyhow::anyhow!("zfs send stdout"))?)
+/// A zfs dataset voxel is allowed to operate on, validated on construction.
+///
+/// Everything below runs under `pfexec` and two of them destroy recursively, so
+/// the name is checked here rather than trusted at the call site. These paths are
+/// built by interpolation from a dataset root and an image name; an empty or
+/// truncated component would silently widen a `destroy -r` to the parent and take
+/// every image with it.
+struct Dataset(String);
+
+impl Dataset {
+    fn new(path: String) -> Result<Self> {
+        let components: Vec<&str> = path.split('/').collect();
+        if components.len() < 3
+            || components.iter().any(|c| c.is_empty())
+            || path.contains(|c: char| c.is_whitespace())
+            || path.contains('@')
+        {
+            bail!(
+                "refusing to operate on zfs dataset {path:?}: expected a \
+                 <pool>/<...>/<name> path with no empty components"
+            );
+        }
+        Ok(Self(path))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn snapshot(&self, name: &str) -> String {
+        format!("{}@{name}", self.0)
+    }
+}
+
+/// `zfs destroy -r`, tolerating only the absence of the target.
+///
+/// Any other failure is reported: silently swallowing them hides real problems
+/// (a busy dataset, a permission failure) behind a later, stranger error.
+fn destroy_recursive_if_present(target: &str) -> Result<()> {
+    let out = Command::new("pfexec")
+        .args(["zfs", "destroy", "-r", target])
+        .output()
+        .with_context(|| format!("run zfs destroy -r {target}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("does not exist") {
+        return Ok(());
+    }
+    bail!("zfs destroy -r {target} failed: {}", stderr.trim());
+}
+
+fn snapshot(ds: &Dataset, name: &str) -> Result<()> {
+    let snap = ds.snapshot(name);
+    let status = Command::new("pfexec")
+        .args(["zfs", "snapshot", &snap])
         .status()
-        .context("run zfs recv")?;
-    if !recv.success() {
-        bail!("zfs send | zfs recv failed capturing {node_ds} -> {img_ds}");
+        .with_context(|| format!("run zfs snapshot {snap}"))?;
+    if !status.success() {
+        bail!("zfs snapshot {snap} failed");
     }
     Ok(())
 }
 
-/// A best-effort `zfs` call whose failure is expected and uninteresting.
-fn zfs_quiet(args: &[&str]) {
-    let _ = Command::new("pfexec")
-        .arg("zfs")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-fn zfs(args: &[&str]) -> Result<()> {
-    let status = Command::new("pfexec")
-        .arg("zfs")
-        .args(args)
+/// Stream a snapshot into a new dataset. The send is FULL, not incremental, so
+/// the result carries no dependency on the base it was cloned from; only
+/// allocated blocks move.
+fn send_recv(from_snapshot: &str, to: &Dataset) -> Result<()> {
+    let send = Command::new("pfexec")
+        .args(["zfs", "send", from_snapshot])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn zfs send")?;
+    let recv = Command::new("pfexec")
+        .args(["zfs", "recv", to.as_str()])
+        .stdin(
+            send.stdout
+                .ok_or_else(|| anyhow::anyhow!("zfs send stdout"))?,
+        )
         .status()
-        .with_context(|| format!("run zfs {}", args.join(" ")))?;
-    if !status.success() {
-        bail!("zfs {} failed", args.join(" "));
+        .context("run zfs recv")?;
+    if !recv.success() {
+        bail!("zfs send {from_snapshot} | zfs recv {} failed", to.as_str());
     }
     Ok(())
 }

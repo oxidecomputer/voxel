@@ -27,7 +27,7 @@ enum Cmd {
     Gimlet,
     /// Bring up a customer router/edge from a voxel-frr image (linux / debian).
     Router,
-    /// Image-BUILD-time install, run inside the builder guest by build-image.sh.
+    /// Image-BUILD-time install, run inside the builder guest by `image bake`.
     /// Installs baked software only; applies no topology configuration.
     Install {
         /// Which image is being baked.
@@ -60,8 +60,8 @@ fn main() {
         Cmd::Gimlet => gimlet::bring_up(),
         Cmd::Router => router::bring_up(),
         Cmd::Install { role } => match role {
-            InstallRole::Cp => install::cp(),
-            InstallRole::Frr => install::frr(),
+            InstallRole::Cp => install::build_control_plane_image(),
+            InstallRole::Frr => install::build_frr_image(),
         },
         Cmd::SwitchEnforcer { slot } => {
             gimlet::switch_enforcer(slot);

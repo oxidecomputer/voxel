@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::process::Command;
 use voxel_config::VoxelConfig;
 
-use crate::isolated_external::{link_mtu, up as external_up};
+use crate::isolated_external::{DryRun, link_mtu, up as external_up};
 use crate::net::{
     ce_static_ip, resolve_external_ip, set_external_route, ssh_capture, ssh_output,
     wait_external_reachable, zlogin,
@@ -305,7 +305,8 @@ pub(crate) async fn cmd_launch(
     // nodes' static addresses (staged into each cargo-bay) stay in use after
     // bring-up (RSS watch, router NAT, host route to ce).
     if cfg.external.isolated() {
-        external_up(&cfg.external, false).context("bringing up the isolated external segment")?;
+        external_up(&cfg.external, DryRun::No)
+            .context("bringing up the isolated external segment")?;
     } else {
         lan_mtu_preflight()?;
     }

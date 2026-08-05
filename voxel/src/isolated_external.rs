@@ -80,6 +80,27 @@ fn probe_out(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Run a mutating host command under pfexec, or print it under `--dry-run`.
+/// Whether `up`/`down` apply their host changes or only print them. A bare
+/// `bool` at these call sites reads as an unexplained `false`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DryRun {
+    /// Print the `pfexec` commands without running them.
+    Yes,
+    /// Apply the changes.
+    No,
+}
+
+impl DryRun {
+    /// True when commands should only be printed.
+    fn applies(self) -> bool {
+        matches!(self, DryRun::Yes)
+    }
+
+    pub(crate) fn from_flag(dry_run: bool) -> Self {
+        if dry_run { DryRun::Yes } else { DryRun::No }
+    }
+}
+
 fn run(dry_run: bool, args: &[&str]) -> anyhow::Result<()> {
     if dry_run {
         eprintln!("+ pfexec {}", args.join(" "));
@@ -246,7 +267,8 @@ fn load_nat(uplink: &str, subnet: &str, dry_run: bool) -> anyhow::Result<()> {
 /// threshold, when `subnet` is not CIDR or overlaps a host-owned address, or
 /// when one of the underlying `dladm`/`ipadm`/`routeadm`/`ipnat` commands
 /// fails.
-pub(crate) fn up(x: &External, dry_run: bool) -> anyhow::Result<()> {
+pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
+    let dry_run = dry_run.applies();
     let uplink = x.uplink.as_deref().context(
         "external.uplink must be set in isolated mode (voxel config set external.uplink <link>)",
     )?;
@@ -337,7 +359,8 @@ pub(crate) fn up(x: &External, dry_run: bool) -> anyhow::Result<()> {
 ///
 /// Fails when a delete command fails, e.g. the etherstub still carries node
 /// VNICs from a running rack.
-pub(crate) fn down(x: &External, dry_run: bool) -> anyhow::Result<()> {
+pub(crate) fn down(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
+    let dry_run = dry_run.applies();
     eprintln!("[voxel] external: taking down isolated segment");
     if probe("ipadm", &["show-addr", ADDROBJ]) {
         run(dry_run, &["ipadm", "delete-addr", ADDROBJ])?;

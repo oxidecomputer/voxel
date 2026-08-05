@@ -1,5 +1,4 @@
-//! `voxel image create` - the per-commit control-plane build. Replaces
-//! `build-cp.sh` and `fetch-sidecar.sh`.
+//! `voxel image create` - the per-commit control-plane build.
 //!
 //! TUF can't be used here: its control-plane.tar.gz carries only the service
 //! zones, not the i86pc global-zone software (sled-agent/switch/opte/mgs), so
@@ -9,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::imagebuild::{BakeOpts, bake, isolated_builder, repo_root, toolchain_bin};
+use crate::imagebuild::{BakeOpts, bake, builder_network, repo_root, toolchain_bin};
 
 /// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
 const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
@@ -33,7 +32,7 @@ pub(crate) struct CpBuild<'a> {
     /// Commit/tag to check out when not `as_is`.
     pub commit: Option<&'a str>,
     /// Gimlet SP count baked into the build-time smf configs.
-    pub gimlets: usize,
+    pub num_gimlets: usize,
     pub dataset: &'a str,
     pub build_rss_gen: bool,
     pub external: Option<&'a voxel_config::External>,
@@ -78,7 +77,7 @@ pub(crate) async fn create(
             (commit.to_string(), src, false)
         }
     };
-    let gimlets = std::env::var("GIMLETS")
+    let num_gimlets = std::env::var("NUM_GIMLETS")
         .ok()
         .and_then(|g| g.parse().ok())
         .unwrap_or(4);
@@ -88,7 +87,7 @@ pub(crate) async fn create(
         omicron_src,
         as_is,
         commit: if as_is { None } else { Some(&label) },
-        gimlets,
+        num_gimlets,
         dataset,
         build_rss_gen,
         external,
@@ -125,7 +124,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
             eprintln!("[voxel] cloning omicron -> {}", src.display());
             let repo = std::env::var("OMICRON_REPO")
                 .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
-            run(Command::new("git").arg("clone").arg(&repo).arg(src), "git clone omicron")?;
+            run(
+                Command::new("git").arg("clone").arg(&repo).arg(src),
+                "git clone omicron",
+            )?;
         }
         eprintln!("[voxel] checking out {commit}");
         // A fetch failure is tolerable: the commit may already be local.
@@ -135,7 +137,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
             .args(["fetch", "--all", "--tags", "-q"])
             .status();
         run(
-            Command::new("git").arg("-C").arg(src).args(["checkout", "-q", commit]),
+            Command::new("git")
+                .arg("-C")
+                .arg(src)
+                .args(["checkout", "-q", commit]),
             "git checkout",
         )?;
     }
@@ -144,11 +149,15 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
     // --- 2. prerequisites + softnpu machinery --------------------------------
     eprintln!("[voxel] install_builder_prerequisites.sh -y");
-    run(omicron_cmd(src, "./tools/install_builder_prerequisites.sh").arg("-y"),
-        "install_builder_prerequisites")?;
+    run(
+        omicron_cmd(src, "./tools/install_builder_prerequisites.sh").arg("-y"),
+        "install_builder_prerequisites",
+    )?;
     eprintln!("[voxel] ci_download_softnpu_machinery (out/npuzone)");
-    run(&mut omicron_cmd(src, "./tools/ci_download_softnpu_machinery"),
-        "ci_download_softnpu_machinery")?;
+    run(
+        &mut omicron_cmd(src, "./tools/ci_download_softnpu_machinery"),
+        "ci_download_softnpu_machinery",
+    )?;
 
     // --- 3. build the package tools ------------------------------------------
     eprintln!("[voxel] cargo build --release omicron-package xtask xtask-downloader");
@@ -169,9 +178,9 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     // --- 4. render build-time smf configs ------------------------------------
     eprintln!(
         "[voxel] rendering build-time smf configs from voxel-config (gimlets={})",
-        b.gimlets
+        b.num_gimlets
     );
-    crate::image::render_smf(src, b.gimlets)?;
+    crate::image::render_smf(src, b.num_gimlets)?;
 
     // --- 5. package the control plane ----------------------------------------
     // NB: `-p a4x2` is OMICRON's own package preset (a build target in its
@@ -238,7 +247,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let _ = Command::new("chmod").arg("+x").arg(&agent).status();
 
     // --- 8. bake -------------------------------------------------------------
-    let (ext_if, builder_net) = isolated_builder(b.external)?;
+    let network = builder_network(b.external)?;
     bake(BakeOpts {
         base_image: "helios-3.0",
         role: Some("cp"),
@@ -250,8 +259,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         disk_gb: 100,
         mem_gb: 16,
         cores: 8,
-        ext_interface: ext_if.as_deref(),
-        builder_net: builder_net.as_deref(),
+        network: &network,
     })
     .await?;
 
@@ -295,13 +303,14 @@ fn apply_patches(voxel_image: &Path, src: &Path) -> Result<()> {
     eprintln!("[voxel] patching sled-hardware parse_smbios_output: Pc -> Gimlet baseboard");
     let smbios = src.join("sled-hardware/src/illumos/mod.rs");
     run(
-        Command::new("perl").args([
-            "-pi",
-            "-e",
-            "s/Some\\(Baseboard::new_pc\\(serial_number, product\\)\\)/\
+        Command::new("perl")
+            .args([
+                "-pi",
+                "-e",
+                "s/Some\\(Baseboard::new_pc\\(serial_number, product\\)\\)/\
              Some(Baseboard::new_gimlet(serial_number, product, 2))/",
-        ])
-        .arg(&smbios),
+            ])
+            .arg(&smbios),
         "perl smbios baseboard patch",
     )?;
     if !file_contains(&smbios, "new_gimlet(serial_number, product, 2)") {
@@ -328,14 +337,16 @@ fn apply_patches(voxel_image: &Path, src: &Path) -> Result<()> {
 /// stage them for the image. The builder VM may not reach buildomat.eng - only
 /// the host does - so this happens here rather than in-guest.
 fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
-    let rev =
-        std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
+    let rev = std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
     let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
     std::fs::create_dir_all(&cache).with_context(|| format!("mkdir {}", cache.display()))?;
     std::fs::create_dir_all(dest).with_context(|| format!("mkdir {}", dest.display()))?;
     for artifact in ["scadm", "libsidecar_lite.so"] {
         let cached = cache.join(artifact);
-        if std::fs::metadata(&cached).map(|m| m.len() == 0).unwrap_or(true) {
+        if std::fs::metadata(&cached)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+        {
             eprintln!("[voxel] fetching {artifact} @ {rev}");
             run(
                 Command::new("curl")
@@ -346,8 +357,7 @@ fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
             )?;
         }
         let _ = Command::new("chmod").arg("+x").arg(&cached).status();
-        std::fs::copy(&cached, dest.join(artifact))
-            .with_context(|| format!("stage {artifact}"))?;
+        std::fs::copy(&cached, dest.join(artifact)).with_context(|| format!("stage {artifact}"))?;
     }
     eprintln!(
         "[voxel] staged scadm + libsidecar_lite.so -> {}",

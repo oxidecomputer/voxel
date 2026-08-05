@@ -230,7 +230,6 @@ enum ImageCmd {
         commit: Option<String>,
         /// Build from an existing omicron checkout/worktree AS-IS (host build,
         /// for dev): skips clone + checkout so your working-tree edits are built.
-        /// Applies voxel's omicron patches + smf configs to that tree (idempotent).
         #[arg(long)]
         src: Option<PathBuf>,
     },
@@ -284,7 +283,7 @@ enum ImageCmd {
         version: String,
     },
     /// (build helper) Bake an image: boot a one-node builder, run the in-guest
-    /// agent's install role, capture the disk. Used by build-cp.sh/build-frr.sh.
+    /// agent's install role, capture the disk.
     #[command(hide = true)]
     Bake {
         /// Registered image name (captured to `<dataset>/img/<name>@base`).
@@ -318,7 +317,7 @@ enum ImageCmd {
         ext_interface: Option<String>,
     },
     /// (build helper) Render the build-time smf configs (mgs-sim, sp-sim,
-    /// sled-agent) into an omicron checkout. Used by build-cp.sh.
+    /// sled-agent) into an omicron checkout.
     #[command(hide = true)]
     RenderSmf {
         /// Path to the omicron checkout root.
@@ -469,7 +468,7 @@ enum SpCmd {
     ///
     /// The firmware counterpart to `rack patch`. `<image>` is a hubris `.zip`
     /// for an SP, or a raw oxide-rot-1 image for target `rot` (restarts every RoT
-    /// bridge). Live + ephemeral (reverts on relaunch; bake via `build-cp.sh`).
+    /// bridge). Live + ephemeral (reverts on relaunch; bake via `image create`).
     Reflash {
         /// Target: `sidecar` | `gN` | a port | `rot`.
         target: String,
@@ -823,8 +822,10 @@ async fn main() -> Result<(), Error> {
                     disk_gb: *disk_gb,
                     mem_gb: *mem_gb,
                     cores: *cores,
-                    ext_interface: ext_interface.as_deref(),
-                    builder_net: None,
+                    network: &imagebuild::BuilderNetwork {
+                        interface: ext_interface.clone(),
+                        static_address: None,
+                    },
                 })
                 .await
             }
@@ -857,10 +858,14 @@ async fn main() -> Result<(), Error> {
             NetworkCmd::External { cmd } => {
                 let cfg = load_config(&config_path)?;
                 match cmd {
-                    ExternalCmd::Up { dry_run } => isolated_external::up(&cfg.external, *dry_run),
-                    ExternalCmd::Down { dry_run } => {
-                        isolated_external::down(&cfg.external, *dry_run)
-                    }
+                    ExternalCmd::Up { dry_run } => isolated_external::up(
+                        &cfg.external,
+                        isolated_external::DryRun::from_flag(*dry_run),
+                    ),
+                    ExternalCmd::Down { dry_run } => isolated_external::down(
+                        &cfg.external,
+                        isolated_external::DryRun::from_flag(*dry_run),
+                    ),
                     ExternalCmd::Check => isolated_external::check(&cfg.external),
                 }
             }

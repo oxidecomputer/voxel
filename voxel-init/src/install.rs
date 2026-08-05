@@ -1,10 +1,9 @@
 //! Image-BUILD-time install, run inside the builder guest.
 //!
-//! Replaces the per-image install shell scripts (`install-cp.sh`,
-//! `install-frr.sh`): `build-image.sh` runs `voxel-init install --role <role>`
-//! in the builder node, which installs baked software and applies NO
-//! topology-specific configuration. Per-topology config is generated in Rust and
-//! pushed at LAUNCH by the `gimlet` / `router` roles.
+//! `voxel image bake` runs `voxel-init install --role <role>` in the builder
+//! node. Each role installs baked software and applies NO topology-specific
+//! configuration: per-topology config is generated on the host and pushed at
+//! LAUNCH by the `gimlet` / `router` roles.
 //!
 //! Same source builds for both guest OSes; the role picks the implementation at
 //! runtime, matching how `gimlet` / `router` already work.
@@ -50,14 +49,13 @@ fn bake_agent() -> Result<()> {
     Ok(())
 }
 
-/// Write the marker `build-image.sh` greps to confirm the install ran to
+/// Write the marker `image bake` greps to confirm the install ran to
 /// completion before it captures the disk.
 fn mark_ready(body: &str) -> Result<()> {
     run_quiet("sync", &[]);
     let built = capture("date", &["+%Y-%m-%dT%H:%M:%S"]).unwrap_or_default();
     let line = format!("{body} built={built}\n");
-    fs::write(READY_MARKER, &line)
-        .map_err(|e| anyhow::anyhow!("write {READY_MARKER}: {e}"))?;
+    fs::write(READY_MARKER, &line).map_err(|e| anyhow::anyhow!("write {READY_MARKER}: {e}"))?;
     note(format!("image ready: {}", line.trim()));
     Ok(())
 }
@@ -107,9 +105,8 @@ fn sleep2() {
 /// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet - flashing
 /// hubris images is a runtime concern, so `voxel launch --emu-sp` stages and
 /// flashes it per-scrimlet from the `[sp]` config instead.
-pub fn cp() -> Result<()> {
-    let version =
-        std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
+pub fn build_control_plane_image() -> Result<()> {
+    let version = std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
 
     // --- networking: reach pkg.oxide.computer ---
     // The builder has a single external NIC; find a vioif and address it.
@@ -146,9 +143,8 @@ pub fn cp() -> Result<()> {
             run("ipadm", &["create-addr", "-T", "dhcp", &addrobj]);
             note("waiting for DHCP lease...");
             for _ in 0..30 {
-                let leased =
-                    capture("ipadm", &["show-addr", &addrobj, "-p", "-o", "addr"])
-                        .is_some_and(|a| a.contains('/'));
+                let leased = capture("ipadm", &["show-addr", &addrobj, "-p", "-o", "addr"])
+                    .is_some_and(|a| a.contains('/'));
                 if leased {
                     break;
                 }
@@ -177,8 +173,7 @@ pub fn cp() -> Result<()> {
 
     // The builder runs us from /opt/cargo-bay; the staged omicron dir is here.
     let omicron = format!("{CARGO_BAY}/omicron");
-    std::env::set_current_dir(&omicron)
-        .map_err(|e| anyhow::anyhow!("cd {omicron}: {e}"))?;
+    std::env::set_current_dir(&omicron).map_err(|e| anyhow::anyhow!("cd {omicron}: {e}"))?;
     for f in ["omicron-package", "xtask", "xtask-downloader"] {
         run_quiet("chmod", &["+x", f]);
     }
@@ -192,11 +187,7 @@ pub fn cp() -> Result<()> {
         ("XTASK_DOWNLOADER_BIN", xtask_dl.as_str()),
     ];
     let mut attempt = 0;
-    while !crate::sys::run_env(
-        "./tools/install_runner_prerequisites.sh",
-        &["-y"],
-        &envs,
-    ) {
+    while !crate::sys::run_env("./tools/install_runner_prerequisites.sh", &["-y"], &envs) {
         attempt += 1;
         if attempt >= 5 {
             bail!("install_runner_prerequisites failed after {attempt} attempts");
@@ -217,7 +208,9 @@ pub fn cp() -> Result<()> {
     if artifacts == 0 {
         bail!("omicron-package unpack produced no artifacts in /opt/oxide");
     }
-    note(format!("unpacked {artifacts} zone artifacts into /opt/oxide"));
+    note(format!(
+        "unpacked {artifacts} zone artifacts into /opt/oxide"
+    ));
 
     // Strip the default config-rss.toml that omicron v20+ ships in the sled-agent
     // non-gimlet package. sled-agent's SMF auto-starts at boot and would RSS-init
@@ -247,7 +240,7 @@ pub fn cp() -> Result<()> {
     );
 
     // SoftNPU sidecar_lite; scrimlets load it into propolis at launch. Staged
-    // into the cargo-bay by build-cp.sh because the builder VM may not reach
+    // into the cargo-bay by `image create` because the builder VM may not reach
     // buildomat.eng - only the host does.
     let sc_dir = format!("{CARGO_BAY}/sidecar");
     if Path::new(&format!("{sc_dir}/scadm")).exists()
@@ -277,7 +270,7 @@ pub fn cp() -> Result<()> {
         warn("svccfg import voxel-switch-enforcer failed (manifest staged for boot-time import)");
     }
 
-    // Clearing /etc/path_to_inst is build-image.sh's LAST exec before capture;
+    // Clearing /etc/path_to_inst is the bake's LAST exec before capture;
     // doing it here doesn't stick (later steps regenerate it for this VM).
     mark_ready(&format!(
         "voxel-cp version={version} unpacked_artifacts={artifacts}"
@@ -287,9 +280,8 @@ pub fn cp() -> Result<()> {
 /// Debian router image: install + enable FRR, bake the agent, scrub the
 /// builder's DHCP identity. No topology config - `frr.conf` is generated per
 /// topology and pushed at launch.
-pub fn frr() -> Result<()> {
-    let version =
-        std::env::var("VOXEL_FRR_VERSION").unwrap_or_else(|_| "unknown".into());
+pub fn build_frr_image() -> Result<()> {
+    let version = std::env::var("VOXEL_FRR_VERSION").unwrap_or_else(|_| "unknown".into());
 
     // --- reach apt ---
     // falcon's default ext link normally gives the node a DHCP NIC. Isolated
@@ -332,14 +324,19 @@ pub fn frr() -> Result<()> {
     // apt-daily timers race the apt lock and can wipe FRR state.
     run_quiet(
         "systemctl",
-        &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"],
+        &[
+            "disable",
+            "--now",
+            "apt-daily-upgrade.timer",
+            "apt-daily.timer",
+        ],
     );
 
     // --- install FRR (baked) ---
     let mut attempt = 0;
     loop {
-        let ok = run_env_noninteractive(&["update", "-y"])
-            && run_env_noninteractive(&[
+        let ok = apt_get_noninteractive(&["update", "-y"])
+            && apt_get_noninteractive(&[
                 "install",
                 "-y",
                 "frr",
@@ -390,18 +387,14 @@ pub fn frr() -> Result<()> {
     fs::write("/etc/machine-id", "").ok();
     fs::remove_file("/var/lib/dbus/machine-id").ok();
 
-    let frr_ver = capture("dpkg-query", &["-W", "-f=${Version}", "frr"])
-        .unwrap_or_else(|| "?".into());
+    let frr_ver =
+        capture("dpkg-query", &["-W", "-f=${Version}", "frr"]).unwrap_or_else(|| "?".into());
     mark_ready(&format!("voxel-frr version={version} frr={frr_ver}"))
 }
 
 /// `apt-get` with the noninteractive frontend the baked install needs.
-fn run_env_noninteractive(args: &[&str]) -> bool {
-    crate::sys::run_env(
-        "apt-get",
-        args,
-        &[("DEBIAN_FRONTEND", "noninteractive")],
-    )
+fn apt_get_noninteractive(args: &[&str]) -> bool {
+    crate::sys::run_env("apt-get", args, &[("DEBIAN_FRONTEND", "noninteractive")])
 }
 
 /// `/var/lib/dhcp/dhclient*.leases` - the shell used a glob; enumerate instead.
