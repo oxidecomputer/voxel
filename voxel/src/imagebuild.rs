@@ -85,8 +85,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     // its propolis processes, and leave its VNICs busy. build-image.sh avoided
     // this by `cd`-ing to voxel-image/ first; do the same.
     let workspace = repo_root()?.join("voxel-image");
-    std::env::set_current_dir(&workspace)
-        .with_context(|| format!("cd {}", workspace.display()))?;
+    std::env::set_current_dir(&workspace).with_context(|| format!("cd {}", workspace.display()))?;
 
     let mut d = Runner::new(o.deploy);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
@@ -204,11 +203,15 @@ pub(crate) async fn create_frr(
         .status();
     let built = Command::new(toolchain_bin("cargo"))
         .current_dir(&root)
-        .args(["build", "-p", "voxel-init", "--release", "--target", FRR_TARGET])
-        .env(
-            "RUSTFLAGS",
-            "-C linker=rust-lld -C link-self-contained=yes",
-        )
+        .args([
+            "build",
+            "-p",
+            "voxel-init",
+            "--release",
+            "--target",
+            FRR_TARGET,
+        ])
+        .env("RUSTFLAGS", "-C linker=rust-lld -C link-self-contained=yes")
         .status()
         .context("run cargo build -p voxel-init")?;
     if !built.success() {
@@ -374,8 +377,7 @@ fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
     // silence these - their "does not exist" noise reads like a real failure.
     zfs_quiet(&["destroy", "-r", &format!("{node_ds}@base")]);
     zfs_quiet(&["destroy", "-r", &img_ds]);
-    zfs(&["snapshot", &format!("{node_ds}@base")])
-        .context("snapshot the builder disk")?;
+    zfs(&["snapshot", &format!("{node_ds}@base")]).context("snapshot the builder disk")?;
 
     // `zfs send | zfs recv`, both under pfexec.
     let send = Command::new("pfexec")
@@ -385,7 +387,10 @@ fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
         .context("spawn zfs send")?;
     let recv = Command::new("pfexec")
         .args(["zfs", "recv", &img_ds])
-        .stdin(send.stdout.ok_or_else(|| anyhow::anyhow!("zfs send stdout"))?)
+        .stdin(
+            send.stdout
+                .ok_or_else(|| anyhow::anyhow!("zfs send stdout"))?,
+        )
         .status()
         .context("run zfs recv")?;
     if !recv.success() {
