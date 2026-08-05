@@ -1,0 +1,283 @@
+//! The changes voxel makes to an omicron checkout before building it: two
+//! source patches and the config probe.
+//!
+//! These live here because both callers need them and must agree exactly. The
+//! host applies them when it builds omicron itself; `voxel-init build` applies
+//! them when the build happens inside the builder guest. A difference between
+//! the two would produce two different images from one commit.
+
+use crate::config::{ServicePoolSchema, SledDataLinksSchema, SledDisksSchema};
+use std::path::Path;
+
+/// A malformed or moved patch site.
+#[derive(Debug)]
+pub struct PatchError(String);
+
+impl std::fmt::Display for PatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PatchError {}
+
+type Result<T> = std::result::Result<T, PatchError>;
+
+fn err<T>(msg: String) -> Result<T> {
+    Err(PatchError(msg))
+}
+
+/// Replace the single occurrence of `anchor` in `path` with `replacement`.
+/// No-op if `marker` is already present, so a re-run is idempotent. Requiring
+/// exactly one match means an upstream rewrite fails here instead of silently
+/// producing a mis-built image.
+pub fn patch_file(path: &Path, marker: &str, anchor: &str, replacement: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| PatchError(format!("read {} to patch: {e}", path.display())))?;
+    if text.contains(marker) {
+        return Ok(());
+    }
+    let hits = text.matches(anchor).count();
+    if hits != 1 {
+        return err(format!(
+            "{}: expected exactly 1 match of the patch anchor, found {hits}. \
+             Omicron changed upstream; the patch needs updating.",
+            path.display()
+        ));
+    }
+    std::fs::write(path, text.replace(anchor, replacement))
+        .map_err(|e| PatchError(format!("write patched {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Nexus rack-init builds the "initial-infra" address lot as a single block from
+/// `rack_network_config.infra_ip_first`/`last` and lot-validates every
+/// switch-port address against it. In Static mode that lot is a finite v4 range
+/// (the numbered /30 uplinks), so voxel's sidecar-interconnect ports (underlay,
+/// v6 addrconf) can't reserve and handoff 400s with "address not in lot". BGP
+/// mode already uses a v6 `::` lot, where the same addrconf ports reserve fine.
+///
+/// The replacement's indentation lands in real Rust source that must compile.
+pub fn apply_nexus_infra_lot_patch(rack_rs: &Path) -> Result<()> {
+    patch_file(
+        rack_rs,
+        "voxel: add a v6 block",
+        "        let blocks = vec![ipv4_block];",
+        "        // voxel: add a v6 block so Static-mode addrconf (interconnect) ports\n\
+         \x20       // reserve in the infra lot; BGP mode already uses a v6 :: lot.\n\
+         \x20       let mut blocks = vec![ipv4_block];\n\
+         \x20       if first_address.is_ipv4() {\n\
+         \x20           blocks.push(networking::AddressLotBlockCreate {\n\
+         \x20               first_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+         \x20               last_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+         \x20           });\n\
+         \x20       }",
+    )
+}
+
+/// sled-hardware returns a Pc baseboard for i86pc sleds, but wicketd correlates
+/// bootstrap addresses by matching the SP's Gimlet baseboard, so every sled
+/// shows "bootstrap address UNKNOWN". Revision 2 matches the emulated SP VPD.
+pub fn apply_smbios_baseboard_patch(mod_rs: &Path) -> Result<()> {
+    patch_file(
+        mod_rs,
+        "new_gimlet(serial_number, product, 2)",
+        "Some(Baseboard::new_pc(serial_number, product))",
+        "Some(Baseboard::new_gimlet(serial_number, product, 2))",
+    )
+}
+
+/// Both source patches, re-applied after every checkout (which resets the tree).
+pub fn apply_patches(src: &Path) -> Result<()> {
+    apply_smbios_baseboard_patch(&src.join("sled-hardware/src/illumos/mod.rs"))?;
+    apply_nexus_infra_lot_patch(&src.join("nexus/src/app/rack.rs"))
+}
+
+/// Where the probe is written, relative to an omicron checkout. `examples/` is
+/// discovered by cargo with no manifest entry, so there is no workspace member
+/// to add and no lockfile churn.
+pub const PROBE_PATH: &str = "sled-agent/examples/voxel-config-check.rs";
+
+/// The probe. It calls the same two parsers `sled-agent`'s own `main` calls at
+/// boot, so "valid" means exactly "this sled-agent would accept it": nested
+/// fields, renamed variants, changed types and the semantic checks
+/// `RackInitializeRequest`'s `TryFrom` runs are all covered.
+///
+/// It only deserializes. It names no field and constructs no omicron type, so it
+/// compiles unchanged against any era. That is the difference from the generator
+/// this replaced, whose every breakage was in construction.
+pub const PROBE_SRC: &str = r#"//! Generated by voxel. Validates voxel's rendered
+//! configs with this commit's own parsers. Safe to delete.
+
+fn report(what: &str, e: &dyn std::error::Error) {
+    eprintln!("{what} rejected by this omicron:");
+    eprintln!("  {e}");
+    let mut src = e.source();
+    while let Some(e) = src {
+        eprintln!("  caused by: {e}");
+        src = e.source();
+    }
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let usage = "usage: voxel-config-check <config.toml> <config-rss.toml>";
+    let sled = camino::Utf8PathBuf::from(args.next().expect(usage));
+    let rss = camino::Utf8PathBuf::from(args.next().expect(usage));
+
+    let mut bad = false;
+    if let Err(e) = omicron_sled_agent::config::Config::from_file(&sled) {
+        report("sled-agent config", &e);
+        bad = true;
+    }
+    if let Err(e) = sled_agent_rack_setup::rack_initialize_request_from_file(&rss) {
+        report("config-rss", &e);
+        bad = true;
+    }
+    if bad {
+        std::process::exit(1);
+    }
+    println!("ok: both configs parse");
+}
+"#;
+
+/// The build flags omicron needs on Helios. Both build paths must use the same
+/// string: a mismatch invalidates every cached artifact, turning a warm build
+/// back into a cold one.
+pub const RUSTFLAGS: &str = "--cfg svcadm_autoclear \
+     -C link-arg=-R/usr/platform/oxide/lib/amd64 \
+     -C link-arg=-Wl,-znocompstrtab --cfg tokio_unstable";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("voxel-omicron-patch-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rack.rs");
+        std::fs::write(&f, body).unwrap();
+        f
+    }
+
+    /// Byte for byte the text the python patch this replaced emitted.
+    #[test]
+    fn nexus_infra_lot_patch_matches_reference_output() {
+        let f = scratch(
+            "lot",
+            "BEFORE\n        let blocks = vec![ipv4_block];\nAFTER\n",
+        );
+        apply_nexus_infra_lot_patch(&f).unwrap();
+        let want = "BEFORE\n\
+        \x20       // voxel: add a v6 block so Static-mode addrconf (interconnect) ports\n\
+        \x20       // reserve in the infra lot; BGP mode already uses a v6 :: lot.\n\
+        \x20       let mut blocks = vec![ipv4_block];\n\
+        \x20       if first_address.is_ipv4() {\n\
+        \x20           blocks.push(networking::AddressLotBlockCreate {\n\
+        \x20               first_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+        \x20               last_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+        \x20           });\n\
+        \x20       }\nAFTER\n";
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), want);
+
+        // Re-applying is a no-op, so a re-checked-out tree doesn't double-patch.
+        apply_nexus_infra_lot_patch(&f).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), want);
+    }
+
+    /// A vanished anchor must fail the build. A silent no-op would surface much
+    /// later as a handoff 400.
+    #[test]
+    fn patch_fails_when_anchor_is_gone() {
+        let f = scratch("missing", "nothing to anchor on\n");
+        assert!(apply_nexus_infra_lot_patch(&f).is_err());
+    }
+
+    /// Two matches are ambiguous; patching either could be wrong.
+    #[test]
+    fn patch_fails_when_anchor_is_ambiguous() {
+        let line = "        let blocks = vec![ipv4_block];\n";
+        let f = scratch("dup", &format!("{line}{line}"));
+        assert!(apply_nexus_infra_lot_patch(&f).is_err());
+    }
+}
+
+/// Read `rel` from an omicron checkout, empty when absent. Detection is
+/// advisory: a checkout that cannot be read falls back to the oldest shapes.
+fn read(root: &Path, rel: &str) -> String {
+    std::fs::read_to_string(root.join(rel)).unwrap_or_default()
+}
+
+/// Detect the sled-agent config shapes a checkout expects. The `ExternalDisks`
+/// variants are declared in sled-hardware, so the enum is read there rather than
+/// the field in sled-agent: `Virtual { vdevs }` and `HardcodedPhysical { disks }`
+/// merged into `Hardcoded { vdevs, disks }`, and `HardcodedPhysical {` must not
+/// match `Hardcoded {`.
+pub fn detect_sled_schemas(root: &Path) -> (SledDataLinksSchema, SledDisksSchema) {
+    let src = read(root, "sled-agent/src/config.rs");
+    let disks = if !src.contains("pub external_disks") {
+        SledDisksSchema::Vdevs
+    } else if read(root, "sled-hardware/src/lib.rs").contains("Hardcoded {") {
+        SledDisksSchema::Hardcoded
+    } else {
+        SledDisksSchema::ExternalDisks
+    };
+    let data_links = if src.contains("data_links: DataLinks") {
+        SledDataLinksSchema::Tagged
+    } else {
+        SledDataLinksSchema::List
+    };
+    (data_links, disks)
+}
+
+/// Detect the config-rss service IP pool shape. omicron #10956 replaced
+/// `internal_services_ip_pool_ranges` with `service_ip_pools`.
+pub fn detect_service_pool_schema(root: &Path) -> ServicePoolSchema {
+    if read(root, "sled-agent/bootstrap-agent-lockstep-types/src/lib.rs")
+        .contains("service_ip_pools")
+    {
+        ServicePoolSchema::Pools
+    } else {
+        ServicePoolSchema::Ranges
+    }
+}
+
+/// Render the build-time smf configs into a checkout. Bakes switch0 for
+/// `gimlets` sleds with scrimlets at the first and last, which the launch-time
+/// topology must match for the baked switch0 to pair with the generated switch1.
+///
+/// Shared so the host path and the in-guest build write identical files.
+pub fn render_smf(
+    root: &Path,
+    gimlets: usize,
+    data_links: SledDataLinksSchema,
+    disks: SledDisksSchema,
+) -> Result<Vec<std::path::PathBuf>> {
+    let scrimlets = [0usize, gimlets.saturating_sub(1)];
+    let fleet = crate::sp::SpFleet::sim(gimlets);
+    let writes = [
+        (
+            "smf/mgs-sim/config.toml",
+            crate::mgs::switch_config(0, &fleet, &scrimlets),
+        ),
+        ("smf/sp-sim/config.toml", fleet.sp_sim_config()),
+        (
+            "smf/sled-agent/non-gimlet/config.toml",
+            crate::sled::SledAgentConfig::new(0, true)
+                .with_data_links_schema(data_links)
+                .with_disks_schema(disks)
+                .render(),
+        ),
+    ];
+    let mut written = Vec::new();
+    for (rel, text) in writes {
+        let path = root.join(rel);
+        let dir = path.parent().expect("smf path has a parent");
+        std::fs::create_dir_all(dir)
+            .map_err(|e| PatchError(format!("mkdir {}: {e}", dir.display())))?;
+        std::fs::write(&path, text)
+            .map_err(|e| PatchError(format!("write {}: {e}", path.display())))?;
+        written.push(path);
+    }
+    Ok(written)
+}

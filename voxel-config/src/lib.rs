@@ -12,6 +12,7 @@
 pub mod config;
 pub mod frr;
 pub mod mgs;
+pub mod omicron;
 pub mod rss;
 pub mod sled;
 pub mod sp;
