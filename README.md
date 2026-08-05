@@ -198,13 +198,9 @@ Notes:
 - If you set `[topology].ce_external_ip`, keep it outside the static node
   range (sleds count up from `ip_start`, then routers in `topology.routers`
   order).
-- The manually-run `build-frr.sh` doesn't read the config, so on an isolated
-  box export `EXT_INTERFACE=voxel_ext_stub0` and
-  `VOXEL_BUILDER_NET="172.30.199.198/24 172.30.199.199"` (the builder gets
-  `host_ip - 1`) when baking the FRR image. Export `FALCON_DATASET` to match
-  `falcon.dataset` for the same reason; otherwise, the bake registers the image
-  under falcon's default dataset, `launch` keeps using the old one, and
-  nothing reports an error.
+- `voxel image create-frr` reads the config, so an isolated box needs no manual
+  setup: it brings the segment up and gives the builder `host_ip - 1`.
+  `EXT_INTERFACE` and `VOXEL_BUILDER_NET` still override if you need them.
 - A manually plumbed fake network (`fake_external0` etc.) can coexist because
   voxel's link names are distinct, and `$EXT_INTERFACE` always wins.
 

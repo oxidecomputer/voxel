@@ -300,8 +300,8 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 )
             } else if let Some(n) = fname.strip_suffix(".raw.xz") {
                 bail!(
-                    "raw import for {n} not wired here yet - use build-image.sh's \
-                     streaming raw import (presized zvol). zfs streams (.zfs.zst) import directly."
+                    "raw import for {n} is not implemented (it needs a presized zvol). \
+                     Export as a zfs stream instead: those (.zfs.zst) import directly."
                 );
             } else {
                 bail!("unrecognized extension on {fname} (want .zfs.zst or .raw.xz)");

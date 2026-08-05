@@ -1,7 +1,7 @@
 //! Image-BUILD-time install, run inside the builder guest.
 //!
 //! Replaces the per-image install shell scripts (`install-cp.sh`,
-//! `install-frr.sh`): `build-image.sh` runs `voxel-init install --role <role>`
+//! `install-frr.sh`): `voxel image bake` runs `voxel-init install --role <role>`
 //! in the builder node, which installs baked software and applies NO
 //! topology-specific configuration. Per-topology config is generated in Rust and
 //! pushed at LAUNCH by the `gimlet` / `router` roles.
@@ -50,7 +50,7 @@ fn bake_agent() -> Result<()> {
     Ok(())
 }
 
-/// Write the marker `build-image.sh` greps to confirm the install ran to
+/// Write the marker `voxel image bake` greps to confirm the install ran to
 /// completion before it captures the disk.
 fn mark_ready(body: &str) -> Result<()> {
     run_quiet("sync", &[]);
@@ -247,7 +247,7 @@ pub fn cp() -> Result<()> {
     );
 
     // SoftNPU sidecar_lite; scrimlets load it into propolis at launch. Staged
-    // into the cargo-bay by build-cp.sh because the builder VM may not reach
+    // into the cargo-bay by `voxel image create` because the builder VM may not reach
     // buildomat.eng - only the host does.
     let sc_dir = format!("{CARGO_BAY}/sidecar");
     if Path::new(&format!("{sc_dir}/scadm")).exists()
@@ -277,7 +277,7 @@ pub fn cp() -> Result<()> {
         warn("svccfg import voxel-switch-enforcer failed (manifest staged for boot-time import)");
     }
 
-    // Clearing /etc/path_to_inst is build-image.sh's LAST exec before capture;
+    // Clearing /etc/path_to_inst is the bake's LAST exec before capture;
     // doing it here doesn't stick (later steps regenerate it for this VM).
     mark_ready(&format!(
         "voxel-cp version={version} unpacked_artifacts={artifacts}"

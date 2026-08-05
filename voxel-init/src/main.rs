@@ -27,7 +27,7 @@ enum Cmd {
     Gimlet,
     /// Bring up a customer router/edge from a voxel-frr image (linux / debian).
     Router,
-    /// Image-BUILD-time install, run inside the builder guest by build-image.sh.
+    /// Image-BUILD-time install, run inside the builder guest by `voxel image bake`.
     /// Installs baked software only; applies no topology configuration.
     Install {
         /// Which image is being baked.

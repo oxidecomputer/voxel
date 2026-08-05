@@ -626,8 +626,8 @@ pub(crate) fn cmd_image_patch(
     if let Some(d) = dest {
         cmd.env("DEST", d);
     }
-    // FALCON_DATASET is already exported by resolve_falcon_env; patch-image.sh +
-    // build-image.sh read it.
+    // FALCON_DATASET is already exported by resolve_falcon_env; patch-image.sh
+    // and the bake read it.
     let status = cmd
         .status()
         .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
