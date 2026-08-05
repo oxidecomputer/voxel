@@ -126,6 +126,10 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     let step = match (o.role, o.exec) {
         (Some(role), _) => Some((
             format!("install --role {role}"),
+            // The cargo-bay is one-way: illumos guests get a `p9kp pull` copy,
+            // linux guests a read-only 9p mount. Nothing written there reaches
+            // the host, so the log stays in-guest and travels back as the
+            // exec's return value.
             format!(
                 "cp /opt/cargo-bay/voxel-init /tmp/voxel-init && chmod +x /tmp/voxel-init && \
                  /tmp/voxel-init install --role {role} 2>&1 | tee /tmp/install.log"
@@ -135,9 +139,16 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         (None, None) => None,
     };
     if let Some((label, cmd)) = step {
-        d.exec(node, &cmd)
+        // falcon returns the guest command's output. Print it: it is the only
+        // record of a step that can run for twenty minutes, and on failure it
+        // is the only diagnostic, since the guest is destroyed afterwards.
+        let out = d
+            .exec(node, &cmd)
             .await
             .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+        if !out.trim().is_empty() {
+            eprintln!("{}", out.trim());
+        }
 
         // falcon's exec does NOT propagate the guest command's exit code, so
         // validate the marker's CONTENT - written only on a complete run.
