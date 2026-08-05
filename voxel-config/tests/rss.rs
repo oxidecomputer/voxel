@@ -8,7 +8,7 @@
 //! pass; that launders a serialization change into the baseline. Rebuild them
 //! from omicron's types instead.
 
-use voxel_config::VoxelConfig;
+use voxel_config::{ServicePoolSchema, VoxelConfig};
 
 /// The scenarios span every axis that changes config-rss output: routing mode,
 /// BFD, per-rack projection, and sled count.
@@ -32,7 +32,7 @@ fn config(scenario: &str) -> VoxelConfig {
 
 fn check(scenario: &str, rack: usize) {
     let rendered = config(scenario)
-        .to_config_rss(rack)
+        .to_config_rss(rack, ServicePoolSchema::Ranges)
         .expect("render config-rss");
     expectorate::assert_contents(
         format!("tests/output/rss/{scenario}-rack{rack}.toml"),
@@ -70,4 +70,37 @@ fn multirack_rack0_matches_rss_gen() {
 #[test]
 fn multirack_rack1_matches_rss_gen() {
     check("multirack", 1);
+}
+
+/// omicron #10956 replaced the bare range list with a named pool. The two
+/// shapes share one slot, so exactly one must ever appear.
+#[test]
+fn pools_schema_matches_omicron_main() {
+    let rendered = config("bgp")
+        .to_config_rss(0, ServicePoolSchema::Pools)
+        .expect("render config-rss");
+    expectorate::assert_contents("tests/output/rss/bgp-rack0-pools.toml", &rendered);
+}
+
+#[test]
+fn exactly_one_service_pool_shape_is_emitted() {
+    for (pools, want, unwanted) in [
+        (
+            ServicePoolSchema::Ranges,
+            "internal_services_ip_pool_ranges",
+            "service_ip_pools",
+        ),
+        (
+            ServicePoolSchema::Pools,
+            "service_ip_pools",
+            "internal_services_ip_pool_ranges",
+        ),
+    ] {
+        let keys = config("bgp").config_rss_keys(pools).expect("keys");
+        assert!(keys.iter().any(|k| k == want), "{pools:?} missing {want}");
+        assert!(
+            !keys.iter().any(|k| k == unwanted),
+            "{pools:?} still emits {unwanted}"
+        );
+    }
 }

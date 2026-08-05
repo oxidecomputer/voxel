@@ -37,6 +37,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
 | `disks_schema` | enum | unset | `vdevs` or `external_disks`. Unset auto-detects from the image. |
+| `service_pool_schema` | enum | unset | `ranges` or `pools` (omicron #10956 renamed the config-rss service IP pool field). Unset auto-detects from the image. |
 
 ## [network]
 

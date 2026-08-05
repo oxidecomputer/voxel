@@ -19,7 +19,7 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use serde::Serialize;
 
-use crate::config::{RouterMode, UplinkPort, VoxelConfig};
+use crate::config::{RouterMode, ServicePoolSchema, UplinkPort, VoxelConfig};
 
 /// A malformed address or prefix in the `voxel.toml`, named by its field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +52,12 @@ struct RackInitializeRequest {
     bootstrap_discovery: BootstrapAddressDiscovery,
     ntp_servers: Vec<String>,
     dns_servers: Vec<IpAddr>,
-    internal_services_ip_pool_ranges: Vec<IpRange>,
+    /// Exactly one of these two is emitted, per [`ServicePoolSchema`]. They
+    /// occupy the same slot in omicron's own field order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    internal_services_ip_pool_ranges: Option<Vec<IpRange>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_ip_pools: Option<Vec<ServiceIpPoolConfig>>,
     external_dns_ips: Vec<IpAddr>,
     external_dns_zone_name: String,
     external_certificates: Vec<Certificate>,
@@ -85,6 +90,16 @@ enum BootstrapAddressDiscovery {
 struct IpRange {
     first: IpAddr,
     last: IpAddr,
+}
+
+/// `wicketd_commission_types::rack_setup::ServiceIpPoolConfig`. Omicron holds
+/// these in an `IdOrdMap` keyed by name, which serializes as a sequence.
+/// Ranges must be non-empty and all one address family.
+#[derive(Debug, Serialize)]
+struct ServiceIpPoolConfig {
+    name: String,
+    description: String,
+    ranges: Vec<IpRange>,
 }
 
 /// `Certificate`. Voxel emits none, but the field is required and must
@@ -432,7 +447,11 @@ fn interconnect_port(switch: &str, port: &str) -> PortConfig {
 /// config. Multi-rack deployments call this once per rack: each rack is an
 /// independent RSS domain, so the bootstrap set is filtered to that rack's
 /// sleds and the customer/service network is offset by `Network::for_rack`.
-fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeRequest> {
+fn request_from_config(
+    cfg: &VoxelConfig,
+    rack: usize,
+    pools: ServicePoolSchema,
+) -> Result<RackInitializeRequest> {
     let n = cfg.network.for_rack(rack);
 
     let rss_sleds = || cfg.sleds().into_iter().filter(|s| s.rss && s.rack == rack);
@@ -448,7 +467,25 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
         })
         .collect();
 
+    // The service pool occupies one slot under two different names. Omicron's
+    // own example names the pool after its address family.
     let pool = ip_range(&n.service_pool_first, &n.service_pool_last)?;
+    let v4 = pool.first.is_ipv4();
+    let (ranges, service_ip_pools) = match pools {
+        ServicePoolSchema::Ranges => (Some(vec![pool]), None),
+        ServicePoolSchema::Pools => {
+            let family = if v4 { "v4" } else { "v6" };
+            let ip = if v4 { "IPv4" } else { "IPv6" };
+            (
+                None,
+                Some(vec![ServiceIpPoolConfig {
+                    name: format!("oxide-service-pool-{family}"),
+                    description: format!("{ip} IP Pool for Oxide Services"),
+                    ranges: vec![pool],
+                }]),
+            )
+        }
+    };
 
     // 2-way fanout: one port per fabric router per switch (qsfp0, qsfp1, ...).
     let uplink_ports = cfg.uplink_ports(rack);
@@ -552,7 +589,8 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
         },
         ntp_servers: n.ntp_servers.clone(),
         dns_servers,
-        internal_services_ip_pool_ranges: vec![pool],
+        internal_services_ip_pool_ranges: ranges,
+        service_ip_pools,
         external_dns_ips,
         external_dns_zone_name: n.dns_zone.clone(),
         external_certificates: vec![],
@@ -570,9 +608,21 @@ fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeR
 }
 
 impl VoxelConfig {
-    /// Render this config's `config-rss.toml` for `rack` (0-based).
-    pub fn to_config_rss(&self, rack: usize) -> Result<String> {
-        let req = request_from_config(self, rack)?;
+    /// Render this config's `config-rss.toml` for `rack` (0-based). `pools`
+    /// selects the service IP pool shape for the target omicron; the caller
+    /// detects it per image.
+    pub fn to_config_rss(&self, rack: usize, pools: ServicePoolSchema) -> Result<String> {
+        let req = request_from_config(self, rack, pools)?;
         toml::to_string(&req).map_err(|e| RssConfigError(format!("serialize config-rss.toml: {e}")))
+    }
+
+    /// The top-level keys this config would emit. Used by `voxel image create`
+    /// to compare against the target omicron's own example config-rss before
+    /// spending 30 minutes on a build.
+    pub fn config_rss_keys(&self, pools: ServicePoolSchema) -> Result<Vec<String>> {
+        let text = self.to_config_rss(0, pools)?;
+        let doc: toml::Table = toml::from_str(&text)
+            .map_err(|e| RssConfigError(format!("reparse generated config-rss: {e}")))?;
+        Ok(doc.keys().cloned().collect())
     }
 }

@@ -35,7 +35,9 @@ pub(crate) struct CpBuild<'a> {
     /// Gimlet SP count baked into the build-time smf configs.
     pub gimlets: usize,
     pub dataset: &'a str,
-    pub external: Option<&'a voxel_config::External>,
+    /// The active `voxel.toml`, when there is one. Supplies the external
+    /// segment for an isolated builder and the config-rss schema check.
+    pub cfg: Option<&'a voxel_config::VoxelConfig>,
 }
 
 /// `voxel image create`: resolve where the omicron source is and what the image
@@ -46,7 +48,7 @@ pub(crate) async fn create(
     commit: Option<&str>,
     src: Option<&Path>,
     dataset: &str,
-    external: Option<&voxel_config::External>,
+    cfg: Option<&voxel_config::VoxelConfig>,
 ) -> Result<()> {
     let (label, omicron_src, as_is) = match src {
         Some(s) => {
@@ -88,7 +90,7 @@ pub(crate) async fn create(
         commit: if as_is { None } else { Some(&label) },
         gimlets,
         dataset,
-        external,
+        cfg,
     })
     .await
 }
@@ -138,6 +140,19 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     }
 
     apply_patches(src)?;
+
+    // Fail on config-rss schema drift HERE, before the ~30 minutes of build
+    // below, rather than at bring-up. Uses a default config when there's no
+    // voxel.toml: the top-level key set doesn't depend on the topology.
+    let owned;
+    let schema_cfg = match b.cfg {
+        Some(c) => c,
+        None => {
+            owned = voxel_config::VoxelConfig::default();
+            &owned
+        }
+    };
+    crate::topo::check_rss_schema(schema_cfg, src)?;
 
     // --- 2. prerequisites + softnpu machinery --------------------------------
     eprintln!("[voxel] install_builder_prerequisites.sh -y");
@@ -235,7 +250,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let _ = Command::new("chmod").arg("+x").arg(&agent).status();
 
     // --- 8. bake -------------------------------------------------------------
-    let (ext_if, builder_net) = isolated_builder(b.external)?;
+    let (ext_if, builder_net) = isolated_builder(b.cfg.map(|c| &c.external))?;
     bake(BakeOpts {
         base_image: "helios-3.0",
         role: Some("cp"),

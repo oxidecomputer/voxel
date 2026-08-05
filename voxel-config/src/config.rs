@@ -574,6 +574,9 @@ pub struct Image {
     /// Normally leave unset (`None`) - auto-detected per image. See
     /// [`SledDisksSchema`].
     pub disks_schema: Option<SledDisksSchema>,
+    /// Override the config-rss service IP pool shape. Normally leave unset
+    /// (`None`) - auto-detected per image. See [`ServicePoolSchema`].
+    pub service_pool_schema: Option<ServicePoolSchema>,
 }
 
 impl Default for Image {
@@ -584,8 +587,27 @@ impl Default for Image {
             frr: None,
             data_links_schema: None,
             disks_schema: None,
+            service_pool_schema: None,
         }
     }
+}
+
+/// The shape of the config-rss service IP pool config, which changed in
+/// omicron #10956 ("Require full service IP Pool details at RSS time"). The
+/// bare range list became a named pool carrying a description.
+///
+/// The field is required, and `RackInitializeRequest` does not
+/// `deny_unknown_fields`, so emitting the wrong one fails as a MISSING field
+/// while the stale one is silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServicePoolSchema {
+    /// Pre-#10956: `[[internal_services_ip_pool_ranges]] first/last`.
+    #[default]
+    Ranges,
+    /// omicron main: `[[service_ip_pools]]` with `name`, `description` and
+    /// a `ranges` list.
+    Pools,
 }
 
 /// The shape of sled-agent's `data_links` config field, which changed across

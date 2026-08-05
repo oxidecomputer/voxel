@@ -777,7 +777,7 @@ async fn main() -> Result<(), Error> {
                     commit.as_deref(),
                     src.as_deref(),
                     &image::falcon_dataset(),
-                    cfg.as_ref().map(|c| &c.external),
+                    cfg.as_ref(),
                 )
                 .await
             }

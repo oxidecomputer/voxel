@@ -7,7 +7,9 @@ use attest_mock::MockData;
 use libfalcon::{NodeRef, Runner, SmbiosType1Input, unit::gb};
 use std::fs;
 use std::path::{Path, PathBuf};
-use voxel_config::{SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig};
+use voxel_config::{
+    ServicePoolSchema, SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig,
+};
 
 pub(crate) struct Topo {
     pub(crate) runner: Runner,
@@ -230,9 +232,14 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
 
 /// Render this rack's `config-rss.toml` into `dir`. Generation lives in
 /// `voxel_config::rss`.
-fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Result<()> {
+fn generate_rss_config(
+    cfg: &VoxelConfig,
+    dir: &Path,
+    rack: usize,
+    pools: ServicePoolSchema,
+) -> anyhow::Result<()> {
     let text = cfg
-        .to_config_rss(rack)
+        .to_config_rss(rack, pools)
         .map_err(|e| anyhow!("render config-rss.toml for rack {rack}: {e}"))?;
     let out = dir.join("config-rss.toml");
     fs::write(&out, text).with_context(|| format!("write {}", out.display()))?;
@@ -274,6 +281,92 @@ fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchem
     )
 }
 
+/// Path of the omicron checkout the image was built from, if it's on disk.
+pub(crate) fn omicron_src() -> Option<PathBuf> {
+    std::env::var("VOXEL_OMICRON_SRC")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+}
+
+/// The config-rss file omicron ships as its own worked example. It tracks the
+/// schema in-tree, which makes it the cheapest ground truth for what a given
+/// commit expects.
+pub(crate) const OMICRON_EXAMPLE_RSS: &str = "smf/sled-agent/non-gimlet/config-rss.toml";
+
+/// Detect the service IP pool shape from an omicron checkout. omicron #10956
+/// replaced `internal_services_ip_pool_ranges` with `service_ip_pools`;
+/// the field is declared in the bootstrap-agent lockstep types.
+pub(crate) fn detect_service_pool_schema(src: Option<&Path>) -> ServicePoolSchema {
+    let declared = src
+        .map(|s| s.join("sled-agent/bootstrap-agent-lockstep-types/src/lib.rs"))
+        .and_then(|p| fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    if declared.contains("service_ip_pools") {
+        ServicePoolSchema::Pools
+    } else {
+        ServicePoolSchema::Ranges
+    }
+}
+
+/// Compare the top-level keys voxel emits against the ones `src`'s own example
+/// config-rss carries. `RackInitializeRequest` does not `deny_unknown_fields`,
+/// so a stale key voxel emits is ignored, but a key omicron expects and voxel
+/// omits is a hard "missing field" at sled-agent startup. Only the second
+/// direction fails here; the first is reported as drift worth cleaning up.
+///
+/// Returns Ok(()) when the example can't be read, so an unusual checkout layout
+/// doesn't block a build.
+pub(crate) fn check_rss_schema(cfg: &VoxelConfig, src: &Path) -> anyhow::Result<()> {
+    let example = src.join(OMICRON_EXAMPLE_RSS);
+    let Ok(text) = fs::read_to_string(&example) else {
+        return Ok(());
+    };
+    let expected: toml::Table =
+        toml::from_str(&text).with_context(|| format!("parse {}", example.display()))?;
+    let pools = cfg
+        .image
+        .service_pool_schema
+        .unwrap_or_else(|| detect_service_pool_schema(Some(src)));
+    let ours = cfg
+        .config_rss_keys(pools)
+        .map_err(|e| anyhow!("render config-rss to check its schema: {e}"))?;
+
+    let missing: Vec<&String> = expected.keys().filter(|k| !ours.contains(k)).collect();
+    let stale: Vec<&String> = ours.iter().filter(|k| !expected.contains_key(*k)).collect();
+    if !stale.is_empty() {
+        eprintln!(
+            "[voxel] note: config-rss keys this omicron's example doesn't carry: {}. \
+             Optional fields are fine here; anything else is drift.",
+            stale
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "config-rss schema drift: {} expects top-level {} that voxel does not emit.\n\
+             sled-agent would reject the generated config at bring-up with a missing-field \
+             error, so this fails the build instead.\n\
+             Fix voxel-config's rss module (and add a golden for the new shape), or force a \
+             known shape with `[image].service_pool_schema`.",
+            example.display(),
+            missing
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    eprintln!(
+        "[voxel] config-rss schema matches {} (service pool: {pools:?})",
+        example.display()
+    );
+    Ok(())
+}
+
 /// Generate + stage per-node config into the cargo-bay before launch.
 pub(crate) fn stage_config(
     cfg: &VoxelConfig,
@@ -313,6 +406,11 @@ pub(crate) fn stage_config(
     // bootstrap sled - g0 for rack 0, g{rack*sleds} for the rest). Each rack is an
     // independent RSS domain: generation filters the bootstrap set to that rack
     // and offsets its customer/service network.
+    let pools = cfg
+        .image
+        .service_pool_schema
+        .unwrap_or_else(|| detect_service_pool_schema(omicron_src().as_deref()));
+    eprintln!("[voxel] config-rss service pool schema: {pools:?}");
     for rack in 0..cfg.topology.racks() {
         let rss_node = sleds
             .iter()
@@ -338,7 +436,7 @@ pub(crate) fn stage_config(
         } else {
             cargo_bay(&rss_node.name)
         };
-        generate_rss_config(cfg, &rss_dir, rack)?;
+        generate_rss_config(cfg, &rss_dir, rack, pools)?;
     }
 
     // Per-router frr.conf.
@@ -606,4 +704,94 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
 
     fs::remove_dir_all(&src).with_context(|| format!("{src}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in omicron checkout carrying only the two files the schema
+    /// check reads: the example config-rss and the lockstep type declaration.
+    fn fake_omicron(name: &str, example_pool_key: &str, lockstep_field: &str) -> PathBuf {
+        let src = std::env::temp_dir().join(format!("voxel-rsscheck-{name}"));
+        let _ = fs::remove_dir_all(&src);
+        fs::create_dir_all(src.join("smf/sled-agent/non-gimlet")).unwrap();
+        fs::create_dir_all(src.join("sled-agent/bootstrap-agent-lockstep-types/src")).unwrap();
+        // Every era's example carries this same key set apart from the pool.
+        let example = format!(
+            "ntp_servers = []\ndns_servers = []\nexternal_dns_ips = []\n\
+             external_dns_zone_name = \"x\"\nexternal_certificates = []\n\
+             {example_pool_key}\n[bootstrap_discovery]\ntype = \"only_these\"\naddrs = []\n\
+             [recovery_silo]\nsilo_name = \"r\"\nuser_name = \"r\"\nuser_password_hash = \"h\"\n\
+             [rack_network_config]\nrack_subnet = \"fd00::/56\"\n\
+             [allowed_source_ips]\nallow = \"any\"\n"
+        );
+        fs::write(src.join(OMICRON_EXAMPLE_RSS), example).unwrap();
+        fs::write(
+            src.join("sled-agent/bootstrap-agent-lockstep-types/src/lib.rs"),
+            format!("pub struct RackInitializeRequest {{ pub {lockstep_field}: T }}"),
+        )
+        .unwrap();
+        src
+    }
+
+    fn pools_era(name: &str) -> PathBuf {
+        fake_omicron(
+            name,
+            "[[service_ip_pools]]\nname = \"p\"\ndescription = \"d\"\nranges = []",
+            "service_ip_pools",
+        )
+    }
+
+    fn ranges_era(name: &str) -> PathBuf {
+        fake_omicron(
+            name,
+            "[[internal_services_ip_pool_ranges]]\nfirst = \"1.1.1.1\"\nlast = \"1.1.1.2\"",
+            "internal_services_ip_pool_ranges",
+        )
+    }
+
+    #[test]
+    fn detects_the_service_pool_shape_per_era() {
+        assert_eq!(
+            detect_service_pool_schema(Some(&pools_era("det-new"))),
+            ServicePoolSchema::Pools
+        );
+        assert_eq!(
+            detect_service_pool_schema(Some(&ranges_era("det-old"))),
+            ServicePoolSchema::Ranges
+        );
+        // No checkout on disk: assume the older shape.
+        assert_eq!(detect_service_pool_schema(None), ServicePoolSchema::Ranges);
+    }
+
+    #[test]
+    fn schema_check_passes_on_both_eras() {
+        let cfg = VoxelConfig::default();
+        check_rss_schema(&cfg, &pools_era("ok-new")).expect("new era");
+        check_rss_schema(&cfg, &ranges_era("ok-old")).expect("old era");
+    }
+
+    /// The regression this exists for: omicron #10956 renamed the pool field.
+    /// Pinning voxel to the old shape against a new omicron must fail the
+    /// BUILD, naming the field, not surface as a bring-up failure.
+    #[test]
+    fn schema_check_fails_when_voxel_lags_omicron() {
+        let mut cfg = VoxelConfig::default();
+        cfg.image.service_pool_schema = Some(ServicePoolSchema::Ranges);
+        let err = check_rss_schema(&cfg, &pools_era("drift"))
+            .expect_err("stale pool shape must fail the build")
+            .to_string();
+        assert!(err.contains("service_ip_pools"), "unhelpful error: {err}");
+        assert!(err.contains("schema drift"), "unhelpful error: {err}");
+    }
+
+    /// An unreadable/unusual checkout must not block a build.
+    #[test]
+    fn schema_check_skips_without_an_example() {
+        let empty = std::env::temp_dir().join("voxel-rsscheck-empty");
+        let _ = fs::remove_dir_all(&empty);
+        fs::create_dir_all(&empty).unwrap();
+        check_rss_schema(&VoxelConfig::default(), &empty).expect("no example is not fatal");
+    }
 }
