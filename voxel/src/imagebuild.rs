@@ -399,9 +399,13 @@ fn hyperstop(name: &str) {
     }
 }
 
-/// Capture the builder's disk as a registered falcon base image. A FULL (not
-/// incremental) `zfs send` is self-contained, so the image carries no dependency
-/// on the base it was cloned from; only allocated blocks move.
+/// Capture the builder's disk as a registered falcon base image.
+///
+/// Streams into a staging dataset and renames it over the target only once the
+/// stream has succeeded, so a failed capture leaves the existing image intact.
+///
+/// A FULL (not incremental) `zfs send` is self-contained, so the image carries
+/// no dependency on the base it was cloned from; only allocated blocks move.
 fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
     let node = Dataset::new(format!("{dataset}/topo/{deploy}/{NODE}"))?;
     let zvol = format!("/dev/zvol/rdsk/{}", node.as_str());
@@ -409,17 +413,49 @@ fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
         bail!("node zvol not found at {zvol}");
     }
     let image = Dataset::new(format!("{dataset}/img/{image_name}"))?;
-    eprintln!(
-        "[voxel] capturing {} -> {}@base",
-        node.as_str(),
-        image.as_str()
-    );
+    // Not `voxel-`-prefixed, so `image ls` never offers a half-streamed image.
+    let staging = Dataset::new(format!("{dataset}/img/incoming-{image_name}"))?;
+    let replacing = exists(&image);
 
-    // A prior run's snapshot and image usually do not exist yet.
+    if replacing {
+        eprintln!("[voxel] overwriting voxel image {image_name}");
+    }
+    // Left behind by a capture that died mid-stream.
+    destroy_recursive_if_present(staging.as_str())?;
+    // Snapshot of the builder's own disk, which is torn down next.
     destroy_recursive_if_present(&node.snapshot("base"))?;
-    destroy_recursive_if_present(image.as_str())?;
+
+    eprintln!("[voxel] building temp image {}", staging.as_str());
     snapshot(&node, "base")?;
-    send_recv(&node.snapshot("base"), &image)
+    send_recv(&node.snapshot("base"), &staging)?;
+
+    if replacing {
+        eprintln!("[voxel] build complete, overwriting image {image_name}");
+        destroy_recursive_if_present(image.as_str())?;
+    }
+    rename(&staging, &image)
+}
+
+/// Whether a dataset is present.
+fn exists(ds: &Dataset) -> bool {
+    Command::new("zfs")
+        .args(["list", "-H", "-o", "name", ds.as_str()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn rename(from: &Dataset, to: &Dataset) -> Result<()> {
+    let status = Command::new("pfexec")
+        .args(["zfs", "rename", from.as_str(), to.as_str()])
+        .status()
+        .with_context(|| format!("run zfs rename {} {}", from.as_str(), to.as_str()))?;
+    if !status.success() {
+        bail!("zfs rename {} -> {} failed", from.as_str(), to.as_str());
+    }
+    Ok(())
 }
 
 /// A zfs dataset voxel is allowed to operate on, validated on construction.
