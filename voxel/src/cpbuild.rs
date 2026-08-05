@@ -111,10 +111,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         if !src.exists() {
             bail!("--src {} not found", src.display());
         }
-        eprintln!(
-            "[voxel] building {} as-is (--src; no clone/checkout)",
-            src.display()
-        );
+        eprintln!("[voxel] building in place: {}", src.display());
     } else {
         let commit = b.commit.context("a commit is required without --src")?;
         if !src.join(".git").exists() {
@@ -158,7 +155,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     eprintln!("[voxel] install_builder_prerequisites.sh -y");
     run(omicron_cmd(src, "./tools/install_builder_prerequisites.sh").arg("-y"),
         "install_builder_prerequisites")?;
-    eprintln!("[voxel] ci_download_softnpu_machinery (out/npuzone)");
+    eprintln!("[voxel] ci_download_softnpu_machinery");
     run(&mut omicron_cmd(src, "./tools/ci_download_softnpu_machinery"),
         "ci_download_softnpu_machinery")?;
 
@@ -179,10 +176,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     )?;
 
     // --- 4. render build-time smf configs ------------------------------------
-    eprintln!(
-        "[voxel] rendering build-time smf configs from voxel-config (gimlets={})",
-        b.gimlets
-    );
+    eprintln!("[voxel] rendering smf configs, gimlets={}", b.gimlets);
     crate::image::render_smf(src, b.gimlets)?;
 
     // --- 5. package the control plane ----------------------------------------
@@ -194,7 +188,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
             .args(["-t", "default", "target", "create", "-p", "a4x2"]),
         "omicron-package target create",
     )?;
-    eprintln!("[voxel] omicron-package package (~11 min)");
+    eprintln!("[voxel] omicron-package package");
     run(
         omicron_cmd(src, "./target/release/omicron-package").arg("package"),
         "omicron-package package",
@@ -237,7 +231,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
     // --- 7b. build + stage the in-guest agent --------------------------------
     // Native illumos build: this box is the gimlet's OS.
-    eprintln!("[voxel] building voxel-init (native illumos) for the gimlet image");
+    eprintln!("[voxel] building voxel-init for illumos");
     run(
         Command::new(toolchain_bin("cargo"))
             .current_dir(&root)

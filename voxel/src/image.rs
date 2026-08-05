@@ -76,7 +76,7 @@ pub(crate) fn render_smf(omicron_root: &Path, gimlets: usize) -> anyhow::Result<
         let dir = path.parent().expect("smf path has a parent");
         fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
         fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-        println!("rendered {}", path.display());
+        eprintln!("[voxel] rendered {}", path.display());
     }
     Ok(())
 }

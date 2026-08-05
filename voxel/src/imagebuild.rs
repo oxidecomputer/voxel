@@ -112,9 +112,9 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     mounted.map_err(|e| anyhow::anyhow!("mount cargo-bay ({}): {e}", o.cargo_bay))?;
 
     eprintln!(
-        "[voxel] booting builder ({}), installing role {}",
+        "[voxel] booting builder {}, role {}",
         o.base_image,
-        o.role.unwrap_or("<none>")
+        o.role.unwrap_or("none")
     );
     d.launch()
         .await
@@ -185,7 +185,7 @@ pub(crate) async fn create_frr(
     let image_name = format!("voxel-frr-{version}");
     let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-frr");
 
-    eprintln!("[voxel] cross-compiling voxel-init for {FRR_TARGET} (static)");
+    eprintln!("[voxel] cross-compiling voxel-init for {FRR_TARGET}");
     // Best-effort: already-installed targets exit nonzero on some rustup versions.
     let _ = Command::new(toolchain_bin("rustup"))
         .args(["target", "add", FRR_TARGET])
@@ -287,7 +287,7 @@ fn stage_builder_net(cargo_bay: &str, explicit: Option<&str>) -> Result<()> {
     let from_env = std::env::var("VOXEL_BUILDER_NET").ok();
     match explicit.map(str::to_string).or(from_env) {
         Some(net) if !net.trim().is_empty() => {
-            eprintln!("[voxel] staging builder-net ({net}) into {cargo_bay}");
+            eprintln!("[voxel] staging builder-net {net} -> {cargo_bay}");
             std::fs::write(&path, format!("{}\n", net.trim()))
                 .with_context(|| format!("write {}", path.display()))?;
         }
@@ -306,16 +306,16 @@ fn stage_builder_net(cargo_bay: &str, explicit: Option<&str>) -> Result<()> {
 /// propolis has to flush the removal to the zvol or the last write is lost.
 /// devfsadmd is stopped first so it cannot re-create the map.
 async fn quiesce(d: &Runner, node: libfalcon::NodeRef) {
-    eprintln!("[voxel] clearing device-instance map + clean halt (flush to disk)");
+    eprintln!("[voxel] clearing device-instance map, halting");
     let _ = d
         .exec(
             node,
             "pkill -x devfsadmd 2>/dev/null; rm -f /etc/path_to_inst; sync; sync; (sleep 1; halt) &",
         )
         .await;
-    eprintln!("[voxel] waiting for clean shutdown to flush...");
+    eprintln!("[voxel] waiting for shutdown");
     std::thread::sleep(std::time::Duration::from_secs(25));
-    eprintln!("[voxel] stopping hypervisor (cleanup)");
+    eprintln!("[voxel] stopping hypervisor");
     hyperstop(NODE);
 }
 
@@ -358,7 +358,7 @@ fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
         bail!("node zvol not found at {zvol}");
     }
     let img_ds = format!("{dataset}/img/{image_name}");
-    eprintln!("[voxel] capturing (zfs send/recv) {node_ds} -> {img_ds}@base");
+    eprintln!("[voxel] capturing {node_ds} -> {img_ds}@base");
 
     // Best-effort: a prior run's snapshot / image usually does NOT exist, so
     // silence these - their "does not exist" noise reads like a real failure.

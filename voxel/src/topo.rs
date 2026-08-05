@@ -336,8 +336,7 @@ pub(crate) fn check_rss_schema(cfg: &VoxelConfig, src: &Path) -> anyhow::Result<
     let stale: Vec<&String> = ours.iter().filter(|k| !expected.contains_key(*k)).collect();
     if !stale.is_empty() {
         eprintln!(
-            "[voxel] note: config-rss keys this omicron's example doesn't carry: {}. \
-             Optional fields are fine here; anything else is drift.",
+            "[voxel] config-rss keys absent from this omicron's example: {}",
             stale
                 .iter()
                 .map(|s| s.as_str())
@@ -347,11 +346,8 @@ pub(crate) fn check_rss_schema(cfg: &VoxelConfig, src: &Path) -> anyhow::Result<
     }
     if !missing.is_empty() {
         return Err(anyhow!(
-            "config-rss schema drift: {} expects top-level {} that voxel does not emit.\n\
-             sled-agent would reject the generated config at bring-up with a missing-field \
-             error, so this fails the build instead.\n\
-             Fix voxel-config's rss module (and add a golden for the new shape), or force a \
-             known shape with `[image].service_pool_schema`.",
+            "config-rss schema drift: {} requires top-level {}, which voxel does not emit. \
+             Update voxel-config's rss module, or set [image].service_pool_schema.",
             example.display(),
             missing
                 .iter()
@@ -360,10 +356,7 @@ pub(crate) fn check_rss_schema(cfg: &VoxelConfig, src: &Path) -> anyhow::Result<
                 .join(", "),
         ));
     }
-    eprintln!(
-        "[voxel] config-rss schema matches {} (service pool: {pools:?})",
-        example.display()
-    );
+    eprintln!("[voxel] config-rss schema ok, service pool {pools:?}");
     Ok(())
 }
 
