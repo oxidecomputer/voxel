@@ -14,19 +14,46 @@ use voxel_config::VoxelConfig;
 /// BFD, per-rack projection, and sled count.
 fn config(scenario: &str) -> VoxelConfig {
     let network = match scenario {
-        "bgp" | "multirack" | "a6x2" => "router_mode = \"bgp\"\ntransit_bfd = false",
-        "static" => "router_mode = \"static\"\ntransit_bfd = false",
-        "static-bfd" => "router_mode = \"static\"\ntransit_bfd = true",
+        "bgp" | "multirack" | "a6x2" => {
+            r#"router_mode = "bgp"
+transit_bfd = false"#
+        }
+        "static" => {
+            r#"router_mode = "static"
+transit_bfd = false"#
+        }
+        "static-bfd" => {
+            r#"router_mode = "static"
+transit_bfd = true"#
+        }
         other => panic!("unknown scenario {other}"),
     };
     // Multirack drops ce_external_ip (it is a single-rack host-route knob) and
     // a6x2 widens the rack; both are otherwise the default lab topology.
     let topology = match scenario {
-        "multirack" => "racks = 2\nsleds = 3",
-        "a6x2" => "racks = 1\nsleds = 6",
-        _ => "racks = 1\nsleds = 3\nce_external_ip = \"192.168.68.170\"",
+        "multirack" => {
+            r#"racks = 2
+sleds = 3"#
+        }
+        "a6x2" => {
+            r#"racks = 1
+sleds = 6"#
+        }
+        _ => {
+            r#"racks = 1
+sleds = 3
+ce_external_ip = "192.168.68.170""#
+        }
     };
-    let text = format!("[topology]\n{topology}\nsled_memory_gb = 7\n\n[network]\n{network}\n");
+    let text = format!(
+        r#"[topology]
+{topology}
+sled_memory_gb = 7
+
+[network]
+{network}
+"#
+    );
     VoxelConfig::from_toml(&text).expect("parse scenario config")
 }
 

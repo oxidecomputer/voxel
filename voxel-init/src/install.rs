@@ -1,10 +1,9 @@
 //! Image-BUILD-time install, run inside the builder guest.
 //!
-//! Replaces the per-image install shell scripts (`install-cp.sh`,
-//! `install-frr.sh`): `voxel image bake` runs `voxel-init install --role <role>`
-//! in the builder node, which installs baked software and applies NO
-//! topology-specific configuration. Per-topology config is generated in Rust and
-//! pushed at LAUNCH by the `gimlet` / `router` roles.
+//! `voxel image bake` runs `voxel-init install --role <role>` in the builder
+//! node. Each role installs baked software and applies NO topology-specific
+//! configuration: per-topology config is generated on the host and pushed at
+//! LAUNCH by the `gimlet` / `router` roles.
 //!
 //! Same source builds for both guest OSes; the role picks the implementation at
 //! runtime, matching how `gimlet` / `router` already work.
