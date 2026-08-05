@@ -13,9 +13,9 @@
 //!   POST /rack-setup                                   (trigger init)
 //! then the normal `watch_rss` reports the wicketd-triggered bring-up.
 //!
-//! The config body is reshaped from the same `config-rss.toml` voxel-rss-gen
-//! produces (release-accurate by construction) into wicket's `UserSpecified*`
-//! form -- the one fiddly bit is the flat-string serializations
+//! The config body is reshaped from the same `config-rss.toml` voxel generates
+//! into wicket's `UserSpecified*` form. The fiddly bit is the flat-string
+//! serializations
 //! (`address = "addrconf"`, `addr = "unnumbered"`), validated against live wicketd.
 
 use crate::net::{SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin};

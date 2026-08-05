@@ -228,62 +228,32 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render `config-rss.toml` with the typed, release-pinned generator
-/// (`voxel-rss-gen`, built against the image's omicron - see voxel/rss-gen).
-/// This is release-accurate by construction; we deliberately do NOT fall back
-/// to a hand-rolled renderer. Point `VOXEL_RSS_GEN` at the binary if it isn't
-/// at the default path.
+/// Render this rack's `config-rss.toml` into `dir`. Generation lives in
+/// `voxel_config::rss`.
 fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Result<()> {
-    let rss_gen_bin = std::env::var("VOXEL_RSS_GEN")
-        .unwrap_or_else(|_| "/opt/omicron/target/debug/voxel-rss-gen".to_string());
-    let effective = dir.join("voxel-effective.toml");
-    // Write the *resolved* config (derived scrimlets/rss_sleds made explicit) -
-    // the separately-built rss-gen doesn't re-run the derivation, so empty
-    // scrimlets / rss_sleds = 0 would yield an empty bootstrap set ("Must
-    // request at least one peer"). rss-gen projects it to a single rack via
-    // `--rack` (filters the bootstrap set + offsets the customer network).
-    fs::write(&effective, cfg.to_resolved_toml())?;
-    let status = std::process::Command::new(&rss_gen_bin)
-        .arg("generate")
-        .arg(&effective)
-        .arg(dir.join("config-rss.toml"))
-        .arg("--rack")
-        .arg(rack.to_string())
-        .status()
-        .map_err(|e| {
-            anyhow!("run {rss_gen_bin}: {e} - build voxel/rss-gen or set VOXEL_RSS_GEN")
-        })?;
-    if !status.success() {
-        return Err(anyhow!(
-            "{rss_gen_bin} generate failed. If the error above is a TOML 'unknown field', \
-             voxel-rss-gen is STALE for the current voxel-config (it's built separately and \
-             pins voxel-config at build time) - rebuild it: \
-             `voxel-image/build-rss-gen.sh <omicron-src>`, or run `voxel image create <commit>` \
-             without BUILD_RSS_GEN=0."
-        ));
-    }
+    let text = cfg
+        .to_config_rss(rack)
+        .map_err(|e| anyhow!("render config-rss.toml for rack {rack}: {e}"))?;
+    let out = dir.join("config-rss.toml");
+    fs::write(&out, text).with_context(|| format!("write {}", out.display()))?;
     Ok(())
 }
 
 /// Auto-detect the sled-agent config shapes (`data_links`, disks) from the
-/// image's omicron source, so operators never hand-set per-era knobs. The source
-/// sits beside the commit-pinned rss-gen (`$VOXEL_RSS_GEN` =
-/// `<build_root>/omicron-<commit>/target/debug/voxel-rss-gen`), so we read its
-/// `sled-agent/src/config.rs` and key off the field declarations - which are the
-/// ground truth for that commit. Falls back to the oldest shapes if the source
+/// image's omicron source, so operators never hand-set per-era knobs. Reads
+/// `sled-agent/src/config.rs` from `$VOXEL_OMICRON_SRC`, derived in
+/// `resolve_falcon_env` from the build root and `image.cp`'s commit, and keys
+/// off the field declarations. Falls back to the oldest shapes if the source
 /// can't be read; an explicit `[image]` override wins over detection.
 ///
-/// This is the "schema changelog", automated: instead of a hand-maintained
-/// commits->requirements table, voxel reads what the commit itself declares.
+/// This is the schema changelog, automated: instead of a hand-maintained
+/// commits to requirements table, voxel reads what the commit itself declares.
+/// It is the only place voxel consults an omicron checkout, and it is
+/// advisory. A rack whose source is absent still launches.
 fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
-    let src = std::env::var("VOXEL_RSS_GEN")
+    let src = std::env::var("VOXEL_OMICRON_SRC")
         .ok()
-        .and_then(|g| {
-            Path::new(&g)
-                .ancestors()
-                .nth(3)
-                .map(|p| p.join("sled-agent/src/config.rs"))
-        })
+        .map(|s| Path::new(&s).join("sled-agent/src/config.rs"))
         .and_then(|p| fs::read_to_string(p).ok())
         .unwrap_or_default();
     // `pub external_disks: ExternalDisks` (main) vs `pub vdevs: ...` (older).
@@ -341,8 +311,8 @@ pub(crate) fn stage_config(
 
     // One typed config-rss per rack, staged on that rack's RSS node (its first
     // bootstrap sled - g0 for rack 0, g{rack*sleds} for the rest). Each rack is an
-    // independent RSS domain: rss-gen (`--rack`) filters the bootstrap set to that
-    // rack and offsets its customer/service network.
+    // independent RSS domain: generation filters the bootstrap set to that rack
+    // and offsets its customer/service network.
     for rack in 0..cfg.topology.racks() {
         let rss_node = sleds
             .iter()

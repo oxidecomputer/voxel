@@ -7,9 +7,7 @@ members = [
     "voxel-init",
 ]
 
-# rss-gen depends on omicron's own config types via a path to the IMAGE's omicron
-# source (box-specific, per-publish). Not built as part of this workspace.
-exclude = ["voxel/rss-gen", "vendor/sprockets-tls-test-utils"]
+exclude = ["vendor/sprockets-tls-test-utils"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"

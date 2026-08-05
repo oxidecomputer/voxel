@@ -1,0 +1,181 @@
+ntp_servers = ["time.cloudflare.com"]
+dns_servers = ["1.1.1.1", "9.9.9.9"]
+external_dns_ips = ["198.51.100.20", "198.51.100.21"]
+external_dns_zone_name = "rack1.oxide.test"
+external_certificates = []
+external_jumbo_frames_opt_in_enabled = false
+
+[[trust_quorum_peers]]
+part_number = "913-0000019"
+serial_number = "2FAKE000"
+
+[[trust_quorum_peers]]
+part_number = "913-0000019"
+serial_number = "2FAKE001"
+
+[[trust_quorum_peers]]
+part_number = "913-0000019"
+serial_number = "2FAKE002"
+
+[bootstrap_discovery]
+type = "only_these"
+addrs = ["fdb0:a840:2500:1::1", "fdb0:a840:2500:3::1", "fdb0:a840:2500:5::1"]
+
+[[internal_services_ip_pool_ranges]]
+first = "198.51.100.20"
+last = "198.51.100.29"
+
+[recovery_silo]
+silo_name = "recovery"
+user_name = "recovery"
+user_password_hash = "$argon2id$v=19$m=98304,t=23,p=1$Effh/p6M2ZKdnpJFeGqtGQ$ZtUwcVODAvUAVK6EQ5FJMv+GMlUCo9PQQsy9cagL+EU"
+
+[rack_network_config]
+rack_subnet = "fd00:17:1:d00::/56"
+infra_ip_first = "::"
+infra_ip_last = "::"
+bfd = []
+
+[[rack_network_config.ports]]
+routes = []
+switch = "switch0"
+port = "qsfp0"
+uplink_port_speed = "speed40_g"
+uplink_port_fec = "none"
+autoneg = false
+
+[[rack_network_config.ports.addresses]]
+
+[rack_network_config.ports.addresses.address]
+type = "addrconf"
+
+[[rack_network_config.ports.bgp_peers]]
+asn = 65000
+port = "qsfp0"
+communities = []
+enforce_first_as = false
+
+[rack_network_config.ports.bgp_peers.addr]
+type = "unnumbered"
+router_lifetime = 300
+
+[rack_network_config.ports.bgp_peers.allowed_import]
+type = "no_filtering"
+
+[rack_network_config.ports.bgp_peers.allowed_export]
+type = "no_filtering"
+
+[rack_network_config.ports.lldp]
+status = "enabled"
+chassis_id = "switch0"
+port_description = "uplink0-cr1"
+
+[[rack_network_config.ports]]
+routes = []
+switch = "switch0"
+port = "qsfp1"
+uplink_port_speed = "speed40_g"
+uplink_port_fec = "none"
+autoneg = false
+
+[[rack_network_config.ports.addresses]]
+
+[rack_network_config.ports.addresses.address]
+type = "addrconf"
+
+[[rack_network_config.ports.bgp_peers]]
+asn = 65000
+port = "qsfp1"
+communities = []
+enforce_first_as = false
+
+[rack_network_config.ports.bgp_peers.addr]
+type = "unnumbered"
+router_lifetime = 300
+
+[rack_network_config.ports.bgp_peers.allowed_import]
+type = "no_filtering"
+
+[rack_network_config.ports.bgp_peers.allowed_export]
+type = "no_filtering"
+
+[rack_network_config.ports.lldp]
+status = "enabled"
+chassis_id = "switch0"
+port_description = "uplink0-cr2"
+
+[[rack_network_config.ports]]
+routes = []
+switch = "switch1"
+port = "qsfp0"
+uplink_port_speed = "speed40_g"
+uplink_port_fec = "none"
+autoneg = false
+
+[[rack_network_config.ports.addresses]]
+
+[rack_network_config.ports.addresses.address]
+type = "addrconf"
+
+[[rack_network_config.ports.bgp_peers]]
+asn = 65000
+port = "qsfp0"
+communities = []
+enforce_first_as = false
+
+[rack_network_config.ports.bgp_peers.addr]
+type = "unnumbered"
+router_lifetime = 300
+
+[rack_network_config.ports.bgp_peers.allowed_import]
+type = "no_filtering"
+
+[rack_network_config.ports.bgp_peers.allowed_export]
+type = "no_filtering"
+
+[rack_network_config.ports.lldp]
+status = "enabled"
+chassis_id = "switch1"
+port_description = "uplink1-cr1"
+
+[[rack_network_config.ports]]
+routes = []
+switch = "switch1"
+port = "qsfp1"
+uplink_port_speed = "speed40_g"
+uplink_port_fec = "none"
+autoneg = false
+
+[[rack_network_config.ports.addresses]]
+
+[rack_network_config.ports.addresses.address]
+type = "addrconf"
+
+[[rack_network_config.ports.bgp_peers]]
+asn = 65000
+port = "qsfp1"
+communities = []
+enforce_first_as = false
+
+[rack_network_config.ports.bgp_peers.addr]
+type = "unnumbered"
+router_lifetime = 300
+
+[rack_network_config.ports.bgp_peers.allowed_import]
+type = "no_filtering"
+
+[rack_network_config.ports.bgp_peers.allowed_export]
+type = "no_filtering"
+
+[rack_network_config.ports.lldp]
+status = "enabled"
+chassis_id = "switch1"
+port_description = "uplink1-cr2"
+
+[[rack_network_config.bgp]]
+asn = 65000
+originate = ["198.51.100.0/24"]
+max_paths = 1
+
+[allowed_source_ips]
+allow = "any"
