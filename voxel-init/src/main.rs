@@ -45,7 +45,7 @@ enum Cmd {
     SwitchEnforcerSvc,
 }
 
-/// Which image `install` is baking. Both arms build for both guest OSes; the
+/// Which image `install` is baking. The arms build for both guest OSes; the
 /// role picks the implementation at runtime, as with `gimlet` / `router`.
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum InstallRole {
@@ -53,6 +53,8 @@ enum InstallRole {
     Cp,
     /// voxel-frr router image (linux / debian).
     Frr,
+    /// voxel-builder omicron build host (illumos / helios).
+    Builder,
 }
 
 fn main() {
@@ -62,6 +64,7 @@ fn main() {
         Cmd::Install { role } => match role {
             InstallRole::Cp => install::cp(),
             InstallRole::Frr => install::frr(),
+            InstallRole::Builder => install::builder(),
         },
         Cmd::SwitchEnforcer { slot } => {
             gimlet::switch_enforcer(slot);

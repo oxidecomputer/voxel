@@ -96,21 +96,13 @@ fn sleep2() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 }
 
-/// Helios control-plane image: install pinned deps, unpack the control-plane
-/// zone artifacts, bake what launch needs. Applies NO topology configuration -
-/// config-rss injection, sprockets keys, SMBIOS identity and RSS all happen at
-/// launch.
+/// Address the guest's single external NIC and wait until `hosts` resolve.
+/// Shared by the illumos roles: every one of them has to reach a package repo
+/// before it can do anything.
 ///
-/// Deliberately NOT baked, kept ephemeral or per-launch: `xtask
-/// virtual-hardware create` (per-node emulated U.2/M.2), `scadm propolis
-/// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet - flashing
-/// hubris images is a runtime concern, so `voxel launch --emu-sp` stages and
-/// flashes it per-scrimlet from the `[sp]` config instead.
-pub fn cp() -> Result<()> {
-    let version = std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
-
-    // --- networking: reach pkg.oxide.computer ---
-    // The builder has a single external NIC; find a vioif and address it.
+/// In isolated mode the host stages a static address (no DHCP on that segment);
+/// otherwise the NIC leases one.
+fn bring_up_network(hosts: &[&str]) -> Result<()> {
     let ext_if = std::env::var("EXT_IF")
         .ok()
         .filter(|s| !s.is_empty())
@@ -128,7 +120,6 @@ pub fn cp() -> Result<()> {
 
     let addrobj = format!("{ext_if}/v4");
     match builder_net() {
-        // Isolated mode: no DHCP server on the segment, use the staged address.
         Some(net) => {
             note(format!(
                 "static builder net: {} via {}",
@@ -142,7 +133,7 @@ pub fn cp() -> Result<()> {
         }
         None => {
             run("ipadm", &["create-addr", "-T", "dhcp", &addrobj]);
-            note("waiting for DHCP lease...");
+            note("waiting for DHCP lease");
             for _ in 0..30 {
                 let leased = capture("ipadm", &["show-addr", &addrobj, "-p", "-o", "addr"])
                     .is_some_and(|a| a.contains('/'));
@@ -153,17 +144,25 @@ pub fn cp() -> Result<()> {
             }
         }
     }
-    note("waiting for DNS...");
-    for _ in 0..15 {
-        if run_quiet("getent", &["hosts", "pkg.oxide.computer"]) {
-            break;
+    for host in hosts {
+        note(format!("waiting for DNS: {host}"));
+        for _ in 0..15 {
+            if run_quiet("getent", &["hosts", host]) {
+                break;
+            }
+            sleep2();
         }
-        sleep2();
     }
+    Ok(())
+}
 
-    // --- pinned package deps (baked) ---
+/// `pkg install`, retried. A boot-time pkg client can still hold the image lock
+/// for a while ("in use by another package client"), which is transient.
+fn pkg_install(pkgs: &[&str]) -> Result<()> {
+    let mut args = vec!["install"];
+    args.extend_from_slice(pkgs);
     let mut attempt = 0;
-    while !run("pkg", &["install", "tofino", "looker", "htop", "jq"]) {
+    while !run("pkg", &args) {
         attempt += 1;
         if attempt >= 25 {
             bail!("pkg install failed after {attempt} attempts");
@@ -171,6 +170,26 @@ pub fn cp() -> Result<()> {
         note(format!("pkg install attempt {attempt} failed; retrying"));
         sleep2();
     }
+    Ok(())
+}
+
+/// Helios control-plane image: install pinned deps, unpack the control-plane
+/// zone artifacts, bake what launch needs. Applies NO topology configuration -
+/// config-rss injection, sprockets keys, SMBIOS identity and RSS all happen at
+/// launch.
+///
+/// Deliberately NOT baked, kept ephemeral or per-launch: `xtask
+/// virtual-hardware create` (per-node emulated U.2/M.2), `scadm propolis
+/// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet - flashing
+/// hubris images is a runtime concern, so `voxel launch --emu-sp` stages and
+/// flashes it per-scrimlet from the `[sp]` config instead.
+pub fn cp() -> Result<()> {
+    let version = std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
+
+    bring_up_network(&["pkg.oxide.computer"])?;
+
+    // --- pinned package deps (baked) ---
+    pkg_install(&["tofino", "looker", "htop", "jq"])?;
 
     // The builder runs us from /opt/cargo-bay; the staged omicron dir is here.
     let omicron = format!("{CARGO_BAY}/omicron");
@@ -394,6 +413,114 @@ pub fn frr() -> Result<()> {
 }
 
 /// `apt-get` with the noninteractive frontend the baked install needs.
+/// Where the builder keeps its warm omicron checkout. Per-commit builds reuse
+/// this path so they hit a warm cache instead of cloning and downloading again.
+const WARM_SRC: &str = "/omicron";
+
+/// The build flags omicron needs on Helios. Kept identical to voxel's
+/// `OMICRON_RUSTFLAGS`: a mismatch invalidates every cached artifact, which
+/// turns a warm build back into a cold one.
+const OMICRON_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
+     -C link-arg=-R/usr/platform/oxide/lib/amd64 \
+     -C link-arg=-Wl,-znocompstrtab --cfg tokio_unstable";
+
+/// Helios BUILDER image: a guest that can build omicron, so the host needs no
+/// git and no Rust toolchain.
+///
+/// Installs git, rustup and omicron's own builder prerequisites. The
+/// prerequisites step needs a checkout to run from, so it clones one and leaves
+/// it at [`WARM_SRC`] along with the artifacts it downloads (cockroach,
+/// clickhouse, dendrite).
+///
+/// It deliberately does NOT compile omicron here. `target/` is the multi-gigabyte
+/// part, and baking it would make this image enormous for a cache that goes
+/// stale at the next commit. The build cache belongs to the builder INSTANCE,
+/// not to this image.
+///
+/// voxel-init is not baked in either: `voxel image` stages the agent through the
+/// cargo-bay on every run, so the builder always uses the agent that shipped
+/// with the `voxel` binary driving it, and the two cannot drift apart.
+pub fn builder() -> Result<()> {
+    let version = std::env::var("VOXEL_BUILDER_VERSION").unwrap_or_else(|_| "unknown".into());
+
+    bring_up_network(&["pkg.oxide.computer", "github.com"])?;
+    pkg_install(&["git", "jq", "tofino", "looker", "htop"])?;
+
+    // rustup, not a pinned toolchain: omicron selects its own via
+    // rust-toolchain.toml, and rustup fetches that on first use in the checkout.
+    let cargo_bin = format!(
+        "{}/.cargo/bin",
+        std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+    );
+    if !Path::new(&format!("{cargo_bin}/rustup")).exists() {
+        note("installing rustup");
+        if !run(
+            "curl",
+            &[
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "-sSfL",
+                "https://sh.rustup.rs",
+                "-o",
+                "/tmp/rustup-init.sh",
+            ],
+        ) {
+            bail!("download rustup installer");
+        }
+        if !run("sh", &["/tmp/rustup-init.sh", "-y", "--profile", "minimal"]) {
+            bail!("install rustup");
+        }
+    }
+
+    let path = format!(
+        "{cargo_bin}:/opt/ooce/bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let warm = warm_omicron(&path);
+    if !warm {
+        warn("omicron warm-up incomplete; the first build will do this work instead");
+    }
+
+    mark_ready(&format!(
+        "voxel-builder version={version} omicron_warm={warm}"
+    ))
+}
+
+/// Clone omicron and run its builder prerequisites, so a later build starts with
+/// the OS packages and ci-downloaded artifacts already present. Best effort: a
+/// transient network or pkg failure should degrade the image, not fail it, and
+/// the per-build path re-runs both anyway.
+fn warm_omicron(path: &str) -> bool {
+    let repo = std::env::var("OMICRON_REPO")
+        .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
+    if !Path::new(&format!("{WARM_SRC}/.git")).exists() {
+        note(format!("cloning omicron -> {WARM_SRC}"));
+        if !run("git", &["clone", &repo, WARM_SRC]) {
+            warn("warm clone failed");
+            return false;
+        }
+    }
+    if std::env::set_current_dir(WARM_SRC).is_err() {
+        warn(format!("cd {WARM_SRC} failed"));
+        return false;
+    }
+    let envs = [("PATH", path), ("RUSTFLAGS", OMICRON_RUSTFLAGS)];
+    let mut attempt = 0;
+    while !crate::sys::run_env("./tools/install_builder_prerequisites.sh", &["-y"], &envs) {
+        attempt += 1;
+        if attempt >= 20 {
+            warn("install_builder_prerequisites failed; leaving it to the per-build run");
+            return false;
+        }
+        note(format!(
+            "prerequisites attempt {attempt} failed (pkg busy?); retrying"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(15));
+    }
+    true
+}
+
 fn run_env_noninteractive(args: &[&str]) -> bool {
     crate::sys::run_env("apt-get", args, &[("DEBIAN_FRONTEND", "noninteractive")])
 }

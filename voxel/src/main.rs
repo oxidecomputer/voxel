@@ -279,6 +279,13 @@ enum ImageCmd {
         #[arg(default_value = "proto")]
         version: String,
     },
+    /// Build a `voxel-builder` omicron build host (git + rustup + omicron's
+    /// builder prerequisites), so building a cp image needs no host toolchain.
+    CreateBuilder {
+        /// Image label; the image is named `voxel-builder-<version>`.
+        #[arg(default_value = "proto")]
+        version: String,
+    },
     /// (build helper) Bake an image: boot a one-node builder, run the in-guest
     /// agent's install role, capture the disk. Used by build-cp.sh/build-frr.sh.
     #[command(hide = true)]
@@ -783,6 +790,9 @@ async fn main() -> Result<(), Error> {
             }
             ImageCmd::CreateFrr { version } => {
                 imagebuild::create_frr(version, &image::falcon_dataset(), cfg.as_ref()).await
+            }
+            ImageCmd::CreateBuilder { version } => {
+                imagebuild::create_builder(version, &image::falcon_dataset(), cfg.as_ref()).await
             }
             ImageCmd::Bake {
                 name,

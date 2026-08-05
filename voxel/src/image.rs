@@ -370,6 +370,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         ImageCmd::Patch { .. } => bail!("internal: `image patch` is dispatched in main"),
         ImageCmd::Bake { .. } => bail!("internal: `image bake` is dispatched in main"),
         ImageCmd::CreateFrr { .. } => bail!("internal: `image create-frr` is dispatched in main"),
+        ImageCmd::CreateBuilder { .. } => {
+            bail!("internal: `image create-builder` is dispatched in main")
+        }
         ImageCmd::RenderSmf {
             omicron_root,
             gimlets,

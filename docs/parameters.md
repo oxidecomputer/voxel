@@ -35,6 +35,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. |
 | `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
+| `builder` | string | unset | Full builder image name (the omicron build host). Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
 | `disks_schema` | enum | unset | `vdevs` or `external_disks`. Unset auto-detects from the image. |
 | `service_pool_schema` | enum | unset | `ranges` or `pools` (omicron #10956 renamed the config-rss service IP pool field). Unset auto-detects from the image. |

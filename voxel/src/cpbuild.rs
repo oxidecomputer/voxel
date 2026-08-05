@@ -243,17 +243,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
     // --- 7b. build + stage the in-guest agent --------------------------------
     // Native illumos build: this box is the gimlet's OS.
-    eprintln!("[voxel] building voxel-init for illumos");
-    run(
-        Command::new(toolchain_bin("cargo"))
-            .current_dir(&root)
-            .args(["build", "-p", "voxel-init", "--release"]),
-        "cargo build voxel-init",
-    )?;
-    let agent = cargo_bay.join("voxel-init");
-    std::fs::copy(root.join("target/release/voxel-init"), &agent)
-        .context("stage voxel-init into the cargo-bay")?;
-    let _ = Command::new("chmod").arg("+x").arg(&agent).status();
+    crate::imagebuild::stage_native_agent(&root, &cargo_bay)?;
 
     // --- 8. bake -------------------------------------------------------------
     let (ext_if, builder_net) = isolated_builder(b.cfg.map(|c| &c.external))?;

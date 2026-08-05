@@ -184,6 +184,70 @@ pub(crate) fn report_built(image_name: &str, key: &str, current: Option<String>)
     }
 }
 
+/// Build a `voxel-builder` image: a Helios guest with git, rustup and omicron's
+/// builder prerequisites, which `voxel image create` boots to build omicron
+/// in-guest. Same shape as `create_frr`, on the illumos side.
+///
+/// The disk is sized for the warm checkout plus the artifacts the prerequisites
+/// download, not for a build: the omicron `target/` dir belongs to whatever
+/// instance boots from this image, not to the image.
+pub(crate) async fn create_builder(
+    version: &str,
+    dataset: &str,
+    cfg: Option<&voxel_config::VoxelConfig>,
+) -> Result<()> {
+    let root = repo_root()?;
+    let (ext_if, builder_net) = isolated_builder(cfg.map(|c| &c.external))?;
+    let image_name = format!("voxel-builder-{version}");
+    let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-builder");
+
+    stage_native_agent(&root, &cargo_bay)?;
+
+    bake(BakeOpts {
+        base_image: "helios-3.0",
+        role: Some("builder"),
+        exec: None,
+        cargo_bay: &cargo_bay.display().to_string(),
+        image_name: &image_name,
+        dataset,
+        deploy: "voxel_build",
+        disk_gb: 60,
+        mem_gb: 16,
+        cores: 8,
+        ext_interface: ext_if.as_deref(),
+        builder_net: builder_net.as_deref(),
+    })
+    .await?;
+
+    report_built(
+        &image_name,
+        "image.builder",
+        cfg.map(|c| c.image.builder_image()),
+    );
+    Ok(())
+}
+
+/// Build voxel-init for the host's own (illumos) target and stage it into
+/// `cargo_bay`. The agent is staged per run rather than baked into an image, so
+/// it is always the build that shipped with this `voxel`.
+pub(crate) fn stage_native_agent(root: &Path, cargo_bay: &Path) -> Result<()> {
+    eprintln!("[voxel] building voxel-init for illumos");
+    let built = Command::new(toolchain_bin("cargo"))
+        .current_dir(root)
+        .args(["build", "-p", "voxel-init", "--release"])
+        .status()
+        .context("run cargo build -p voxel-init")?;
+    if !built.success() {
+        bail!("building voxel-init failed");
+    }
+    std::fs::create_dir_all(cargo_bay).with_context(|| format!("mkdir {}", cargo_bay.display()))?;
+    let agent = cargo_bay.join("voxel-init");
+    std::fs::copy(root.join("target/release/voxel-init"), &agent)
+        .context("stage voxel-init into the cargo-bay")?;
+    let _ = Command::new("chmod").arg("+x").arg(&agent).status();
+    Ok(())
+}
+
 pub(crate) async fn create_frr(
     version: &str,
     dataset: &str,

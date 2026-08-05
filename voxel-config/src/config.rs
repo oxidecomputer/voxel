@@ -566,6 +566,8 @@ pub struct Image {
     pub version: String,
     pub cp: Option<String>,
     pub frr: Option<String>,
+    /// Full builder image name. Overrides `version`.
+    pub builder: Option<String>,
     /// Override the sled-agent `data_links` config shape. Normally leave this
     /// unset (`None`): voxel auto-detects it from the image's omicron source at
     /// launch. Set it only to force a shape. See [`SledDataLinksSchema`].
@@ -585,6 +587,7 @@ impl Default for Image {
             version: "proto".into(),
             cp: None,
             frr: None,
+            builder: None,
             data_links_schema: None,
             disks_schema: None,
             service_pool_schema: None,
@@ -667,6 +670,13 @@ impl Image {
         self.frr
             .clone()
             .unwrap_or_else(|| format!("voxel-frr-{}", self.version))
+    }
+    /// The omicron build host. Unlike cp and frr this never boots as part of a
+    /// rack: `voxel image create` boots it to build omicron in-guest.
+    pub fn builder_image(&self) -> String {
+        self.builder
+            .clone()
+            .unwrap_or_else(|| format!("voxel-builder-{}", self.version))
     }
 }
 
