@@ -473,11 +473,7 @@ pub fn builder() -> Result<()> {
         }
     }
 
-    let path = format!(
-        "{cargo_bin}:/opt/ooce/bin:{}",
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let warm = warm_omicron(&path);
+    let warm = warm_omicron(&omicron_path(WARM_SRC, &cargo_bin));
     if !warm {
         warn("omicron warm-up incomplete; the first build will do this work instead");
     }
@@ -485,6 +481,19 @@ pub fn builder() -> Result<()> {
     mark_ready(&format!(
         "voxel-builder version={version} omicron_warm={warm}"
     ))
+}
+
+/// The PATH omicron's own tooling expects, mirroring voxel's `omicron_cmd` on
+/// the host. `install_builder_prerequisites.sh` downloads cockroach, clickhouse
+/// and dpd into `out/` and then verifies each is on PATH, so omitting these
+/// three directories fails the script every time, after the downloads have
+/// already succeeded.
+fn omicron_path(src: &str, cargo_bin: &str) -> String {
+    format!(
+        "{src}/out/cockroachdb/bin:{src}/out/clickhouse:{src}/out/dendrite-stub/bin:\
+         {cargo_bin}:/opt/ooce/bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    )
 }
 
 /// Clone omicron and run its builder prerequisites, so a later build starts with
@@ -509,13 +518,11 @@ fn warm_omicron(path: &str) -> bool {
     let mut attempt = 0;
     while !crate::sys::run_env("./tools/install_builder_prerequisites.sh", &["-y"], &envs) {
         attempt += 1;
-        if attempt >= 20 {
+        if attempt >= 5 {
             warn("install_builder_prerequisites failed; leaving it to the per-build run");
             return false;
         }
-        note(format!(
-            "prerequisites attempt {attempt} failed (pkg busy?); retrying"
-        ));
+        note(format!("prerequisites attempt {attempt} failed; retrying"));
         std::thread::sleep(std::time::Duration::from_secs(15));
     }
     true
