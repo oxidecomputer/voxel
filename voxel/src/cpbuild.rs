@@ -137,7 +137,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         )?;
     }
 
-    apply_patches(&voxel_image, src)?;
+    apply_patches(src)?;
 
     // --- 2. prerequisites + softnpu machinery --------------------------------
     eprintln!("[voxel] install_builder_prerequisites.sh -y");
@@ -256,44 +256,75 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Replace the single occurrence of `anchor` in `path` with `replacement`.
+/// No-op if `marker` is already present, so a re-run is idempotent. Requiring
+/// exactly one match means an upstream rewrite fails the build here instead of
+/// silently producing a mis-built image.
+fn patch_file(path: &Path, marker: &str, anchor: &str, replacement: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read {} to patch", path.display()))?;
+    if text.contains(marker) {
+        return Ok(());
+    }
+    let hits = text.matches(anchor).count();
+    if hits != 1 {
+        bail!(
+            "{}: expected exactly 1 match of the patch anchor, found {hits}. \
+             Omicron changed upstream; the patch needs updating.",
+            path.display()
+        );
+    }
+    std::fs::write(path, text.replace(anchor, replacement))
+        .with_context(|| format!("write patched {}", path.display()))?;
+    if !file_contains(path, marker) {
+        bail!("{}: patch did not apply", path.display());
+    }
+    Ok(())
+}
+
 /// voxel's two omicron source patches, re-applied after every checkout (which
-/// resets the tree). Both verify they landed: a silent no-op here surfaces much
-/// later as a mis-built image.
-fn apply_patches(voxel_image: &Path, src: &Path) -> Result<()> {
-    // sled-hardware returns a *Pc* baseboard for i86pc sleds, but wicketd
-    // correlates bootstrap addresses by matching the SP's *Gimlet* baseboard, so
+/// resets the tree).
+fn apply_patches(src: &Path) -> Result<()> {
+    // sled-hardware returns a Pc baseboard for i86pc sleds, but wicketd
+    // correlates bootstrap addresses by matching the SP's Gimlet baseboard, so
     // every sled shows "bootstrap address UNKNOWN". Revision 2 matches the
     // emulated SP VPD.
     eprintln!("[voxel] patching sled-hardware parse_smbios_output: Pc -> Gimlet baseboard");
-    let smbios = src.join("sled-hardware/src/illumos/mod.rs");
-    run(
-        Command::new("perl").args([
-            "-pi",
-            "-e",
-            "s/Some\\(Baseboard::new_pc\\(serial_number, product\\)\\)/\
-             Some(Baseboard::new_gimlet(serial_number, product, 2))/",
-        ])
-        .arg(&smbios),
-        "perl smbios baseboard patch",
+    patch_file(
+        &src.join("sled-hardware/src/illumos/mod.rs"),
+        "new_gimlet(serial_number, product, 2)",
+        "Some(Baseboard::new_pc(serial_number, product))",
+        "Some(Baseboard::new_gimlet(serial_number, product, 2))",
     )?;
-    if !file_contains(&smbios, "new_gimlet(serial_number, product, 2)") {
-        bail!("smbios baseboard patch did not apply");
-    }
 
-    // Nexus lot-validates every switch-port address against the single-block
-    // infra lot. In Static mode that lot is v4, so voxel's v6 addrconf
-    // interconnect ports can't reserve (handoff 400 "address not in lot").
     eprintln!("[voxel] patching nexus rack-init: add v6 block to the infra address lot");
-    run(
-        Command::new("python3")
-            .arg(voxel_image.join("patches/nexus-infra-lot-v6.py"))
-            .arg(src),
-        "nexus infra-lot v6 patch",
-    )?;
-    if !file_contains(&src.join("nexus/src/app/rack.rs"), "voxel: add a v6 block") {
-        bail!("nexus infra-lot v6 patch did not apply");
-    }
+    apply_nexus_infra_lot_patch(&src.join("nexus/src/app/rack.rs"))?;
     Ok(())
+}
+
+/// Nexus rack-init builds the "initial-infra" address lot as a single block from
+/// `rack_network_config.infra_ip_first`/`last` and lot-validates every
+/// switch-port address against it. In Static mode that lot is a finite v4 range
+/// (the numbered /30 uplinks), so voxel's sidecar-interconnect ports (underlay,
+/// v6 addrconf) can't reserve and handoff 400s with "address not in lot". BGP
+/// mode already uses a v6 `::` lot, where the same addrconf ports reserve fine.
+///
+/// The replacement's indentation lands in real Rust source that must compile.
+fn apply_nexus_infra_lot_patch(rack_rs: &Path) -> Result<()> {
+    patch_file(
+        rack_rs,
+        "voxel: add a v6 block",
+        "        let blocks = vec![ipv4_block];",
+        "        // voxel: add a v6 block so Static-mode addrconf (interconnect) ports\n\
+         \x20       // reserve in the infra lot; BGP mode already uses a v6 :: lot.\n\
+         \x20       let mut blocks = vec![ipv4_block];\n\
+         \x20       if first_address.is_ipv4() {\n\
+         \x20           blocks.push(networking::AddressLotBlockCreate {\n\
+         \x20               first_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+         \x20               last_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+         \x20           });\n\
+         \x20       }",
+    )
 }
 
 /// Fetch sidecar-lite's scadm + libsidecar_lite.so, via a rev-keyed cache, and
@@ -364,4 +395,58 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
         bail!("{what} failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("voxel-patch-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("rack.rs");
+        std::fs::write(&f, body).unwrap();
+        f
+    }
+
+    /// Byte for byte the text the python patch this replaced emitted.
+    #[test]
+    fn nexus_infra_lot_patch_matches_reference_output() {
+        let f = scratch(
+            "lot",
+            "BEFORE\n        let blocks = vec![ipv4_block];\nAFTER\n",
+        );
+        apply_nexus_infra_lot_patch(&f).unwrap();
+        let want = "BEFORE\n\
+        \x20       // voxel: add a v6 block so Static-mode addrconf (interconnect) ports\n\
+        \x20       // reserve in the infra lot; BGP mode already uses a v6 :: lot.\n\
+        \x20       let mut blocks = vec![ipv4_block];\n\
+        \x20       if first_address.is_ipv4() {\n\
+        \x20           blocks.push(networking::AddressLotBlockCreate {\n\
+        \x20               first_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+        \x20               last_address: std::net::Ipv6Addr::UNSPECIFIED.into(),\n\
+        \x20           });\n\
+        \x20       }\nAFTER\n";
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), want);
+
+        // Re-applying is a no-op, so a re-checked-out tree doesn't double-patch.
+        apply_nexus_infra_lot_patch(&f).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), want);
+    }
+
+    /// A vanished anchor must fail the build. A silent no-op would surface much
+    /// later as a handoff 400.
+    #[test]
+    fn patch_fails_when_anchor_is_gone() {
+        let f = scratch("missing", "nothing to anchor on\n");
+        assert!(apply_nexus_infra_lot_patch(&f).is_err());
+    }
+
+    /// Two matches are ambiguous; patching either could be wrong.
+    #[test]
+    fn patch_fails_when_anchor_is_ambiguous() {
+        let line = "        let blocks = vec![ipv4_block];\n";
+        let f = scratch("dup", &format!("{line}{line}"));
+        assert!(apply_nexus_infra_lot_patch(&f).is_err());
+    }
 }
