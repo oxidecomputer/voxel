@@ -326,14 +326,16 @@ async fn quiesce(d: &Runner, node: libfalcon::NodeRef) {
     hyperstop(NODE);
 }
 
-/// Wait for propolis to exit after the guest halts, polling rather than sleeping
-/// a fixed interval. Returning as soon as it is down keeps a fast halt fast, and
-/// the timeout is not fatal: `hyperstop` takes the VM down either way.
+/// Give the halting guest time to flush, returning early if propolis exits on
+/// its own.
+///
+/// Propolis usually outlives the guest's halt, so reaching the timeout is the
+/// normal path, not a failure: `hyperstop` takes the VM down next either way.
 fn wait_for_propolis_exit(name: &str, timeout: Duration) {
     let Some(pid) = read_pidfile(name) else {
         return;
     };
-    eprintln!("[voxel] waiting up to {}s for shutdown", timeout.as_secs());
+    eprintln!("[voxel] flushing, up to {}s", timeout.as_secs());
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         // Signal 0 tests for existence without delivering anything.
@@ -436,15 +438,8 @@ fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
     rename(&staging, &image)
 }
 
-/// Whether a dataset is present.
 fn exists(ds: &Dataset) -> bool {
-    Command::new("zfs")
-        .args(["list", "-H", "-o", "name", ds.as_str()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    zfs_exists(ds.as_str())
 }
 
 fn rename(from: &Dataset, to: &Dataset) -> Result<()> {
@@ -492,23 +487,37 @@ impl Dataset {
     }
 }
 
-/// `zfs destroy -r`, tolerating only the absence of the target.
+/// `zfs destroy -r`, skipped when the target is absent.
 ///
-/// Any other failure is reported: silently swallowing them hides real problems
-/// (a busy dataset, a permission failure) behind a later, stranger error.
+/// Checks first rather than matching stderr: zfs words absence differently for
+/// datasets and snapshots, and any failure that does reach us is a real one
+/// (a busy dataset, a dependent clone, a permission failure).
 fn destroy_recursive_if_present(target: &str) -> Result<()> {
+    if !zfs_exists(target) {
+        return Ok(());
+    }
     let out = Command::new("pfexec")
         .args(["zfs", "destroy", "-r", target])
         .output()
         .with_context(|| format!("run zfs destroy -r {target}"))?;
-    if out.status.success() {
-        return Ok(());
+    if !out.status.success() {
+        bail!(
+            "zfs destroy -r {target} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("does not exist") {
-        return Ok(());
-    }
-    bail!("zfs destroy -r {target} failed: {}", stderr.trim());
+    Ok(())
+}
+
+/// Whether a dataset or snapshot is present.
+fn zfs_exists(name: &str) -> bool {
+    Command::new("zfs")
+        .args(["list", "-H", "-o", "name", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn snapshot(ds: &Dataset, name: &str) -> Result<()> {
