@@ -9,10 +9,13 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::imagebuild::{BakeOpts, bake, isolated_builder, repo_root, toolchain_bin};
+use crate::imagebuild::{
+    BakeOpts, BakeStep, InstallRole, bake, isolated_builder, repo_root, toolchain_bin,
+};
 
 /// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
-const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
+const OMICRON_URL: &str = "https://github.com/oxidecomputer/omicron";
+const SIDECAR_LITE_REV_PINNED: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
 const SIDECAR_URL: &str =
     "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
 
@@ -63,18 +66,14 @@ pub(crate) async fn create(
         }
         None => {
             let commit = commit.context("a <COMMIT> is required (or pass --src <path>)")?;
-            let build_root = std::env::var("BUILD_ROOT").unwrap_or_else(|_| {
-                format!(
-                    "{}/voxel-builds",
-                    std::env::var("HOME").unwrap_or_else(|_| "/root".into())
-                )
-            });
+            let build_root = crate::env_vars::BUILD_ROOT
+                .or_else(|| format!("{}/voxel-builds", crate::env_vars::home()));
             let src = PathBuf::from(build_root).join(format!("omicron-{commit}"));
             (commit.to_string(), src, false)
         }
     };
-    let gimlets = std::env::var("GIMLETS")
-        .ok()
+    let gimlets = crate::env_vars::GIMLETS
+        .get()
         .and_then(|g| g.parse().ok())
         .unwrap_or(4);
     create_cp(CpBuild {
@@ -113,8 +112,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
                 std::fs::create_dir_all(parent).ok();
             }
             eprintln!("[voxel] cloning omicron -> {}", src.display());
-            let repo = std::env::var("OMICRON_REPO")
-                .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
+            let repo = crate::env_vars::OMICRON_REPO.or(OMICRON_URL);
             run(
                 Command::new("git").arg("clone").arg(&repo).arg(src),
                 "git clone omicron",
@@ -244,8 +242,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let (ext_if, builder_net) = isolated_builder(b.cfg.map(|c| &c.external))?;
     bake(BakeOpts {
         base_image: "helios-3.0",
-        role: Some("cp"),
-        exec: None,
+        step: BakeStep::Install(InstallRole::ControlPlane),
         cargo_bay: &cargo_bay.display().to_string(),
         image_name: &image_name,
         dataset: b.dataset,
@@ -336,7 +333,7 @@ fn check_generated_configs(src: &Path, cfg: &voxel_config::VoxelConfig) -> Resul
 /// stage them for the image. The builder VM may not reach buildomat.eng - only
 /// the host does - so this happens here rather than in-guest.
 fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
-    let rev = std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
+    let rev = crate::env_vars::SIDECAR_LITE_REV.or(SIDECAR_LITE_REV_PINNED);
     let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
     std::fs::create_dir_all(&cache).with_context(|| format!("mkdir {}", cache.display()))?;
     std::fs::create_dir_all(dest).with_context(|| format!("mkdir {}", dest.display()))?;
@@ -374,8 +371,8 @@ fn omicron_cmd(src: &Path, program: &str) -> Command {
     let mut c = Command::new(program);
     c.current_dir(src);
     let s = src.display();
-    let existing = std::env::var("PATH").unwrap_or_default();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let existing = crate::env_vars::PATH.or("");
+    let home = crate::env_vars::home();
     c.env(
         "PATH",
         format!(
@@ -383,7 +380,7 @@ fn omicron_cmd(src: &Path, program: &str) -> Command {
              {home}/.cargo/bin:/opt/ooce/bin:{existing}"
         ),
     );
-    if std::env::var("RUSTFLAGS").is_err() {
+    if !crate::env_vars::RUSTFLAGS.is_set() {
         c.env("RUSTFLAGS", voxel_config::omicron::RUSTFLAGS);
     }
     c

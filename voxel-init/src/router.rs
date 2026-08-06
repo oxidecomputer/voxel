@@ -318,7 +318,7 @@ fn link_names() -> Vec<String> {
 }
 
 fn uplink_iface() -> Option<String> {
-    if let Ok(v) = std::env::var("UPSTREAM_IFACE")
+    if let Some(v) = crate::env_vars::UPSTREAM_IFACE.get()
         && !v.is_empty()
     {
         return Some(v);

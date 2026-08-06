@@ -65,7 +65,7 @@ fn physical_ram_gb() -> Option<u64> {
 /// a clear "won't fit" up front than a cryptic boot-spike timeout. Best-effort:
 /// if physical RAM can't be read we skip; `VOXEL_SKIP_MEM_PREFLIGHT=1` overrides.
 fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
-    if std::env::var("VOXEL_SKIP_MEM_PREFLIGHT").is_ok() {
+    if crate::env_vars::VOXEL_SKIP_MEM_PREFLIGHT.is_set() {
         return Ok(());
     }
     let Some(phys) = physical_ram_gb() else {
@@ -108,9 +108,9 @@ fn default_route_iface() -> Option<String> {
 /// the link or its MTU can't be read we skip and let falcon surface the
 /// problem.
 fn lan_mtu_preflight() -> anyhow::Result<()> {
-    let link = match std::env::var("EXT_INTERFACE") {
-        Ok(l) => l,
-        Err(_) => match default_route_iface() {
+    let link = match crate::env_vars::EXT_INTERFACE.get() {
+        Some(l) => l,
+        None => match default_route_iface() {
             Some(l) => l,
             None => return Ok(()),
         },

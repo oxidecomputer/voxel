@@ -21,13 +21,8 @@ pub(crate) struct BakeOpts<'a> {
     /// Base image to boot: `helios-3.0`, `debian-13.2`, or an existing voxel
     /// image when re-baking one (`image patch`).
     pub base_image: &'a str,
-    /// Agent install role (`cp` / `frr`).
-    pub role: Option<&'a str>,
-    /// An arbitrary in-guest command to run instead of an agent role, for
-    /// boot-modify-capture (`image patch` places a component this way). With
-    /// neither `role` nor `exec` the builder just boots, which smoke-tests that
-    /// a captured image comes up with its payload intact.
-    pub exec: Option<&'a str>,
+    /// What to run inside the booted builder before capturing it.
+    pub step: BakeStep<'a>,
     /// Host dir mounted at `/opt/cargo-bay` in the guest.
     pub cargo_bay: &'a str,
     /// Registered image name; captured to `<dataset>/img/<name>@base`.
@@ -43,6 +38,41 @@ pub(crate) struct BakeOpts<'a> {
     pub ext_interface: Option<&'a str>,
     /// `"<cidr> <gateway>"` for an isolated-mode build, staged as `builder-net`.
     pub builder_net: Option<&'a str>,
+}
+
+/// What the builder does once it is up.
+pub(crate) enum BakeStep<'a> {
+    Install(InstallRole),
+    Exec(&'a str),
+    /// Boot and capture unchanged.
+    BootOnly,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum InstallRole {
+    ControlPlane,
+    Router,
+    Builder,
+}
+
+impl InstallRole {
+    /// The --role value passed to the agent in-guest.
+    fn as_str(self) -> &'static str {
+        match self {
+            InstallRole::ControlPlane => "cp",
+            InstallRole::Router => "frr",
+            InstallRole::Builder => "builder",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self> {
+        match s {
+            "cp" => Ok(InstallRole::ControlPlane),
+            "frr" => Ok(InstallRole::Router),
+            "builder" => Ok(InstallRole::Builder),
+            other => bail!("unknown install role {other:?} (expected cp, frr or builder)"),
+        }
+    }
 }
 
 /// Prepare the host side of an isolated-mode image build: stand the segment up
@@ -110,11 +140,12 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     };
     mounted.map_err(|e| anyhow::anyhow!("mount cargo-bay ({}): {e}", o.cargo_bay))?;
 
-    eprintln!(
-        "[voxel] booting builder {}, role {}",
-        o.base_image,
-        o.role.unwrap_or("none")
-    );
+    let what = match &o.step {
+        BakeStep::Install(role) => format!("role {}", role.as_str()),
+        BakeStep::Exec(_) => "exec".to_string(),
+        BakeStep::BootOnly => "boot only".to_string(),
+    };
+    eprintln!("[voxel] booting builder {}, {what}", o.base_image);
     d.launch()
         .await
         .map_err(|e| anyhow::anyhow!("launch builder: {e}"))?;
@@ -123,20 +154,21 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     // The 9p cargo-bay mount drops the exec bit, so the agent is copied to local
     // disk before running. (build-image.sh needed a shell shim for that; driving
     // the exec ourselves lets us inline it.)
-    let step = match (o.role, o.exec) {
-        (Some(role), _) => Some((
-            format!("install --role {role}"),
-            // The cargo-bay is one-way: illumos guests get a `p9kp pull` copy,
-            // linux guests a read-only 9p mount. Nothing written there reaches
-            // the host, so the log stays in-guest and travels back as the
-            // exec's return value.
-            format!(
-                "cp /opt/cargo-bay/voxel-init /tmp/voxel-init && chmod +x /tmp/voxel-init && \
-                 /tmp/voxel-init install --role {role} 2>&1 | tee /tmp/install.log"
-            ),
-        )),
-        (None, Some(cmd)) => Some((format!("exec {cmd}"), cmd.to_string())),
-        (None, None) => None,
+    let step = match o.step {
+        BakeStep::Install(role) => {
+            let role = role.as_str();
+            Some((
+                format!("install --role {role}"),
+                // The cargo-bay is one-way, so the log stays in-guest and comes
+                // back as the exec's return value.
+                format!(
+                    "cp /opt/cargo-bay/voxel-init /tmp/voxel-init && chmod +x /tmp/voxel-init && \
+                     /tmp/voxel-init install --role {role} 2>&1 | tee /tmp/install.log"
+                ),
+            ))
+        }
+        BakeStep::Exec(cmd) => Some((format!("exec {cmd}"), cmd.to_string())),
+        BakeStep::BootOnly => None,
     };
     if let Some((label, cmd)) = step {
         // falcon returns the guest command's output. Print it: it is the only
@@ -216,8 +248,7 @@ pub(crate) async fn create_builder(
 
     bake(BakeOpts {
         base_image: "helios-3.0",
-        role: Some("builder"),
-        exec: None,
+        step: BakeStep::Install(InstallRole::Builder),
         cargo_bay: &cargo_bay.display().to_string(),
         image_name: &image_name,
         dataset,
@@ -304,8 +335,7 @@ pub(crate) async fn create_frr(
 
     bake(BakeOpts {
         base_image: "debian-13.2",
-        role: Some("frr"),
-        exec: None,
+        step: BakeStep::Install(InstallRole::Router),
         cargo_bay: &cargo_bay.display().to_string(),
         image_name: &image_name,
         dataset,
@@ -329,7 +359,7 @@ pub(crate) fn toolchain_bin(name: &str) -> std::path::PathBuf {
     if let Ok(p) = std::env::var(name.to_uppercase()) {
         return std::path::PathBuf::from(p);
     }
-    for home in [std::env::var("HOME").ok(), Some("/root".into())]
+    for home in [crate::env_vars::HOME.get(), Some("/root".into())]
         .into_iter()
         .flatten()
     {
@@ -344,7 +374,7 @@ pub(crate) fn toolchain_bin(name: &str) -> std::path::PathBuf {
 /// voxel's own source tree, derived the same way `locate_script` finds
 /// `voxel-image/`: next to the binary, else the cwd.
 pub(crate) fn repo_root() -> Result<std::path::PathBuf> {
-    if let Ok(root) = std::env::var("VOXEL_REPO_ROOT") {
+    if let Some(root) = crate::env_vars::VOXEL_REPO_ROOT.get() {
         return Ok(std::path::PathBuf::from(root));
     }
     if let Ok(exe) = std::env::current_exe()
@@ -358,7 +388,10 @@ pub(crate) fn repo_root() -> Result<std::path::PathBuf> {
     if Path::new("voxel-image").exists() {
         return Ok(std::path::PathBuf::from("."));
     }
-    bail!("can't find voxel's source tree - set VOXEL_REPO_ROOT")
+    bail!(
+        "can't find voxel's source tree - set {}",
+        crate::env_vars::VOXEL_REPO_ROOT.name()
+    )
 }
 
 /// Stage the builder's static address for an isolated-mode build, or clear a
@@ -372,7 +405,7 @@ pub(crate) fn repo_root() -> Result<std::path::PathBuf> {
 /// access.
 fn stage_builder_net(cargo_bay: &str, explicit: Option<&str>) -> Result<()> {
     let path = Path::new(cargo_bay).join("builder-net");
-    let from_env = std::env::var("VOXEL_BUILDER_NET").ok();
+    let from_env = crate::env_vars::VOXEL_BUILDER_NET.get();
     match explicit.map(str::to_string).or(from_env) {
         Some(net) if !net.trim().is_empty() => {
             eprintln!("[voxel] staging builder-net {net} -> {cargo_bay}");

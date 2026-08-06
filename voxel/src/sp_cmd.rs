@@ -675,7 +675,7 @@ async fn sp_dump(
     }
     // humility runs on the HOST; don't bake a sibling-repo path - take it from
     // $VOXEL_HUMILITY, else `humility` on PATH.
-    let humility = std::env::var("VOXEL_HUMILITY").unwrap_or_else(|_| "humility".to_string());
+    let humility = crate::env_vars::VOXEL_HUMILITY.or("humility");
 
     // A baked sp-emu (emu rack) is required - sp-sim has no dump dir to arm.
     let have = ssh_capture(&ip, &format!("test -x {SP_EMU_ZONE}/sp-emu && echo ok"))

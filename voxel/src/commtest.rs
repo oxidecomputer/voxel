@@ -327,7 +327,7 @@ fn checkout(reference: &str) -> anyhow::Result<PathBuf> {
     let root = build_root().join("commtest");
     let repository = root.join("omicron.git");
     let worktrees = root.join("worktrees");
-    let repo = std::env::var("OMICRON_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
+    let repo = crate::env_vars::OMICRON_REPO.or(DEFAULT_REPO);
 
     std::fs::create_dir_all(&root)
         .with_context(|| format!("create commtest cache {}", root.display()))?;

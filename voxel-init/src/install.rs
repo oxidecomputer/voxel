@@ -103,9 +103,8 @@ fn sleep2() {
 /// In isolated mode the host stages a static address (no DHCP on that segment);
 /// otherwise the NIC leases one.
 fn bring_up_network(hosts: &[&str]) -> Result<()> {
-    let ext_if = std::env::var("EXT_IF")
-        .ok()
-        .filter(|s| !s.is_empty())
+    let ext_if = crate::env_vars::EXT_IF
+        .get()
         .or_else(|| {
             capture("dladm", &["show-phys", "-o", "link", "-p"]).and_then(|o| {
                 o.lines()
@@ -184,7 +183,7 @@ fn pkg_install(pkgs: &[&str]) -> Result<()> {
 /// hubris images is a runtime concern, so `voxel launch --emu-sp` stages and
 /// flashes it per-scrimlet from the `[sp]` config instead.
 pub fn cp() -> Result<()> {
-    let version = std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
+    let version = crate::env_vars::VOXEL_CP_VERSION.or(crate::env_vars::UNKNOWN_VERSION);
 
     bring_up_network(&["pkg.oxide.computer"])?;
 
@@ -301,7 +300,7 @@ pub fn cp() -> Result<()> {
 /// builder's DHCP identity. No topology config - `frr.conf` is generated per
 /// topology and pushed at launch.
 pub fn frr() -> Result<()> {
-    let version = std::env::var("VOXEL_FRR_VERSION").unwrap_or_else(|_| "unknown".into());
+    let version = crate::env_vars::VOXEL_FRR_VERSION.or(crate::env_vars::UNKNOWN_VERSION);
 
     // --- reach apt ---
     // falcon's default ext link normally gives the node a DHCP NIC. Isolated
@@ -417,6 +416,9 @@ pub fn frr() -> Result<()> {
 /// this path so they hit a warm cache instead of cloning and downloading again.
 const WARM_SRC: &str = "/omicron";
 
+/// Where omicron is cloned from when `OMICRON_REPO` is unset.
+const OMICRON_URL: &str = "https://github.com/oxidecomputer/omicron";
+
 /// The build flags omicron needs on Helios. Kept identical to voxel's
 /// `OMICRON_RUSTFLAGS`: a mismatch invalidates every cached artifact, which
 /// turns a warm build back into a cold one.
@@ -441,17 +443,14 @@ const OMICRON_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
 /// cargo-bay on every run, so the builder always uses the agent that shipped
 /// with the `voxel` binary driving it, and the two cannot drift apart.
 pub fn builder() -> Result<()> {
-    let version = std::env::var("VOXEL_BUILDER_VERSION").unwrap_or_else(|_| "unknown".into());
+    let version = crate::env_vars::VOXEL_BUILDER_VERSION.or(crate::env_vars::UNKNOWN_VERSION);
 
     bring_up_network(&["pkg.oxide.computer", "github.com"])?;
     pkg_install(&["git", "jq", "tofino", "looker", "htop"])?;
 
     // rustup, not a pinned toolchain: omicron selects its own via
     // rust-toolchain.toml, and rustup fetches that on first use in the checkout.
-    let cargo_bin = format!(
-        "{}/.cargo/bin",
-        std::env::var("HOME").unwrap_or_else(|_| "/root".into())
-    );
+    let cargo_bin = format!("{}/.cargo/bin", crate::env_vars::home());
     if !Path::new(&format!("{cargo_bin}/rustup")).exists() {
         note("installing rustup");
         if !run(
@@ -492,7 +491,7 @@ fn omicron_path(src: &str, cargo_bin: &str) -> String {
     format!(
         "{src}/out/cockroachdb/bin:{src}/out/clickhouse:{src}/out/dendrite-stub/bin:\
          {cargo_bin}:/opt/ooce/bin:{}",
-        std::env::var("PATH").unwrap_or_default()
+        crate::env_vars::PATH.or("")
     )
 }
 
@@ -501,8 +500,7 @@ fn omicron_path(src: &str, cargo_bin: &str) -> String {
 /// transient network or pkg failure should degrade the image, not fail it, and
 /// the per-build path re-runs both anyway.
 fn warm_omicron(path: &str) -> bool {
-    let repo = std::env::var("OMICRON_REPO")
-        .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
+    let repo = crate::env_vars::OMICRON_REPO.or(OMICRON_URL);
     if !Path::new(&format!("{WARM_SRC}/.git")).exists() {
         note(format!("cloning omicron -> {WARM_SRC}"));
         if !run("git", &["clone", &repo, WARM_SRC]) {

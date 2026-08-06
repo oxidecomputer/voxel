@@ -46,7 +46,7 @@ impl Topo {
 /// config-driven link (the voxel-managed stub in isolated mode), then falcon's
 /// default (the host's default-route interface).
 fn ext_interface(d: &mut Runner, n: NodeRef, cfg_link: Option<&str>) -> anyhow::Result<()> {
-    if let Ok(ifx) = std::env::var("EXT_INTERFACE") {
+    if let Some(ifx) = crate::env_vars::EXT_INTERFACE.get() {
         d.ext_link(&ifx, n);
     } else if let Some(ifx) = cfg_link {
         d.ext_link(ifx, n);
@@ -292,8 +292,8 @@ pub(crate) fn detect_sled_schema(
 
 /// Path of the omicron checkout the image was built from, if it's on disk.
 pub(crate) fn omicron_src() -> Option<PathBuf> {
-    std::env::var("VOXEL_OMICRON_SRC")
-        .ok()
+    crate::env_vars::VOXEL_OMICRON_SRC
+        .get()
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
 }

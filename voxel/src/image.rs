@@ -10,7 +10,7 @@ use crate::util::shell_quote;
 
 /// The resolved falcon dataset (set by `resolve_falcon_env`; else `rpool/falcon`).
 pub(crate) fn falcon_dataset() -> String {
-    std::env::var("FALCON_DATASET").unwrap_or_else(|_| "rpool/falcon".into())
+    crate::env_vars::FALCON_DATASET.or("rpool/falcon")
 }
 
 /// Fail before staging/booting if a configured image isn't present, with a

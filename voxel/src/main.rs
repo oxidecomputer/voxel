@@ -23,6 +23,7 @@ mod access;
 mod commtest;
 mod config_cmd;
 mod cpbuild;
+mod env_vars;
 mod image;
 mod imagebuild;
 mod isolated_external;
@@ -610,8 +611,8 @@ fn discover_config(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
         return absolutize(p.to_path_buf());
     }
-    let user = std::env::var("HOME")
-        .ok()
+    let user = env_vars::HOME
+        .get()
         .map(|h| PathBuf::from(h).join(".config/voxel/voxel.toml"));
     if let Some(cand) = &user
         && cand.is_file()
@@ -637,13 +638,13 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .dataset
         .clone()
         .or_else(|| cfg.and_then(|c| c.falcon.dataset.clone()))
-        .or_else(|| std::env::var("FALCON_DATASET").ok());
+        .or_else(|| env_vars::FALCON_DATASET.get());
     if let Some(d) = dataset {
         // SAFETY: runs before the tokio runtime spawns any worker, while the
         // process is still single-threaded, so no concurrent getenv (from
         // Rust or C) can race the write.
         unsafe {
-            std::env::set_var("FALCON_DATASET", d);
+            env_vars::FALCON_DATASET.set(&d);
         }
     }
     // Resolve the build root first (cli > config > env), since the omicron source
@@ -654,30 +655,25 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .as_ref()
         .map(|p| p.display().to_string())
         .or_else(|| cfg.and_then(|c| c.falcon.build_root.clone()))
-        .or_else(|| std::env::var("BUILD_ROOT").ok());
+        .or_else(|| env_vars::BUILD_ROOT.get());
     if let Some(b) = &build_root {
         // SAFETY: same single-threaded argument as FALCON_DATASET above.
         unsafe {
-            std::env::set_var("BUILD_ROOT", b);
+            env_vars::BUILD_ROOT.set(b);
         }
     }
-    let build_root_eff = build_root.unwrap_or_else(|| {
-        format!(
-            "{}/voxel-builds",
-            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
-        )
-    });
+    let build_root_eff = build_root.unwrap_or_else(|| format!("{}/voxel-builds", env_vars::home()));
     // The omicron checkout the CP image was built from. Only the sled-agent
     // schema detection reads it. Derived from the image's commit so it can't
     // drift from `image.cp`; $VOXEL_OMICRON_SRC overrides.
-    let omicron_src = std::env::var("VOXEL_OMICRON_SRC").ok().or_else(|| {
+    let omicron_src = env_vars::VOXEL_OMICRON_SRC.get().or_else(|| {
         cfg.and_then(|c| c.image.cp_commit())
             .map(|commit| format!("{build_root_eff}/omicron-{commit}"))
     });
     if let Some(s) = omicron_src {
         // SAFETY: same single-threaded argument as FALCON_DATASET above.
         unsafe {
-            std::env::set_var("VOXEL_OMICRON_SRC", s);
+            env_vars::VOXEL_OMICRON_SRC.set(&s);
         }
     }
 }
@@ -808,10 +804,16 @@ async fn main() -> Result<(), Error> {
             } => {
                 let bay = cargo_bay.display().to_string();
                 let dataset = image::falcon_dataset();
+                let step = match (role.as_deref(), exec.as_deref()) {
+                    (Some(role), _) => {
+                        imagebuild::BakeStep::Install(imagebuild::InstallRole::parse(role)?)
+                    }
+                    (None, Some(cmd)) => imagebuild::BakeStep::Exec(cmd),
+                    (None, None) => imagebuild::BakeStep::BootOnly,
+                };
                 imagebuild::bake(imagebuild::BakeOpts {
                     base_image: base,
-                    role: role.as_deref(),
-                    exec: exec.as_deref(),
+                    step,
                     cargo_bay: &bay,
                     image_name: name,
                     dataset: &dataset,

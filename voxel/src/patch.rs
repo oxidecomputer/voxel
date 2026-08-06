@@ -238,12 +238,12 @@ pub(crate) fn list() {
 /// Where downloaded artifacts are cached on the box: `<build_root>/patch-cache`
 /// (build_root from `[falcon].build_root`/`$BUILD_ROOT`, else `$HOME/voxel-builds`).
 fn cache_dir() -> PathBuf {
-    let root = std::env::var("BUILD_ROOT")
-        .ok()
+    let root = crate::env_vars::BUILD_ROOT
+        .get()
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME")
-                .ok()
+            crate::env_vars::HOME
+                .get()
                 .map(|h| PathBuf::from(h).join("voxel-builds"))
         })
         .unwrap_or_else(|| PathBuf::from("."));

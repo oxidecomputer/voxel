@@ -7,6 +7,7 @@
 //! orchestration of OS commands, so the same source builds for both targets;
 //! only the role selected at runtime differs.
 
+mod env_vars;
 mod gimlet;
 mod install;
 mod router;
