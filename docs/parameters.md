@@ -33,7 +33,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. |
-| `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching `voxel-rss-gen` is found. |
+| `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
 | `disks_schema` | enum | unset | `vdevs` or `external_disks`. Unset auto-detects from the image. |
@@ -71,8 +71,8 @@ One block per switch. Defaults: `switch0`/`uplink0` and `switch1`/`uplink1`.
 
 ## [external]
 
-Host-side external segment. This is stripped from the resolved config handed to
-rss-gen. See the README's "Isolated external network" section.
+Host-side external segment. This is host-only plumbing and never reaches the
+rack's RSS config. See the README's "Isolated external network" section.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
@@ -100,7 +100,7 @@ Runtime paths. Each unset value resolves via env then built-in default.
 |-----|------|---------|-------|
 | `dataset` | string | `$FALCON_DATASET`, else `rpool/falcon` | ZFS dataset. |
 | `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/` and `.falcon/` live under. Absolute. |
-| `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkout, rss-gen builds). |
+| `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkouts). |
 
 ## [sp]
 

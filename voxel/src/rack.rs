@@ -148,12 +148,12 @@ async fn run_voxel_init(d: &Runner, items: Vec<(NodeRef, &'static str, String)>)
 }
 
 /// Bring up the cross-rack interconnect front ports on a HELD (pre-RSS) rack.
-/// rack 0 gets these from early networking during RSS (rss-gen emits them as
-/// AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
+/// rack 0 gets these from early networking during RSS (config-rss carries them
+/// as AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
 /// ports are never configured. Create each interconnect port + its link-local by
-/// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port rss-gen
-/// emits for rack 0, so the cross-rack DDM underlay has a live link on both ends.
-/// No-op for a single rack (`interconnect_ports` is empty).
+/// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port
+/// config-rss carries for rack 0, so the cross-rack DDM underlay has a live
+/// link on both ends. No-op for a single rack (`interconnect_ports` is empty).
 async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack: usize) {
     let ports = cfg.interconnect_ports(rack);
     if ports.is_empty() {

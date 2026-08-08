@@ -7,12 +7,13 @@ members = [
     "voxel-init",
 ]
 
-# rss-gen depends on omicron's own config types via a path to the IMAGE's omicron
-# source (box-specific, per-publish). Not built as part of this workspace.
-exclude = ["voxel/rss-gen", "vendor/sprockets-tls-test-utils"]
+exclude = ["vendor/sprockets-tls-test-utils"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+# The omicron commit voxel is pinned to. Bumping this rev is the new-omicron
+# motion; build.rs surfaces it to voxel image create.
+rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "1a6b0b6ec5b56339955837dab94a7749c5faf97f" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own

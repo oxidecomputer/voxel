@@ -34,7 +34,6 @@ pub(crate) struct CpBuild<'a> {
     /// Gimlet SP count baked into the build-time smf configs.
     pub num_gimlets: usize,
     pub dataset: &'a str,
-    pub build_rss_gen: bool,
     pub external: Option<&'a voxel_config::External>,
 }
 
@@ -81,7 +80,6 @@ pub(crate) async fn create(
         .ok()
         .and_then(|g| g.parse().ok())
         .unwrap_or(4);
-    let build_rss_gen = std::env::var("BUILD_RSS_GEN").as_deref() != Ok("0");
     create_cp(CpBuild {
         label: &label,
         omicron_src,
@@ -89,7 +87,6 @@ pub(crate) async fn create(
         commit: if as_is { None } else { Some(&label) },
         num_gimlets,
         dataset,
-        build_rss_gen,
         external,
     })
     .await
@@ -262,31 +259,6 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         network: &network,
     })
     .await?;
-
-    // --- 9. the commit-pinned voxel-rss-gen ----------------------------------
-    // Non-fatal: the IMAGE is built and usable; only the typed RSS renderer
-    // needs a schema update before launch.
-    if b.build_rss_gen {
-        eprintln!("[voxel] building commit-pinned voxel-rss-gen");
-        let script = voxel_image.join("build-rss-gen.sh");
-        let ok = Command::new("bash")
-            .arg(&script)
-            .arg(src)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            eprintln!(
-                "[voxel] rss-gen ready: {}/target/debug/voxel-rss-gen",
-                src.display()
-            );
-        } else {
-            eprintln!(
-                "[voxel] WARN: voxel-rss-gen didn't build; {image_name} is usable, \
-                 but the RSS renderer needs a schema update before launch"
-            );
-        }
-    }
 
     println!("built image {image_name}");
     Ok(())
