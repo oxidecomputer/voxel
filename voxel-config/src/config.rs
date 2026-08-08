@@ -615,6 +615,10 @@ pub enum SledDisksSchema {
     /// `Virtual` variant (e.g. cc07512e0):
     /// `external_disks = { kind = "virtual", vdevs = ["m2_g0_0.vdev", ...] }`.
     ExternalDisks,
+    /// omicron main, after `Virtual { vdevs }` and `HardcodedPhysical { disks }`
+    /// merged into one variant:
+    /// `external_disks = { kind = "hardcoded", vdevs = [...], disks = [] }`.
+    Hardcoded,
 }
 
 impl Image {

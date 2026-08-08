@@ -238,21 +238,35 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
 
 /// Auto-detect the sled-agent config shapes (`data_links`, disks) from the
 /// image's omicron source, so operators never hand-set per-era knobs. Reads
-/// `$VOXEL_OMICRON_SRC/sled-agent/src/config.rs` (derived from `image.cp`'s
-/// commit) and keys off the field declarations - the ground truth for that
-/// commit. Falls back to the oldest shapes if the source can't be read; an
-/// explicit `[image]` override wins over detection.
-fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
-    let src = std::env::var("VOXEL_OMICRON_SRC")
-        .ok()
-        .map(|s| Path::new(&s).join("sled-agent/src/config.rs"))
-        .and_then(|p| fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    // `pub external_disks: ExternalDisks` (main) vs `pub vdevs: ...` (older).
-    let disks = if src.contains("pub external_disks") {
-        SledDisksSchema::ExternalDisks
-    } else {
+/// `sled-agent/src/config.rs` from `$VOXEL_OMICRON_SRC`, derived in
+/// `resolve_falcon_env` from the build root and `image.cp`'s commit, and keys
+/// off the field declarations. Falls back to the oldest shapes if the source
+/// can't be read; an explicit `[image]` override wins over detection.
+///
+/// This is the schema changelog, automated: instead of a hand-maintained
+/// commits to requirements table, voxel reads what the commit itself declares.
+/// It is the only place voxel consults an omicron checkout, and it is
+/// advisory. A rack whose source is absent still launches.
+fn detect_sled_schema(
+    cfg: &VoxelConfig,
+    src_root: Option<&Path>,
+) -> (SledDataLinksSchema, SledDisksSchema) {
+    let read = |rel: &str| {
+        src_root
+            .map(|p| p.join(rel))
+            .and_then(|p| fs::read_to_string(p).ok())
+            .unwrap_or_default()
+    };
+    let src = read("sled-agent/src/config.rs");
+    // The variants of `ExternalDisks` are declared in sled-hardware, so read the
+    // enum itself rather than the field that references it. `Virtual { vdevs }`
+    // and `HardcodedPhysical { disks }` merged into `Hardcoded { vdevs, disks }`.
+    let disks = if !src.contains("pub external_disks") {
         SledDisksSchema::Vdevs
+    } else if read("sled-hardware/src/lib.rs").contains("Hardcoded {") {
+        SledDisksSchema::Hardcoded
+    } else {
+        SledDisksSchema::ExternalDisks
     };
     // `data_links: DataLinks` (tagged enum) vs the older flat list.
     let data_links = if src.contains("data_links: DataLinks") {
@@ -264,6 +278,14 @@ fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchem
         cfg.image.data_links_schema.unwrap_or(data_links),
         cfg.image.disks_schema.unwrap_or(disks),
     )
+}
+
+/// Path of the omicron checkout the image was built from, if it's on disk.
+pub(crate) fn omicron_src() -> Option<PathBuf> {
+    std::env::var("VOXEL_OMICRON_SRC")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
 }
 
 /// Generate + stage per-node config into the cargo-bay before launch.
@@ -288,7 +310,7 @@ pub(crate) fn stage_config(
         .count();
     // Auto-detect the sled-agent config shapes from the image's omicron (no
     // per-era operator knobs); an [image] override wins if set.
-    let (data_links, disks) = detect_sled_schema(cfg);
+    let (data_links, disks) = detect_sled_schema(cfg, omicron_src().as_deref());
     eprintln!("[voxel] sled-agent config schema: data_links={data_links:?} disks={disks:?}");
     for s in &sleds {
         let dir = cargo_bay(&s.name);
@@ -598,4 +620,64 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
 
     fs::remove_dir_all(&src).with_context(|| format!("{src}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in checkout carrying the two files the sled-schema detection
+    /// reads: the sled-agent config field and the sled-hardware enum variants.
+    fn fake_sled_src(name: &str, field: &str, variants: &str) -> PathBuf {
+        let src = std::env::temp_dir().join(format!("voxel-sledcheck-{name}"));
+        let _ = fs::remove_dir_all(&src);
+        fs::create_dir_all(src.join("sled-agent/src")).unwrap();
+        fs::create_dir_all(src.join("sled-hardware/src")).unwrap();
+        fs::write(
+            src.join("sled-agent/src/config.rs"),
+            format!("pub struct Config {{ {field} }}"),
+        )
+        .unwrap();
+        fs::write(
+            src.join("sled-hardware/src/lib.rs"),
+            format!("pub enum ExternalDisks {{ {variants} }}"),
+        )
+        .unwrap();
+        src
+    }
+
+    /// The disks shape moved twice. `HardcodedPhysical {` must not be mistaken
+    /// for the newer `Hardcoded {`, or a cc07512e0-era image would be handed
+    /// main's shape and refuse to boot.
+    #[test]
+    fn detects_the_disks_shape_per_era() {
+        let cfg = VoxelConfig::default();
+        let disks = |src: &PathBuf| detect_sled_schema(&cfg, Some(src)).1;
+
+        // Oldest: a flat `vdevs` list, no `external_disks` field at all.
+        assert_eq!(
+            disks(&fake_sled_src("old", "pub vdevs: Vec<String>,", "")),
+            SledDisksSchema::Vdevs
+        );
+        // Middle: separate `Virtual` and `HardcodedPhysical` variants.
+        assert_eq!(
+            disks(&fake_sled_src(
+                "mid",
+                "pub external_disks: ExternalDisks,",
+                "Virtual { vdevs: Vec<String> }, HardcodedPhysical { disks: Vec<D> }, DetectPhysical,",
+            )),
+            SledDisksSchema::ExternalDisks
+        );
+        // Current: the two merged into `Hardcoded { vdevs, disks }`.
+        assert_eq!(
+            disks(&fake_sled_src(
+                "new",
+                "pub external_disks: ExternalDisks,",
+                "Hardcoded { vdevs: Vec<String>, disks: Vec<D> }, DetectPhysical,",
+            )),
+            SledDisksSchema::Hardcoded
+        );
+        // No checkout on disk: assume the oldest shape.
+        assert_eq!(detect_sled_schema(&cfg, None).1, SledDisksSchema::Vdevs);
+    }
 }

@@ -154,6 +154,21 @@ impl SledAgentConfig {
                 )
                 .unwrap();
             }
+            crate::config::SledDisksSchema::Hardcoded => {
+                // `Virtual { vdevs }` and `HardcodedPhysical { disks }` merged
+                // into one `Hardcoded { vdevs, disks }`. Both fields are
+                // required; voxel injects no raw disks, so `disks` is empty.
+                let list = vdevs
+                    .iter()
+                    .map(|v| format!("\"{v}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    o,
+                    "external_disks = {{ kind = \"hardcoded\", vdevs = [{list}], disks = [] }}"
+                )
+                .unwrap();
+            }
         }
         writeln!(o).unwrap();
 
@@ -351,5 +366,36 @@ mod tests {
         assert!(ext.get("vdevs").is_none(), "flat vdevs must be gone");
         assert_eq!(ext["external_disks"]["kind"].as_str(), Some("virtual"));
         assert_eq!(ext["external_disks"]["vdevs"].as_array().unwrap().len(), 7);
+    }
+
+    /// omicron merged `Virtual { vdevs }` and `HardcodedPhysical { disks }` into
+    /// `Hardcoded { vdevs, disks }`. Emitting the old `virtual` variant puts
+    /// sled-agent into MAINTENANCE with "unknown variant `virtual`, expected
+    /// `hardcoded` or `detect_physical`", so both the tag and the now-required
+    /// empty `disks` list matter.
+    #[test]
+    fn hardcoded_disks_schema_matches_omicron_main() {
+        use crate::config::SledDisksSchema;
+        let cfg = parse(
+            &SledAgentConfig::new(0, false)
+                .with_disks_schema(SledDisksSchema::Hardcoded)
+                .render(),
+        );
+        assert!(cfg.get("vdevs").is_none(), "flat vdevs must be gone");
+        let disks = &cfg["external_disks"];
+        assert_eq!(disks["kind"].as_str(), Some("hardcoded"));
+        assert_eq!(disks["vdevs"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            disks["vdevs"][0].as_str(),
+            Some("m2_g0_0.vdev"),
+            "vdev naming must survive the shape change"
+        );
+        assert!(
+            disks["disks"]
+                .as_array()
+                .expect("disks is required")
+                .is_empty(),
+            "voxel injects no raw disks"
+        );
     }
 }
