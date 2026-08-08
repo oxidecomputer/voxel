@@ -221,9 +221,9 @@ enum ImageCmd {
     /// `--src <path>` instead builds an existing omicron checkout/worktree AS-IS
     /// (the dev loop: your working-tree edits, warm target).
     Create {
-        /// omicron git commit (or tag) to build and pin the image to. With
-        /// `--src` this is an optional image label (default: the checkout's HEAD).
-        #[arg(required_unless_present = "src")]
+        /// omicron git commit (or tag) to build and pin the image to (default:
+        /// the omicron rev voxel itself is pinned to). With `--src` this is an
+        /// optional image label (default: the checkout's HEAD).
         commit: Option<String>,
         /// Build from an existing omicron checkout/worktree AS-IS (host build,
         /// for dev): skips clone + checkout so your working-tree edits are built.
