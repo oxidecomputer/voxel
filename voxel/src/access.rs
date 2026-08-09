@@ -24,9 +24,12 @@ pub(crate) async fn cmd_host_exec(
         .with_context(|| format!("no such sled: {sled}"))?;
     let ip = resolve_external_ip(cfg, &topo.runner, sled, *n, false)
         .await
-        .with_context(|| format!("is the rack up? (`voxel serial {sled}` for the console)"))?;
-    let out = ssh_output(&ip, command)
-        .with_context(|| format!("couldn't ssh root@{ip} ({sled}) - is the rack up?"))?;
+        .with_context(|| {
+            format!("is the rack up? (`voxel serial {sled}` for the console)")
+        })?;
+    let out = ssh_output(&ip, command).with_context(|| {
+        format!("couldn't ssh root@{ip} ({sled}) - is the rack up?")
+    })?;
     print!("{out}");
     Ok(())
 }
@@ -45,26 +48,26 @@ pub(crate) async fn cmd_tp_exec(
     let ip = resolve_external_ip(cfg, &topo.runner, &s.name, *n, false)
         .await
         .with_context(|| {
-            format!(
-                "is the rack up? (`voxel serial {}` for the console)",
-                s.name
-            )
-        })?;
-    let out = ssh_output(&ip, &zlogin(command))
-        .with_context(|| format!("couldn't reach oxz_switch on {} ({switch})", s.name))?;
+        format!("is the rack up? (`voxel serial {}` for the console)", s.name)
+    })?;
+    let out = ssh_output(&ip, &zlogin(command)).with_context(|| {
+        format!("couldn't reach oxz_switch on {} ({switch})", s.name)
+    })?;
     print!("{out}");
     Ok(())
 }
 
-pub(crate) async fn cmd_serial(cfg: &VoxelConfig, name: &str, node: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_serial(
+    cfg: &VoxelConfig,
+    name: &str,
+    node: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     if topo.node_ref(node).is_none() {
         bail!("no such node: {node}");
     }
     let dir = topo.runner.get_falcon_dir();
-    console(node, camino::Utf8Path::new(&dir))
-        .await
-        .context("serial")
+    console(node, camino::Utf8Path::new(&dir)).await.context("serial")
 }
 
 /// Hand the terminal to `ssh root@<ip>` (optionally running a remote command),
@@ -84,7 +87,10 @@ fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
     bail!("could not exec ssh: {}", c.exec())
 }
 
-pub(crate) async fn cmd_host_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_host_ls(
+    cfg: &VoxelConfig,
+    name: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     println!("{:<6}  {:<16}  ROLE", "NODE", "IP");
     for (s, n) in &topo.sleds {
@@ -119,7 +125,9 @@ pub(crate) async fn cmd_host_login(
         .with_context(|| format!("no such node: {node}"))?;
     let ip = resolve_external_ip(cfg, &topo.runner, node, n, is_router)
         .await
-        .with_context(|| format!("is the rack up? (`voxel serial {node}` for the console)"))?;
+        .with_context(|| {
+        format!("is the rack up? (`voxel serial {node}` for the console)")
+    })?;
     eprintln!(
         "[voxel] ssh root@{ip}  ({node} {})",
         if is_router { "router" } else { "global zone" }
@@ -147,8 +155,7 @@ pub(crate) fn resolve_switch<'a>(
     if let Some((r, sw)) = switch.split_once('/')
         && let (Some(rack), Some(slot)) = (
             r.strip_prefix("rack").and_then(|x| x.parse::<usize>().ok()),
-            sw.strip_prefix("switch")
-                .and_then(|x| x.parse::<usize>().ok()),
+            sw.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok()),
         )
     {
         let rack0 = rack.saturating_sub(1);
@@ -156,23 +163,29 @@ pub(crate) fn resolve_switch<'a>(
             .iter()
             .filter(|(s, _)| s.rack == rack0)
             .nth(slot)
-            .with_context(|| format!("no rack{rack}/switch{slot} in topology"))?;
+            .with_context(|| {
+            format!("no rack{rack}/switch{slot} in topology")
+        })?;
         return Ok(hit);
     }
     // Bare `switchN` - global Nth scrimlet.
-    if let Some(n) = switch
-        .strip_prefix("switch")
-        .and_then(|x| x.parse::<usize>().ok())
+    if let Some(n) =
+        switch.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok())
     {
         return scrimlets
             .into_iter()
             .nth(n)
             .with_context(|| format!("no scrimlet for {switch}"));
     }
-    bail!("unknown switch '{switch}' (expected <scrimlet>|switchN|rackR/switchS)")
+    bail!(
+        "unknown switch '{switch}' (expected <scrimlet>|switchN|rackR/switchS)"
+    )
 }
 
-pub(crate) async fn cmd_tp_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_tp_ls(
+    cfg: &VoxelConfig,
+    name: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     // Each rack has its own switch0/switch1, so number the switch slot PER RACK
     // and show which rack it's in (1-based, matching `voxel info`).
@@ -182,7 +195,8 @@ pub(crate) async fn cmd_tp_ls(cfg: &VoxelConfig, name: &str) -> anyhow::Result<(
     } else {
         println!("{:<8}  {:<6}  IP", "SWITCH", "NODE");
     }
-    let mut per_rack: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    let mut per_rack: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
     for (s, n) in topo.sleds.iter().filter(|(s, _)| s.scrimlet) {
         let slot = per_rack.entry(s.rack).or_insert(0);
         let ip = resolve_external_ip(cfg, &topo.runner, &s.name, *n, false)
@@ -213,11 +227,8 @@ pub(crate) async fn cmd_tp_login(
     let ip = resolve_external_ip(cfg, &topo.runner, &s.name, *n, false)
         .await
         .with_context(|| {
-            format!(
-                "is the rack up? (`voxel serial {}` for the console)",
-                s.name
-            )
-        })?;
+        format!("is the rack up? (`voxel serial {}` for the console)", s.name)
+    })?;
     eprintln!("[voxel] ssh root@{ip} -> {ZLOGIN}  ({} {switch})", s.name);
     ssh_exec(&ip, Some(ZLOGIN))
 }

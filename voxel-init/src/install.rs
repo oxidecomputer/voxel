@@ -45,7 +45,8 @@ fn bake_agent() -> Result<()> {
     }
     note("baking voxel-init agent");
     fs::create_dir_all("/opt/oxide").ok();
-    fs::copy(&src, AGENT_DST).map_err(|e| anyhow::anyhow!("copy {src} -> {AGENT_DST}: {e}"))?;
+    fs::copy(&src, AGENT_DST)
+        .map_err(|e| anyhow::anyhow!("copy {src} -> {AGENT_DST}: {e}"))?;
     run("chmod", &["+x", AGENT_DST]);
     Ok(())
 }
@@ -56,7 +57,8 @@ fn mark_ready(body: &str) -> Result<()> {
     run_quiet("sync", &[]);
     let built = capture("date", &["+%Y-%m-%dT%H:%M:%S"]).unwrap_or_default();
     let line = format!("{body} built={built}\n");
-    fs::write(READY_MARKER, &line).map_err(|e| anyhow::anyhow!("write {READY_MARKER}: {e}"))?;
+    fs::write(READY_MARKER, &line)
+        .map_err(|e| anyhow::anyhow!("write {READY_MARKER}: {e}"))?;
     note(format!("image ready: {}", line.trim()));
     Ok(())
 }
@@ -107,7 +109,8 @@ fn sleep2() {
 /// hubris images is a runtime concern, so `voxel launch --emu-sp` stages and
 /// flashes it per-scrimlet from the `[sp]` config instead.
 pub fn build_control_plane_image() -> Result<()> {
-    let version = std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
+    let version =
+        std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
 
     // --- networking: reach pkg.oxide.computer ---
     // The builder has a single external NIC; find a vioif and address it.
@@ -116,9 +119,7 @@ pub fn build_control_plane_image() -> Result<()> {
         .filter(|s| !s.is_empty())
         .or_else(|| {
             capture("dladm", &["show-phys", "-o", "link", "-p"]).and_then(|o| {
-                o.lines()
-                    .find(|l| l.starts_with("vioif"))
-                    .map(str::to_string)
+                o.lines().find(|l| l.starts_with("vioif")).map(str::to_string)
             })
         })
         .unwrap_or_else(|| "vioif0".into());
@@ -144,8 +145,11 @@ pub fn build_control_plane_image() -> Result<()> {
             run("ipadm", &["create-addr", "-T", "dhcp", &addrobj]);
             note("waiting for DHCP lease...");
             for _ in 0..30 {
-                let leased = capture("ipadm", &["show-addr", &addrobj, "-p", "-o", "addr"])
-                    .is_some_and(|a| a.contains('/'));
+                let leased = capture(
+                    "ipadm",
+                    &["show-addr", &addrobj, "-p", "-o", "addr"],
+                )
+                .is_some_and(|a| a.contains('/'));
                 if leased {
                     break;
                 }
@@ -174,7 +178,8 @@ pub fn build_control_plane_image() -> Result<()> {
 
     // The builder runs us from /opt/cargo-bay; the staged omicron dir is here.
     let omicron = format!("{CARGO_BAY}/omicron");
-    std::env::set_current_dir(&omicron).map_err(|e| anyhow::anyhow!("cd {omicron}: {e}"))?;
+    std::env::set_current_dir(&omicron)
+        .map_err(|e| anyhow::anyhow!("cd {omicron}: {e}"))?;
     for f in ["omicron-package", "xtask", "xtask-downloader"] {
         run_quiet("chmod", &["+x", f]);
     }
@@ -188,10 +193,16 @@ pub fn build_control_plane_image() -> Result<()> {
         ("XTASK_DOWNLOADER_BIN", xtask_dl.as_str()),
     ];
     let mut attempt = 0;
-    while !crate::sys::run_env("./tools/install_runner_prerequisites.sh", &["-y"], &envs) {
+    while !crate::sys::run_env(
+        "./tools/install_runner_prerequisites.sh",
+        &["-y"],
+        &envs,
+    ) {
         attempt += 1;
         if attempt >= 5 {
-            bail!("install_runner_prerequisites failed after {attempt} attempts");
+            bail!(
+                "install_runner_prerequisites failed after {attempt} attempts"
+            );
         }
         note(format!(
             "prerequisites attempt {attempt} failed; retrying in 20s"
@@ -200,7 +211,8 @@ pub fn build_control_plane_image() -> Result<()> {
     }
 
     note("unpacking control-plane zone artifacts into /opt/oxide ...");
-    if !crate::sys::run_env("./omicron-package", &["--force", "unpack"], &envs) {
+    if !crate::sys::run_env("./omicron-package", &["--force", "unpack"], &envs)
+    {
         bail!("omicron-package unpack failed");
     }
     let artifacts = capture("find", &["/opt/oxide", "-name", "*.tar.gz"])
@@ -209,9 +221,7 @@ pub fn build_control_plane_image() -> Result<()> {
     if artifacts == 0 {
         bail!("omicron-package unpack produced no artifacts in /opt/oxide");
     }
-    note(format!(
-        "unpacked {artifacts} zone artifacts into /opt/oxide"
-    ));
+    note(format!("unpacked {artifacts} zone artifacts into /opt/oxide"));
 
     // Strip the default config-rss.toml that omicron v20+ ships in the sled-agent
     // non-gimlet package. sled-agent's SMF auto-starts at boot and would RSS-init
@@ -219,7 +229,9 @@ pub fn build_control_plane_image() -> Result<()> {
     // per-launch config - then RSS retries with voxel's and sled-agent refuses
     // ("Sled Agent already running" with a different request).
     fs::remove_file("/opt/oxide/sled-agent/pkg/config-rss.toml").ok();
-    note("removed baked default config-rss (RSS will use voxel's injected one)");
+    note(
+        "removed baked default config-rss (RSS will use voxel's injected one)",
+    );
 
     // --- bake launch-time bits ---
     // Bake the WHOLE staged omicron dir: `omicron-package activate` reads
@@ -250,8 +262,11 @@ pub fn build_control_plane_image() -> Result<()> {
         note("baking sidecar_lite from cargo-bay");
         fs::create_dir_all("/opt/oxide/sidecar").ok();
         for f in ["scadm", "libsidecar_lite.so"] {
-            fs::copy(format!("{sc_dir}/{f}"), format!("/opt/oxide/sidecar/{f}"))
-                .map_err(|e| anyhow::anyhow!("bake sidecar {f}: {e}"))?;
+            fs::copy(
+                format!("{sc_dir}/{f}"),
+                format!("/opt/oxide/sidecar/{f}"),
+            )
+            .map_err(|e| anyhow::anyhow!("bake sidecar {f}: {e}"))?;
         }
         run("chmod", &["+x", "/opt/oxide/sidecar/scadm"]);
     } else {
@@ -268,7 +283,9 @@ pub fn build_control_plane_image() -> Result<()> {
     if run("svccfg", &["import", manifest]) {
         note("imported voxel-switch-enforcer");
     } else {
-        warn("svccfg import voxel-switch-enforcer failed (manifest staged for boot-time import)");
+        warn(
+            "svccfg import voxel-switch-enforcer failed (manifest staged for boot-time import)",
+        );
     }
 
     // Clearing /etc/path_to_inst is the bake's LAST exec before capture;
@@ -282,7 +299,8 @@ pub fn build_control_plane_image() -> Result<()> {
 /// builder's DHCP identity. No topology config - `frr.conf` is generated per
 /// topology and pushed at launch.
 pub fn build_frr_image() -> Result<()> {
-    let version = std::env::var("VOXEL_FRR_VERSION").unwrap_or_else(|_| "unknown".into());
+    let version =
+        std::env::var("VOXEL_FRR_VERSION").unwrap_or_else(|_| "unknown".into());
 
     // --- reach apt ---
     // falcon's default ext link normally gives the node a DHCP NIC. Isolated
@@ -325,12 +343,7 @@ pub fn build_frr_image() -> Result<()> {
     // apt-daily timers race the apt lock and can wipe FRR state.
     run_quiet(
         "systemctl",
-        &[
-            "disable",
-            "--now",
-            "apt-daily-upgrade.timer",
-            "apt-daily.timer",
-        ],
+        &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"],
     );
 
     // --- install FRR (baked) ---
@@ -391,14 +404,18 @@ pub fn build_frr_image() -> Result<()> {
     fs::write("/etc/machine-id", "").ok();
     fs::remove_file("/var/lib/dbus/machine-id").ok();
 
-    let frr_ver =
-        capture("dpkg-query", &["-W", "-f=${Version}", "frr"]).unwrap_or_else(|| "?".into());
+    let frr_ver = capture("dpkg-query", &["-W", "-f=${Version}", "frr"])
+        .unwrap_or_else(|| "?".into());
     mark_ready(&format!("voxel-frr version={version} frr={frr_ver}"))
 }
 
 /// `apt-get` with the noninteractive frontend the baked install needs.
 fn apt_get_noninteractive(args: &[&str]) -> bool {
-    crate::sys::run_env("apt-get", args, &[("DEBIAN_FRONTEND", "noninteractive")])
+    crate::sys::run_env(
+        "apt-get",
+        args,
+        &[("DEBIAN_FRONTEND", "noninteractive")],
+    )
 }
 
 /// `/var/lib/dhcp/dhclient*.leases` - the shell used a glob; enumerate instead.

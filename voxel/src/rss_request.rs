@@ -5,11 +5,13 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
 use rack_init_config::{
-    AllowedSourceIps, BaseboardId, BfdMode, BfdPeerConfig, BgpConfig, BgpPeerConfig,
-    BootstrapAddressDiscovery, IdOrdMap, IpRange, Ipv4Range, Ipv6Range, LinkFec, LinkSpeed,
-    LldpAdminStatus, LldpPortConfig, MaxPathConfig, PortConfig, RackInitializeRequest,
-    RackNetworkConfig, RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, RouterPeerType,
-    ServiceIpPoolConfig, SwitchSlot, UplinkAddress, UplinkAddressConfig, UplinkPorts,
+    AllowedSourceIps, BaseboardId, BfdMode, BfdPeerConfig, BgpConfig,
+    BgpPeerConfig, BootstrapAddressDiscovery, IdOrdMap, IpRange, Ipv4Range,
+    Ipv6Range, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
+    MaxPathConfig, PortConfig, RackInitializeRequest, RackNetworkConfig,
+    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, RouterPeerType,
+    ServiceIpPoolConfig, SwitchSlot, UplinkAddress, UplinkAddressConfig,
+    UplinkPorts,
 };
 use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
 
@@ -81,8 +83,10 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
                 asn: p.peer_asn,
                 port: p.port.clone(),
                 addr: RouterPeerType::Unnumbered {
-                    router_lifetime: RouterLifetimeConfig::new(p.router_lifetime)
-                        .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
+                    router_lifetime: RouterLifetimeConfig::new(
+                        p.router_lifetime,
+                    )
+                    .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
                 },
                 hold_time: None,
                 idle_hold_time: None,
@@ -154,7 +158,10 @@ fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
 /// Build the request for a single rack (0-based) of a voxel config. Each rack
 /// is an independent RSS domain: the bootstrap set is filtered to that rack's
 /// sleds and the customer/service network is offset per rack.
-pub fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitializeRequest> {
+pub fn request_from_config(
+    cfg: &VoxelConfig,
+    rack: usize,
+) -> Result<RackInitializeRequest> {
     let n = &cfg.network.for_rack(rack);
 
     let bootstrap_addrs: BTreeSet<Ipv6Addr> = cfg
@@ -183,7 +190,8 @@ pub fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitial
         vec![ip_range(&n.service_pool_first, &n.service_pool_last)?],
     )
     .context("service pool")?;
-    let service_ip_pools = IdOrdMap::from_iter_unique([pool]).context("service pools")?;
+    let service_ip_pools =
+        IdOrdMap::from_iter_unique([pool]).context("service pools")?;
 
     let uplink_ports = cfg.uplink_ports(rack);
     let mut ports = Vec::new();
@@ -193,8 +201,8 @@ pub fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitial
     for (sw, port) in cfg.interconnect_ports(rack) {
         ports.push(interconnect_port(&sw, &port)?);
     }
-    let ports =
-        UplinkPorts::new(ports).context("rack network config needs at least one uplink port")?;
+    let ports = UplinkPorts::new(ports)
+        .context("rack network config needs at least one uplink port")?;
 
     // Static-mode uplinks are numbered /30s validated against this lot at
     // handoff; Bgp uplinks are unnumbered, so the lot is unused.
@@ -216,7 +224,9 @@ pub fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitial
         bgp: match n.router_mode {
             RouterMode::Bgp => vec![BgpConfig {
                 asn: n.bgp_asn,
-                originate: vec![n.infra_prefix.parse().context("infra_prefix")?],
+                originate: vec![
+                    n.infra_prefix.parse().context("infra_prefix")?,
+                ],
                 shaper: None,
                 checker: None,
                 max_paths: MaxPathConfig::default(),
@@ -299,7 +309,8 @@ pub fn request_from_config(cfg: &VoxelConfig, rack: usize) -> Result<RackInitial
 /// Render a rack's config-rss.toml.
 pub fn config_rss_toml(cfg: &VoxelConfig, rack: usize) -> Result<String> {
     let request = request_from_config(cfg, rack)?;
-    rack_init_config::to_config_rss_toml(&request).context("serialize RackInitializeRequest")
+    rack_init_config::to_config_rss_toml(&request)
+        .context("serialize RackInitializeRequest")
 }
 
 #[cfg(test)]
@@ -307,7 +318,9 @@ mod tests {
     use super::*;
 
     fn config(racks: usize, network: &str) -> VoxelConfig {
-        let text = format!("[topology]\nracks = {racks}\nsleds = 3\n\n[network]\n{network}\n");
+        let text = format!(
+            "[topology]\nracks = {racks}\nsleds = 3\n\n[network]\n{network}\n"
+        );
         VoxelConfig::from_toml(&text).expect("parse test config")
     }
 
@@ -362,7 +375,9 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
         };
         assert!(serials(&rack0).is_disjoint(&serials(&rack1)));
-        let BootstrapAddressDiscovery::OnlyThese { addrs } = &rack1.bootstrap_discovery else {
+        let BootstrapAddressDiscovery::OnlyThese { addrs } =
+            &rack1.bootstrap_discovery
+        else {
             panic!("bootstrap discovery must list rack 1's sleds");
         };
         assert_eq!(addrs.len(), 3);

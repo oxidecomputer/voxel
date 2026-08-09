@@ -74,7 +74,10 @@ pub(crate) struct Options<'a> {
     pub passthrough: &'a [String],
 }
 
-pub(crate) fn run(cfg: &VoxelConfig, options: Options<'_>) -> anyhow::Result<()> {
+pub(crate) fn run(
+    cfg: &VoxelConfig,
+    options: Options<'_>,
+) -> anyhow::Result<()> {
     let Options {
         source,
         rack,
@@ -85,7 +88,9 @@ pub(crate) fn run(cfg: &VoxelConfig, options: Options<'_>) -> anyhow::Result<()>
         passthrough,
     } = options;
     ensure_unprivileged(allow_root)?;
-    if passthrough.is_empty() || passthrough.iter().any(|arg| arg == RUN_SUBCOMMAND) {
+    if passthrough.is_empty()
+        || passthrough.iter().any(|arg| arg == RUN_SUBCOMMAND)
+    {
         ensure_icmp_privilege()?;
     }
     if rack == 0 || rack > cfg.topology.racks() {
@@ -115,9 +120,13 @@ pub(crate) fn run(cfg: &VoxelConfig, options: Options<'_>) -> anyhow::Result<()>
     if !no_build {
         eprintln!("[voxel] building Omicron commtest from {}", source);
         let mut cargo = Command::new("cargo");
-        cargo
-            .current_dir(&source)
-            .args(["build", "-p", "end-to-end-tests", "--bin", "commtest"]);
+        cargo.current_dir(&source).args([
+            "build",
+            "-p",
+            "end-to-end-tests",
+            "--bin",
+            "commtest",
+        ]);
         apply_helios_build_env(&mut cargo);
         require_success(cargo.status(), "cargo build commtest")?;
     } else if !bin.is_file() {
@@ -148,7 +157,11 @@ fn publish_mode(traffic: Traffic) {
 /// while still reaching this terminal, so a dashboard can tail the live
 /// transcript. Both copies are joined after the child exits, so the transcript
 /// is complete before the exit status is reported.
-fn run_streamed(bin: &Utf8Path, api: &str, args: &[String]) -> anyhow::Result<ExitStatus> {
+fn run_streamed(
+    bin: &Utf8Path,
+    api: &str,
+    args: &[String],
+) -> anyhow::Result<ExitStatus> {
     let log = std::fs::File::create(RUN_LOG).ok();
     let log_err = log.as_ref().and_then(|f| f.try_clone().ok());
     let mut child = Command::new(bin)
@@ -161,7 +174,8 @@ fn run_streamed(bin: &Utf8Path, api: &str, args: &[String]) -> anyhow::Result<Ex
     let out = child.stdout.take().expect("stdout piped above");
     let err = child.stderr.take().expect("stderr piped above");
     let t_out = std::thread::spawn(move || tee(out, std::io::stdout(), log));
-    let t_err = std::thread::spawn(move || tee(err, std::io::stderr(), log_err));
+    let t_err =
+        std::thread::spawn(move || tee(err, std::io::stderr(), log_err));
     let status = child.wait().with_context(|| format!("wait for {}", bin))?;
     join_tee(t_out, "stdout")?;
     join_tee(t_err, "stderr")?;
@@ -209,7 +223,10 @@ fn tee(
 }
 
 /// Resolve the Omicron checkout to run from.
-fn resolve_source(cfg: &VoxelConfig, source: Source<'_>) -> anyhow::Result<Utf8PathBuf> {
+fn resolve_source(
+    cfg: &VoxelConfig,
+    source: Source<'_>,
+) -> anyhow::Result<Utf8PathBuf> {
     match source {
         Source::Local(path) => validate_source(path),
         Source::Reference(r) => checkout(r),
@@ -323,15 +340,15 @@ fn checkout(reference: &str) -> anyhow::Result<Utf8PathBuf> {
     let root = build_root().join("commtest");
     let repository = root.join("omicron.git");
     let worktrees = root.join("worktrees");
-    let repo = std::env::var("OMICRON_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
+    let repo =
+        std::env::var("OMICRON_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
 
-    std::fs::create_dir_all(&root).with_context(|| format!("create commtest cache {}", root))?;
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("create commtest cache {}", root))?;
     if !repository.exists() {
         eprintln!("[voxel] creating Omicron Git cache in {}", repository);
         let mut clone = Command::new("git");
-        clone
-            .args(["clone", "--mirror", "--", &repo])
-            .arg(&repository);
+        clone.args(["clone", "--mirror", "--", &repo]).arg(&repository);
         require_success(clone.status(), "git clone Omicron")?;
     } else {
         validate_repository(&repository, &repo)?;
@@ -350,12 +367,11 @@ fn checkout(reference: &str) -> anyhow::Result<Utf8PathBuf> {
     if source.exists() {
         validate_worktree(&source, &wanted)?;
     } else {
-        std::fs::create_dir_all(&worktrees)
-            .with_context(|| format!("create worktree directory {}", worktrees))?;
+        std::fs::create_dir_all(&worktrees).with_context(|| {
+            format!("create worktree directory {}", worktrees)
+        })?;
         require_success(
-            git_dir_command(&repository)
-                .args(["worktree", "prune"])
-                .status(),
+            git_dir_command(&repository).args(["worktree", "prune"]).status(),
             "git worktree prune",
         )?;
         eprintln!("[voxel] creating detached Omicron worktree {}", source);
@@ -371,13 +387,19 @@ fn checkout(reference: &str) -> anyhow::Result<Utf8PathBuf> {
     validate_source(&source)
 }
 
-fn validate_repository(repository: &Utf8Path, expected_remote: &str) -> anyhow::Result<()> {
-    if git_dir_output(repository, &["rev-parse", "--is-bare-repository"])? != "true" {
+fn validate_repository(
+    repository: &Utf8Path,
+    expected_remote: &str,
+) -> anyhow::Result<()> {
+    if git_dir_output(repository, &["rev-parse", "--is-bare-repository"])?
+        != "true"
+    {
         bail!("{} exists but is not a bare Git repository", repository);
     }
     // `remote get-url` applies the user's `url.<base>.insteadOf` rewrites and
     // can false-mismatch the configured URL. Read the raw remote instead.
-    let actual_remote = git_dir_output(repository, &["config", "--get", "remote.origin.url"])?;
+    let actual_remote =
+        git_dir_output(repository, &["config", "--get", "remote.origin.url"])?;
     if actual_remote != expected_remote {
         bail!(
             "{} uses origin '{}', but OMICRON_REPO is '{}'; use a different \
@@ -390,7 +412,10 @@ fn validate_repository(repository: &Utf8Path, expected_remote: &str) -> anyhow::
     Ok(())
 }
 
-fn resolve_reference(repository: &Utf8Path, reference: &str) -> anyhow::Result<String> {
+fn resolve_reference(
+    repository: &Utf8Path,
+    reference: &str,
+) -> anyhow::Result<String> {
     let candidates = reference_candidates(reference)?;
     let mut matches = Vec::new();
     for candidate in &candidates {
@@ -400,7 +425,8 @@ fn resolve_reference(repository: &Utf8Path, reference: &str) -> anyhow::Result<S
             .output()
             .with_context(|| format!("resolve Omicron ref {reference}"))?;
         if out.status.success() {
-            let commit_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let commit_id =
+                String::from_utf8_lossy(&out.stdout).trim().to_string();
             // Dedup so candidates pointing at the same commit (a branch and
             // tag, or a hex-named ref and the commit it names) resolve
             // unambiguously.
@@ -439,7 +465,8 @@ fn reference_candidates(reference: &str) -> anyhow::Result<Vec<String>> {
     // A hex string may also be an abbreviated commit ID. Named refs come
     // first, matching git's own refname-over-object-ID precedence, and a ref
     // and commit that resolve differently surface as ambiguous.
-    if (4..=40).contains(&reference.len()) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if (4..=40).contains(&reference.len())
+        && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         candidates.push(reference.into());
     }
@@ -468,7 +495,10 @@ fn validate_worktree(source: &Utf8Path, wanted: &str) -> anyhow::Result<()> {
             &current[..current.len().min(12)]
         );
     }
-    let dirty = git_worktree_output(source, &["status", "--porcelain", "--untracked-files=no"])?;
+    let dirty = git_worktree_output(
+        source,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?;
     if !dirty.is_empty() {
         bail!(
             "{} has tracked local changes; move them to a separate checkout and \
@@ -485,7 +515,10 @@ fn git_dir_command(repository: &Utf8Path) -> Command {
     git
 }
 
-fn git_dir_output(repository: &Utf8Path, args: &[&str]) -> anyhow::Result<String> {
+fn git_dir_output(
+    repository: &Utf8Path,
+    args: &[&str],
+) -> anyhow::Result<String> {
     let out = git_dir_command(repository)
         .args(args)
         .output()
@@ -500,7 +533,10 @@ fn git_dir_output(repository: &Utf8Path, args: &[&str]) -> anyhow::Result<String
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn git_worktree_output(source: &Utf8Path, args: &[&str]) -> anyhow::Result<String> {
+fn git_worktree_output(
+    source: &Utf8Path,
+    args: &[&str],
+) -> anyhow::Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(source)
@@ -518,7 +554,10 @@ fn git_worktree_output(source: &Utf8Path, args: &[&str]) -> anyhow::Result<Strin
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn require_success(status: std::io::Result<ExitStatus>, operation: &str) -> anyhow::Result<()> {
+fn require_success(
+    status: std::io::Result<ExitStatus>,
+    operation: &str,
+) -> anyhow::Result<()> {
     let status = status.with_context(|| operation.to_string())?;
     if !status.success() {
         bail!("{operation} failed ({status})");
@@ -616,17 +655,11 @@ fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
     let Ok(first) = network.service_pool_first.parse::<Ipv4Addr>() else {
         return Vec::new();
     };
-    let last = network
-        .service_pool_last
-        .parse::<Ipv4Addr>()
-        .unwrap_or(first);
+    let last = network.service_pool_last.parse::<Ipv4Addr>().unwrap_or(first);
     let lo = u32::from(first);
     let hi = u32::from(last).max(lo).min(lo.saturating_add(31));
-    let dns: Vec<&str> = network
-        .external_dns_ips
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let dns: Vec<&str> =
+        network.external_dns_ips.iter().map(String::as_str).collect();
     let (rest, dns_members): (Vec<Ipv4Addr>, Vec<Ipv4Addr>) = (lo..=hi)
         .map(Ipv4Addr::from)
         .partition(|addr| !dns.contains(&addr.to_string().as_str()));
@@ -637,8 +670,8 @@ fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
 /// source so older unicast-only eras keep working without a probe run.
 fn supports_multicast(source: &Utf8Path) -> anyhow::Result<bool> {
     let source_file = source.join("end-to-end-tests/src/bin/commtest.rs");
-    let text =
-        std::fs::read_to_string(&source_file).with_context(|| format!("read {}", source_file))?;
+    let text = std::fs::read_to_string(&source_file)
+        .with_context(|| format!("read {}", source_file))?;
     Ok(text.contains("skip_unicast") && text.contains("mcast_group"))
 }
 
@@ -699,7 +732,9 @@ fn apply_traffic(
     match traffic {
         Traffic::Unicast => {
             if has_arg(args, "--skip-unicast") {
-                bail!("--traffic unicast conflicts with commtest argument --skip-unicast");
+                bail!(
+                    "--traffic unicast conflicts with commtest argument --skip-unicast"
+                );
             }
             // Older commtests are unicast-only and need no phase selector.
             if supports_multicast && !has_arg(args, "--skip-mcast") {
@@ -715,7 +750,9 @@ fn apply_traffic(
         }
         Traffic::Multicast => {
             if has_arg(args, "--skip-mcast") {
-                bail!("--traffic multicast conflicts with commtest argument --skip-mcast");
+                bail!(
+                    "--traffic multicast conflicts with commtest argument --skip-mcast"
+                );
             }
             if !has_arg(args, "--skip-unicast") {
                 args.push("--skip-unicast".into());
@@ -723,8 +760,11 @@ fn apply_traffic(
             add_default_mcast_group(args);
         }
         Traffic::Both => {
-            if has_arg(args, "--skip-unicast") || has_arg(args, "--skip-mcast") {
-                bail!("--traffic both conflicts with commtest --skip-unicast/--skip-mcast");
+            if has_arg(args, "--skip-unicast") || has_arg(args, "--skip-mcast")
+            {
+                bail!(
+                    "--traffic both conflicts with commtest --skip-unicast/--skip-mcast"
+                );
             }
             add_default_mcast_group(args);
         }
@@ -733,8 +773,7 @@ fn apply_traffic(
 }
 
 fn has_arg(args: &[String], name: &str) -> bool {
-    args.iter()
-        .any(|a| a == name || a.starts_with(&format!("{name}=")))
+    args.iter().any(|a| a == name || a.starts_with(&format!("{name}=")))
 }
 
 fn add_default_mcast_group(args: &mut Vec<String>) {
@@ -744,19 +783,24 @@ fn add_default_mcast_group(args: &mut Vec<String>) {
     }
 }
 
-fn derive_pool(network: &Network, sleds: usize) -> anyhow::Result<(Ipv4Addr, Ipv4Addr)> {
-    let last: Ipv4Addr = network.service_pool_last.parse().with_context(|| {
-        format!(
-            "network.service_pool_last '{}' is not IPv4",
-            network.service_pool_last
-        )
-    })?;
-    let infra: oxnet::Ipv4Net = network.infra_prefix.parse().with_context(|| {
-        format!(
-            "network.infra_prefix '{}' is not IPv4 CIDR",
-            network.infra_prefix
-        )
-    })?;
+fn derive_pool(
+    network: &Network,
+    sleds: usize,
+) -> anyhow::Result<(Ipv4Addr, Ipv4Addr)> {
+    let last: Ipv4Addr =
+        network.service_pool_last.parse().with_context(|| {
+            format!(
+                "network.service_pool_last '{}' is not IPv4",
+                network.service_pool_last
+            )
+        })?;
+    let infra: oxnet::Ipv4Net =
+        network.infra_prefix.parse().with_context(|| {
+            format!(
+                "network.infra_prefix '{}' is not IPv4 CIDR",
+                network.infra_prefix
+            )
+        })?;
     let network_addr = u32::from(infra.first_addr());
     let broadcast = u32::from(infra.last_addr());
     let begin = u32::from(last)

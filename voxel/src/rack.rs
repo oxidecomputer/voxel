@@ -9,24 +9,26 @@ use voxel_config::VoxelConfig;
 
 use crate::isolated_external::{DryRun, link_mtu, up as external_up};
 use crate::net::{
-    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture, ssh_output,
-    wait_external_reachable, zlogin,
+    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture,
+    ssh_output, wait_external_reachable, zlogin,
 };
 use crate::rss::watch_rss;
-use crate::topo::{Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets};
+use crate::topo::{
+    Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets,
+};
 
 /// A per-rack progress/label tag: `rackN` (1-based) when the deployment has more
 /// than one rack, else the single-rack fallback the caller passes ("rack",
 /// "rack-init", ...).
 fn rack_label(racks: usize, rack: usize, single: &str) -> String {
-    if racks > 1 {
-        format!("rack{}", rack + 1)
-    } else {
-        single.to_string()
-    }
+    if racks > 1 { format!("rack{}", rack + 1) } else { single.to_string() }
 }
 
-pub(crate) async fn cmd_route(cfg: &VoxelConfig, name: &str, dry_run: bool) -> anyhow::Result<()> {
+pub(crate) async fn cmd_route(
+    cfg: &VoxelConfig,
+    name: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let ce = topo.node_ref("ce").context("no ce router in topology")?;
     // One host route per rack's external prefix - all racks egress via the shared ce.
@@ -88,10 +90,8 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
 /// The host's default-route interface via `route -n get default`, or `None`
 /// when there is no default route (falcon reports that on its own).
 fn default_route_iface() -> Option<String> {
-    let out = Command::new("route")
-        .args(["-n", "get", "default"])
-        .output()
-        .ok()?;
+    let out =
+        Command::new("route").args(["-n", "get", "default"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -131,7 +131,10 @@ fn lan_mtu_preflight() -> anyhow::Result<()> {
 /// Run `/opt/oxide/voxel-init <role>` on each given node concurrently, surfacing
 /// each node's `[voxel-init]` milestone lines (the raw `+ cmd` echoes stay in the
 /// guest's `/tmp/launch.log`).
-async fn run_voxel_init(d: &Runner, items: Vec<(NodeRef, &'static str, String)>) {
+async fn run_voxel_init(
+    d: &Runner,
+    items: Vec<(NodeRef, &'static str, String)>,
+) {
     let handles = items.into_iter().map(|(n, command, node)| async move {
         info!(d.log, "{node}: launch start");
         match d.exec(n, command).await {
@@ -154,7 +157,12 @@ async fn run_voxel_init(d: &Runner, items: Vec<(NodeRef, &'static str, String)>)
 /// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port
 /// config-rss carries for rack 0, so the cross-rack DDM underlay has a live
 /// link on both ends. No-op for a single rack (`interconnect_ports` is empty).
-async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack: usize) {
+async fn bring_up_interconnect(
+    d: &Runner,
+    topo: &Topo,
+    cfg: &VoxelConfig,
+    rack: usize,
+) {
     let ports = cfg.interconnect_ports(rack);
     if ports.is_empty() {
         return;
@@ -167,9 +175,8 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
         .map(|(s, n)| (*n, s.name.clone()))
         .collect();
     for (sw, port) in ports {
-        let Some(slot) = sw
-            .strip_prefix("switch")
-            .and_then(|s| s.parse::<usize>().ok())
+        let Some(slot) =
+            sw.strip_prefix("switch").and_then(|s| s.parse::<usize>().ok())
         else {
             continue;
         };
@@ -191,13 +198,17 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
         // Poll until dendrite answers, then create + enable the link (the
         // `voxel network link-up` path) and poll its link-local to DAD
         // complete, all under one deadline. Logs only when the state changes.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(600);
         let mut up = false;
         let mut last = String::new();
         while std::time::Instant::now() < deadline {
             let step = if !crate::network::switch_ready(&ip) {
-                "waiting for the switch zone (dendrite not answering)".to_string()
-            } else if let Err(e) = crate::network::enable_link(&ip, sled, &port, "100G", "none") {
+                "waiting for the switch zone (dendrite not answering)"
+                    .to_string()
+            } else if let Err(e) =
+                crate::network::enable_link(&ip, sled, &port, "100G", "none")
+            {
                 format!("link create/enable: {e}")
             } else {
                 let _ = ssh_output(
@@ -267,10 +278,8 @@ pub(crate) async fn cmd_launch(
         );
     }
     for rack in 0..racks {
-        let scrimlets = sleds
-            .iter()
-            .filter(|s| s.rack == rack && s.scrimlet)
-            .count();
+        let scrimlets =
+            sleds.iter().filter(|s| s.rack == rack && s.scrimlet).count();
         if scrimlets != 2 {
             bail!(
                 "rack {rack} needs exactly 2 scrimlets for the dual-switch RSS->Nexus handoff; got {scrimlets}"
@@ -281,12 +290,8 @@ pub(crate) async fn cmd_launch(
     // interconnects. Guard against exceeding the sidecar's port budget (the full
     // cross-rack mesh grows with racks*switches).
     const MAX_FRONT_PORTS: usize = 128;
-    let n_cr = cfg
-        .topology
-        .routers
-        .iter()
-        .filter(|r| r.as_str() != "ce")
-        .count();
+    let n_cr =
+        cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
     for s in sleds.iter().filter(|s| s.scrimlet) {
         let front = n_cr + cfg.topology.interconnect_count_for(s.index);
         if front > MAX_FRONT_PORTS {
@@ -340,8 +345,10 @@ pub(crate) async fn cmd_launch(
     }
 
     // Run the in-guest agent, baked into the images at /opt/oxide/voxel-init.
-    const GIMLET_LAUNCH: &str = "/opt/oxide/voxel-init gimlet 2>&1 | tee /tmp/launch.log";
-    const ROUTER_LAUNCH: &str = "/opt/oxide/voxel-init router 2>&1 | tee /tmp/launch.log";
+    const GIMLET_LAUNCH: &str =
+        "/opt/oxide/voxel-init gimlet 2>&1 | tee /tmp/launch.log";
+    const ROUTER_LAUNCH: &str =
+        "/opt/oxide/voxel-init router 2>&1 | tee /tmp/launch.log";
     let d = &topo.runner;
 
     // Customer routers (the shared transit) first - quick, and must be up for
@@ -402,7 +409,9 @@ pub(crate) async fn cmd_launch(
                 );
                 continue;
             }
-            if let Some((s, n)) = topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack) {
+            if let Some((s, n)) =
+                topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
+            {
                 let tag = rack_label(racks, rack, "rack-init");
                 // --wicket-setup: nothing auto-inited (no staged config-rss), so
                 // drive RSS through wicketd (upload config + cert + recovery
@@ -452,7 +461,15 @@ pub(crate) async fn cmd_launch(
                 } else {
                     None
                 };
-                watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap, known_ip).await;
+                watch_rss(
+                    d,
+                    *n,
+                    &s.bootstrap_addr(),
+                    &tag,
+                    watch_cap,
+                    known_ip,
+                )
+                .await;
             }
         }
         info!(d.log, "launch complete");
@@ -533,14 +550,12 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
         }
     }
 
-    let out = match Command::new("pgrep")
-        .args(["-f", "propolis-server"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        // pgrep exits non-zero when there are no matches - nothing to reap.
-        _ => return 0,
-    };
+    let out =
+        match Command::new("pgrep").args(["-f", "propolis-server"]).output() {
+            Ok(o) if o.status.success() => o.stdout,
+            // pgrep exits non-zero when there are no matches - nothing to reap.
+            _ => return 0,
+        };
     let needle = format!("/dev/net/{name}_");
     let mut reaped = 0;
     for line in String::from_utf8_lossy(&out).lines() {
@@ -561,7 +576,8 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
                 log,
                 "reaping orphaned propolis {pid} holding {name} resources (no falcon pid file)"
             );
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let _ =
+                Command::new("kill").args(["-9", &pid.to_string()]).status();
             reaped += 1;
         }
     }
@@ -642,10 +658,17 @@ pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
 /// rack needs. (`cmd_status` watches a running rack with no emu_sp context, so it
 /// passes `false`.)
 fn rss_watch_cap(emu_sp: bool, racks: usize) -> std::time::Duration {
-    std::time::Duration::from_secs(if emu_sp || racks > 1 { 3600 } else { 1800 })
+    std::time::Duration::from_secs(if emu_sp || racks > 1 {
+        3600
+    } else {
+        1800
+    })
 }
 
-pub(crate) async fn cmd_status(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+pub(crate) async fn cmd_status(
+    cfg: &VoxelConfig,
+    name: &str,
+) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let racks = cfg.topology.racks();
     let rss_nodes = topo.rss_sleds();

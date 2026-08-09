@@ -155,7 +155,8 @@ fn switch0_config(fleet: &SpFleet, scrimlets: &[usize]) -> String {
         writeln!(o, "kind = \"simulated\"").unwrap();
         writeln!(o, "fake-interface = \"{}\"", sp.fake_interface).unwrap();
         writeln!(o, "addr = \"{}:{}\"", sp.mgs_host, sp.base_port).unwrap();
-        writeln!(o, "ereport-addr = \"{}:{}\"", sp.mgs_host, sp.ereport_base).unwrap();
+        writeln!(o, "ereport-addr = \"{}:{}\"", sp.mgs_host, sp.ereport_base)
+            .unwrap();
         writeln!(o, "ignition-target = {}", sp.ignition_target).unwrap();
         writeln!(o, "location = {}", sp.mgs_location()).unwrap();
         writeln!(o).unwrap();
@@ -169,7 +170,9 @@ fn switch0_config(fleet: &SpFleet, scrimlets: &[usize]) -> String {
     // this only needs to cover a single slow RPC. sp-sim keeps the tight default.
     if fleet.has_emu() {
         o = o.replace(
-            &format!("per_attempt_timeout_millis = {SP_RPC_TIMEOUT_DEFAULT_MS}"),
+            &format!(
+                "per_attempt_timeout_millis = {SP_RPC_TIMEOUT_DEFAULT_MS}"
+            ),
             &format!("per_attempt_timeout_millis = {SP_RPC_TIMEOUT_EMU_MS}"),
         );
     }
@@ -187,18 +190,21 @@ pub fn switch_config(slot: u8, fleet: &SpFleet, scrimlets: &[usize]) -> String {
     if slot == 0 {
         return base;
     }
-    let digit = char::from_digit(slot as u32, 10)
-        .unwrap_or_else(|| panic!("switch slot {slot} is not a single decimal digit"));
+    let digit = char::from_digit(slot as u32, 10).unwrap_or_else(|| {
+        panic!("switch slot {slot} is not a single decimal digit")
+    });
 
     let mut out = String::with_capacity(base.len());
     for line in base.lines() {
         // `fake-switch0` -> `fake-switch{slot}` (the local interface name; the
         // `switch0`/`switch1` location *labels* never appear as `fake-switch0`).
-        let mut rewritten = line.replace("fake-switch0", &format!("fake-switch{slot}"));
+        let mut rewritten =
+            line.replace("fake-switch0", &format!("fake-switch{slot}"));
         // Each simulated SP listens on per-switch ports; the trailing digit of
         // the port is the switch instance. Bump it on the address lines.
         let trimmed = rewritten.trim_start();
-        if (trimmed.starts_with("addr =") || trimmed.starts_with("ereport-addr ="))
+        if (trimmed.starts_with("addr =")
+            || trimmed.starts_with("ereport-addr ="))
             && let Some(close) = rewritten.rfind('"')
             && close >= 1
             && rewritten.as_bytes()[close - 1].is_ascii_digit()
@@ -352,7 +358,10 @@ mode = "stderr-terminal"
     fn four_sled_switch0_is_byte_exact_to_reference() {
         // The generator must reproduce the live-validated 4-sled config exactly -
         // the default `sim` fleet keeps MGS on loopback, so nothing changes.
-        assert_eq!(switch_config(0, &SpFleet::sim(4), &[0, 3]), REFERENCE_4SLED);
+        assert_eq!(
+            switch_config(0, &SpFleet::sim(4), &[0, 3]),
+            REFERENCE_4SLED
+        );
     }
 
     #[test]
@@ -363,10 +372,14 @@ mode = "stderr-terminal"
         let host = "[fdb0:a840:2500:1::1]";
         let s = switch_config(
             0,
-            &SpFleet::new(4, crate::sp::SpBackend::Central { host: host.into() }),
+            &SpFleet::new(
+                4,
+                crate::sp::SpBackend::Central { host: host.into() },
+            ),
             &[0, 3],
         );
-        let _: toml::Value = toml::from_str(&s).expect("emulated switch0 valid TOML");
+        let _: toml::Value =
+            toml::from_str(&s).expect("emulated switch0 valid TOML");
         assert!(s.contains(&format!("addr = \"{host}:33300\"")));
         assert!(s.contains(&format!("addr = \"{host}:33310\"")));
         assert!(!s.contains("[::1]:33300")); // no longer loopback
@@ -376,7 +389,9 @@ mode = "stderr-terminal"
     fn switch1_transform_unchanged() {
         let s1 = switch_config(1, &SpFleet::sim(4), &[0, 3]);
         let _: toml::Value = toml::from_str(&s1).expect("switch1 valid TOML");
-        assert!(s1.contains("local_ignition_controller_interface = \"fake-switch1\""));
+        assert!(s1.contains(
+            "local_ignition_controller_interface = \"fake-switch1\""
+        ));
         assert!(s1.contains("fake-interface = \"fake-switch1\""));
         assert!(!s1.contains("fake-switch0"));
         assert!(s1.contains("addr = \"[::1]:33301\""));

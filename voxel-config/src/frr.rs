@@ -20,11 +20,11 @@ pub struct FrrNeighbor {
 }
 
 impl FrrNeighbor {
-    pub fn new(interface: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            interface: interface.into(),
-            description: description.into(),
-        }
+    pub fn new(
+        interface: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self { interface: interface.into(), description: description.into() }
     }
 }
 
@@ -87,7 +87,10 @@ impl FrrRouter {
     }
 
     /// `interface`/`description` blocks for the unnumbered (ce) neighbors.
-    fn write_neighbor_interfaces(&self, o: &mut impl fmt::Write) -> fmt::Result {
+    fn write_neighbor_interfaces(
+        &self,
+        o: &mut impl fmt::Write,
+    ) -> fmt::Result {
         for n in &self.neighbors {
             writeln!(o, "interface {}", n.interface)?;
             writeln!(o, " description {}", n.description)?;
@@ -102,7 +105,11 @@ impl FrrRouter {
         writeln!(o, "router bgp {}", self.asn)?;
         writeln!(o, " no bgp ebgp-requires-policy")?;
         for n in &self.neighbors {
-            writeln!(o, " neighbor {} interface remote-as external", n.interface)?;
+            writeln!(
+                o,
+                " neighbor {} interface remote-as external",
+                n.interface
+            )?;
             writeln!(o, " neighbor {} timers connect 1", n.interface)?;
         }
         Ok(())

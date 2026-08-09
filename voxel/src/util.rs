@@ -18,13 +18,17 @@ pub(crate) fn temp_dir() -> Utf8PathBuf {
 /// Locate a `voxel-image/<rel>` helper script: the `env_var` override first, else
 /// relative to the running binary (`<exe>/../../voxel-image/<rel>`), else
 /// `voxel-image/<rel>` under the CWD. Errors point at `env_var`.
-pub(crate) fn locate_script(env_var: &str, rel: &str) -> anyhow::Result<Utf8PathBuf> {
+pub(crate) fn locate_script(
+    env_var: &str,
+    rel: &str,
+) -> anyhow::Result<Utf8PathBuf> {
     if let Ok(p) = std::env::var(env_var) {
         return Ok(Utf8PathBuf::from(p));
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
-        && let Ok(candidate) = Utf8PathBuf::try_from(dir.join(format!("../../voxel-image/{rel}")))
+        && let Ok(candidate) =
+            Utf8PathBuf::try_from(dir.join(format!("../../voxel-image/{rel}")))
         && candidate.exists()
     {
         return Ok(candidate);
@@ -33,7 +37,5 @@ pub(crate) fn locate_script(env_var: &str, rel: &str) -> anyhow::Result<Utf8Path
     if cwd.exists() {
         return Ok(cwd);
     }
-    Err(anyhow::anyhow!(
-        "can't find {rel} - set {env_var} to its path"
-    ))
+    Err(anyhow::anyhow!("can't find {rel} - set {env_var} to its path"))
 }

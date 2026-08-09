@@ -135,7 +135,8 @@ fn create_addr(dry_run: bool, addrobj: &str, addr: &str) -> anyhow::Result<()> {
 
 /// The uplink's `dladm show-phys` state, or `None` when the link is absent.
 fn uplink_state(link: &str) -> Option<String> {
-    probe_out("dladm", &["show-phys", "-p", "-o", "state", link]).map(|s| s.trim().to_string())
+    probe_out("dladm", &["show-phys", "-p", "-o", "state", link])
+        .map(|s| s.trim().to_string())
 }
 
 /// A link's current MTU.
@@ -154,7 +155,9 @@ pub(crate) fn link_mtu(link: &str) -> Option<String> {
 /// -o addrobj,addr` prints one entry per line, e.g. `igb0/dhcp:172.20.0.5/24`,
 /// or `tun0/v4:100.121.38.79->100.121.38.79` for point-to-point interfaces.
 fn host_v4_addrs() -> Vec<Ipv4Net> {
-    let Some(out) = probe_out("ipadm", &["show-addr", "-p", "-o", "addrobj,addr"]) else {
+    let Some(out) =
+        probe_out("ipadm", &["show-addr", "-p", "-o", "addrobj,addr"])
+    else {
         return Vec::new();
     };
     let own = format!("{VNIC}/");
@@ -185,9 +188,9 @@ fn parse_host_addr(addr: &str) -> Option<Ipv4Net> {
 /// the segment unreachable via the wrong route. Either way, no automatic
 /// recovery.
 fn assert_subnet_disjoint(subnet: &str) -> anyhow::Result<()> {
-    let cfg: Ipv4Net = subnet
-        .parse()
-        .with_context(|| format!("external.subnet '{subnet}' must be CIDR (a.b.c.d/len)"))?;
+    let cfg: Ipv4Net = subnet.parse().with_context(|| {
+        format!("external.subnet '{subnet}' must be CIDR (a.b.c.d/len)")
+    })?;
     for host in host_v4_addrs() {
         if cfg.overlaps(&host) {
             bail!(
@@ -282,9 +285,9 @@ pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
             x.subnet
         );
     }
-    let prefix = x
-        .prefix_length()
-        .with_context(|| format!("external.subnet '{}' must be CIDR (a.b.c.d/len)", x.subnet))?;
+    let prefix = x.prefix_length().with_context(|| {
+        format!("external.subnet '{}' must be CIDR (a.b.c.d/len)", x.subnet)
+    })?;
 
     eprintln!(
         "[voxel] external: bringing up isolated segment ({} via {uplink})",
@@ -311,8 +314,9 @@ pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
         run(dry_run, &["ipadm", "create-if", "-t", VNIC])?;
     }
     let desired_addr = format!("{}/{prefix}", x.host_ip);
-    let live_addr = probe_out("ipadm", &["show-addr", "-p", "-o", "addr", ADDROBJ])
-        .map(|s| s.trim().to_string());
+    let live_addr =
+        probe_out("ipadm", &["show-addr", "-p", "-o", "addr", ADDROBJ])
+            .map(|s| s.trim().to_string());
     match live_addr.as_deref() {
         Some(a) if a == desired_addr => {}
         Some(_) => {
@@ -422,19 +426,17 @@ pub(crate) fn check(x: &External) -> anyhow::Result<()> {
             x.mtu
         ),
     );
-    item(
-        probe("dladm", &["show-vnic", VNIC]),
-        &format!("vnic {VNIC}"),
-    );
+    item(probe("dladm", &["show-vnic", VNIC]), &format!("vnic {VNIC}"));
     // Match on the exact address, not just addrobj existence: a stale addr
     // from a prior host_ip / subnet-prefix config would otherwise pass.
     let expected = x
         .prefix_length()
         .map(|p| format!("{}/{p}", x.host_ip))
         .unwrap_or_else(|| x.host_ip.clone());
-    let live_ok = probe_out("ipadm", &["show-addr", "-p", "-o", "addr", ADDROBJ])
-        .map(|s| s.trim().to_string())
-        == Some(expected.clone());
+    let live_ok =
+        probe_out("ipadm", &["show-addr", "-p", "-o", "addr", ADDROBJ])
+            .map(|s| s.trim().to_string())
+            == Some(expected.clone());
     item(live_ok, &format!("addr {ADDROBJ} ({expected})"));
     item(
         probe_out("routeadm", &["-p", "ipv4-forwarding"])
