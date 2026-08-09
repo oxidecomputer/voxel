@@ -55,28 +55,16 @@ fn ext_interface(d: &mut Runner, n: NodeRef, cfg_link: Option<&str>) -> anyhow::
     Ok(())
 }
 
-/// Fill in the SMBIOS type-1 for a given sled. The manufacturer must currently
-/// always be `a4x2` — the ONLY string omicron's `sled-hardware` recognises to
-/// read identity from SMBIOS instead of falling back to the hostname. We can change
-/// this in Omicron to allow more strings, such as "voxel" in the future.
+/// Fill in the SMBIOS type-1 for a given sled. The manufacturer must be
+/// `a4x2`, the one string omicron's `sled-hardware` reads SMBIOS identity
+/// from (anything else falls back to the hostname). We could teach omicron
+/// more strings, such as "voxel", in the future.
 ///
-/// We must ensure the reported SMBIOS info used to populate the `BaseboardId`
-/// in an emulated hardware environments matches what is reported by MGS for
-/// simulated and emulated SPs.
-///
-/// TODO: eliminate any need to patch as described below. This should come soon
-/// with the changes in https://github.com/oxidecomputer/omicron/pull/10518
-/// that remove a lot of the reliance on `Baseboard` and use `BaseboardId` more
-/// broadly instead.
-///
-///  Serial `2FAKE00{index+1}` and revision `2` BYTE-MATCH the emulated
-/// SP's VPD (sp-emu builds `2FAKE00{(port-33300)/10}`, i.e. `index+1`,
-/// barcode rev `002`) and model `913-0000019`. Paired with the omicron
-/// `parse_smbios_output` Pc->Gimlet patch (applied in build-cp.sh), sled-agent
-/// then reports the SAME `Gimlet` baseboard the SP reports via MGS, so
-/// wicketd's RACK SETUP correlates each sled's bootstrap address instead of
-/// showing UNKNOWN. (Without the patch sled-agent returns a `Pc` baseboard,
-/// which can never equal the SP's `Gimlet` in wicketd's lookup.)
+/// Serial and model must match what MGS reports for the sled's SP (sp-sim
+/// config or sp-emu VPD): wicketd correlates each sled's bootstrap address
+/// by BaseboardId, part number plus serial, so a mismatch leaves the sled's
+/// bootstrap address unknown in rack setup. Revision 2 matches the sp-emu
+/// VPD barcode rev 002; BaseboardId does not compare it.
 fn populate_smbios(d: &mut Runner, x: NodeRef, sled: &SledDesc) {
     d.set_smbios_type1(
         x,

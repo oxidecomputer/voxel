@@ -160,9 +160,15 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
                 .args(["checkout", "-q", commit]),
             "git checkout",
         )?;
+        // Drop leftover local edits so the pinned commit builds pristine.
+        run(
+            Command::new("git")
+                .arg("-C")
+                .arg(src)
+                .args(["checkout", "-q", "--", "."]),
+            "git restore tracked files",
+        )?;
     }
-
-    apply_patches(&voxel_image, src)?;
 
     // --- 2. prerequisites + softnpu machinery --------------------------------
     eprintln!("[voxel] install_builder_prerequisites.sh -y");
@@ -284,47 +290,6 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     Ok(())
 }
 
-/// voxel's two omicron source patches, re-applied after every checkout (which
-/// resets the tree). Both verify they landed: a silent no-op here surfaces much
-/// later as a mis-built image.
-fn apply_patches(voxel_image: &Path, src: &Path) -> Result<()> {
-    // sled-hardware returns a *Pc* baseboard for i86pc sleds, but wicketd
-    // correlates bootstrap addresses by matching the SP's *Gimlet* baseboard, so
-    // every sled shows "bootstrap address UNKNOWN". Revision 2 matches the
-    // emulated SP VPD.
-    eprintln!("[voxel] patching sled-hardware parse_smbios_output: Pc -> Gimlet baseboard");
-    let smbios = src.join("sled-hardware/src/illumos/mod.rs");
-    run(
-        Command::new("perl")
-            .args([
-                "-pi",
-                "-e",
-                "s/Some\\(Baseboard::new_pc\\(serial_number, product\\)\\)/\
-             Some(Baseboard::new_gimlet(serial_number, product, 2))/",
-            ])
-            .arg(&smbios),
-        "perl smbios baseboard patch",
-    )?;
-    if !file_contains(&smbios, "new_gimlet(serial_number, product, 2)") {
-        bail!("smbios baseboard patch did not apply");
-    }
-
-    // Nexus lot-validates every switch-port address against the single-block
-    // infra lot. In Static mode that lot is v4, so voxel's v6 addrconf
-    // interconnect ports can't reserve (handoff 400 "address not in lot").
-    eprintln!("[voxel] patching nexus rack-init: add v6 block to the infra address lot");
-    run(
-        Command::new("python3")
-            .arg(voxel_image.join("patches/nexus-infra-lot-v6.py"))
-            .arg(src),
-        "nexus infra-lot v6 patch",
-    )?;
-    if !file_contains(&src.join("nexus/src/app/rack.rs"), "voxel: add a v6 block") {
-        bail!("nexus infra-lot v6 patch did not apply");
-    }
-    Ok(())
-}
-
 /// Fetch sidecar-lite's scadm + libsidecar_lite.so, via a rev-keyed cache, and
 /// stage them for the image. The builder VM may not reach buildomat.eng - only
 /// the host does - so this happens here rather than in-guest.
@@ -380,12 +345,6 @@ fn omicron_cmd(src: &Path, program: &str) -> Command {
         c.env("RUSTFLAGS", OMICRON_RUSTFLAGS);
     }
     c
-}
-
-fn file_contains(path: &Path, needle: &str) -> bool {
-    std::fs::read_to_string(path)
-        .map(|s| s.contains(needle))
-        .unwrap_or(false)
 }
 
 fn run(cmd: &mut Command, what: &str) -> Result<()> {
