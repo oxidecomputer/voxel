@@ -3,10 +3,10 @@
 
 use anyhow::{Context, bail};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ImageCmd;
-use crate::util::{locate_script, shell_quote};
+use crate::util::shell_quote;
 
 /// The resolved falcon dataset (set by `resolve_falcon_env`; else `rpool/falcon`).
 pub(crate) fn falcon_dataset() -> String {
@@ -33,17 +33,55 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Locate `voxel-image/build-cp.sh`: `VOXEL_BUILD_CP` override, else relative to
-/// the running binary, else CWD.
-fn build_cp_script() -> anyhow::Result<PathBuf> {
-    locate_script("VOXEL_BUILD_CP", "build-cp.sh")
+/// The checkout's short HEAD sha (the default `--src` image label).
+pub(crate) fn head_short_sha(src: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(src)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .with_context(|| format!("run git in {}", src.display()))?;
+    if !out.status.success() {
+        bail!(
+            "git rev-parse HEAD failed in {} (is it an omicron checkout?)",
+            src.display()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-pub(crate) fn cmd_image(
-    cmd: &ImageCmd,
-    active: Option<String>,
-    external: Option<&voxel_config::External>,
-) -> anyhow::Result<()> {
+/// Render the build-time smf configs (mgs-sim, sp-sim, sled-agent) into an
+/// omicron checkout. Bakes switch0 for `gimlets` sleds with scrimlets at the
+/// first + last sled (the default topology's convention): the launch-time
+/// topology must keep scrimlets at those indices for the baked switch0 to match
+/// the generated switch1. One SP fleet drives both the MGS port table and
+/// sp-sim's side, so they agree by construction; baked images use the sim
+/// backend.
+pub(crate) fn render_smf(omicron_root: &Path, gimlets: usize) -> anyhow::Result<()> {
+    let scrimlets = [0usize, gimlets.saturating_sub(1)];
+    let fleet = voxel_config::sp::SpFleet::sim(gimlets);
+    let writes = [
+        (
+            "smf/mgs-sim/config.toml",
+            voxel_config::mgs::switch_config(0, &fleet, &scrimlets),
+        ),
+        ("smf/sp-sim/config.toml", fleet.sp_sim_config()),
+        (
+            "smf/sled-agent/non-gimlet/config.toml",
+            voxel_config::sled::SledAgentConfig::new(0, true).render(),
+        ),
+    ];
+    for (rel, text) in writes {
+        let path = omicron_root.join(rel);
+        let dir = path.parent().expect("smf path has a parent");
+        fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+        fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+        println!("rendered {}", path.display());
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Result<()> {
     match cmd {
         ImageCmd::Ls => {
             // Image bundles are falcon base images at <dataset>/img/<name>@base.
@@ -202,46 +240,7 @@ pub(crate) fn cmd_image(
             }
             Ok(())
         }
-        ImageCmd::Create { commit } => {
-            let script = build_cp_script()?;
-            let mut build = std::process::Command::new("bash");
-            build.arg(&script).arg(commit);
-            // The builder VM DHCPs an external NIC for internet access. In
-            // isolated mode, that network is the voxel-managed segment, so
-            // stand it up and point the builder at the stub (build-cp.sh ->
-            // build-image.sh -> voxel-image-builder all inherit the env).
-            if let Some(x) = external.filter(|x| x.isolated()) {
-                crate::isolated_external::up(x, false)
-                    .context("bringing up the isolated external segment for the builder")?;
-                build.env("EXT_INTERFACE", crate::isolated_external::STUB);
-                // There's no DHCP on the isolated segment, so hand the builder
-                // its own static address (host_ip - 1) + gateway.
-                // build-image.sh writes this into the builder cargo-bay as
-                // `builder-net`, and the in-VM install-cp.sh / install-frr.sh
-                // apply it in place of DHCP.
-                let net = x.builder_net().with_context(|| {
-                    format!(
-                        "cannot derive a usable isolated builder address before host_ip '{}' \
-                         within subnet '{}'; choose a host_ip at least two addresses above \
-                         the subnet network",
-                        x.host_ip, x.subnet
-                    )
-                })?;
-                build.env("VOXEL_BUILDER_NET", net);
-            }
-            eprintln!(
-                "[voxel] building voxel-cp-{commit} via {}",
-                script.display()
-            );
-            let status = build
-                .status()
-                .with_context(|| format!("run {}", script.display()))?;
-            if !status.success() {
-                bail!("build-cp.sh failed for commit {commit}");
-            }
-            println!("built image voxel-cp-{commit}");
-            Ok(())
-        }
+        ImageCmd::Create { .. } => bail!("internal: `image create` is dispatched in main"),
         ImageCmd::Export { name, out, raw } => {
             let dataset = falcon_dataset();
             let snap = format!("{dataset}/img/{name}@base");
@@ -301,8 +300,8 @@ pub(crate) fn cmd_image(
                 )
             } else if let Some(n) = fname.strip_suffix(".raw.xz") {
                 bail!(
-                    "raw import for {n} not wired here yet - use build-image.sh's \
-                     streaming raw import (presized zvol). zfs streams (.zfs.zst) import directly."
+                    "raw import for {n} is not implemented (it needs a presized zvol). \
+                     Export as a zfs stream instead: those (.zfs.zst) import directly."
                 );
             } else {
                 bail!("unrecognized extension on {fname} (want .zfs.zst or .raw.xz)");
@@ -347,37 +346,11 @@ pub(crate) fn cmd_image(
         // `image patch` needs the loaded config (for the default source image),
         // so it's dispatched in `main` before delegating the rest here.
         ImageCmd::Patch { .. } => bail!("internal: `image patch` is dispatched in main"),
+        ImageCmd::Bake { .. } => bail!("internal: `image bake` is dispatched in main"),
+        ImageCmd::CreateFrr { .. } => bail!("internal: `image create-frr` is dispatched in main"),
         ImageCmd::RenderSmf {
             omicron_root,
             gimlets,
-        } => {
-            // Bake switch0 for `gimlets` sleds with scrimlets at the first + last
-            // sled (the convention the default topology follows). The launch-time
-            // topology must keep scrimlets at those indices for the baked switch0
-            // to match the generated switch1.
-            let scrimlets = [0usize, gimlets.saturating_sub(1)];
-            // One SP fleet drives both the MGS port table and sp-sim's side, so
-            // they agree by construction. Baked images use the sim backend.
-            let fleet = voxel_config::sp::SpFleet::sim(*gimlets);
-            let writes = [
-                (
-                    "smf/mgs-sim/config.toml",
-                    voxel_config::mgs::switch_config(0, &fleet, &scrimlets),
-                ),
-                ("smf/sp-sim/config.toml", fleet.sp_sim_config()),
-                (
-                    "smf/sled-agent/non-gimlet/config.toml",
-                    voxel_config::sled::SledAgentConfig::new(0, true).render(),
-                ),
-            ];
-            for (rel, text) in writes {
-                let path = omicron_root.join(rel);
-                let dir = path.parent().expect("smf path has a parent");
-                fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
-                fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-                println!("rendered {}", path.display());
-            }
-            Ok(())
-        }
+        } => render_smf(omicron_root, *gimlets),
     }
 }

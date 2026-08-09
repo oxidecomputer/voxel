@@ -13,8 +13,6 @@ generation.
 ## Layout
 
 - **`voxel/`**: CLI and launcher
-  - **`voxel/rss-gen/`**: typed, release-pinned `config-rss.toml` generator, built
-    against the image's omicron source (path dependency).
 - **`voxel-config/`**: the `VoxelConfig` model (`voxel.toml`) and all per-topology
   config generation (sled-agent, RSS, FRR, MGS/SP-sim).
 - **`voxel-init/`**: the in-guest bring-up agent baked into the images (gimlet/router
@@ -30,16 +28,16 @@ See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference, t
 cargo build
 ```
 
-`voxel/rss-gen` builds separately against the target image's omicron source. See
-[`voxel-image/build-rss-gen.sh`](voxel-image/build-rss-gen.sh). It will auto-run
-if you create a new `voxel image`.
+`voxel` links omicron's own RSS config types (the `rack-init-config` crate in
+omicron, pinned to a commit), so `config-rss.toml` is rendered in-process and schema
+drift surfaces at voxel compile time.
 
 ## Quickstart
 
 1. `cargo build` builds voxel.
-2. `voxel image create 43bb5af` builds omicron (v21), bakes `voxel-cp-43bb5af`, and
-   builds the commit-pinned `voxel-rss-gen` (30-45 min).
-3. `bash voxel-image/build-frr.sh proto` bakes `voxel-frr-proto` (omicron-independent;
+2. `voxel image create 43bb5af` builds omicron (v21) and bakes `voxel-cp-43bb5af`
+   (30-45 min).
+3. `voxel image create-frr proto` bakes `voxel-frr-proto` (omicron-independent;
    build once, reuse for any commit).
 4. Configure:
 
@@ -56,7 +54,7 @@ to improve performance by using a separate disk, there are some knobs set via `v
 * falcon.dataset: Location for built control plane snapshots, exported as
   `FALCON_DATASET`, with images and topo zvols under `<ds>/img/...`
 * falcon.build_root: Location where omicron will clone and compile for new images,
-  exported as `BUILD_ROOT`, holding the omicron checkout and the rss-gen build
+  exported as `BUILD_ROOT`, holding the omicron checkout
 * falcon.workdir: Location where voxel will do its configuration and setup for new launches
 
 ## Privileges

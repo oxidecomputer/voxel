@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::process::Command;
 use voxel_config::VoxelConfig;
 
-use crate::isolated_external::{link_mtu, up as external_up};
+use crate::isolated_external::{DryRun, link_mtu, up as external_up};
 use crate::net::{
     ce_static_ip, resolve_external_ip, set_external_route, ssh_capture, ssh_output,
     wait_external_reachable, zlogin,
@@ -148,12 +148,12 @@ async fn run_voxel_init(d: &Runner, items: Vec<(NodeRef, &'static str, String)>)
 }
 
 /// Bring up the cross-rack interconnect front ports on a HELD (pre-RSS) rack.
-/// rack 0 gets these from early networking during RSS (rss-gen emits them as
-/// AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
+/// rack 0 gets these from early networking during RSS (config-rss carries them
+/// as AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
 /// ports are never configured. Create each interconnect port + its link-local by
-/// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port rss-gen
-/// emits for rack 0, so the cross-rack DDM underlay has a live link on both ends.
-/// No-op for a single rack (`interconnect_ports` is empty).
+/// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port
+/// config-rss carries for rack 0, so the cross-rack DDM underlay has a live
+/// link on both ends. No-op for a single rack (`interconnect_ports` is empty).
 async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack: usize) {
     let ports = cfg.interconnect_ports(rack);
     if ports.is_empty() {
@@ -305,7 +305,8 @@ pub(crate) async fn cmd_launch(
     // nodes' static addresses (staged into each cargo-bay) stay in use after
     // bring-up (RSS watch, router NAT, host route to ce).
     if cfg.external.isolated() {
-        external_up(&cfg.external, false).context("bringing up the isolated external segment")?;
+        external_up(&cfg.external, DryRun::No)
+            .context("bringing up the isolated external segment")?;
     } else {
         lan_mtu_preflight()?;
     }

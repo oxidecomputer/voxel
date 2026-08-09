@@ -228,69 +228,45 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Render `config-rss.toml` with the typed, release-pinned generator
-/// (`voxel-rss-gen`, built against the image's omicron - see voxel/rss-gen).
-/// This is release-accurate by construction; we deliberately do NOT fall back
-/// to a hand-rolled renderer. Point `VOXEL_RSS_GEN` at the binary if it isn't
-/// at the default path.
+/// Render config-rss.toml through omicron's own types (the rack-init-config
+/// crate, pinned to an omicron commit).
 fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Result<()> {
-    let rss_gen_bin = std::env::var("VOXEL_RSS_GEN")
-        .unwrap_or_else(|_| "/opt/omicron/target/debug/voxel-rss-gen".to_string());
-    let effective = dir.join("voxel-effective.toml");
-    // Write the *resolved* config (derived scrimlets/rss_sleds made explicit) -
-    // the separately-built rss-gen doesn't re-run the derivation, so empty
-    // scrimlets / rss_sleds = 0 would yield an empty bootstrap set ("Must
-    // request at least one peer"). rss-gen projects it to a single rack via
-    // `--rack` (filters the bootstrap set + offsets the customer network).
-    fs::write(&effective, cfg.to_resolved_toml())?;
-    let status = std::process::Command::new(&rss_gen_bin)
-        .arg("generate")
-        .arg(&effective)
-        .arg(dir.join("config-rss.toml"))
-        .arg("--rack")
-        .arg(rack.to_string())
-        .status()
-        .map_err(|e| {
-            anyhow!("run {rss_gen_bin}: {e} - build voxel/rss-gen or set VOXEL_RSS_GEN")
-        })?;
-    if !status.success() {
-        return Err(anyhow!(
-            "{rss_gen_bin} generate failed. If the error above is a TOML 'unknown field', \
-             voxel-rss-gen is STALE for the current voxel-config (it's built separately and \
-             pins voxel-config at build time) - rebuild it: \
-             `voxel-image/build-rss-gen.sh <omicron-src>`, or run `voxel image create <commit>` \
-             without BUILD_RSS_GEN=0."
-        ));
-    }
+    let rendered = crate::rss_request::config_rss_toml(cfg, rack)?;
+    fs::write(dir.join("config-rss.toml"), rendered)?;
     Ok(())
 }
 
 /// Auto-detect the sled-agent config shapes (`data_links`, disks) from the
-/// image's omicron source, so operators never hand-set per-era knobs. The source
-/// sits beside the commit-pinned rss-gen (`$VOXEL_RSS_GEN` =
-/// `<build_root>/omicron-<commit>/target/debug/voxel-rss-gen`), so we read its
-/// `sled-agent/src/config.rs` and key off the field declarations - which are the
-/// ground truth for that commit. Falls back to the oldest shapes if the source
+/// image's omicron source, so operators never hand-set per-era knobs. Reads
+/// `sled-agent/src/config.rs` from `$VOXEL_OMICRON_SRC`, derived in
+/// `resolve_falcon_env` from the build root and `image.cp`'s commit, and keys
+/// off the field declarations. Falls back to the oldest shapes if the source
 /// can't be read; an explicit `[image]` override wins over detection.
 ///
-/// This is the "schema changelog", automated: instead of a hand-maintained
-/// commits->requirements table, voxel reads what the commit itself declares.
-fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchema) {
-    let src = std::env::var("VOXEL_RSS_GEN")
-        .ok()
-        .and_then(|g| {
-            Path::new(&g)
-                .ancestors()
-                .nth(3)
-                .map(|p| p.join("sled-agent/src/config.rs"))
-        })
-        .and_then(|p| fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    // `pub external_disks: ExternalDisks` (main) vs `pub vdevs: ...` (older).
-    let disks = if src.contains("pub external_disks") {
-        SledDisksSchema::ExternalDisks
-    } else {
+/// This is the schema changelog, automated: instead of a hand-maintained
+/// commits to requirements table, voxel reads what the commit itself declares.
+/// It is the only place voxel consults an omicron checkout, and it is
+/// advisory. A rack whose source is absent still launches.
+fn detect_sled_schema(
+    cfg: &VoxelConfig,
+    src_root: Option<&Path>,
+) -> (SledDataLinksSchema, SledDisksSchema) {
+    let read = |rel: &str| {
+        src_root
+            .map(|p| p.join(rel))
+            .and_then(|p| fs::read_to_string(p).ok())
+            .unwrap_or_default()
+    };
+    let src = read("sled-agent/src/config.rs");
+    // The variants of `ExternalDisks` are declared in sled-hardware, so read the
+    // enum itself rather than the field that references it. `Virtual { vdevs }`
+    // and `HardcodedPhysical { disks }` merged into `Hardcoded { vdevs, disks }`.
+    let disks = if !src.contains("pub external_disks") {
         SledDisksSchema::Vdevs
+    } else if read("sled-hardware/src/lib.rs").contains("Hardcoded {") {
+        SledDisksSchema::Hardcoded
+    } else {
+        SledDisksSchema::ExternalDisks
     };
     // `data_links: DataLinks` (tagged enum) vs the older flat list.
     let data_links = if src.contains("data_links: DataLinks") {
@@ -302,6 +278,14 @@ fn detect_sled_schema(cfg: &VoxelConfig) -> (SledDataLinksSchema, SledDisksSchem
         cfg.image.data_links_schema.unwrap_or(data_links),
         cfg.image.disks_schema.unwrap_or(disks),
     )
+}
+
+/// Path of the omicron checkout the image was built from, if it's on disk.
+pub(crate) fn omicron_src() -> Option<PathBuf> {
+    std::env::var("VOXEL_OMICRON_SRC")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
 }
 
 /// Generate + stage per-node config into the cargo-bay before launch.
@@ -326,7 +310,7 @@ pub(crate) fn stage_config(
         .count();
     // Auto-detect the sled-agent config shapes from the image's omicron (no
     // per-era operator knobs); an [image] override wins if set.
-    let (data_links, disks) = detect_sled_schema(cfg);
+    let (data_links, disks) = detect_sled_schema(cfg, omicron_src().as_deref());
     eprintln!("[voxel] sled-agent config schema: data_links={data_links:?} disks={disks:?}");
     for s in &sleds {
         let dir = cargo_bay(&s.name);
@@ -340,9 +324,9 @@ pub(crate) fn stage_config(
     }
 
     // One typed config-rss per rack, staged on that rack's RSS node (its first
-    // bootstrap sled - g0 for rack 0, g{rack*sleds} for the rest). Each rack is an
-    // independent RSS domain: rss-gen (`--rack`) filters the bootstrap set to that
-    // rack and offsets its customer/service network.
+    // bootstrap sled - g0 for rack 0, g{rack*sleds} for the rest). Each rack is
+    // an independent RSS domain: the bootstrap set is filtered to that rack and
+    // its customer/service network is offset per rack.
     for rack in 0..cfg.topology.racks() {
         let rss_node = sleds
             .iter()
@@ -636,4 +620,64 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
 
     fs::remove_dir_all(&src).with_context(|| format!("{src}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in checkout carrying the two files the sled-schema detection
+    /// reads: the sled-agent config field and the sled-hardware enum variants.
+    fn fake_sled_src(name: &str, field: &str, variants: &str) -> PathBuf {
+        let src = std::env::temp_dir().join(format!("voxel-sledcheck-{name}"));
+        let _ = fs::remove_dir_all(&src);
+        fs::create_dir_all(src.join("sled-agent/src")).unwrap();
+        fs::create_dir_all(src.join("sled-hardware/src")).unwrap();
+        fs::write(
+            src.join("sled-agent/src/config.rs"),
+            format!("pub struct Config {{ {field} }}"),
+        )
+        .unwrap();
+        fs::write(
+            src.join("sled-hardware/src/lib.rs"),
+            format!("pub enum ExternalDisks {{ {variants} }}"),
+        )
+        .unwrap();
+        src
+    }
+
+    /// The disks shape moved twice. `HardcodedPhysical {` must not be mistaken
+    /// for the newer `Hardcoded {`, or a cc07512e0-era image would be handed
+    /// main's shape and refuse to boot.
+    #[test]
+    fn detects_the_disks_shape_per_era() {
+        let cfg = VoxelConfig::default();
+        let disks = |src: &PathBuf| detect_sled_schema(&cfg, Some(src)).1;
+
+        // Oldest: a flat `vdevs` list, no `external_disks` field at all.
+        assert_eq!(
+            disks(&fake_sled_src("old", "pub vdevs: Vec<String>,", "")),
+            SledDisksSchema::Vdevs
+        );
+        // Middle: separate `Virtual` and `HardcodedPhysical` variants.
+        assert_eq!(
+            disks(&fake_sled_src(
+                "mid",
+                "pub external_disks: ExternalDisks,",
+                "Virtual { vdevs: Vec<String> }, HardcodedPhysical { disks: Vec<D> }, DetectPhysical,",
+            )),
+            SledDisksSchema::ExternalDisks
+        );
+        // Current: the two merged into `Hardcoded { vdevs, disks }`.
+        assert_eq!(
+            disks(&fake_sled_src(
+                "new",
+                "pub external_disks: ExternalDisks,",
+                "Hardcoded { vdevs: Vec<String>, disks: Vec<D> }, DetectPhysical,",
+            )),
+            SledDisksSchema::Hardcoded
+        );
+        // No checkout on disk: assume the oldest shape.
+        assert_eq!(detect_sled_schema(&cfg, None).1, SledDisksSchema::Vdevs);
+    }
 }

@@ -22,13 +22,16 @@ use voxel_config::VoxelConfig;
 mod access;
 mod commtest;
 mod config_cmd;
+mod cpbuild;
 mod image;
+mod imagebuild;
 mod isolated_external;
 mod net;
 mod network;
 mod patch;
 mod rack;
 mod rss;
+mod rss_request;
 mod sp_cmd;
 mod topo;
 mod util;
@@ -56,10 +59,6 @@ struct Cli {
     /// zfs dataset falcon uses (default: `rpool/falcon`).
     #[arg(long, global = true)]
     dataset: Option<String>,
-
-    /// Override the `voxel-rss-gen` path (default: derived from the image's commit).
-    #[arg(long, global = true)]
-    rss_gen: Option<PathBuf>,
 
     /// Build root for `image create` (default: `$HOME/voxel-builds`).
     #[arg(long, global = true)]
@@ -218,9 +217,18 @@ enum ImageCmd {
     #[command(visible_alias = "list")]
     Ls,
     /// Build a `voxel-cp` image for an omicron commit (from source).
+    ///
+    /// `--src <path>` instead builds an existing omicron checkout/worktree AS-IS
+    /// (the dev loop: your working-tree edits, warm target).
     Create {
-        /// omicron git commit (or tag) to build and pin the image to.
-        commit: String,
+        /// omicron git commit (or tag) to build and pin the image to (default:
+        /// the omicron rev voxel itself is pinned to). With `--src` this is an
+        /// optional image label (default: the checkout's HEAD).
+        commit: Option<String>,
+        /// Build from an existing omicron checkout/worktree AS-IS (host build,
+        /// for dev): skips clone + checkout so your working-tree edits are built.
+        #[arg(long)]
+        src: Option<PathBuf>,
     },
     /// Export an image bundle to a file for distribution.
     ///
@@ -265,8 +273,48 @@ enum ImageCmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Build a `voxel-frr` customer-router image.
+    CreateFrr {
+        /// Image label; the image is named `voxel-frr-<version>`.
+        #[arg(default_value = "proto")]
+        version: String,
+    },
+    /// (build helper) Bake an image: boot a one-node builder, run the in-guest
+    /// agent's install role, capture the disk.
+    #[command(hide = true)]
+    Bake {
+        /// Registered image name (captured to `<dataset>/img/<name>@base`).
+        name: String,
+        /// Base image the builder boots.
+        #[arg(long, default_value = "helios-3.0")]
+        base: String,
+        /// Agent install role (`cp` | `frr`).
+        #[arg(long)]
+        role: Option<String>,
+        /// An in-guest command to run instead of an agent role
+        /// (boot-modify-capture, used by `image patch`). With neither, the
+        /// builder just boots, smoke-testing that the image comes up.
+        #[arg(long, conflicts_with = "role")]
+        exec: Option<String>,
+        /// Host dir mounted at `/opt/cargo-bay` in the guest.
+        #[arg(long, default_value = "./cargo-bay/vbuild")]
+        cargo_bay: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        cores: u8,
+        #[arg(long, default_value_t = 16)]
+        mem_gb: u64,
+        #[arg(long, default_value_t = 100)]
+        disk_gb: u64,
+        /// falcon deployment name for the builder topology.
+        #[arg(long, default_value = "voxel_build")]
+        deploy: String,
+        /// Host link the builder reaches the package repos through (default:
+        /// falcon's default external interface).
+        #[arg(long)]
+        ext_interface: Option<String>,
+    },
     /// (build helper) Render the build-time smf configs (mgs-sim, sp-sim,
-    /// sled-agent) into an omicron checkout. Used by build-cp.sh.
+    /// sled-agent) into an omicron checkout.
     #[command(hide = true)]
     RenderSmf {
         /// Path to the omicron checkout root.
@@ -417,7 +465,7 @@ enum SpCmd {
     ///
     /// The firmware counterpart to `rack patch`. `<image>` is a hubris `.zip`
     /// for an SP, or a raw oxide-rot-1 image for target `rot` (restarts every RoT
-    /// bridge). Live + ephemeral (reverts on relaunch; bake via `build-cp.sh`).
+    /// bridge). Live + ephemeral (reverts on relaunch; bake via `image create`).
     Reflash {
         /// Target: `sidecar` | `gN` | a port | `rot`.
         target: String,
@@ -573,10 +621,10 @@ fn discover_config(explicit: Option<&Path>) -> PathBuf {
 }
 
 /// Resolve falcon settings (flag > voxel.toml `[falcon]` > existing env) and
-/// export them as `FALCON_DATASET` / `VOXEL_RSS_GEN`, so falcon's `Runner`, the
-/// RSS renderer, the `image` commands, and any subprocess all see one consistent
-/// value. An unset var falls back to its built-in default (falcon's
-/// `rpool/falcon`; the renderer's default path).
+/// export them as `FALCON_DATASET` / `VOXEL_OMICRON_SRC`, so falcon's `Runner`,
+/// the sled-schema detection, the `image` commands, and any subprocess all see
+/// one consistent value. An unset var falls back to its built-in default
+/// (falcon's `rpool/falcon`).
 fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     let dataset = cli
         .dataset
@@ -591,8 +639,9 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
             std::env::set_var("FALCON_DATASET", d);
         }
     }
-    // Resolve the build root first (cli > config > env), since the rss-gen path is
-    // derived from it below. Export it as-is; apply the default only for our derive.
+    // Resolve the build root first (cli > config > env), since the omicron source
+    // path is derived from it below. Export it as-is; apply the default only for
+    // our derive.
     let build_root = cli
         .build_root
         .as_ref()
@@ -611,23 +660,17 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
             std::env::var("HOME").unwrap_or_else(|_| "/root".into())
         )
     });
-    // voxel-rss-gen: `--rss-gen` flag or `$VOXEL_RSS_GEN` still override, but by
-    // default DERIVE the path from the image's omicron commit so it can never drift
-    // from `image.cp` (no `[falcon].rss_gen` knob to mismatch).
-    let rss = cli
-        .rss_gen
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or_else(|| std::env::var("VOXEL_RSS_GEN").ok())
-        .or_else(|| {
-            cfg.and_then(|c| c.image.cp_commit()).map(|commit| {
-                format!("{build_root_eff}/omicron-{commit}/target/debug/voxel-rss-gen")
-            })
-        });
-    if let Some(r) = rss {
+    // The omicron checkout the CP image was built from. Only the sled-agent
+    // schema detection reads it. Derived from the image's commit so it can't
+    // drift from `image.cp`; $VOXEL_OMICRON_SRC overrides.
+    let omicron_src = std::env::var("VOXEL_OMICRON_SRC").ok().or_else(|| {
+        cfg.and_then(|c| c.image.cp_commit())
+            .map(|commit| format!("{build_root_eff}/omicron-{commit}"))
+    });
+    if let Some(s) = omicron_src {
         // SAFETY: same single-threaded argument as FALCON_DATASET above.
         unsafe {
-            std::env::set_var("VOXEL_RSS_GEN", r);
+            std::env::set_var("VOXEL_OMICRON_SRC", s);
         }
     }
 }
@@ -729,11 +772,56 @@ async fn main() -> Result<(), Error> {
                 let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
                 patch::cmd_image_patch(component, reference, &src, out.as_deref())
             }
-            other => image::cmd_image(
-                other,
-                cfg.as_ref().map(|c| c.image.cp_image()),
-                cfg.as_ref().map(|c| &c.external),
-            ),
+            ImageCmd::Create { commit, src } => {
+                cpbuild::create(
+                    commit.as_deref(),
+                    src.as_deref(),
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
+                )
+                .await
+            }
+            ImageCmd::CreateFrr { version } => {
+                imagebuild::create_frr(
+                    version,
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
+                )
+                .await
+            }
+            ImageCmd::Bake {
+                name,
+                base,
+                role,
+                exec,
+                cargo_bay,
+                cores,
+                mem_gb,
+                disk_gb,
+                deploy,
+                ext_interface,
+            } => {
+                let bay = cargo_bay.display().to_string();
+                let dataset = image::falcon_dataset();
+                imagebuild::bake(imagebuild::BakeOpts {
+                    base_image: base,
+                    role: role.as_deref(),
+                    exec: exec.as_deref(),
+                    cargo_bay: &bay,
+                    image_name: name,
+                    dataset: &dataset,
+                    deploy,
+                    disk_gb: *disk_gb,
+                    mem_gb: *mem_gb,
+                    cores: *cores,
+                    network: &imagebuild::BuilderNetwork {
+                        interface: ext_interface.clone(),
+                        static_address: None,
+                    },
+                })
+                .await
+            }
+            other => image::cmd_image(other, cfg.as_ref().map(|c| c.image.cp_image())),
         },
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
@@ -762,10 +850,14 @@ async fn main() -> Result<(), Error> {
             NetworkCmd::External { cmd } => {
                 let cfg = load_config(&config_path)?;
                 match cmd {
-                    ExternalCmd::Up { dry_run } => isolated_external::up(&cfg.external, *dry_run),
-                    ExternalCmd::Down { dry_run } => {
-                        isolated_external::down(&cfg.external, *dry_run)
-                    }
+                    ExternalCmd::Up { dry_run } => isolated_external::up(
+                        &cfg.external,
+                        isolated_external::DryRun::from_flag(*dry_run),
+                    ),
+                    ExternalCmd::Down { dry_run } => isolated_external::down(
+                        &cfg.external,
+                        isolated_external::DryRun::from_flag(*dry_run),
+                    ),
                     ExternalCmd::Check => isolated_external::check(&cfg.external),
                 }
             }
