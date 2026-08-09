@@ -187,48 +187,49 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
                 continue;
             }
         };
-        // Create + enable the link via the same path as `voxel network link-up`
-        // (`enable_link` checks the CREATE_OK/ENABLE_OK markers and errors on a
-        // dropped swadm call), retrying through the transient switch-zone exec
-        // flakiness. Then plumb the link-local DDM binds to and confirm it landed
-        // before declaring the port up. Runs at end of launch, so the switch is
-        // past its startup dendrite restart and these runtime links aren't wiped.
-        let mut ok = false;
-        for attempt in 1..=5 {
-            if let Err(e) = crate::network::enable_link(&ip, sled, &port, "100G", "none") {
-                warn!(
+        // The held rack's switch zone may still be installing at this point.
+        // Poll until dendrite answers, then create + enable the link (the
+        // `voxel network link-up` path) and poll its link-local to DAD
+        // complete, all under one deadline. Logs only when the state changes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut up = false;
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            let step = if !crate::network::switch_ready(&ip) {
+                "waiting for the switch zone (dendrite not answering)".to_string()
+            } else if let Err(e) = crate::network::enable_link(&ip, sled, &port, "100G", "none") {
+                format!("link create/enable: {e}")
+            } else {
+                let _ = ssh_output(
+                    &ip,
+                    &zlogin(&format!(
+                        "ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
+                    )),
+                );
+                let state = ssh_capture(
+                    &ip,
+                    &zlogin(&format!(
+                        "ipadm show-addr -po addrobj,state | grep tfport{port}_0"
+                    )),
+                )
+                .unwrap_or_default();
+                if state.contains(":ok") {
+                    up = true;
+                    break;
+                }
+                "waiting for the link-local to reach ok".to_string()
+            };
+            if step != last {
+                info!(
                     d.log,
-                    "rack{}: interconnect {sled}:{port} attempt {attempt}/5: {e}",
+                    "rack{}: interconnect {sled}:{port}: {step}",
                     rack + 1
                 );
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                continue;
+                last = step;
             }
-            let _ = ssh_output(
-                &ip,
-                &zlogin(&format!(
-                    "ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
-                )),
-            );
-            let addr_present = ssh_capture(
-                &ip,
-                &zlogin(&format!(
-                    "ipadm show-addr -po addrobj | grep tfport{port}_0"
-                )),
-            )
-            .is_some();
-            if addr_present {
-                ok = true;
-                break;
-            }
-            warn!(
-                d.log,
-                "rack{}: interconnect {sled}:{port} attempt {attempt}/5: enabled but no link-local yet",
-                rack + 1
-            );
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
-        if ok {
+        if up {
             info!(
                 d.log,
                 "rack{}: interconnect {sled}:{port} up (link-local)",
@@ -237,7 +238,7 @@ async fn bring_up_interconnect(d: &Runner, topo: &Topo, cfg: &VoxelConfig, rack:
         } else {
             warn!(
                 d.log,
-                "rack{}: interconnect {sled}:{port}: did not come up after 5 tries",
+                "rack{}: interconnect {sled}:{port}: not up within 600s",
                 rack + 1
             );
         }
