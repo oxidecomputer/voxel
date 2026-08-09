@@ -34,14 +34,18 @@ pub(crate) struct CpBuild<'a> {
     /// Gimlet SP count baked into the build-time smf configs.
     pub num_gimlets: usize,
     pub dataset: &'a str,
-    pub build_rss_gen: bool,
     pub external: Option<&'a voxel_config::External>,
 }
+
+/// The omicron sha voxel's own rack-init-config dependency is pinned to. Empty while
+/// the dependency is a path dep. Set by build.rs from Cargo.lock.
+const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
 
 /// `voxel image create`: resolve where the omicron source is and what the image
 /// is called, then build. `--src <path>` builds that checkout as-is with
 /// `commit` reinterpreted as an optional image label; otherwise the commit names
-/// both the checkout under the build root and the image.
+/// both the checkout under the build root and the image, defaulting to the
+/// omicron rev voxel itself is pinned to.
 pub(crate) async fn create(
     commit: Option<&str>,
     src: Option<&Path>,
@@ -66,7 +70,22 @@ pub(crate) async fn create(
             (label, s, true)
         }
         None => {
-            let commit = commit.context("a <COMMIT> is required (or pass --src <path>)")?;
+            let commit = match commit {
+                Some(c) => c.to_string(),
+                None if !PINNED_OMICRON_REV.is_empty() => {
+                    eprintln!(
+                        "[voxel] no commit given; using voxel's pinned omicron {PINNED_OMICRON_REV}"
+                    );
+                    PINNED_OMICRON_REV.to_string()
+                }
+                None => bail!("a <COMMIT> is required (or pass --src <path>)"),
+            };
+            if !PINNED_OMICRON_REV.is_empty() && !PINNED_OMICRON_REV.starts_with(&commit) {
+                eprintln!(
+                    "[voxel] WARN: {commit} is not the omicron rev voxel is pinned to \
+                     ({PINNED_OMICRON_REV}); the generated config-rss may not match this image"
+                );
+            }
             let build_root = std::env::var("BUILD_ROOT").unwrap_or_else(|_| {
                 format!(
                     "{}/voxel-builds",
@@ -74,14 +93,13 @@ pub(crate) async fn create(
                 )
             });
             let src = PathBuf::from(build_root).join(format!("omicron-{commit}"));
-            (commit.to_string(), src, false)
+            (commit, src, false)
         }
     };
     let num_gimlets = std::env::var("NUM_GIMLETS")
         .ok()
         .and_then(|g| g.parse().ok())
         .unwrap_or(4);
-    let build_rss_gen = std::env::var("BUILD_RSS_GEN").as_deref() != Ok("0");
     create_cp(CpBuild {
         label: &label,
         omicron_src,
@@ -89,7 +107,6 @@ pub(crate) async fn create(
         commit: if as_is { None } else { Some(&label) },
         num_gimlets,
         dataset,
-        build_rss_gen,
         external,
     })
     .await
@@ -262,31 +279,6 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         network: &network,
     })
     .await?;
-
-    // --- 9. the commit-pinned voxel-rss-gen ----------------------------------
-    // Non-fatal: the IMAGE is built and usable; only the typed RSS renderer
-    // needs a schema update before launch.
-    if b.build_rss_gen {
-        eprintln!("[voxel] building commit-pinned voxel-rss-gen");
-        let script = voxel_image.join("build-rss-gen.sh");
-        let ok = Command::new("bash")
-            .arg(&script)
-            .arg(src)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            eprintln!(
-                "[voxel] rss-gen ready: {}/target/debug/voxel-rss-gen",
-                src.display()
-            );
-        } else {
-            eprintln!(
-                "[voxel] WARN: voxel-rss-gen didn't build; {image_name} is usable, \
-                 but the RSS renderer needs a schema update before launch"
-            );
-        }
-    }
 
     println!("built image {image_name}");
     Ok(())

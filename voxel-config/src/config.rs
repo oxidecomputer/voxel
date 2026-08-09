@@ -69,9 +69,8 @@ pub struct VoxelConfig {
     pub recovery_silo: RecoverySiloCfg,
     pub falcon: Falcon,
     pub sp: SpCfg,
-    /// This field is omitted from serialized output while untouched so the
-    /// resolved config stays parseable by older (commit-pinned) voxel-rss-gen
-    /// builds.
+    /// Omitted from serialized output while untouched, so a plain LAN rack
+    /// doesn't grow a section the operator never set.
     #[serde(default, skip_serializing_if = "External::is_default")]
     pub external: External,
 }
@@ -107,8 +106,7 @@ pub enum ExternalMode {
 /// over SSH to them and each router NATs rack egress out its own external
 /// address), which is why the segment must exist before launch.
 ///
-/// Note: this is host-only, meaning its stripped from the resolved config
-/// handed to `voxel-rss-gen`.
+/// This is host-only plumbing and never reaches the rack's RSS config.
 ///
 /// [how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -249,11 +247,9 @@ impl External {
 }
 
 /// falcon/runtime settings (zfs dataset, project workdir, image build root).
-/// Each optional - resolved at runtime as **flag > `voxel.toml` > env > built-in
-/// default**. The `voxel-rss-gen` path is NOT configured here: it's derived from
-/// the image's omicron commit (`image.cp` -> `<build_root>/omicron-<commit>/...`)
-/// so the renderer can't drift from the image it renders for. See
-/// `resolve_falcon_env`; `--rss-gen` / `$VOXEL_RSS_GEN` still override.
+/// Each optional, resolved as flag > voxel.toml > env > built-in default.
+/// The omicron checkout path is derived from image.cp's commit in
+/// resolve_falcon_env; $VOXEL_OMICRON_SRC overrides.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Falcon {
@@ -263,10 +259,9 @@ pub struct Falcon {
     /// `voxel` run from anywhere (e.g. installed in `/usr/bin`). `None` -> the
     /// directory containing this `voxel.toml`.
     pub workdir: Option<String>,
-    /// Build root for `voxel image create` (the omicron checkout + rss-gen
-    /// build dirs live here). Exported as `BUILD_ROOT`. `None` -> env, else
-    /// the build script's `$HOME/voxel-builds` default. Lets a non-root user
-    /// build images outside `/root`.
+    /// Build root for `voxel image create` (the omicron checkouts live here).
+    /// Exported as `BUILD_ROOT`. `None` -> env, else the `$HOME/voxel-builds`
+    /// default. Lets a non-root user build images outside `/root`.
     pub build_root: Option<String>,
 }
 
@@ -320,27 +315,6 @@ impl VoxelConfig {
     /// Render this config as `voxel.toml` (what `config show` prints / seeds).
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).expect("VoxelConfig serializes")
-    }
-
-    /// Render the config with the auto-derived topology fields made explicit -
-    /// `scrimlets` and `rss_sleds` filled in from the sled count. Use this for
-    /// the `voxel-effective.toml` handed to `voxel-rss-gen`: that binary is built
-    /// separately (pinned to the image's omicron) and may predate the derivation
-    /// logic, so it must receive resolved values, not empty `scrimlets`/`rss_sleds
-    /// = 0` it would read as "no peers". "Effective" means fully resolved.
-    pub fn to_resolved_toml(&self) -> String {
-        let mut c = self.clone();
-        c.topology.scrimlets = self.topology.scrimlet_names();
-        c.topology.rss_sleds = self.topology.rss_count();
-        // Drop host-only fields the separately-built (commit-pinned) voxel-rss-gen
-        // doesn't know about - its voxel-config has `deny_unknown_fields`, so a key
-        // it predates would fail to parse. `ce_external_ip` is purely a voxel host
-        // routing detail, irrelevant to RSS config generation.
-        c.topology.ce_external_ip = None;
-        // Same: the external segment is host plumbing (etherstub/NAT/static
-        // IPs). Resetting it to default makes serialization omit the table.
-        c.external = External::default();
-        c.to_toml()
     }
 
     /// The computed sled set (replaces the old `SLEDS` const).
@@ -637,9 +611,14 @@ pub enum SledDisksSchema {
     /// `vdevs = ["m2_g0_0.vdev", ...]`.
     #[default]
     Vdevs,
-    /// omicron main (the `ExternalDisks` enum, `#[serde(tag = "kind")]`):
+    /// The `ExternalDisks` enum, `#[serde(tag = "kind")]`, while it still had a
+    /// `Virtual` variant (e.g. cc07512e0):
     /// `external_disks = { kind = "virtual", vdevs = ["m2_g0_0.vdev", ...] }`.
     ExternalDisks,
+    /// omicron main, after `Virtual { vdevs }` and `HardcodedPhysical { disks }`
+    /// merged into one variant:
+    /// `external_disks = { kind = "hardcoded", vdevs = [...], disks = [] }`.
+    Hardcoded,
 }
 
 impl Image {
@@ -651,8 +630,8 @@ impl Image {
 
     /// The omicron commit encoded in the cp image name (`voxel-cp-<commit>` with
     /// an optional `-<variant>` suffix like `-rd`). Used to locate the matching
-    /// `voxel-rss-gen` build under `<build_root>/omicron-<commit>/`. `None` if the
-    /// name doesn't follow the `voxel-cp-` convention.
+    /// checkout under `<build_root>/omicron-<commit>`. `None` if the name
+    /// doesn't follow the `voxel-cp-` convention.
     pub fn cp_commit(&self) -> Option<String> {
         let name = self.cp_image();
         name.strip_prefix("voxel-cp-")
@@ -877,8 +856,8 @@ impl Network {
 
 /// One generated scrimlet uplink port toward a specific fabric router (the
 /// 2-way fanout: every switch gets one port per fabric router). Derived, not a
-/// config knob; consumed by rss-gen (sidecar side) and mirrored by `to_frr`
-/// (router side).
+/// config knob; consumed by voxel's RSS request builder (sidecar side) and
+/// mirrored by `to_frr` (router side).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UplinkPort {
     pub switch: String,
@@ -943,9 +922,8 @@ impl Default for RecoverySiloCfg {
 }
 
 // ---------------------------------------------------------------------------
-// Generation. The RSS `config-rss.toml` is produced by the separate, typed
-// `voxel-rss-gen` binary (which consumes a `VoxelConfig`); the FRR router
-// configs are generated here.
+// Generation. The FRR router configs are generated here; the RSS
+// `config-rss.toml` in voxel's rss_request module.
 // ---------------------------------------------------------------------------
 
 impl VoxelConfig {
@@ -1001,7 +979,7 @@ impl VoxelConfig {
     /// Each cross-rack sidecar link (see `Topology::interconnect_pairs`) lands on
     /// a front port after the fabric uplinks - `qsfp{n_cr + k}`, in
     /// `interconnect_pairs` order, matching `build_topo`'s per-switch front-port
-    /// assignment. rss-gen emits these as link-local (`AddrConf`) cluster ports so
+    /// assignment. Emitted as link-local (`AddrConf`) cluster ports so
     /// DDM can run the cross-rack underlay over the mesh. Empty for a single rack.
     pub fn interconnect_ports(&self, rack: usize) -> Vec<(String, String)> {
         let n_cr = self.fabric_router_count();
@@ -1387,18 +1365,22 @@ mod tests {
     }
 
     #[test]
-    fn resolved_toml_materializes_auto_derived_topology() {
-        // Auto config (empty scrimlets, rss_sleds 0) must serialize the DERIVED
-        // values, so rss-gen sees explicit peers instead of an empty set.
+    fn auto_topology_derives_scrimlets_and_rss_peers() {
+        // An auto config leaves `scrimlets` empty and `rss_sleds` 0; the derived
+        // values are what the RSS bootstrap set and switch placement come from,
+        // so an empty set here would mean "no peers".
         let cfg = VoxelConfig::from_toml("[topology]\nsleds = 4\n").unwrap();
-        let resolved = VoxelConfig::from_toml(&cfg.to_resolved_toml()).unwrap();
         assert_eq!(
-            resolved.topology.scrimlets,
+            cfg.topology.scrimlet_names(),
             vec!["g0".to_string(), "g3".to_string()]
         );
-        assert_eq!(resolved.topology.rss_sleds, 4);
-        // Same sled set as the original - resolution is behavior-preserving.
-        assert_eq!(resolved.sleds(), cfg.sleds());
+        assert_eq!(cfg.topology.rss_count(), 4);
+        // Spelling the derived values out explicitly describes the same rack.
+        let explicit = VoxelConfig::from_toml(
+            "[topology]\nsleds = 4\nscrimlets = [\"g0\", \"g3\"]\nrss_sleds = 4\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.sleds(), cfg.sleds());
     }
 
     #[test]
@@ -1502,20 +1484,6 @@ mod tests {
         assert_eq!(cfg.external.uplink.as_deref(), Some("igb0"));
         // deny_unknown_fields catches typos.
         assert!(set(&out, "external.uplnk", "igb0").is_err());
-    }
-
-    #[test]
-    fn resolved_toml_strips_external_section() {
-        // The external segment is host plumbing; the commit-pinned rss-gen
-        // must never see the section.
-        let cfg =
-            VoxelConfig::from_toml("[external]\nmode = \"isolated\"\nuplink = \"igb0\"\n").unwrap();
-        let resolved = cfg.to_resolved_toml();
-        assert!(
-            !resolved.contains("[external]"),
-            "resolved kept [external]: {resolved}"
-        );
-        assert!(VoxelConfig::from_toml(&resolved).is_ok());
     }
 
     #[test]

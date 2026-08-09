@@ -9,6 +9,9 @@ members = [
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+# The omicron commit voxel is pinned to. Bumping this rev is the new-omicron
+# motion; build.rs surfaces it to voxel image create.
+rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "c0b3e090c933051d29d5abf1599bfd359ebdec2d" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
