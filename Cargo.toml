@@ -7,8 +7,6 @@ members = [
     "voxel-init",
 ]
 
-exclude = ["vendor/sprockets-tls-test-utils"]
-
 [workspace.dependencies]
 anyhow = "1.0.102"
 # The omicron commit voxel is pinned to. Bumping this rev is the new-omicron
