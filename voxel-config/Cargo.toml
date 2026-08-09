@@ -14,3 +14,4 @@ toml_edit = { workspace = true }
 
 [dev-dependencies]
 expectorate.workspace = true
+indoc.workspace = true

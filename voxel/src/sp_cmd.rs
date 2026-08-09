@@ -11,7 +11,8 @@
 //!    `read-caboose`, `power-state`, `rot-boot-info`, ...).
 
 use anyhow::anyhow;
-use std::path::{Path, PathBuf};
+use camino::{Utf8Path, Utf8PathBuf};
+use indoc::formatdoc;
 use voxel_config::sp::{PORT_STRIDE, SP_PORT_BASE, Sp, SpBackend, SpFleet, SpRole};
 use voxel_config::{SLED_SERIAL_PREFIX, VoxelConfig};
 
@@ -175,7 +176,7 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
     // Preferred: scp it straight from the configured host binary - the proven path,
     // independent of in-zone 9p visibility of the cargo-bay copy.
     if let Some(faux) = host_faux
-        && Path::new(faux).exists()
+        && Utf8Path::new(faux).exists()
         && scp_to(ip, faux, &faux_gz)
         && ssh_capture(ip, &format!("chmod +x {faux_gz} && echo ok"))
             .map(|o| o.contains("ok"))
@@ -270,8 +271,8 @@ async fn switch_ip(
 /// Per-scrimlet host-LAN IP cache (workdir-relative; voxel anchors to the project
 /// root). Lets `sp` commands reach the switch zone over ssh without re-touching
 /// the serial console after the first resolve.
-fn ip_cache(node: &str) -> PathBuf {
-    PathBuf::from(".falcon").join(format!(".sp-ip-{node}"))
+fn ip_cache(node: &str) -> Utf8PathBuf {
+    Utf8PathBuf::from(".falcon").join(format!(".sp-ip-{node}"))
 }
 fn read_cached_ip(node: &str) -> Option<String> {
     std::fs::read_to_string(ip_cache(node))
@@ -320,14 +321,12 @@ async fn sp_reflash(
     name: &str,
     switch: &str,
     target: &str,
-    image: &Path,
+    image: &Utf8Path,
 ) -> anyhow::Result<()> {
     if !image.exists() {
-        return Err(anyhow!("image not found: {}", image.display()));
+        return Err(anyhow!("image not found: {}", image));
     }
-    let local = image
-        .to_str()
-        .ok_or_else(|| anyhow!("non-utf8 image path"))?;
+    let local = image.as_str();
     let topo = build_topo(cfg, name)?;
     let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     // The baked sp-emu fleet must be present - reflash is meaningless on a
@@ -348,7 +347,7 @@ async fn sp_reflash(
         // and restart them all; the SPs reconnect to the bridge.
         eprintln!(
             "[voxel] reflashing shared RoT (rot.flash) on {sw} from {}",
-            image.display()
+            image
         );
         if !scp_to(
             &ip,
@@ -381,11 +380,10 @@ async fn sp_reflash(
     let port = resolve_port(&fleet, target)?;
     let zip = image
         .file_name()
-        .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("bad image filename"))?;
     eprintln!(
         "[voxel] reflashing SP {target} (port {port}) on {sw} from {}",
-        image.display()
+        image
     );
     let remote_zip_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/{zip}");
     if !scp_to(&ip, local, &remote_zip_gz) {
@@ -464,15 +462,16 @@ async fn sp_debug(
     // double-quoted so values like `[::1]:33320` survive. Shipped as a FILE to
     // dodge nested ssh/zlogin quoting of the parens + quotes.
     let quoted: Vec<String> = tokens.iter().map(|t| format!("\"{t}\"")).collect();
-    let content = format!(
-        "select {fmri}\nsetprop start/environment = astring: ({})\n",
-        quoted.join(" ")
-    );
-    let local = std::env::temp_dir().join(format!("voxel-sp-env-{port}.scfg"));
-    std::fs::write(&local, &content).map_err(|e| anyhow!("write {}: {e}", local.display()))?;
+    let env = quoted.join(" ");
+    let content = formatdoc! {"
+        select {fmri}
+        setprop start/environment = astring: ({env})
+    "};
+    let local = crate::util::temp_dir().join(format!("voxel-sp-env-{port}.scfg"));
+    std::fs::write(&local, &content).map_err(|e| anyhow!("write {}: {e}", local))?;
     let remote_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-env-{port}.scfg");
     let remote = format!("/var/tmp/voxel-sp-env-{port}.scfg");
-    if !scp_to(&ip, local.to_str().unwrap_or_default(), &remote_gz) {
+    if !scp_to(&ip, local.as_str(), &remote_gz) {
         clear_cached_ip(&sw);
         return Err(anyhow!("scp of the svccfg file into {sw} failed"));
     }
@@ -553,7 +552,7 @@ async fn sp_ipcc(
     let emu_bin = cfg.sp.emu_bin.as_deref().ok_or_else(|| {
         anyhow!("[sp].emu_bin not set - need the sp-emu binary (with the `ipcc` subcommand)")
     })?;
-    if !Path::new(emu_bin).exists() {
+    if !Utf8Path::new(emu_bin).exists() {
         return Err(anyhow!("sp-emu binary not found: {emu_bin}"));
     }
     if !scp_to(
@@ -608,11 +607,11 @@ echo "[voxel] IPCC timed out"
 exit 1
 "#
     );
-    let local = std::env::temp_dir().join(format!("voxel-ipcc-{port}.sh"));
-    std::fs::write(&local, &script).map_err(|e| anyhow!("write {}: {e}", local.display()))?;
+    let local = crate::util::temp_dir().join(format!("voxel-ipcc-{port}.sh"));
+    std::fs::write(&local, &script).map_err(|e| anyhow!("write {}: {e}", local))?;
     if !scp_to(
         &ip,
-        local.to_str().unwrap_or_default(),
+        local.as_str(),
         &format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-ipcc-{port}.sh"),
     ) {
         clear_cached_ip(&sw);
@@ -670,7 +669,7 @@ async fn sp_dump(
              is this an --emu rack?"
         )
     })?;
-    if !Path::new(archive).exists() {
+    if !Utf8Path::new(archive).exists() {
         return Err(anyhow!("hubris archive not found: {archive}"));
     }
     // humility runs on the HOST; don't bake a sibling-repo path - take it from
@@ -729,15 +728,16 @@ async fn sp_dump(
         tokens.push(want_dir.clone());
         tokens.push(want_id.clone());
         let quoted: Vec<String> = tokens.iter().map(|t| format!("\"{t}\"")).collect();
-        let content = format!(
-            "select {fmri}\nsetprop start/environment = astring: ({})\n",
-            quoted.join(" ")
-        );
-        let local = std::env::temp_dir().join(format!("voxel-sp-dumpenv-{port}.scfg"));
-        std::fs::write(&local, &content).map_err(|e| anyhow!("write {}: {e}", local.display()))?;
+        let env = quoted.join(" ");
+        let content = formatdoc! {"
+            select {fmri}
+            setprop start/environment = astring: ({env})
+        "};
+        let local = crate::util::temp_dir().join(format!("voxel-sp-dumpenv-{port}.scfg"));
+        std::fs::write(&local, &content).map_err(|e| anyhow!("write {}: {e}", local))?;
         let remote_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-dumpenv-{port}.scfg");
         let remote = format!("/var/tmp/voxel-sp-dumpenv-{port}.scfg");
-        if !scp_to(&ip, local.to_str().unwrap_or_default(), &remote_gz) {
+        if !scp_to(&ip, local.as_str(), &remote_gz) {
             clear_cached_ip(&sw);
             return Err(anyhow!("scp of the svccfg file into {sw} failed"));
         }
@@ -771,11 +771,11 @@ async fn sp_dump(
     }
 
     // Pull the zip to the host and decode it there (humility + archive live here).
-    let host_dir = std::env::temp_dir().join(format!("voxel-spdump-{port}"));
-    std::fs::create_dir_all(&host_dir).map_err(|e| anyhow!("mkdir {}: {e}", host_dir.display()))?;
+    let host_dir = crate::util::temp_dir().join(format!("voxel-spdump-{port}"));
+    std::fs::create_dir_all(&host_dir).map_err(|e| anyhow!("mkdir {}: {e}", host_dir))?;
     let zip_local = host_dir.join("dump.zip");
     let zip_remote = format!("{SWITCH_ZONE_ROOT}{dump_dir}/dump.zip");
-    if !scp_from(&ip, &zip_remote, zip_local.to_str().unwrap_or_default()) {
+    if !scp_from(&ip, &zip_remote, zip_local.as_str()) {
         return Err(anyhow!("couldn't pull the dump zip from {sw}"));
     }
     let hydrated = host_dir.join("hydrated.dump");
@@ -814,8 +814,7 @@ async fn sp_dump(
     eprint!("{}", String::from_utf8_lossy(&dec.stderr));
     eprintln!(
         "[voxel] dump saved: {} - inspect further with `{humility} -d {} <ringbuf|readvar|...>`",
-        hydrated.display(),
-        hydrated.display()
+        hydrated, hydrated
     );
     Ok(())
 }
@@ -927,7 +926,7 @@ fn field(out: &str, label: &str) -> String {
 // --- artifact commands (was `Ls`, now `Ready`; flash/build unchanged) -------
 
 fn present(p: &str) -> bool {
-    Path::new(p).exists()
+    Utf8Path::new(p).exists()
 }
 
 fn show(name: &str, val: Option<&str>) {
@@ -962,16 +961,16 @@ fn ready(cfg: &VoxelConfig) {
     );
 }
 
-fn flash(cfg: &VoxelConfig, image: &Path, out: &Path) -> anyhow::Result<()> {
+fn flash(cfg: &VoxelConfig, image: &Utf8Path, out: &Utf8Path) -> anyhow::Result<()> {
     let emu_bin = cfg
         .sp
         .emu_bin
         .as_deref()
         .ok_or_else(|| anyhow!("[sp].emu_bin is not set (path to the sp-emu binary)"))?;
     if !image.exists() {
-        return Err(anyhow!("image not found: {}", image.display()));
+        return Err(anyhow!("image not found: {}", image));
     }
-    eprintln!("[voxel] flashing {} -> {}", image.display(), out.display());
+    eprintln!("[voxel] flashing {} -> {}", image, out);
     let status = std::process::Command::new(emu_bin)
         .env("SP_EMU_FLASH", out)
         .args(["flash", "a"])
@@ -981,7 +980,7 @@ fn flash(cfg: &VoxelConfig, image: &Path, out: &Path) -> anyhow::Result<()> {
     if !status.success() {
         return Err(anyhow!("sp-emu flash failed"));
     }
-    println!("flashed {}", out.display());
+    println!("flashed {}", out);
     Ok(())
 }
 
@@ -989,13 +988,13 @@ fn build(commit: &str) -> anyhow::Result<()> {
     let script = build_sp_script()?;
     eprintln!(
         "[voxel] building sp-emu hubris images for {commit} via {}",
-        script.display()
+        script
     );
     let status = std::process::Command::new("bash")
         .arg(&script)
         .arg(commit)
         .status()
-        .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
+        .map_err(|e| anyhow!("run {}: {e}", script))?;
     if !status.success() {
         return Err(anyhow!("build-sp.sh failed for {commit}"));
     }
@@ -1003,6 +1002,6 @@ fn build(commit: &str) -> anyhow::Result<()> {
 }
 
 /// Locate `voxel-image/build-sp.sh` (mirrors `image::build_cp_script`).
-fn build_sp_script() -> anyhow::Result<PathBuf> {
+fn build_sp_script() -> anyhow::Result<Utf8PathBuf> {
     crate::util::locate_script("VOXEL_BUILD_SP", "build-sp.sh")
 }

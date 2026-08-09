@@ -134,8 +134,8 @@ const PASSWORD_AUTH_OPTS: &[&str] = &[
 /// Materialize the SSH_ASKPASS helper that supplies the rack's empty root password
 /// (a script that prints a blank line), returning its path. `None` if it can't be
 /// written / made executable. Shared by `ssh_exec` and `scp_to`.
-fn ensure_askpass() -> Option<std::path::PathBuf> {
-    let askpass = std::env::temp_dir().join("voxel-empty-askpass.sh");
+fn ensure_askpass() -> Option<camino::Utf8PathBuf> {
+    let askpass = crate::util::temp_dir().join("voxel-empty-askpass.sh");
     if !askpass.exists() {
         std::fs::write(&askpass, "#!/bin/sh\necho\n").ok()?;
         #[cfg(unix)]

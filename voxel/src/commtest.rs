@@ -5,8 +5,8 @@
 //! latest upstream `main`), while `--source` runs a local checkout as-is.
 
 use anyhow::{Context, bail};
+use camino::{Utf8Path, Utf8PathBuf};
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use voxel_config::{Network, VoxelConfig};
 
@@ -61,7 +61,7 @@ pub(crate) enum Source<'a> {
     /// An explicit commit, tag, or ref, materialized via the mirror cache.
     Reference(&'a str),
     /// A local checkout built in place, without fetching or changing it.
-    Local(&'a Path),
+    Local(&'a Utf8Path),
 }
 
 pub(crate) struct Options<'a> {
@@ -113,10 +113,7 @@ pub(crate) fn run(cfg: &VoxelConfig, options: Options<'_>) -> anyhow::Result<()>
     )?;
 
     if !no_build {
-        eprintln!(
-            "[voxel] building Omicron commtest from {}",
-            source.display()
-        );
+        eprintln!("[voxel] building Omicron commtest from {}", source);
         let mut cargo = Command::new("cargo");
         cargo
             .current_dir(&source)
@@ -127,11 +124,11 @@ pub(crate) fn run(cfg: &VoxelConfig, options: Options<'_>) -> anyhow::Result<()>
         bail!(
             "{} does not exist; omit --no-build or build it with \
              `cargo build -p end-to-end-tests --bin commtest`",
-            bin.display()
+            bin
         );
     }
 
-    eprintln!("[voxel] running {} {api} {}", bin.display(), args.join(" "));
+    eprintln!("[voxel] running {} {api} {}", bin, args.join(" "));
     publish_mode(traffic);
     let status = run_streamed(&bin, &api, &args)?;
     if !status.success() {
@@ -151,7 +148,7 @@ fn publish_mode(traffic: Traffic) {
 /// while still reaching this terminal, so a dashboard can tail the live
 /// transcript. Both copies are joined after the child exits, so the transcript
 /// is complete before the exit status is reported.
-fn run_streamed(bin: &Path, api: &str, args: &[String]) -> anyhow::Result<ExitStatus> {
+fn run_streamed(bin: &Utf8Path, api: &str, args: &[String]) -> anyhow::Result<ExitStatus> {
     let log = std::fs::File::create(RUN_LOG).ok();
     let log_err = log.as_ref().and_then(|f| f.try_clone().ok());
     let mut child = Command::new(bin)
@@ -160,14 +157,12 @@ fn run_streamed(bin: &Path, api: &str, args: &[String]) -> anyhow::Result<ExitSt
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("run {}", bin.display()))?;
+        .with_context(|| format!("run {}", bin))?;
     let out = child.stdout.take().expect("stdout piped above");
     let err = child.stderr.take().expect("stderr piped above");
     let t_out = std::thread::spawn(move || tee(out, std::io::stdout(), log));
     let t_err = std::thread::spawn(move || tee(err, std::io::stderr(), log_err));
-    let status = child
-        .wait()
-        .with_context(|| format!("wait for {}", bin.display()))?;
+    let status = child.wait().with_context(|| format!("wait for {}", bin))?;
     join_tee(t_out, "stdout")?;
     join_tee(t_err, "stderr")?;
     Ok(status)
@@ -214,7 +209,7 @@ fn tee(
 }
 
 /// Resolve the Omicron checkout to run from.
-fn resolve_source(cfg: &VoxelConfig, source: Source<'_>) -> anyhow::Result<PathBuf> {
+fn resolve_source(cfg: &VoxelConfig, source: Source<'_>) -> anyhow::Result<Utf8PathBuf> {
     match source {
         Source::Local(path) => validate_source(path),
         Source::Reference(r) => checkout(r),
@@ -231,26 +226,27 @@ fn resolve_source(cfg: &VoxelConfig, source: Source<'_>) -> anyhow::Result<PathB
     }
 }
 
-fn validate_source(path: &Path) -> anyhow::Result<PathBuf> {
+fn validate_source(path: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
     let path = path
-        .canonicalize()
-        .with_context(|| format!("resolve Omicron source {}", path.display()))?;
+        .canonicalize_utf8()
+        .with_context(|| format!("resolve Omicron source {}", path))?;
     let commtest = path.join("end-to-end-tests/src/bin/commtest.rs");
     if !path.join("Cargo.toml").is_file() || !commtest.is_file() {
-        bail!(
-            "{} is not an Omicron checkout with {}",
-            path.display(),
-            commtest.display()
-        );
+        bail!("{} is not an Omicron checkout with {}", path, commtest);
     }
     Ok(path)
 }
 
-fn build_root() -> PathBuf {
-    std::env::var_os("BUILD_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("voxel-builds")))
-        .unwrap_or_else(|| PathBuf::from("."))
+fn build_root() -> Utf8PathBuf {
+    std::env::var("BUILD_ROOT")
+        .map(Utf8PathBuf::from)
+        .ok()
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| Utf8PathBuf::from(home).join("voxel-builds"))
+        })
+        .unwrap_or_else(|| Utf8PathBuf::from("."))
 }
 
 fn ensure_unprivileged(allow_root: bool) -> anyhow::Result<()> {
@@ -260,7 +256,7 @@ fn ensure_unprivileged(allow_root: bool) -> anyhow::Result<()> {
             eprintln!(
                 "[voxel] warning: running as root; artifacts under {} will \
                  be root-owned and may break later unprivileged runs",
-                build_root().display()
+                build_root()
             );
             return Ok(());
         }
@@ -323,19 +319,15 @@ fn ensure_default_recovery_silo(cfg: &VoxelConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn checkout(reference: &str) -> anyhow::Result<PathBuf> {
+fn checkout(reference: &str) -> anyhow::Result<Utf8PathBuf> {
     let root = build_root().join("commtest");
     let repository = root.join("omicron.git");
     let worktrees = root.join("worktrees");
     let repo = std::env::var("OMICRON_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
 
-    std::fs::create_dir_all(&root)
-        .with_context(|| format!("create commtest cache {}", root.display()))?;
+    std::fs::create_dir_all(&root).with_context(|| format!("create commtest cache {}", root))?;
     if !repository.exists() {
-        eprintln!(
-            "[voxel] creating Omicron Git cache in {}",
-            repository.display()
-        );
+        eprintln!("[voxel] creating Omicron Git cache in {}", repository);
         let mut clone = Command::new("git");
         clone
             .args(["clone", "--mirror", "--", &repo])
@@ -359,17 +351,14 @@ fn checkout(reference: &str) -> anyhow::Result<PathBuf> {
         validate_worktree(&source, &wanted)?;
     } else {
         std::fs::create_dir_all(&worktrees)
-            .with_context(|| format!("create worktree directory {}", worktrees.display()))?;
+            .with_context(|| format!("create worktree directory {}", worktrees))?;
         require_success(
             git_dir_command(&repository)
                 .args(["worktree", "prune"])
                 .status(),
             "git worktree prune",
         )?;
-        eprintln!(
-            "[voxel] creating detached Omicron worktree {}",
-            source.display()
-        );
+        eprintln!("[voxel] creating detached Omicron worktree {}", source);
         require_success(
             git_dir_command(&repository)
                 .args(["worktree", "add", "--detach", "--"])
@@ -382,12 +371,9 @@ fn checkout(reference: &str) -> anyhow::Result<PathBuf> {
     validate_source(&source)
 }
 
-fn validate_repository(repository: &Path, expected_remote: &str) -> anyhow::Result<()> {
+fn validate_repository(repository: &Utf8Path, expected_remote: &str) -> anyhow::Result<()> {
     if git_dir_output(repository, &["rev-parse", "--is-bare-repository"])? != "true" {
-        bail!(
-            "{} exists but is not a bare Git repository",
-            repository.display()
-        );
+        bail!("{} exists but is not a bare Git repository", repository);
     }
     // `remote get-url` applies the user's `url.<base>.insteadOf` rewrites and
     // can false-mismatch the configured URL. Read the raw remote instead.
@@ -396,7 +382,7 @@ fn validate_repository(repository: &Path, expected_remote: &str) -> anyhow::Resu
         bail!(
             "{} uses origin '{}', but OMICRON_REPO is '{}'; use a different \
              BUILD_ROOT for the other repository",
-            repository.display(),
+            repository,
             actual_remote,
             expected_remote
         );
@@ -404,7 +390,7 @@ fn validate_repository(repository: &Path, expected_remote: &str) -> anyhow::Resu
     Ok(())
 }
 
-fn resolve_reference(repository: &Path, reference: &str) -> anyhow::Result<String> {
+fn resolve_reference(repository: &Utf8Path, reference: &str) -> anyhow::Result<String> {
     let candidates = reference_candidates(reference)?;
     let mut matches = Vec::new();
     for candidate in &candidates {
@@ -427,7 +413,7 @@ fn resolve_reference(repository: &Path, reference: &str) -> anyhow::Result<Strin
         [commit_id] => Ok(commit_id.clone()),
         [] => bail!(
             "Omicron commit or ref '{reference}' was not found in {}",
-            repository.display()
+            repository
         ),
         _ => bail!(
             "Omicron ref '{reference}' is ambiguous; use a full refs/heads/... \
@@ -471,13 +457,13 @@ fn validate_refname(reference: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_worktree(source: &Path, wanted: &str) -> anyhow::Result<()> {
+fn validate_worktree(source: &Utf8Path, wanted: &str) -> anyhow::Result<()> {
     let current = git_worktree_output(source, &["rev-parse", "HEAD"])?;
     if current != wanted {
         bail!(
             "{} is registered for Omicron commit {}, but is currently at {}; \
              move it aside or select a different BUILD_ROOT",
-            source.display(),
+            source,
             &wanted[..wanted.len().min(12)],
             &current[..current.len().min(12)]
         );
@@ -487,19 +473,19 @@ fn validate_worktree(source: &Path, wanted: &str) -> anyhow::Result<()> {
         bail!(
             "{} has tracked local changes; move them to a separate checkout and \
              use --source, or restore this cached worktree",
-            source.display()
+            source
         );
     }
     Ok(())
 }
 
-fn git_dir_command(repository: &Path) -> Command {
+fn git_dir_command(repository: &Utf8Path) -> Command {
     let mut git = Command::new("git");
     git.arg("--git-dir").arg(repository);
     git
 }
 
-fn git_dir_output(repository: &Path, args: &[&str]) -> anyhow::Result<String> {
+fn git_dir_output(repository: &Utf8Path, args: &[&str]) -> anyhow::Result<String> {
     let out = git_dir_command(repository)
         .args(args)
         .output()
@@ -514,7 +500,7 @@ fn git_dir_output(repository: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn git_worktree_output(source: &Path, args: &[&str]) -> anyhow::Result<String> {
+fn git_worktree_output(source: &Utf8Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(source)
@@ -525,7 +511,7 @@ fn git_worktree_output(source: &Path, args: &[&str]) -> anyhow::Result<String> {
         bail!(
             "git {} failed in {}: {}",
             args.join(" "),
-            source.display(),
+            source,
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -545,10 +531,10 @@ fn require_success(status: std::io::Result<ExitStatus>, operation: &str) -> anyh
 /// This honors `CARGO_TARGET_DIR`, resolved against the checkout to match
 /// cargo's interpretation (the build runs with the checkout as its working
 /// directory), falling back to `<source>/target` otherwise.
-fn target_dir(source: &Path) -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => source.join(dir),
-        None => source.join("target"),
+fn target_dir(source: &Utf8Path) -> Utf8PathBuf {
+    match std::env::var("CARGO_TARGET_DIR") {
+        Ok(dir) => source.join(dir),
+        Err(_) => source.join("target"),
     }
 }
 
@@ -566,10 +552,10 @@ fn apply_helios_build_env(cmd: &mut Command) {
         cmd.env("RUSTFLAGS", HELIOS_RUSTFLAGS);
     }
     let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".cargo/bin"));
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(std::path::PathBuf::from(home).join(".cargo/bin"));
     }
-    paths.push(PathBuf::from("/opt/ooce/bin"));
+    paths.push(std::path::PathBuf::from("/opt/ooce/bin"));
     if let Some(current) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&current));
     }
@@ -649,15 +635,15 @@ fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
 
 /// Whether the checkout's commtest has the multicast phases, detected from its
 /// source so older unicast-only eras keep working without a probe run.
-fn supports_multicast(source: &Path) -> anyhow::Result<bool> {
+fn supports_multicast(source: &Utf8Path) -> anyhow::Result<bool> {
     let source_file = source.join("end-to-end-tests/src/bin/commtest.rs");
-    let text = std::fs::read_to_string(&source_file)
-        .with_context(|| format!("read {}", source_file.display()))?;
+    let text =
+        std::fs::read_to_string(&source_file).with_context(|| format!("read {}", source_file))?;
     Ok(text.contains("skip_unicast") && text.contains("mcast_group"))
 }
 
 fn commtest_args_for(
-    source: &Path,
+    source: &Utf8Path,
     network: &Network,
     sleds: usize,
     traffic: Traffic,
@@ -705,7 +691,7 @@ fn commtest_args_for(
 }
 
 fn apply_traffic(
-    source: &Path,
+    source: &Utf8Path,
     traffic: Traffic,
     supports_multicast: bool,
     args: &mut Vec<String>,
@@ -724,7 +710,7 @@ fn apply_traffic(
             bail!(
                 "{} does not support multicast commtest; select --traffic unicast \
                  or use an Omicron commit containing multicast commtest support",
-                source.display()
+                source
             );
         }
         Traffic::Multicast => {
@@ -814,7 +800,7 @@ mod test {
         );
         assert_eq!(
             commtest_args_for(
-                Path::new("/tmp/old-omicron"),
+                Utf8Path::new("/tmp/old-omicron"),
                 &network,
                 4,
                 Traffic::Unicast,
@@ -847,7 +833,7 @@ mod test {
         ];
         assert_eq!(
             commtest_args_for(
-                Path::new("/tmp/old-omicron"),
+                Utf8Path::new("/tmp/old-omicron"),
                 &network,
                 4,
                 Traffic::Unicast,
@@ -859,7 +845,7 @@ mod test {
         );
         assert_eq!(
             commtest_args_for(
-                Path::new("/tmp/old-omicron"),
+                Utf8Path::new("/tmp/old-omicron"),
                 &network,
                 4,
                 Traffic::Unicast,
@@ -884,7 +870,7 @@ mod test {
         ] {
             assert!(
                 commtest_args_for(
-                    Path::new("/tmp/old-omicron"),
+                    Utf8Path::new("/tmp/old-omicron"),
                     &network,
                     4,
                     Traffic::Unicast,
@@ -900,7 +886,7 @@ mod test {
     fn selects_multicast_phases() {
         let network = Network::default();
         let multicast = commtest_args_for(
-            Path::new("/tmp/new-omicron"),
+            Utf8Path::new("/tmp/new-omicron"),
             &network,
             4,
             Traffic::Multicast,
@@ -912,7 +898,7 @@ mod test {
         assert!(multicast.contains(&DEFAULT_MCAST_GROUP.into()));
 
         let both = commtest_args_for(
-            Path::new("/tmp/new-omicron"),
+            Utf8Path::new("/tmp/new-omicron"),
             &network,
             4,
             Traffic::Both,
@@ -929,7 +915,7 @@ mod test {
     fn rejects_multicast_on_old_commtest() {
         assert!(
             commtest_args_for(
-                Path::new("/tmp/old-omicron"),
+                Utf8Path::new("/tmp/old-omicron"),
                 &Network::default(),
                 4,
                 Traffic::Multicast,

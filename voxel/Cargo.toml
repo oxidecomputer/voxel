@@ -18,6 +18,7 @@ slog.workspace = true
 futures.workspace = true
 clap.workspace = true
 camino.workspace = true
+indoc.workspace = true
 oxnet.workspace = true
 voxel-config = { path = "../voxel-config" }
 # Omicron's own RackInitializeRequest types and config-rss serialization,

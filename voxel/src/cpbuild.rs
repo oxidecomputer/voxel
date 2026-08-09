@@ -5,7 +5,7 @@
 //! the GZ half has to be a real i86pc omicron build.
 
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 
 use crate::imagebuild::{BakeOpts, bake, builder_network, repo_root, toolchain_bin};
@@ -25,7 +25,7 @@ pub(crate) struct CpBuild<'a> {
     /// Image label; the image is named `voxel-cp-<label>`.
     pub label: &'a str,
     /// The omicron checkout to build.
-    pub omicron_src: PathBuf,
+    pub omicron_src: Utf8PathBuf,
     /// `--src`: build the checkout in place, no clone or checkout, so a dev's
     /// working-tree edits are what gets built.
     pub as_is: bool,
@@ -48,20 +48,17 @@ const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
 /// omicron rev voxel itself is pinned to.
 pub(crate) async fn create(
     commit: Option<&str>,
-    src: Option<&Path>,
+    src: Option<&Utf8Path>,
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
     let (label, omicron_src, as_is) = match src {
         Some(s) => {
             let s = s
-                .canonicalize()
-                .with_context(|| format!("resolve --src {}", s.display()))?;
+                .canonicalize_utf8()
+                .with_context(|| format!("resolve --src {s}"))?;
             if !s.join("package-manifest.toml").exists() {
-                bail!(
-                    "{} doesn't look like an omicron checkout (no package-manifest.toml)",
-                    s.display()
-                );
+                bail!("{s} doesn't look like an omicron checkout (no package-manifest.toml)");
             }
             let label = match commit {
                 Some(l) => l.to_string(),
@@ -92,7 +89,7 @@ pub(crate) async fn create(
                     std::env::var("HOME").unwrap_or_else(|_| "/root".into())
                 )
             });
-            let src = PathBuf::from(build_root).join(format!("omicron-{commit}"));
+            let src = Utf8PathBuf::from(build_root).join(format!("omicron-{commit}"));
             (commit, src, false)
         }
     };
@@ -126,19 +123,16 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     // --- 1. clone + checkout --------------------------------------------------
     if b.as_is {
         if !src.exists() {
-            bail!("--src {} not found", src.display());
+            bail!("--src {src} not found");
         }
-        eprintln!(
-            "[voxel] building {} as-is (--src; no clone/checkout)",
-            src.display()
-        );
+        eprintln!("[voxel] building {src} as-is (--src; no clone/checkout)");
     } else {
         let commit = b.commit.context("a commit is required without --src")?;
         if !src.join(".git").exists() {
             if let Some(parent) = src.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            eprintln!("[voxel] cloning omicron -> {}", src.display());
+            eprintln!("[voxel] cloning omicron -> {src}");
             let repo = std::env::var("OMICRON_REPO")
                 .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
             run(
@@ -185,7 +179,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     // --- 3. build the package tools ------------------------------------------
     eprintln!("[voxel] cargo build --release omicron-package xtask xtask-downloader");
     run(
-        omicron_cmd(src, toolchain_bin("cargo").to_str().unwrap_or("cargo")).args([
+        omicron_cmd(src, toolchain_bin("cargo").as_str()).args([
             "build",
             "--release",
             "-p",
@@ -225,9 +219,9 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
     // --- 7. stage the curated omicron dir into the builder cargo-bay ---------
     let stage = cargo_bay.join("omicron");
-    eprintln!("[voxel] staging omicron build -> {}", stage.display());
+    eprintln!("[voxel] staging omicron build -> {stage}");
     let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage).with_context(|| format!("mkdir {}", stage.display()))?;
+    std::fs::create_dir_all(&stage).with_context(|| format!("mkdir {stage}"))?;
     let mut rsync = omicron_cmd(src, "rsync");
     rsync.args([
         "-a",
@@ -252,7 +246,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     ] {
         rsync.arg("--exclude").arg(ex);
     }
-    rsync.arg(format!("{}/", stage.display()));
+    rsync.arg(format!("{stage}/"));
     run(&mut rsync, "rsync omicron -> cargo-bay")?;
 
     // --- 7b. build + stage the in-guest agent --------------------------------
@@ -275,7 +269,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         base_image: "helios-3.0",
         role: Some("cp"),
         exec: None,
-        cargo_bay: &cargo_bay.display().to_string(),
+        cargo_bay: &cargo_bay,
         image_name: &image_name,
         dataset: b.dataset,
         deploy: "voxel_build",
@@ -293,11 +287,11 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 /// Fetch sidecar-lite's scadm + libsidecar_lite.so, via a rev-keyed cache, and
 /// stage them for the image. The builder VM may not reach buildomat.eng - only
 /// the host does - so this happens here rather than in-guest.
-fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
+fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
     let rev = std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
     let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
-    std::fs::create_dir_all(&cache).with_context(|| format!("mkdir {}", cache.display()))?;
-    std::fs::create_dir_all(dest).with_context(|| format!("mkdir {}", dest.display()))?;
+    std::fs::create_dir_all(&cache).with_context(|| format!("mkdir {cache}"))?;
+    std::fs::create_dir_all(dest).with_context(|| format!("mkdir {dest}"))?;
     for artifact in ["scadm", "libsidecar_lite.so"] {
         let cached = cache.join(artifact);
         if std::fs::metadata(&cached)
@@ -316,10 +310,7 @@ fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
         let _ = Command::new("chmod").arg("+x").arg(&cached).status();
         std::fs::copy(&cached, dest.join(artifact)).with_context(|| format!("stage {artifact}"))?;
     }
-    eprintln!(
-        "[voxel] staged scadm + libsidecar_lite.so -> {}",
-        dest.display()
-    );
+    eprintln!("[voxel] staged scadm + libsidecar_lite.so -> {dest}");
     Ok(())
 }
 
@@ -328,10 +319,10 @@ fn fetch_sidecar(voxel_image: &Path, dest: &Path) -> Result<()> {
 /// cockroach/clickhouse/dpd into `out/` and then fails unless they are on PATH -
 /// a check that passes in an interactive dev shell but not a fresh one - so
 /// those go on up front.
-fn omicron_cmd(src: &Path, program: &str) -> Command {
+fn omicron_cmd(src: &Utf8Path, program: &str) -> Command {
     let mut c = Command::new(program);
     c.current_dir(src);
-    let s = src.display();
+    let s = src;
     let existing = std::env::var("PATH").unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     c.env(

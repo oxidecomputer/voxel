@@ -7,9 +7,10 @@
 
 use crate::sys::{note, read_external_net, replace_in_file, run, run_env, run_quiet, warn};
 use anyhow::{Context, Result, bail};
+use camino::Utf8Path;
+use indoc::{formatdoc, indoc};
 use std::fs;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ const PATCHED_CFG: &str = "/tmp/sled-config.toml";
 /// "dev cargo-bay wins, baked image otherwise" rule used to source every sp-emu
 /// artifact.
 fn pick(staged: String, baked: String) -> String {
-    if std::path::Path::new(&staged).exists() {
+    if Utf8Path::new(&staged).exists() {
         staged
     } else {
         baked
@@ -51,7 +52,7 @@ pub fn bring_up() -> Result<()> {
 
     // The omicron CLI tools are baked into the image at /opt/oxide/omicron, and
     // xtask/omicron-package run relative to that tree.
-    if !Path::new(OMICRON).exists() {
+    if !Utf8Path::new(OMICRON).exists() {
         bail!("{OMICRON} not baked into the image");
     }
     std::env::set_current_dir(OMICRON).with_context(|| format!("cd {OMICRON}"))?;
@@ -87,7 +88,7 @@ pub fn bring_up() -> Result<()> {
 /// config edits.
 fn setup_ssh() {
     let authorized = format!("{CARGO_BAY}/root_authorized_keys");
-    if Path::new(&authorized).exists() {
+    if Utf8Path::new(&authorized).exists() {
         let _ = fs::create_dir_all("/root/.ssh");
         if let Ok(keys) = fs::read(&authorized) {
             use std::io::Write;
@@ -321,7 +322,7 @@ fn inject_runtime_configs() -> Result<()> {
     fs::copy(PATCHED_CFG, "/opt/oxide/sled-agent/pkg/config.toml")
         .context("inject sled-agent config.toml")?;
     let rss = format!("{CARGO_BAY}/config-rss.toml");
-    if Path::new(&rss).exists() {
+    if Utf8Path::new(&rss).exists() {
         fs::copy(&rss, "/opt/oxide/sled-agent/pkg/config-rss.toml")
             .context("inject config-rss.toml")?;
     }
@@ -420,15 +421,15 @@ pub fn switch_enforcer(slot: u8) {
     let sp_staged = format!("{CARGO_BAY}/sp-sim-config.toml");
     for _ in 0..1500 {
         // up to ~25 min safety net
-        if !Path::new(SWITCH_ZONE_MGS).exists() {
+        if !Utf8Path::new(SWITCH_ZONE_MGS).exists() {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
         let mgs_ok = files_equal(SWITCH_ZONE_MGS, &mgs_staged);
-        let sp_present = Path::new(SWITCH_ZONE_SP).exists();
+        let sp_present = Utf8Path::new(SWITCH_ZONE_SP).exists();
         // No staged sp-sim config (e.g. --emu, where setup_sp_emu disables sp-sim)
         // -> nothing for the enforcer to reconcile.
-        let sp_ok = !Path::new(&sp_staged).exists()
+        let sp_ok = !Utf8Path::new(&sp_staged).exists()
             || !sp_present
             || files_equal(SWITCH_ZONE_SP, &sp_staged);
         if mgs_ok && sp_ok {
@@ -559,7 +560,7 @@ fn setup_sp_emu() {
     // live from boot -> MGS/Nexus pin the real RoT at rack-init. Enabled if a
     // rot.flash is staged OR the manifest flags it (the baked path).
     let staged_rot = format!("{SP_EMU_CARGO_DIR}/rot.flash");
-    let rot_enabled = std::path::Path::new(&staged_rot).exists() || rot_from_manifest;
+    let rot_enabled = Utf8Path::new(&staged_rot).exists() || rot_from_manifest;
     if rot_enabled {
         let rot_src = pick(staged_rot, format!("{BAKED}/rot.flash"));
         if let Err(e) = fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash")) {
@@ -625,41 +626,47 @@ fn setup_sp_emu() {
 /// MGS/Nexus pin the real RoT at rack-init. When `rot` is false the SPs run with
 /// their canned RoT, as before.
 fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
-    let mut s = String::new();
-    s.push_str("<?xml version=\"1.0\"?>\n");
-    s.push_str(
-        "<!DOCTYPE service_bundle SYSTEM \"/usr/share/lib/xml/dtd/service_bundle.dtd.1\">\n",
-    );
-    s.push_str("<service_bundle type=\"manifest\" name=\"voxel-sp-emu\">\n");
+    let mut s = indoc! {r#"
+        <?xml version="1.0"?>
+        <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
+        <service_bundle type="manifest" name="voxel-sp-emu">
+    "#}
+    .to_string();
     // Per-SP RoT services: one oxide-rot-1 per SP, each on its own zone-local port.
     if rot {
-        s.push_str("  <service name=\"oxide/voxel-rot-emu\" type=\"service\" version=\"1\">\n");
-        s.push_str("    <dependency name=\"multi_user\" grouping=\"require_all\" restart_on=\"none\" type=\"service\">\n");
-        s.push_str("      <service_fmri value=\"svc:/milestone/multi-user:default\"/>\n");
-        s.push_str("    </dependency>\n");
+        s.push_str(indoc! {r#"
+            <service name="oxide/voxel-rot-emu" type="service" version="1">
+              <dependency name="multi_user" grouping="require_all" restart_on="none" type="service">
+                <service_fmri value="svc:/milestone/multi-user:default"/>
+              </dependency>
+        "#});
         for &port in ports {
             let rport = port - SP_EMU_ROT_PORT_OFFSET;
-            s.push_str(&format!(
-                "    <instance name=\"rot{port}\" enabled=\"true\">\n"
-            ));
-            s.push_str(&format!("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu rot-serve [::1]:{rport} /opt/oxide/sp-emu/rot.flash\" timeout_seconds=\"0\"/>\n"));
-            s.push_str("      <exec_method type=\"method\" name=\"stop\" exec=\":kill\" timeout_seconds=\"30\"/>\n");
-            s.push_str("      <property_group name=\"startd\" type=\"framework\">\n");
-            s.push_str("        <propval name=\"duration\" type=\"astring\" value=\"child\"/>\n");
-            s.push_str("      </property_group>\n");
-            s.push_str("    </instance>\n");
+            s.push_str(&formatdoc! {r#"
+                <instance name="rot{port}" enabled="true">
+                  <exec_method type="method" name="start" exec="/opt/oxide/sp-emu/sp-emu rot-serve [::1]:{rport} /opt/oxide/sp-emu/rot.flash" timeout_seconds="0"/>
+                  <exec_method type="method" name="stop" exec=":kill" timeout_seconds="30"/>
+                  <property_group name="startd" type="framework">
+                    <propval name="duration" type="astring" value="child"/>
+                  </property_group>
+                </instance>
+            "#});
         }
-        s.push_str("  </service>\n");
+        s.push_str("</service>\n");
     }
-    s.push_str("  <service name=\"oxide/voxel-sp-emu\" type=\"service\" version=\"1\">\n");
-    s.push_str("    <dependency name=\"multi_user\" grouping=\"require_all\" restart_on=\"none\" type=\"service\">\n");
-    s.push_str("      <service_fmri value=\"svc:/milestone/multi-user:default\"/>\n");
-    s.push_str("    </dependency>\n");
+    s.push_str(indoc! {r#"
+        <service name="oxide/voxel-sp-emu" type="service" version="1">
+          <dependency name="multi_user" grouping="require_all" restart_on="none" type="service">
+            <service_fmri value="svc:/milestone/multi-user:default"/>
+          </dependency>
+    "#});
     if rot {
         // require_all on the whole RoT service: every per-SP rot-serve must be up.
-        s.push_str("    <dependency name=\"rot\" grouping=\"require_all\" restart_on=\"none\" type=\"service\">\n");
-        s.push_str("      <service_fmri value=\"svc:/oxide/voxel-rot-emu\"/>\n");
-        s.push_str("    </dependency>\n");
+        s.push_str(indoc! {r#"
+            <dependency name="rot" grouping="require_all" restart_on="none" type="service">
+              <service_fmri value="svc:/oxide/voxel-rot-emu"/>
+            </dependency>
+        "#});
     }
     for &port in ports {
         let board = if port == SIDECAR_SP_PORT {
@@ -667,39 +674,37 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         } else {
             "gimlet"
         };
-        s.push_str(&format!(
-            "    <instance name=\"sp{port}\" enabled=\"true\">\n"
-        ));
-        s.push_str("      <exec_method type=\"method\" name=\"start\" exec=\"/opt/oxide/sp-emu/sp-emu gdb a 340000000\" timeout_seconds=\"0\">\n");
-        s.push_str("        <method_context>\n          <method_environment>\n");
-        s.push_str(&format!(
-            "            <envvar name=\"SP_EMU_BOARD\" value=\"{board}\"/>\n"
-        ));
-        s.push_str(&format!(
-            "            <envvar name=\"SP_EMU_FLASH\" value=\"/opt/oxide/sp-emu/{port}.flash\"/>\n"
-        ));
-        s.push_str(&format!(
-            "            <envvar name=\"SP_EMU_BRIDGE\" value=\"[::1]:{port}\"/>\n"
-        ));
+        s.push_str(&formatdoc! {r#"
+            <instance name="sp{port}" enabled="true">
+              <exec_method type="method" name="start" exec="/opt/oxide/sp-emu/sp-emu gdb a 340000000" timeout_seconds="0">
+                <method_context>
+                  <method_environment>
+                    <envvar name="SP_EMU_BOARD" value="{board}"/>
+                    <envvar name="SP_EMU_FLASH" value="/opt/oxide/sp-emu/{port}.flash"/>
+                    <envvar name="SP_EMU_BRIDGE" value="[::1]:{port}"/>
+        "#});
         // Point the SP at ITS OWN rot-serve (one RoT per SP): single-core SP +
         // out-of-process RoT, live from boot through RSS—no two-core wedge.
         if rot {
             let rport = port - SP_EMU_ROT_PORT_OFFSET;
             s.push_str(&format!(
-                "            <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"
+                "        <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"
             ));
         }
-        s.push_str("            <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n");
-        s.push_str("            <envvar name=\"SP_EMU_IDLE_MS\" value=\"20\"/>\n");
-        s.push_str("          </method_environment>\n        </method_context>\n");
-        s.push_str("      </exec_method>\n");
-        s.push_str("      <exec_method type=\"method\" name=\"stop\" exec=\":kill\" timeout_seconds=\"30\"/>\n");
-        s.push_str("      <property_group name=\"startd\" type=\"framework\">\n");
-        s.push_str("        <propval name=\"duration\" type=\"astring\" value=\"child\"/>\n");
-        s.push_str("      </property_group>\n");
-        s.push_str("    </instance>\n");
+        s.push_str(indoc! {r#"
+                    <envvar name="SP_EMU_NO_DEBUG" value="1"/>
+                    <envvar name="SP_EMU_IDLE_MS" value="20"/>
+                  </method_environment>
+                </method_context>
+              </exec_method>
+              <exec_method type="method" name="stop" exec=":kill" timeout_seconds="30"/>
+              <property_group name="startd" type="framework">
+                <propval name="duration" type="astring" value="child"/>
+              </property_group>
+            </instance>
+        "#});
     }
-    s.push_str("  </service>\n</service_bundle>\n");
+    s.push_str("</service>\n</service_bundle>\n");
     s
 }
 
@@ -717,7 +722,7 @@ pub fn switch_enforcer_svc() {
     // The cargo-bay 9p mount is present from boot on a real sled; on the image
     // BUILD VM it never appears, so bail fast rather than hang the build/boot.
     let mut waited = 0;
-    while !Path::new(SLED_CFG).exists() {
+    while !Utf8Path::new(SLED_CFG).exists() {
         if waited >= 30 {
             note("switch-enforcer-svc: no cargo-bay mount; nothing to enforce");
             return;
@@ -731,5 +736,32 @@ pub fn switch_enforcer_svc() {
             switch_enforcer(slot);
         }
         None => note("switch-enforcer-svc: no switch slot staged (gimlet); nothing to do"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sp_emu_manifest_structure_is_balanced() {
+        let m = sp_emu_manifest(&[33300, 33310], true);
+        assert_eq!(m.matches("<instance name=\"sp").count(), 2);
+        assert_eq!(m.matches("<instance name=\"rot").count(), 2);
+        assert_eq!(
+            m.matches("<service ").count(),
+            m.matches("</service>").count()
+        );
+        assert_eq!(
+            m.matches("<instance ").count(),
+            m.matches("</instance>").count()
+        );
+        assert!(m.contains("SP_EMU_ROT_SERVICE"));
+        assert!(m.contains("SP_EMU_BOARD\" value=\"sidecar\""));
+
+        let plain = sp_emu_manifest(&[33310], false);
+        assert!(!plain.contains("voxel-rot-emu"));
+        assert!(!plain.contains("SP_EMU_ROT_SERVICE"));
+        assert!(plain.contains("SP_EMU_BOARD\" value=\"gimlet\""));
     }
 }

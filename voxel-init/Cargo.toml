@@ -15,6 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+camino = { workspace = true }
 clap = { workspace = true }
+indoc = { workspace = true }
 toml_edit = { workspace = true }
 libc = "0.2"

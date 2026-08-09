@@ -14,9 +14,9 @@
 //! in the topic modules below.
 
 use anyhow::{Context, Error};
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::path::{Path, PathBuf};
 use voxel_config::VoxelConfig;
 
 mod access;
@@ -46,11 +46,11 @@ mod wicket_setup;
 struct Cli {
     /// voxel.toml to use (default: ~/.config/voxel/voxel.toml, then /etc/voxel/voxel.toml).
     #[arg(long, global = true, env = "VOXEL_CONFIG")]
-    config: Option<PathBuf>,
+    config: Option<Utf8PathBuf>,
 
     /// Project root that cargo-bay/ and .falcon/ live under.
     #[arg(long, global = true, env = "VOXEL_WORKDIR")]
-    workdir: Option<PathBuf>,
+    workdir: Option<Utf8PathBuf>,
 
     /// Topology (falcon deployment) name.
     #[arg(long, global = true, default_value = "voxel", env = "VOXEL_NAME")]
@@ -62,7 +62,7 @@ struct Cli {
 
     /// Build root for `image create` (default: `$HOME/voxel-builds`).
     #[arg(long, global = true)]
-    build_root: Option<PathBuf>,
+    build_root: Option<Utf8PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -102,7 +102,7 @@ enum Cmd {
     #[command(hide = true)]
     WicketDryrun {
         /// Path to a generated config-rss.toml.
-        config_rss: PathBuf,
+        config_rss: Utf8PathBuf,
         /// Per-rack sled count (the bootstrap slot set).
         #[arg(default_value_t = 4)]
         sleds: usize,
@@ -169,7 +169,7 @@ enum Cmd {
 
         /// Use an existing Omicron checkout without fetching or changing it.
         #[arg(long, value_name = "PATH", conflicts_with = "reference")]
-        source: Option<PathBuf>,
+        source: Option<Utf8PathBuf>,
 
         /// Rack to target (1-based).
         #[arg(long, default_value_t = 1)]
@@ -208,7 +208,7 @@ enum ConfigCmd {
     /// Set a dotted scalar key, e.g. `topology.sleds 3`.
     Set { key: String, value: String },
     /// Validate and install a prepared voxel.toml.
-    Load { file: PathBuf },
+    Load { file: Utf8PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -228,7 +228,7 @@ enum ImageCmd {
         /// Build from an existing omicron checkout/worktree AS-IS (host build,
         /// for dev): skips clone + checkout so your working-tree edits are built.
         #[arg(long)]
-        src: Option<PathBuf>,
+        src: Option<Utf8PathBuf>,
     },
     /// Export an image bundle to a file for distribution.
     ///
@@ -238,7 +238,7 @@ enum ImageCmd {
         /// Image name (e.g. `voxel-cp-a3fee0ec`).
         name: String,
         /// Output file (default `<name>.zfs.zst`, or `<name>.raw.xz` with --raw).
-        out: Option<PathBuf>,
+        out: Option<Utf8PathBuf>,
         /// Portable raw disk image (`dd | xz`) instead of a zfs stream.
         #[arg(long)]
         raw: bool,
@@ -246,7 +246,7 @@ enum ImageCmd {
     /// Import an image bundle (`.zfs.zst` or `.raw.xz`) from `image export`.
     Import {
         /// File to import (name is derived from it).
-        file: PathBuf,
+        file: Utf8PathBuf,
     },
     /// Remove an image bundle (`zfs destroy <dataset>/img/<name>`).
     Rm {
@@ -298,7 +298,7 @@ enum ImageCmd {
         exec: Option<String>,
         /// Host dir mounted at `/opt/cargo-bay` in the guest.
         #[arg(long, default_value = "./cargo-bay/vbuild")]
-        cargo_bay: PathBuf,
+        cargo_bay: Utf8PathBuf,
         #[arg(long, default_value_t = 8)]
         cores: u8,
         #[arg(long, default_value_t = 16)]
@@ -318,7 +318,7 @@ enum ImageCmd {
     #[command(hide = true)]
     RenderSmf {
         /// Path to the omicron checkout root.
-        omicron_root: PathBuf,
+        omicron_root: Utf8PathBuf,
         /// Number of gimlet SPs to simulate (sp-sim).
         #[arg(long, default_value_t = 4)]
         gimlets: usize,
@@ -457,9 +457,9 @@ enum SpCmd {
     /// Flash a hubris `.zip` into an sp-emu slot-A flash file (offline).
     Flash {
         /// Hubris image archive (e.g. build-gimlet-c-image-default.zip).
-        image: PathBuf,
+        image: Utf8PathBuf,
         /// Output flash file.
-        out: PathBuf,
+        out: Utf8PathBuf,
     },
     /// Re-flash a live SP (or the shared RoT) and restart its sp-emu service.
     ///
@@ -470,7 +470,7 @@ enum SpCmd {
         /// Target: `sidecar` | `gN` | a port | `rot`.
         target: String,
         /// Hubris `.zip` (SP) or raw oxide-rot-1 flash image (target `rot`).
-        image: PathBuf,
+        image: Utf8PathBuf,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
@@ -570,25 +570,29 @@ enum TpCmd {
 // Config loading + project-root resolution
 // ---------------------------------------------------------------------------
 
-fn config_text(path: &Path) -> anyhow::Result<String> {
+fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
     if path.exists() {
-        Ok(fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?)
+        Ok(fs::read_to_string(path).with_context(|| format!("read {}", path))?)
     } else {
         Ok(VoxelConfig::default().to_toml())
     }
 }
 
-fn load_config(path: &Path) -> anyhow::Result<VoxelConfig> {
+fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    VoxelConfig::from_toml(&text).with_context(|| format!("parse {}", path.display()))
+    VoxelConfig::from_toml(&text).with_context(|| format!("parse {}", path))
 }
 
 /// Make a path absolute against the current directory.
-fn absolutize(p: PathBuf) -> PathBuf {
+fn absolutize(p: Utf8PathBuf) -> Utf8PathBuf {
     if p.is_absolute() {
         p
     } else {
-        std::env::current_dir().unwrap_or_default().join(p)
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|d| Utf8PathBuf::try_from(d).ok())
+            .unwrap_or_default();
+        cwd.join(p)
     }
 }
 
@@ -599,25 +603,25 @@ fn absolutize(p: PathBuf) -> PathBuf {
 /// the CWD - no implicit project-local `./voxel.toml` to silently diverge from
 /// (use `--config` / `config load` for a one-off). Falls back to `./voxel.toml`
 /// only if `$HOME` is unset.
-fn discover_config(explicit: Option<&Path>) -> PathBuf {
+fn discover_config(explicit: Option<&Utf8Path>) -> Utf8PathBuf {
     if let Some(p) = explicit {
         return absolutize(p.to_path_buf());
     }
     let user = std::env::var("HOME")
         .ok()
-        .map(|h| PathBuf::from(h).join(".config/voxel/voxel.toml"));
+        .map(|h| Utf8PathBuf::from(h).join(".config/voxel/voxel.toml"));
     if let Some(cand) = &user
         && cand.is_file()
     {
         return cand.clone();
     }
-    let etc = PathBuf::from("/etc/voxel/voxel.toml");
+    let etc = Utf8PathBuf::from("/etc/voxel/voxel.toml");
     if etc.is_file() {
         return etc;
     }
     // Nothing exists yet: default to the user config so a fresh `config set`
     // creates it there (only fall back to ./voxel.toml if $HOME is unset).
-    user.unwrap_or_else(|| absolutize(PathBuf::from("voxel.toml")))
+    user.unwrap_or_else(|| absolutize(Utf8PathBuf::from("voxel.toml")))
 }
 
 /// Resolve falcon settings (flag > voxel.toml `[falcon]` > existing env) and
@@ -645,7 +649,7 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     let build_root = cli
         .build_root
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|p| p.to_string())
         .or_else(|| cfg.and_then(|c| c.falcon.build_root.clone()))
         .or_else(|| std::env::var("BUILD_ROOT").ok());
     if let Some(b) = &build_root {
@@ -679,20 +683,23 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
 /// resolve correctly no matter where voxel was invoked from (e.g. `/usr/bin`).
 /// Root: `--workdir`/`$VOXEL_WORKDIR` > `[falcon].workdir` > the discovered
 /// `voxel.toml`'s directory. No-op if the chosen root isn't a directory.
-fn anchor_workdir(cli: &Cli, cfg: Option<&VoxelConfig>, config_path: &Path) -> anyhow::Result<()> {
+fn anchor_workdir(
+    cli: &Cli,
+    cfg: Option<&VoxelConfig>,
+    config_path: &Utf8Path,
+) -> anyhow::Result<()> {
     let root = cli
         .workdir
         .clone()
         .or_else(|| {
             cfg.and_then(|c| c.falcon.workdir.clone())
-                .map(PathBuf::from)
+                .map(Utf8PathBuf::from)
         })
-        .or_else(|| config_path.parent().map(Path::to_path_buf));
+        .or_else(|| config_path.parent().map(Utf8Path::to_path_buf));
     if let Some(root) = root
         && root.is_dir()
     {
-        std::env::set_current_dir(&root)
-            .with_context(|| format!("chdir to workdir {}", root.display()))?;
+        std::env::set_current_dir(&root).with_context(|| format!("chdir to workdir {}", root))?;
     }
     Ok(())
 }
@@ -801,13 +808,12 @@ async fn main() -> Result<(), Error> {
                 deploy,
                 ext_interface,
             } => {
-                let bay = cargo_bay.display().to_string();
                 let dataset = image::falcon_dataset();
                 imagebuild::bake(imagebuild::BakeOpts {
                     base_image: base,
                     role: role.as_deref(),
                     exec: exec.as_deref(),
-                    cargo_bay: &bay,
+                    cargo_bay,
                     image_name: name,
                     dataset: &dataset,
                     deploy,

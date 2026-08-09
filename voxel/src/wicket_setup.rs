@@ -20,9 +20,9 @@
 
 use crate::net::{SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin};
 use anyhow::{Context, Result, anyhow};
+use camino::Utf8Path;
 use libfalcon::{NodeRef, Runner};
 use slog::info;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// wicketd's dropshot address inside oxz_switch (loopback only).
@@ -35,9 +35,9 @@ const CONFIG_PUT_ATTEMPTS: u32 = 10;
 /// Offline check (hidden `voxel wicket-dryrun`): parse a config-rss.toml and
 /// print the wicketd `PutRssUserConfigInsensitive` body it would PUT, so the
 /// reshape can be validated against live wicketd without a relaunch.
-pub(crate) fn dryrun(config_rss_path: &Path, num_sleds: usize) -> Result<()> {
+pub(crate) fn dryrun(config_rss_path: &Utf8Path, num_sleds: usize) -> Result<()> {
     let config_rss = std::fs::read_to_string(config_rss_path)
-        .with_context(|| format!("read {}", config_rss_path.display()))?;
+        .with_context(|| format!("read {}", config_rss_path))?;
     // Offline check assumes a single rack (slots 0..n); the live multi-rack slot
     // set comes from the topology in `drive`.
     let slots: Vec<u16> = (0..num_sleds as u16).collect();
@@ -215,7 +215,7 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
 /// run RSS, and validates it against the silo's external hostname
 /// (`*.sys.<zone>` covers `recovery.sys.<zone>`).
 fn gen_cert(zone: &str) -> Result<(String, String)> {
-    let dir = std::env::temp_dir();
+    let dir = crate::util::temp_dir();
     let key = dir.join("voxel-wicket-key.pem");
     let cert = dir.join("voxel-wicket-cert.pem");
     let san = format!("DNS:*.sys.{zone},DNS:*.{zone},DNS:{zone}");
@@ -250,10 +250,10 @@ fn json_string(s: &str) -> String {
 /// returning the HTTP status code. Bodies go via a file (`--data @`) to dodge
 /// shell quoting; `name` is the in-zone temp filename.
 fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> Result<u32> {
-    let local = std::env::temp_dir().join(name);
+    let local = crate::util::temp_dir().join(name);
     std::fs::write(&local, body).with_context(|| format!("write {name}"))?;
     let zone_path = format!("{SWITCH_ZONE_ROOT}/var/tmp/{name}");
-    if !scp_to(ip, local.to_str().unwrap(), &zone_path) {
+    if !scp_to(ip, local.as_str(), &zone_path) {
         return Err(anyhow!("scp {name} to {ip} switch zone failed"));
     }
     let curl = zlogin(&format!(
@@ -297,7 +297,7 @@ pub(crate) struct RackSetup<'a> {
     pub bootstrap_slots: &'a [u16],
     /// The `config-rss.toml` to reshape into the wicketd config body. Generated
     /// outside the cargo-bay so voxel-init cannot auto-init from it.
-    pub config_rss_path: &'a Path,
+    pub config_rss_path: &'a Utf8Path,
     /// External DNS zone, the common name of the self-signed cert.
     pub zone: &'a str,
     /// Log prefix identifying the rack.
@@ -326,7 +326,7 @@ pub(crate) async fn drive(
     wait_wicketd_ready(&ip, bootstrap_slots.len(), &d.log)?;
 
     let config_rss = std::fs::read_to_string(config_rss_path)
-        .with_context(|| format!("read {}", config_rss_path.display()))?;
+        .with_context(|| format!("read {}", config_rss_path))?;
     let (config_body, pw_hash) = build_bodies(&config_rss, bootstrap_slots)?;
     let (cert_pem, key_pem) = gen_cert(zone)?;
 

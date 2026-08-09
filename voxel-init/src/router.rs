@@ -8,8 +8,9 @@ use crate::sys::{
     ExternalNet, capture, note, read_external_net, replace_in_file, run, run_quiet, warn,
 };
 use anyhow::{Context, Result, bail};
+use camino::Utf8Path;
+use indoc::formatdoc;
 use std::fs;
-use std::path::Path;
 use std::time::Duration;
 
 pub fn bring_up() -> Result<()> {
@@ -54,7 +55,7 @@ pub fn bring_up() -> Result<()> {
 /// Debian's stock `PermitRootLogin prohibit-password` refuses that.
 fn setup_ssh() {
     let authorized = "/opt/cargo-bay/root_authorized_keys";
-    if Path::new(authorized).exists() {
+    if Utf8Path::new(authorized).exists() {
         let _ = fs::create_dir_all("/root/.ssh");
         if let Ok(keys) = fs::read(authorized) {
             use std::io::Write;
@@ -148,9 +149,17 @@ fn ensure_unique_uplink_lease() {
         warn("unique-lease: no host-LAN uplink found; skipping");
         return;
     };
-    let cfg = format!(
-        "[Match]\nName={ifc}\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\nRouteMetric=100\n"
-    );
+    let cfg = formatdoc! {"
+        [Match]
+        Name={ifc}
+
+        [Network]
+        DHCP=yes
+
+        [DHCPv4]
+        ClientIdentifier=mac
+        RouteMetric=100
+    "};
     if let Err(e) = fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg) {
         warn(format!("unique-lease: write networkd config: {e}"));
         return;
@@ -361,7 +370,7 @@ fn uplink_subnet(ifc: &str) -> Option<String> {
 
 fn apply_frr() -> Result<()> {
     let src = "/opt/cargo-bay/frr.conf";
-    if !Path::new(src).exists() {
+    if !Utf8Path::new(src).exists() {
         bail!("{src} not staged");
     }
     fs::copy(src, "/etc/frr/frr.conf").context("apply frr.conf")?;

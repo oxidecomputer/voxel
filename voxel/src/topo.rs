@@ -4,9 +4,10 @@
 
 use anyhow::{Context, anyhow};
 use attest_mock::MockData;
+use camino::{Utf8Path, Utf8PathBuf};
+use indoc::formatdoc;
 use libfalcon::{NodeRef, Runner, SmbiosType1Input, unit::gb};
 use std::fs;
-use std::path::{Path, PathBuf};
 use voxel_config::{SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig};
 
 pub(crate) struct Topo {
@@ -193,8 +194,8 @@ pub(crate) fn build_topo(cfg: &VoxelConfig, name: &str) -> anyhow::Result<Topo> 
 /// mounted into each guest at `/opt/cargo-bay`).
 const CARGO_BAY: &str = "./cargo-bay";
 
-fn cargo_bay(node: &str) -> PathBuf {
-    Path::new(CARGO_BAY).join(node)
+fn cargo_bay(node: &str) -> Utf8PathBuf {
+    Utf8Path::new(CARGO_BAY).join(node)
 }
 
 /// Clear each node's cargo-bay before staging so it reflects ONLY the current
@@ -209,7 +210,7 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
     for node in nodes {
         let dir = cargo_bay(&node);
         if dir.exists() {
-            fs::remove_dir_all(&dir).with_context(|| format!("reset {}", dir.display()))?;
+            fs::remove_dir_all(&dir).with_context(|| format!("reset {}", dir))?;
         }
         fs::create_dir_all(&dir)?;
     }
@@ -218,7 +219,7 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
 
 /// Render config-rss.toml through omicron's own types (the rack-init-config
 /// crate, pinned to an omicron commit).
-fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Result<()> {
+fn generate_rss_config(cfg: &VoxelConfig, dir: &Utf8Path, rack: usize) -> anyhow::Result<()> {
     let rendered = crate::rss_request::config_rss_toml(cfg, rack)?;
     fs::write(dir.join("config-rss.toml"), rendered)?;
     Ok(())
@@ -237,7 +238,7 @@ fn generate_rss_config(cfg: &VoxelConfig, dir: &Path, rack: usize) -> anyhow::Re
 /// advisory. A rack whose source is absent still launches.
 fn detect_sled_schema(
     cfg: &VoxelConfig,
-    src_root: Option<&Path>,
+    src_root: Option<&Utf8Path>,
 ) -> (SledDataLinksSchema, SledDisksSchema) {
     let read = |rel: &str| {
         src_root
@@ -269,10 +270,10 @@ fn detect_sled_schema(
 }
 
 /// Path of the omicron checkout the image was built from, if it's on disk.
-pub(crate) fn omicron_src() -> Option<PathBuf> {
+pub(crate) fn omicron_src() -> Option<Utf8PathBuf> {
     std::env::var("VOXEL_OMICRON_SRC")
         .ok()
-        .map(PathBuf::from)
+        .map(Utf8PathBuf::from)
         .filter(|p| p.is_dir())
 }
 
@@ -326,7 +327,7 @@ pub(crate) fn stage_config(
         // simply generate it OUTSIDE the cargo-bay (in `wicket-setup/rackN/`) -
         // `wicket_setup::drive` reads it from there to build the wicketd bodies.
         let rss_dir = if wicket_setup {
-            let d = Path::new("wicket-setup").join(format!("rack{rack}"));
+            let d = Utf8Path::new("wicket-setup").join(format!("rack{rack}"));
             fs::create_dir_all(&d)?;
             d
         } else if rack > 0 {
@@ -334,7 +335,7 @@ pub(crate) fn stage_config(
             // it's an unclaimed rack staged for a future cluster-join (RFD 573).
             // Generate its config-rss OUTSIDE the cargo-bay so voxel-init won't
             // auto-inject + RSS it; kept under multirack-staged/ for the join flow.
-            let d = Path::new("multirack-staged").join(format!("rack{rack}"));
+            let d = Utf8Path::new("multirack-staged").join(format!("rack{rack}"));
             fs::create_dir_all(&d)?;
             d
         } else {
@@ -387,10 +388,12 @@ pub(crate) fn stage_config(
         for (node, ip) in assignments {
             let dir = cargo_bay(&node);
             fs::create_dir_all(&dir)?;
-            let mut body = format!(
-                "ip {ip}/{prefix}\ngateway {}\ndns {dns}\n",
-                cfg.external.host_ip
-            );
+            let gateway = &cfg.external.host_ip;
+            let mut body = formatdoc! {"
+                ip {ip}/{prefix}
+                gateway {gateway}
+                dns {dns}
+            "};
             if router_names.contains(node.as_str()) {
                 body.push_str(&format!("iface {}\n", cfg.router_ext_iface(&node)));
             }
@@ -453,7 +456,7 @@ pub(crate) fn stage_config(
 fn stage_sp_emu(
     cfg: &VoxelConfig,
     fleet: &voxel_config::sp::SpFleet,
-    dir: &Path,
+    dir: &Utf8Path,
     emu_rot: bool,
 ) -> anyhow::Result<()> {
     let emu = fleet.emu_sps();
@@ -477,8 +480,7 @@ fn stage_sp_emu(
         manifest.push_str(&format!("{} {}\n", sp.base_port, role));
     }
     let ports_manifest = out.join("ports");
-    fs::write(&ports_manifest, manifest)
-        .with_context(|| format!("write {}", ports_manifest.display()))?;
+    fs::write(&ports_manifest, manifest).with_context(|| format!("write {}", ports_manifest))?;
     // Dev override: with [sp].emu_bin set, stage the binary + per-SP flashes from
     // the local build for fast iteration (no rebake). Unset -> voxel-init uses the
     // baked image artifacts (the per-SP flash from the baked per-role flash).
@@ -616,8 +618,8 @@ mod tests {
 
     /// A stand-in checkout carrying the two files the sled-schema detection
     /// reads: the sled-agent config field and the sled-hardware enum variants.
-    fn fake_sled_src(name: &str, field: &str, variants: &str) -> PathBuf {
-        let src = std::env::temp_dir().join(format!("voxel-sledcheck-{name}"));
+    fn fake_sled_src(name: &str, field: &str, variants: &str) -> Utf8PathBuf {
+        let src = crate::util::temp_dir().join(format!("voxel-sledcheck-{name}"));
         let _ = fs::remove_dir_all(&src);
         fs::create_dir_all(src.join("sled-agent/src")).unwrap();
         fs::create_dir_all(src.join("sled-hardware/src")).unwrap();
@@ -640,7 +642,7 @@ mod tests {
     #[test]
     fn detects_the_disks_shape_per_era() {
         let cfg = VoxelConfig::default();
-        let disks = |src: &PathBuf| detect_sled_schema(&cfg, Some(src)).1;
+        let disks = |src: &Utf8PathBuf| detect_sled_schema(&cfg, Some(src)).1;
 
         // Oldest: a flat `vdevs` list, no `external_disks` field at all.
         assert_eq!(

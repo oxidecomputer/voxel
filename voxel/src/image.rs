@@ -2,8 +2,8 @@
 //! hidden `render-smf` build helper.
 
 use anyhow::{Context, bail};
+use camino::{Utf8Path, Utf8PathBuf};
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use crate::ImageCmd;
 use crate::util::shell_quote;
@@ -34,17 +34,17 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
 }
 
 /// The checkout's short HEAD sha (the default `--src` image label).
-pub(crate) fn head_short_sha(src: &Path) -> anyhow::Result<String> {
+pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(src)
         .args(["rev-parse", "--short", "HEAD"])
         .output()
-        .with_context(|| format!("run git in {}", src.display()))?;
+        .with_context(|| format!("run git in {}", src))?;
     if !out.status.success() {
         bail!(
             "git rev-parse HEAD failed in {} (is it an omicron checkout?)",
-            src.display()
+            src
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -57,7 +57,7 @@ pub(crate) fn head_short_sha(src: &Path) -> anyhow::Result<String> {
 /// the generated switch1. One SP fleet drives both the MGS port table and
 /// sp-sim's side, so they agree by construction; baked images use the sim
 /// backend.
-pub(crate) fn render_smf(omicron_root: &Path, gimlets: usize) -> anyhow::Result<()> {
+pub(crate) fn render_smf(omicron_root: &Utf8Path, gimlets: usize) -> anyhow::Result<()> {
     let scrimlets = [0usize, gimlets.saturating_sub(1)];
     let fleet = voxel_config::sp::SpFleet::sim(gimlets);
     let writes = [
@@ -74,9 +74,9 @@ pub(crate) fn render_smf(omicron_root: &Path, gimlets: usize) -> anyhow::Result<
     for (rel, text) in writes {
         let path = omicron_root.join(rel);
         let dir = path.parent().expect("smf path has a parent");
-        fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
-        fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-        println!("rendered {}", path.display());
+        fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir))?;
+        fs::write(&path, text).with_context(|| format!("write {}", path))?;
+        println!("rendered {}", path);
     }
     Ok(())
 }
@@ -267,14 +267,13 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                     format!("zfs send {snap} | zstd -T0 -c"),
                 )
             };
-            let out = out.clone().unwrap_or_else(|| PathBuf::from(default_out));
-            eprintln!("[voxel] exporting {snap} -> {}", out.display());
+            let out = out
+                .clone()
+                .unwrap_or_else(|| Utf8PathBuf::from(default_out));
+            eprintln!("[voxel] exporting {snap} -> {}", out);
             let status = std::process::Command::new("bash")
                 .arg("-c")
-                .arg(format!(
-                    "{pipe} > {}",
-                    shell_quote(&out.display().to_string())
-                ))
+                .arg(format!("{pipe} > {}", shell_quote(out.as_str())))
                 .status()
                 .context("export")?;
             if !status.success() {
@@ -283,20 +282,17 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                     if *raw { "xz" } else { "zstd" }
                 );
             }
-            println!("exported {}", out.display());
+            println!("exported {}", out);
             Ok(())
         }
         ImageCmd::Import { file } => {
             let dataset = falcon_dataset();
-            let fname = file
-                .file_name()
-                .and_then(|s| s.to_str())
-                .context("bad file path")?;
+            let fname = file.file_name().context("bad file path")?;
             // Derive image name + decompressor from the extension.
             let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst") {
                 (
                     n.to_string(),
-                    format!("zstd -dc {}", shell_quote(&file.display().to_string())),
+                    format!("zstd -dc {}", shell_quote(file.as_str())),
                 )
             } else if let Some(n) = fname.strip_suffix(".raw.xz") {
                 bail!(
@@ -307,7 +303,7 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 bail!("unrecognized extension on {fname} (want .zfs.zst or .raw.xz)");
             };
             let dst = format!("{dataset}/img/{name}");
-            eprintln!("[voxel] importing {} -> {dst}", file.display());
+            eprintln!("[voxel] importing {} -> {dst}", file);
             let status = std::process::Command::new("bash")
                 .arg("-c")
                 .arg(format!("{decomp} | zfs recv {dst}"))
