@@ -18,7 +18,11 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
 # tokio features (they're additive), so we don't need "full".
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+crossterm = "0.28"
+base64 = "0.22"
 libfalcon = { git = "https://github.com/oxidecomputer/falcon", branch = "main" }
 futures = "0.3"
 oxnet = "0.1"
