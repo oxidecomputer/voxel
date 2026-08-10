@@ -21,59 +21,133 @@ use flate2::{Compression, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use voxel_config::VoxelConfig;
 
+pub(super) mod superreport;
+
 #[cfg(all(test, unix))]
 static COMPETING_DESTINATION_INODE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-const REPORT_GENERATOR: &str = "voxel-perftest-report";
-const MANIFEST_SCHEMA: &str = "voxel-perftest-manifest-v1";
+pub(super) const REPORT_GENERATOR: &str = "voxel-perftest-report";
+pub(super) const MANIFEST_SCHEMA: &str = "voxel-perftest-manifest-v1";
+pub(super) const MAX_REPORT_JSON: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_MANIFEST_JSON: u64 = 1024 * 1024;
+pub(super) const MAX_REPORT_HTML: u64 = 32 * 1024 * 1024;
+const MAX_NORMALIZED_INPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_NORMALIZED_REPEATS: usize = 4096;
+const MAX_DIMENSION_COMBINATIONS: usize = 256;
+const MAX_REPLAY_STRING_BYTES: usize = 4096;
+const MAX_PLANNED_REPEAT_SLOTS: usize = 4096;
 
-/// Raw input provenance needed by artifact publication. The caller retains
-/// ownership, so publication does not need to reread or reinterpret inputs.
+/// Input provenance needed by artifact publication. Aggregates carry only the
+/// validated source digest, so publication never embeds archived raw inputs.
 pub(super) struct PublicationInput<'a> {
     source_name: &'a str,
-    raw_bytes: &'a [u8],
+    sha256: String,
 }
 
 impl<'a> PublicationInput<'a> {
     pub(super) fn new(source_name: &'a str, raw_bytes: &'a [u8]) -> Self {
-        Self { source_name, raw_bytes }
+        Self { source_name, sha256: sha256_hex(raw_bytes) }
+    }
+
+    fn with_digest(source_name: &'a str, sha256: String) -> Self {
+        Self { source_name, sha256 }
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct Manifest {
-    report_generator: String,
-    schema: String,
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct Manifest {
+    pub(super) report_generator: String,
+    pub(super) schema: String,
     generated_at_unix_seconds: u64,
-    inputs: Vec<ManifestInput>,
-    report_html: ManifestArtifact,
-    report_json: ManifestArtifact,
-    manifest_filename: String,
+    pub(super) inputs: Vec<ManifestInput>,
+    pub(super) report_html: ManifestArtifact,
+    pub(super) report_json: ManifestArtifact,
+    pub(super) manifest_filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) aggregation: Option<AggregationMetadata>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ManifestInput {
-    source_name: String,
-    sha256: String,
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ManifestInput {
+    pub(super) source_name: String,
+    pub(super) sha256: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ManifestArtifact {
-    filename: String,
-    sha256: String,
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct ManifestArtifact {
+    pub(super) filename: String,
+    pub(super) sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct AggregationMetadata {
+    pub(super) accepted_archives: Vec<String>,
+    pub(super) rejected_archives: Vec<RejectedArchive>,
+    pub(super) unique_input_count: usize,
+    pub(super) duplicate_count: usize,
+    pub(super) digest_order: Vec<String>,
+    pub(super) origins: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct RejectedArchive {
+    pub(super) path: String,
+    pub(super) reason: String,
+}
+
+/// Checks the exact manifest representation used by publication. Artifact
+/// digests have fixed width, and `u64::MAX` covers the longest timestamp.
+pub(super) fn check_manifest_size(
+    inputs: &[(&str, &str)],
+    aggregation: Option<&AggregationMetadata>,
+    limit: u64,
+) -> Result<()> {
+    let dummy_digest = "0".repeat(64);
+    let manifest = Manifest {
+        report_generator: REPORT_GENERATOR.to_string(),
+        schema: MANIFEST_SCHEMA.to_string(),
+        generated_at_unix_seconds: u64::MAX,
+        inputs: inputs
+            .iter()
+            .map(|(source_name, sha256)| ManifestInput {
+                source_name: (*source_name).to_string(),
+                sha256: (*sha256).to_string(),
+            })
+            .collect(),
+        report_html: ManifestArtifact {
+            filename: "report.html".to_string(),
+            sha256: dummy_digest.clone(),
+        },
+        report_json: ManifestArtifact {
+            filename: "report.json".to_string(),
+            sha256: dummy_digest,
+        },
+        manifest_filename: "manifest.json".to_string(),
+        aggregation: aggregation.cloned(),
+    };
+    let size = serde_json::to_vec_pretty(&manifest)
+        .context("serialize candidate manifest")?
+        .len() as u64;
+    if size > limit {
+        bail!(
+            "manifest.json would use {size} bytes, exceeding {limit} byte limit"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum FailurePoint {
     AfterHtml,
+    DuringDerivedWrite,
     DestinationBeforeDirectoryRename,
     DuringArchive,
     DestinationBeforeArchivePersist,
@@ -92,6 +166,26 @@ pub(super) fn publish_report(
         inputs,
         report_html,
         normalized_report,
+        &[],
+        None,
+    )
+}
+
+fn publish_report_with_derived(
+    out: &Path,
+    archive: bool,
+    inputs: &[PublicationInput<'_>],
+    report_html: &[u8],
+    normalized_report: &Value,
+    derived: &[SvgArtifact],
+) -> Result<()> {
+    publish_report_impl(
+        out,
+        archive,
+        inputs,
+        report_html,
+        normalized_report,
+        derived,
         None,
     )
 }
@@ -102,6 +196,7 @@ fn publish_report_impl(
     inputs: &[PublicationInput<'_>],
     report_html: &[u8],
     normalized_report: &Value,
+    derived: &[SvgArtifact],
     failure: Option<FailurePoint>,
 ) -> Result<()> {
     let lock_path = publication_lock_path(out)?;
@@ -121,6 +216,7 @@ fn publish_report_impl(
         inputs,
         report_html,
         normalized_report,
+        derived,
         failure,
     );
     drop(lock);
@@ -145,8 +241,17 @@ fn publish_report_locked(
     inputs: &[PublicationInput<'_>],
     report_html: &[u8],
     normalized_report: &Value,
+    derived: &[SvgArtifact],
     failure: Option<FailurePoint>,
 ) -> Result<()> {
+    if report_html.len() as u64 > MAX_REPORT_HTML {
+        bail!("report.html exceeds {MAX_REPORT_HTML} byte limit");
+    }
+    let report_json = serde_json::to_vec_pretty(normalized_report)
+        .context("serialize normalized report.json")?;
+    if report_json.len() as u64 > MAX_REPORT_JSON {
+        bail!("report.json exceeds {MAX_REPORT_JSON} byte limit");
+    }
     let archive_path = archive_path(out)?;
     refuse_existing(out, "output directory")?;
     if archive {
@@ -170,8 +275,6 @@ fn publish_report_locked(
         if failure == Some(FailurePoint::AfterHtml) {
             bail!("injected publication failure after report.html");
         }
-        let report_json = serde_json::to_vec_pretty(normalized_report)
-            .context("serialize normalized report.json")?;
         write_complete(&temporary.path().join("report.json"), &report_json)?;
         artifacts.push(("report.json", report_json.clone()));
         let manifest = Manifest {
@@ -185,7 +288,7 @@ fn publish_report_locked(
                 .iter()
                 .map(|input| ManifestInput {
                     source_name: input.source_name.to_string(),
-                    sha256: sha256_hex(input.raw_bytes),
+                    sha256: input.sha256.clone(),
                 })
                 .collect(),
             report_html: ManifestArtifact {
@@ -197,14 +300,48 @@ fn publish_report_locked(
                 sha256: sha256_hex(&report_json),
             },
             manifest_filename: "manifest.json".to_string(),
+            aggregation: normalized_report
+                .get("aggregation")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("serialize aggregation manifest provenance")?,
         };
         let manifest_json = serde_json::to_vec_pretty(&manifest)
             .context("serialize manifest")?;
+        if manifest_json.len() as u64 > MAX_MANIFEST_JSON {
+            bail!("manifest.json exceeds {MAX_MANIFEST_JSON} byte limit");
+        }
         write_complete(
             &temporary.path().join("manifest.json"),
             &manifest_json,
         )?;
         artifacts.push(("manifest.json", manifest_json));
+        if !derived.is_empty() {
+            let images = temporary.path().join("images");
+            fs::create_dir(&images)
+                .context("create derived images directory")?;
+            let mut names = BTreeSet::new();
+            for artifact in derived {
+                validate_svg_filename(&artifact.filename)?;
+                if !names.insert(&artifact.filename) {
+                    bail!(
+                        "duplicate derived SVG filename '{}'",
+                        artifact.filename
+                    );
+                }
+                if failure == Some(FailurePoint::DuringDerivedWrite) {
+                    bail!("injected derived artifact write failure");
+                }
+                write_complete(
+                    &images.join(&artifact.filename),
+                    &artifact.bytes,
+                )?;
+            }
+            File::open(&images)
+                .and_then(|directory| directory.sync_all())
+                .context("flush derived images directory")?;
+        }
         File::open(temporary.path())
             .and_then(|directory| directory.sync_all())
             .with_context(|| {
@@ -266,6 +403,23 @@ fn publish_report_locked(
             }
             Err(error) => return cleanup_path(out, error, true),
         }
+    }
+    Ok(())
+}
+
+fn validate_svg_filename(filename: &str) -> Result<()> {
+    let path = Path::new(filename);
+    if filename.is_empty()
+        || filename.len() > MAX_SVG_FILENAME_BYTES
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || path.extension().and_then(|extension| extension.to_str())
+            != Some("svg")
+    {
+        bail!("unsafe derived SVG filename '{filename}'");
     }
     Ok(())
 }
@@ -489,14 +643,15 @@ fn cleanup_path(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum ExperimentKind {
     StorageLevers,
     MinimumHardware,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct InputIdentity {
     source: PathBuf,
     kind: ExperimentKind,
@@ -504,7 +659,7 @@ struct InputIdentity {
     run_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "availability", content = "details")]
 enum Provenance {
     Unavailable,
@@ -514,6 +669,7 @@ enum Provenance {
 #[derive(
     Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
+#[serde(deny_unknown_fields)]
 struct ProvenanceFields {
     #[serde(default)]
     voxel_revision: Option<String>,
@@ -535,7 +691,7 @@ struct ProvenanceFields {
     host: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "availability", content = "results")]
 enum CapabilityEvidence {
     Unavailable,
@@ -543,6 +699,7 @@ enum CapabilityEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CapabilityResult {
     capability: Capability,
     status: CapabilityStatus,
@@ -586,7 +743,8 @@ enum CapabilityStatus {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct NormalizedRepeat {
     candidate: String,
     outcome: RepeatOutcome,
@@ -597,7 +755,9 @@ struct NormalizedRepeat {
 /// Meaning of a normalized RAM value.  These are deliberately part of the
 /// serialized model and cohort identity: numerically similar values measured
 /// from different baselines are not interchangeable samples.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(rename_all = "kebab-case")]
 enum MemorySemantics {
     LegacyAbsoluteHostPeak,
@@ -612,7 +772,8 @@ enum RepeatOutcome {
     Failure(String),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct CommonMetrics {
     launch_duration_secs: Option<u64>,
     peak_ram_bytes: Option<u64>,
@@ -621,16 +782,18 @@ struct CommonMetrics {
     idle_writes_bytes: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "kebab-case")]
 enum RepeatPayload {
     StorageLevers(StorageRepeatPayload),
     MinimumHardware,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StorageRepeatPayload {
     levers: std::collections::BTreeSet<u8>,
+    #[serde(default)]
     workload_disposition: WorkloadDisposition,
     workload_bytes: Option<u64>,
     workload_duration_secs: Option<u64>,
@@ -643,9 +806,14 @@ struct StorageRepeatPayload {
     boundary_failure: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize,
+)]
 #[serde(rename_all = "kebab-case")]
 enum WorkloadDisposition {
+    #[default]
+    #[serde(skip)]
+    Legacy,
     NotRequested,
     Pending,
     Succeeded,
@@ -653,14 +821,15 @@ enum WorkloadDisposition {
     Blocked,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "dimensions", rename_all = "kebab-case")]
 enum Dimensions {
     StorageLevers(StorageDimensions),
     MinimumHardware(MinimumHardwareDimensions),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StorageDimensions {
     rss_sleds: usize,
     combinations: Vec<String>,
@@ -669,6 +838,7 @@ struct StorageDimensions {
 #[derive(
     Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
+#[serde(deny_unknown_fields)]
 struct MinimumHardwareDimensions {
     vdev_size_bytes: u64,
     vdev_count: usize,
@@ -677,14 +847,15 @@ struct MinimumHardwareDimensions {
     svcadm_autoclear: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "data", rename_all = "kebab-case")]
 enum ExperimentPayload {
     StorageLevers(StoragePayload),
     MinimumHardware(MinimumHardwarePayload),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoragePayload {
     started: u64,
     ended: u64,
@@ -744,6 +915,7 @@ struct LegacyRepeatSample {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MinimumHardwarePayload {
     expected_repeats: usize,
     host_storage_capacity_bytes: u64,
@@ -752,7 +924,8 @@ struct MinimumHardwarePayload {
     peak_allocation_bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct NormalizedInput {
     identity: InputIdentity,
     capability_contract_version: Option<u32>,
@@ -764,7 +937,7 @@ struct NormalizedInput {
     payload: ExperimentPayload,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(
     rename_all = "snake_case",
     tag = "availability",
@@ -840,6 +1013,476 @@ struct ReportDocument<'a> {
     view: &'a ReportView,
     warnings: Vec<String>,
     aggregate_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aggregation: Option<&'a AggregationMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplayReportDocument {
+    schema: String,
+    generator: ReplayGeneratorIdentity,
+    contract: ReplayContractIdentity,
+    inputs: Vec<ReplayInputMetadata>,
+    normalized_inputs: Vec<NormalizedInput>,
+    #[serde(default)]
+    aggregation: Option<AggregationMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayGeneratorIdentity {
+    name: String,
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayContractIdentity {
+    name: String,
+    version: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayInputMetadata {
+    source: String,
+    sha256: String,
+    identity: InputIdentity,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ReplayInput {
+    metadata: ReplayInputMetadata,
+    normalized: NormalizedInput,
+}
+
+pub(super) struct ParsedReplayEvidence {
+    pub(super) inputs: Vec<ReplayInput>,
+    pub(super) aggregation: Option<AggregationMetadata>,
+}
+
+#[derive(Clone)]
+pub(super) struct PreparedInput {
+    source: String,
+    sha256: String,
+    raw_bytes: Option<Vec<u8>>,
+    normalized: NormalizedInput,
+}
+
+impl PreparedInput {
+    pub(super) fn digest(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(super) fn source(&self) -> &str {
+        &self.source
+    }
+}
+
+impl ReplayInput {
+    pub(super) fn digest(&self) -> &str {
+        &self.metadata.sha256
+    }
+
+    pub(super) fn source(&self) -> &str {
+        &self.metadata.source
+    }
+
+    pub(super) fn normalized_size(&self) -> Result<usize> {
+        serde_json::to_vec(&self.normalized)
+            .map(|bytes| bytes.len())
+            .context("serialize normalized evidence")
+    }
+
+    pub(super) fn normalized_fingerprint(&self) -> Result<String> {
+        serde_json::to_vec(&self.normalized)
+            .map(|bytes| sha256_hex(&bytes))
+            .context("serialize normalized evidence fingerprint")
+    }
+
+    pub(super) fn into_prepared(self) -> PreparedInput {
+        PreparedInput {
+            source: self.metadata.source,
+            sha256: self.metadata.sha256,
+            raw_bytes: None,
+            normalized: self.normalized,
+        }
+    }
+}
+
+pub(super) fn parse_normalized_report_evidence(
+    bytes: &[u8],
+) -> Result<Vec<ReplayInput>> {
+    Ok(parse_normalized_report_document(bytes)?.inputs)
+}
+
+pub(super) fn parse_normalized_report_document(
+    bytes: &[u8],
+) -> Result<ParsedReplayEvidence> {
+    let mut document: ReplayReportDocument = serde_json::from_slice(bytes)
+        .context("deserialize normalized report evidence")?;
+    for input in &mut document.normalized_inputs {
+        upgrade_legacy_workload_dispositions(input)?;
+    }
+    if document.schema != "voxel-perftest-report-v1" {
+        bail!("unsupported normalized report schema '{}'", document.schema);
+    }
+    if document.generator.name != REPORT_GENERATOR
+        || document.generator.version.is_empty()
+    {
+        bail!("normalized report generator identity is incompatible");
+    }
+    if document.contract.name != CAPABILITY_CONTRACT_NAME
+        || document.contract.version != CAPABILITY_CONTRACT_VERSION
+    {
+        bail!("normalized report capability contract is incompatible");
+    }
+    if document.inputs.len() != document.normalized_inputs.len() {
+        bail!("normalized report metadata and evidence counts differ");
+    }
+
+    let inputs = document
+        .inputs
+        .into_iter()
+        .zip(document.normalized_inputs)
+        .map(|(metadata, normalized)| {
+            if metadata.sha256.len() != 64
+                || !metadata
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("input digest is not a 64-lowercase-hex SHA-256 value");
+            }
+            if metadata.source != normalized.identity.source.display().to_string()
+                || metadata.identity != normalized.identity
+            {
+                bail!("input metadata identity does not agree with normalized evidence");
+            }
+            validate_normalized_input(&normalized)?;
+            Ok(ReplayInput {
+                metadata,
+                normalized,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(aggregation) = &document.aggregation {
+        let digests = inputs
+            .iter()
+            .map(|input| input.digest().to_string())
+            .collect::<Vec<_>>();
+        let retained =
+            digests.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+        if retained.len() != inputs.len() {
+            bail!("normalized report aggregation input digests are not unique");
+        }
+        let origin_keys = aggregation
+            .origins
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let occurrence_count = aggregation
+            .origins
+            .values()
+            .try_fold(0usize, |count, origins| count.checked_add(origins.len()))
+            .context(
+                "normalized report aggregation occurrence count overflow",
+            )?;
+        let duplicate_count =
+            occurrence_count.checked_sub(inputs.len()).context(
+                "normalized report aggregation has fewer origins than inputs",
+            )?;
+        if aggregation.unique_input_count != inputs.len()
+            || aggregation.digest_order != digests
+            || origin_keys != retained
+            || aggregation.origins.values().any(Vec::is_empty)
+            || aggregation.duplicate_count != duplicate_count
+        {
+            bail!("normalized report aggregation provenance is inconsistent");
+        }
+    }
+    Ok(ParsedReplayEvidence { inputs, aggregation: document.aggregation })
+}
+
+fn upgrade_legacy_workload_dispositions(
+    input: &mut NormalizedInput,
+) -> Result<()> {
+    let workload_requested = matches!(
+        &input.payload,
+        ExperimentPayload::StorageLevers(StoragePayload {
+            workload: Some(_),
+            ..
+        })
+    );
+    for repeat in &mut input.repeats {
+        let RepeatPayload::StorageLevers(payload) = &mut repeat.payload else {
+            continue;
+        };
+        if payload.workload_disposition != WorkloadDisposition::Legacy {
+            continue;
+        }
+        if payload.launch_failure.is_some()
+            || payload.prior_launch_attempt_failures.is_some()
+            || payload.preparation_failure.is_some()
+            || payload.workload_failure.is_some()
+            || payload.boundary_failure.is_some()
+        {
+            bail!(
+                "missing workload disposition alongside checkpoint diagnostics"
+            );
+        }
+        payload.workload_disposition = if !workload_requested {
+            WorkloadDisposition::NotRequested
+        } else if payload.workload_bytes.is_some()
+            && payload.workload_duration_secs.is_some()
+        {
+            WorkloadDisposition::Succeeded
+        } else {
+            WorkloadDisposition::Pending
+        };
+    }
+    Ok(())
+}
+
+fn validate_normalized_input(input: &NormalizedInput) -> Result<()> {
+    let serialized_size = serde_json::to_vec(input)
+        .context("serialize normalized input for resource validation")?
+        .len();
+    if serialized_size > MAX_NORMALIZED_INPUT_BYTES {
+        bail!(
+            "normalized input exceeds {MAX_NORMALIZED_INPUT_BYTES} byte limit"
+        );
+    }
+    if input.repeats.len() > MAX_NORMALIZED_REPEATS {
+        bail!("normalized input exceeds {MAX_NORMALIZED_REPEATS} repeat limit");
+    }
+    let check_string = |name: &str, value: &str| -> Result<()> {
+        if value.len() > MAX_REPLAY_STRING_BYTES {
+            bail!("{name} exceeds {MAX_REPLAY_STRING_BYTES} byte limit");
+        }
+        Ok(())
+    };
+    check_string("run_id", &input.identity.run_id)?;
+    check_string("source", &input.identity.source.display().to_string())?;
+    if let Provenance::Available(provenance) = &input.provenance {
+        for value in [
+            &provenance.voxel_revision,
+            &provenance.omicron_revision,
+            &provenance.image_id,
+            &provenance.host_id,
+            &provenance.voxel_build,
+            &provenance.voxel_binary,
+            &provenance.configured_image,
+            &provenance.omicron_commit,
+            &provenance.host,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            check_string("provenance string", value)?;
+        }
+    }
+    let storage = match (&input.dimensions, &input.payload) {
+        (
+            Dimensions::StorageLevers(dimensions),
+            ExperimentPayload::StorageLevers(payload),
+        ) if input.identity.kind == ExperimentKind::StorageLevers => {
+            if dimensions.combinations.is_empty()
+                || dimensions.combinations.len() > MAX_DIMENSION_COMBINATIONS
+                || dimensions
+                    .combinations
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != dimensions.combinations.len()
+            {
+                bail!(
+                    "storage dimension candidate labels must be nonempty and unique"
+                );
+            }
+            for combination in &dimensions.combinations {
+                check_string("storage combination", combination)?;
+            }
+            if payload.requested_repeats == 0
+                || payload.requested_repeats > MAX_PLANNED_REPEAT_SLOTS
+            {
+                bail!(
+                    "storage requested_repeats must be greater than zero and at most {MAX_PLANNED_REPEAT_SLOTS}"
+                );
+            }
+            let planned = payload
+                .requested_repeats
+                .checked_mul(dimensions.combinations.len())
+                .context("storage planned repeat count overflow")?;
+            if planned > MAX_PLANNED_REPEAT_SLOTS
+                || input.repeats.len() > planned
+            {
+                bail!(
+                    "storage normalized repeats exceed bounded planned slots"
+                );
+            }
+            Some((dimensions, payload))
+        }
+        (
+            Dimensions::MinimumHardware(_),
+            ExperimentPayload::MinimumHardware(_),
+        ) if input.identity.kind == ExperimentKind::MinimumHardware => {
+            let ExperimentPayload::MinimumHardware(payload) = &input.payload
+            else {
+                unreachable!()
+            };
+            if !matches!(
+                input.effective_configuration,
+                EffectiveConfiguration::Available(_)
+            ) {
+                bail!(
+                    "minimum-hardware effective configuration must be available"
+                );
+            }
+            if payload.expected_repeats == 0
+                || payload.expected_repeats > MAX_PLANNED_REPEAT_SLOTS
+            {
+                bail!(
+                    "minimum-hardware expected_repeats must be greater than zero and at most {MAX_PLANNED_REPEAT_SLOTS}"
+                );
+            }
+            if input.repeats.len() > payload.expected_repeats {
+                bail!(
+                    "minimum-hardware normalized repeats exceed planned slots"
+                );
+            }
+            None
+        }
+        _ => bail!(
+            "normalized input kind, dimensions, and payload are inconsistent"
+        ),
+    };
+
+    match (&input.capabilities, input.capability_contract_version) {
+        (CapabilityEvidence::Unavailable, None) => {}
+        (CapabilityEvidence::Available(results), Some(version))
+            if input.identity.kind == ExperimentKind::MinimumHardware =>
+        {
+            validate_capabilities(
+                Some(CAPABILITY_CONTRACT_NAME),
+                Some(version),
+                Some(results),
+            )?
+        }
+        (
+            CapabilityEvidence::Available(results),
+            Some(CAPABILITY_CONTRACT_VERSION),
+        ) => {
+            let required = [
+                Capability::MatrixHostStorageScope,
+                Capability::CleanLaunchTeardownBoundaries,
+                Capability::ApiDiskLifecycle,
+                Capability::SimulatedZpoolPreparation,
+            ];
+            if results.len() != required.len()
+                || required.iter().any(|capability| {
+                    results
+                        .iter()
+                        .filter(|result| result.capability == *capability)
+                        .count()
+                        != 1
+                })
+            {
+                bail!(
+                    "storage capability contract requires one result for each capability"
+                );
+            }
+            validate_capability_result_shapes(results)?;
+        }
+        _ => bail!(
+            "normalized capability evidence and contract version are incompatible"
+        ),
+    }
+    if let CapabilityEvidence::Available(results) = &input.capabilities {
+        for error in results.iter().filter_map(|result| result.error.as_deref())
+        {
+            check_string("capability error", error)?;
+        }
+    }
+
+    for repeat in &input.repeats {
+        check_string("candidate", &repeat.candidate)?;
+        if let RepeatOutcome::Failure(error) = &repeat.outcome {
+            check_string("repeat failure", error)?;
+        }
+        match (storage, &repeat.payload) {
+            (
+                Some((dimensions, payload)),
+                RepeatPayload::StorageLevers(details),
+            ) => {
+                if details.workload_disposition == WorkloadDisposition::Legacy {
+                    bail!("legacy workload disposition was not upgraded");
+                }
+                for value in [
+                    &details.launch_failure,
+                    &details.prior_launch_attempt_failures,
+                    &details.preparation_failure,
+                    &details.workload_failure,
+                    &details.boundary_failure,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    check_string("storage diagnostic", value)?;
+                }
+                if repeat.metrics.peak_ram_bytes.is_some()
+                    != repeat.metrics.peak_ram_semantics.is_some()
+                {
+                    bail!(
+                        "peak RAM value and memory semantics must be present together"
+                    );
+                }
+                let canonical = canonical_combo_label(&details.levers);
+                if repeat.candidate != canonical
+                    || !dimensions.combinations.contains(&canonical)
+                {
+                    bail!(
+                        "storage candidate label and lever set are inconsistent"
+                    );
+                }
+                if repeat.metrics.peak_ram_bytes.is_some()
+                    && repeat.metrics.peak_ram_semantics
+                        != Some(payload.launch_memory_semantics)
+                {
+                    bail!("launch memory semantics are inconsistent");
+                }
+                if details.workload_peak_delta_bytes.is_some()
+                    != details.workload_peak_ram_semantics.is_some()
+                    || (details.workload_peak_delta_bytes.is_some()
+                        && details.workload_peak_ram_semantics
+                            != payload.workload_memory_semantics)
+                {
+                    bail!(
+                        "workload value and memory semantics are inconsistent"
+                    );
+                }
+            }
+            (None, RepeatPayload::MinimumHardware) => {
+                if repeat.candidate != input.identity.run_id {
+                    bail!(
+                        "minimum-hardware candidate does not match run identity"
+                    );
+                }
+                if repeat.metrics.peak_ram_semantics.is_some() {
+                    bail!(
+                        "minimum-hardware memory semantics must remain unavailable"
+                    );
+                }
+            }
+            _ => bail!("normalized repeat payload kind is inconsistent"),
+        }
+    }
+    if let ExperimentPayload::StorageLevers(payload) = &input.payload {
+        if let Some(error) = &payload.abort_error {
+            check_string("payload abort error", error)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn run(inputs: &[PathBuf], out: &Path, archive: bool) -> Result<()> {
@@ -855,8 +1498,7 @@ pub(super) fn run(inputs: &[PathBuf], out: &Path, archive: bool) -> Result<()> {
         refuse_existing(&requested_archive, "archive")?;
     }
 
-    let mut raw_inputs = Vec::with_capacity(inputs.len());
-    let mut normalized = Vec::with_capacity(inputs.len());
+    let mut prepared = Vec::with_capacity(inputs.len());
     for path in inputs {
         let bytes = fs::read(path)
             .with_context(|| format!("read report input {}", path.display()))?;
@@ -867,26 +1509,124 @@ pub(super) fn run(inputs: &[PathBuf], out: &Path, archive: bool) -> Result<()> {
         let input = normalize(path, value).with_context(|| {
             format!("invalid report input {}", path.display())
         })?;
-        raw_inputs.push(bytes);
-        normalized.push(input);
+        prepared.push(PreparedInput {
+            source: path.display().to_string(),
+            sha256: sha256_hex(&bytes),
+            raw_bytes: Some(bytes),
+            normalized: input,
+        });
     }
 
-    let digests = inputs
+    generate_and_publish_report(
+        &prepared,
+        out,
+        archive,
+        &requested_archive,
+        None,
+    )
+}
+
+pub(super) fn generate_and_publish_report(
+    prepared: &[PreparedInput],
+    out: &Path,
+    archive: bool,
+    requested_archive: &Path,
+    aggregation: Option<&AggregationMetadata>,
+) -> Result<()> {
+    let candidate = build_candidate_report(prepared, aggregation)?;
+    let replay = parse_normalized_report_evidence(
+        &serde_json::to_vec(&candidate.document)
+            .context("serialize replay validation model")?,
+    )
+    .context("validate normalized report replay boundary")?;
+    if replay.len() != prepared.len()
+        || replay.iter().zip(prepared).any(|(replay, prepared)| {
+            replay.metadata.source != prepared.source
+                || replay.metadata.sha256 != prepared.sha256
+                || replay.normalized != prepared.normalized
+        })
+    {
+        bail!("normalized report replay changed prepared input evidence");
+    }
+    let publication_inputs = prepared
         .iter()
-        .zip(&raw_inputs)
-        .map(|(source, bytes)| InputDigestView {
-            source: source.display().to_string(),
-            sha256: Some(sha256_hex(bytes)),
+        .map(|input| match &input.raw_bytes {
+            Some(bytes) => PublicationInput::new(&input.source, bytes),
+            None => PublicationInput::with_digest(
+                &input.source,
+                input.sha256.clone(),
+            ),
+        })
+        .collect::<Vec<_>>();
+    if aggregation.is_some() {
+        let derived = render_report_svgs(&candidate.view)?;
+        publish_report_with_derived(
+            out,
+            archive,
+            &publication_inputs,
+            &candidate.html,
+            &candidate.document,
+            &derived,
+        )?;
+    } else {
+        publish_report(
+            out,
+            archive,
+            &publication_inputs,
+            &candidate.html,
+            &candidate.document,
+        )?;
+    }
+
+    print!(
+        "{}",
+        format_run_summary(
+            &candidate.normalized,
+            &candidate.analysis,
+            candidate.eligible
+        )
+    );
+    println!("report: {}", out.display());
+    if archive {
+        println!("archive: {}", requested_archive.display());
+    }
+    Ok(())
+}
+
+struct CandidateReport {
+    normalized: Vec<NormalizedInput>,
+    analysis: Analysis,
+    eligible: usize,
+    html: Vec<u8>,
+    document: Value,
+    view: ReportView,
+}
+
+fn build_candidate_report(
+    prepared: &[PreparedInput],
+    aggregation: Option<&AggregationMetadata>,
+) -> Result<CandidateReport> {
+    let normalized = prepared
+        .iter()
+        .map(|input| input.normalized.clone())
+        .collect::<Vec<_>>();
+    let digests = prepared
+        .iter()
+        .map(|input| InputDigestView {
+            source: input.source.clone(),
+            sha256: Some(input.sha256.clone()),
             run_status: None,
             evidence_state: None,
             abort_error: None,
         })
         .collect::<Vec<_>>();
     let analysis = analyze(&normalized);
-    let view = build_report_view(&normalized, &analysis, &digests)?;
-    let html =
-        render_report_html(&view).context("render offline report HTML")?;
-    let warnings = view
+    let mut view = build_report_view(&normalized, &analysis, &digests)?;
+    view.aggregation = aggregation.cloned();
+    let html = render_report_html(&view)
+        .context("render offline report HTML")?
+        .into_bytes();
+    let mut warnings = view
         .sections
         .iter()
         .flat_map(|section| {
@@ -898,6 +1638,11 @@ pub(super) fn run(inputs: &[PathBuf], out: &Path, archive: bool) -> Result<()> {
             )
         })
         .collect::<Vec<_>>();
+    if let Some(aggregation) = aggregation {
+        warnings.extend(aggregation.rejected_archives.iter().map(|rejected| {
+            format!("Rejected archive {}: {}", rejected.path, rejected.reason)
+        }));
+    }
     let eligible = analysis
         .cohorts
         .iter()
@@ -916,10 +1661,10 @@ pub(super) fn run(inputs: &[PathBuf], out: &Path, archive: bool) -> Result<()> {
         },
         inputs: normalized
             .iter()
-            .zip(&raw_inputs)
-            .map(|(input, bytes)| NormalizedInputMetadata {
+            .zip(prepared)
+            .map(|(input, prepared)| NormalizedInputMetadata {
                 source: input.identity.source.display().to_string(),
-                sha256: sha256_hex(bytes),
+                sha256: prepared.sha256.clone(),
                 identity: &input.identity,
             })
             .collect(),
@@ -933,30 +1678,33 @@ pub(super) fn run(inputs: &[PathBuf], out: &Path, archive: bool) -> Result<()> {
             analysis.cohorts.len(),
             eligible
         ),
+        aggregation,
     };
-    let normalized_report = serde_json::to_value(document)
+    let document = serde_json::to_value(document)
         .context("serialize normalized report model")?;
-    let source_names = inputs
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>();
-    let publication_inputs = source_names
-        .iter()
-        .zip(&raw_inputs)
-        .map(|(source, bytes)| PublicationInput::new(source, bytes))
-        .collect::<Vec<_>>();
-    publish_report(
-        out,
-        archive,
-        &publication_inputs,
-        html.as_bytes(),
-        &normalized_report,
-    )?;
+    Ok(CandidateReport { normalized, analysis, eligible, html, document, view })
+}
 
-    print!("{}", format_run_summary(&normalized, &analysis, eligible));
-    println!("report: {}", out.display());
-    if archive {
-        println!("archive: {}", requested_archive.display());
+pub(super) fn check_candidate_report_size(
+    prepared: &[PreparedInput],
+    aggregation: &AggregationMetadata,
+    json_limit: u64,
+    html_limit: u64,
+) -> Result<()> {
+    let candidate = build_candidate_report(prepared, Some(aggregation))?;
+    let json_size = serde_json::to_vec_pretty(&candidate.document)
+        .context("serialize candidate report.json")?
+        .len() as u64;
+    if json_size > json_limit {
+        bail!(
+            "report.json would use {json_size} bytes, exceeding {json_limit} byte limit"
+        );
+    }
+    let html_size = candidate.html.len() as u64;
+    if html_size > html_limit {
+        bail!(
+            "report.html would use {html_size} bytes, exceeding {html_limit} byte limit"
+        );
     }
     Ok(())
 }
@@ -2210,6 +2958,12 @@ fn validate_capabilities(
             bail!("contract v1 requires exactly one result for {capability:?}");
         }
     }
+    validate_capability_result_shapes(results)
+}
+
+fn validate_capability_result_shapes(
+    results: &[CapabilityResult],
+) -> Result<()> {
     for result in results {
         if let Some(evidence) = &result.evidence {
             let bytes = serde_json::to_vec(&evidence.0)
@@ -2624,6 +3378,18 @@ fn policy(input: &NormalizedInput) -> SelectionPolicy {
     }
 }
 
+// Schema-v4 capability statuses summarize whole-matrix completion, so repeat
+// evidence must attribute their failures to candidates. Schema v5 makes the
+// host-storage scope an independent pre-run proof; that one remains a veto.
+fn capability_gates_candidate(
+    input: &NormalizedInput,
+    capability: Capability,
+) -> bool {
+    input.identity.kind != ExperimentKind::StorageLevers
+        || (input.identity.source_schema_version == 5
+            && capability == Capability::MatrixHostStorageScope)
+}
+
 fn analyze_candidate(
     key: CandidateKey,
     sources: &[&NormalizedInput],
@@ -2651,6 +3417,9 @@ fn analyze_candidate(
         .filter(|r| r.outcome == RepeatOutcome::Success)
         .collect::<Vec<_>>();
     let policies = sources.iter().map(|i| policy(i)).collect::<Vec<_>>();
+    // Replay validation caps every input at MAX_PLANNED_REPEAT_SLOTS and
+    // superreport caps inputs at 4096, so this sum is at most 2^24 and cannot
+    // overflow even on Rust's minimum supported usize width.
     let expected_repeats = policies.iter().map(|p| p.expected_repeats).sum();
     let selection_policy = SelectionPolicy {
         expected_repeats,
@@ -2752,16 +3521,23 @@ fn analyze_candidate(
     {
         ineligibility.push(IneligibilityReason::CapabilityEvidenceUnavailable);
     }
-    if sources.iter().any(|i| matches!(&i.capabilities, CapabilityEvidence::Available(r) if r.iter().any(|x| x.status != CapabilityStatus::Pass))) { ineligibility.push(IneligibilityReason::CapabilityFailed); }
-    for result in sources
+    let failed_capabilities = sources
         .iter()
-        .filter_map(|i| match &i.capabilities {
-            CapabilityEvidence::Available(r) => Some(r),
-            _ => None,
+        .flat_map(|input| {
+            let results = match &input.capabilities {
+                CapabilityEvidence::Available(results) => results.as_slice(),
+                CapabilityEvidence::Unavailable => &[],
+            };
+            results.iter().filter(move |result| {
+                result.status != CapabilityStatus::Pass
+                    && capability_gates_candidate(input, result.capability)
+            })
         })
-        .flatten()
-        .filter(|r| r.status != CapabilityStatus::Pass)
-    {
+        .collect::<Vec<_>>();
+    if !failed_capabilities.is_empty() {
+        ineligibility.push(IneligibilityReason::CapabilityFailed);
+    }
+    for result in failed_capabilities {
         ineligibility.push(IneligibilityReason::CapabilityStatus {
             capability: result.capability,
             status: result.status,
@@ -3229,6 +4005,8 @@ struct CandidateView {
     recommended: bool,
     decision: String,
     ineligibility: Vec<String>,
+    #[serde(skip)]
+    renderer_ineligibility: Vec<String>,
     required_allocation_bytes: Option<u64>,
     peak_allocation_bytes: Option<u64>,
     success_rate: f64,
@@ -3280,6 +4058,31 @@ struct ConditionRow {
     code: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VaryingConditionRow {
+    label: String,
+    values: Vec<Option<ConditionRow>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FactoredConditions {
+    shared: Vec<ConditionRow>,
+    varying: Vec<VaryingConditionRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateSettingProjection {
+    candidates: Vec<String>,
+    shared: Vec<ConditionRow>,
+    varying: Vec<VaryingConditionRow>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FailureGroup {
+    message: String,
+    count: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct MatrixCapabilityView {
     source: String,
@@ -3328,6 +4131,8 @@ struct ReportView {
     executive_conclusion: String,
     inputs: Vec<InputDigestView>,
     sections: Vec<ReportSectionView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aggregation: Option<AggregationMetadata>,
 }
 
 fn input_digest_view(input: &NormalizedInput) -> InputDigestView {
@@ -3763,6 +4568,9 @@ fn flatten_typed_value(
 ) {
     match value {
         Value::Object(object) => {
+            if object.is_empty() {
+                rows.push(condition(label, "{}", true));
+            }
             for (key, value) in object {
                 flatten_typed_value(
                     &format!("{label} / {}", human_key(key)),
@@ -3772,6 +4580,9 @@ fn flatten_typed_value(
             }
         }
         Value::Array(values) => {
+            if values.is_empty() {
+                rows.push(condition(label, "[]", true));
+            }
             for (index, value) in values.iter().enumerate() {
                 flatten_typed_value(
                     &format!("{label} / {}", index + 1),
@@ -3948,6 +4759,246 @@ fn cohort_conditions(key: &CohortKey) -> Vec<ConditionRow> {
     }
 }
 
+fn factor_condition_rows(rows: &[Vec<ConditionRow>]) -> FactoredConditions {
+    let mut labels = Vec::new();
+    for row in rows.iter().flatten() {
+        if !labels.contains(&row.label) {
+            labels.push(row.label.clone());
+        }
+    }
+    let mut shared = Vec::new();
+    let mut varying = Vec::new();
+    for label in labels {
+        let values = rows
+            .iter()
+            .map(|conditions| {
+                conditions
+                    .iter()
+                    .find(|condition| condition.label == label)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        if let Some(first) = values.first().and_then(Option::as_ref) {
+            if values.iter().all(|value| value.as_ref() == Some(first)) {
+                shared.push(first.clone());
+                continue;
+            }
+        }
+        varying.push(VaryingConditionRow { label, values });
+    }
+    FactoredConditions { shared, varying }
+}
+
+fn flatten_candidate_setting(
+    label: &str,
+    value: &Value,
+    rows: &mut Vec<ConditionRow>,
+) {
+    match value {
+        Value::Object(object) => {
+            if object.is_empty() {
+                rows.push(condition(label, "{}", true));
+            }
+            for (key, value) in object {
+                let child = if label.is_empty() {
+                    human_key(key)
+                } else {
+                    format!("{label} / {}", human_key(key))
+                };
+                flatten_candidate_setting(&child, value, rows);
+            }
+        }
+        Value::Array(values) => {
+            if values.is_empty() {
+                rows.push(condition(label, "[]", true));
+            }
+            for (index, value) in values.iter().enumerate() {
+                let child = if label.is_empty() {
+                    (index + 1).to_string()
+                } else {
+                    format!("{label} / {}", index + 1)
+                };
+                flatten_candidate_setting(&child, value, rows);
+            }
+        }
+        Value::String(value) => rows.push(condition(label, value, true)),
+        Value::Null => rows.push(condition(label, "not supplied", false)),
+        value => rows.push(condition(label, value.to_string(), false)),
+    }
+}
+
+fn candidate_setting_projection(
+    cohort: &CohortView,
+) -> Option<CandidateSettingProjection> {
+    let (candidates, rows) = match &cohort.key {
+        CohortKey::Storage(storage) => {
+            let exact = storage
+                .effective_configuration_identity
+                .as_deref()
+                .and_then(|identity| serde_json::from_str(identity).ok())
+                .and_then(|value: Value| value.as_object().cloned());
+            let candidates = storage.combinations.clone();
+            let mut rows = Vec::with_capacity(candidates.len());
+            for name in &candidates {
+                let mut settings = Vec::new();
+                if let Some(configurations) = &exact {
+                    if let Some(configuration) = configurations.get(name) {
+                        flatten_candidate_setting(
+                            "",
+                            configuration,
+                            &mut settings,
+                        );
+                    } else {
+                        settings.push(condition("Storage levers", name, true));
+                    }
+                } else {
+                    let observed = cohort.candidates.iter().find(|candidate| {
+                        renderer_candidate_label(candidate) == *name
+                    });
+                    let value = observed
+                        .and_then(|candidate| match &candidate.key {
+                            CandidateKey::Storage(levers) => {
+                                Some(canonical_combo_label(levers))
+                            }
+                            CandidateKey::MinimumHardware(_) => None,
+                        })
+                        .unwrap_or_else(|| name.clone());
+                    settings.push(condition("Storage levers", value, true));
+                }
+                rows.push(settings);
+            }
+            (candidates, rows)
+        }
+        CohortKey::MinimumHardware(_) => {
+            let mut rows = Vec::with_capacity(cohort.candidates.len());
+            for candidate in &cohort.candidates {
+                let dimensions =
+                    serde_json::to_value(candidate.dimensions.as_ref()?)
+                        .ok()?;
+                let mut settings = Vec::new();
+                flatten_candidate_setting("", &dimensions, &mut settings);
+                rows.push(settings);
+            }
+            (
+                cohort
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.label.clone())
+                    .collect(),
+                rows,
+            )
+        }
+    };
+    let factored = factor_condition_rows(&rows);
+    Some(CandidateSettingProjection {
+        candidates,
+        shared: factored.shared,
+        varying: factored.varying,
+    })
+}
+
+fn verified_storage_ladder(cohort: &CohortView) -> bool {
+    let CohortKey::Storage(storage) = &cohort.key else {
+        return false;
+    };
+    let rendered = cohort
+        .candidates
+        .iter()
+        .map(renderer_candidate_label)
+        .collect::<Vec<_>>();
+    storage.combinations.len() > 1
+        && rendered == storage.combinations
+        && storage.combinations.windows(2).all(|pair| {
+            let Some(previous_candidate) =
+                cohort.candidates.iter().find(|candidate| {
+                    renderer_candidate_label(candidate) == pair[0]
+                })
+            else {
+                return false;
+            };
+            let Some(next_candidate) =
+                cohort.candidates.iter().find(|candidate| {
+                    renderer_candidate_label(candidate) == pair[1]
+                })
+            else {
+                return false;
+            };
+            let (CandidateKey::Storage(previous), CandidateKey::Storage(next)) =
+                (&previous_candidate.key, &next_candidate.key)
+            else {
+                return false;
+            };
+            previous_candidate.rows.iter().any(sample_row_has_measurement)
+                && next_candidate.rows.iter().any(sample_row_has_measurement)
+                && previous.is_subset(next)
+                && next.len() == previous.len() + 1
+        })
+}
+
+fn sample_row_has_measurement(row: &SampleRow) -> bool {
+    row.metrics.launch_duration_secs.is_some()
+        || row.metrics.peak_ram_bytes.is_some()
+        || row.metrics.writes_bytes.is_some()
+        || row.metrics.idle_writes_bytes.is_some()
+        || row.workload_bytes.is_some()
+        || row.workload_duration_secs.is_some()
+        || row.workload_peak_delta_bytes.is_some()
+}
+
+fn cohort_has_no_measurements(cohort: &CohortView) -> bool {
+    !cohort
+        .candidates
+        .iter()
+        .flat_map(|candidate| &candidate.rows)
+        .any(sample_row_has_measurement)
+}
+
+fn renderer_candidate_label(candidate: &CandidateView) -> String {
+    match &candidate.key {
+        CandidateKey::Storage(_) => renderer_storage_label(&candidate.label),
+        CandidateKey::MinimumHardware(_) => candidate.label.clone(),
+    }
+}
+
+fn renderer_storage_label(label: &str) -> String {
+    label.split_once(" — ").map_or_else(
+        || label.to_string(),
+        |(display, canonical)| {
+            if display == canonical {
+                display.to_string()
+            } else {
+                label.to_string()
+            }
+        },
+    )
+}
+
+fn experiment_kind_id(kind: ExperimentKind) -> &'static str {
+    match kind {
+        ExperimentKind::StorageLevers => "storage-levers",
+        ExperimentKind::MinimumHardware => "minimum-hardware",
+    }
+}
+
+fn cohort_anchor(key: &CohortKey) -> String {
+    let typed = serde_json::to_vec(key).expect("cohort key serializes");
+    format!("cohort-{}", &sha256_hex(&typed)[..16])
+}
+
+fn group_exact_failures(failures: &[String]) -> Vec<FailureGroup> {
+    let mut groups: Vec<FailureGroup> = Vec::new();
+    for failure in failures {
+        if let Some(group) =
+            groups.iter_mut().find(|group| group.message == *failure)
+        {
+            group.count += 1;
+        } else {
+            groups.push(FailureGroup { message: failure.clone(), count: 1 });
+        }
+    }
+    groups
+}
+
 fn cohort_label(kind: ExperimentKind, index: usize, key: &CohortKey) -> String {
     match (kind, key) {
         (ExperimentKind::StorageLevers, CohortKey::Storage(storage)) => {
@@ -3980,21 +5031,21 @@ fn analysis_cohorts(
             let cohort_inputs = inputs.iter().filter(|input| cohort_key(input) == cohort.key).collect::<Vec<_>>();
             let conclusion = cohort.recommendation.as_ref().map(recommendation_label)
                 .unwrap_or_else(|| no_recommendation_label(cohort.no_recommendation));
-            let matrix_capabilities = (kind == ExperimentKind::StorageLevers)
-                .then(|| {
-                    cohort_inputs
-                        .iter()
-                        .map(|input| MatrixCapabilityView {
-                            source: input.identity.source.display().to_string(),
-                            run_id: input.identity.run_id.clone(),
-                            results: match &input.capabilities {
-                                CapabilityEvidence::Available(results) => Some(results.clone()),
-                                CapabilityEvidence::Unavailable => None,
-                            },
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let matrix_capabilities = if kind == ExperimentKind::StorageLevers {
+                cohort_inputs
+                    .iter()
+                    .map(|input| MatrixCapabilityView {
+                        source: input.identity.source.display().to_string(),
+                        run_id: input.identity.run_id.clone(),
+                        results: match &input.capabilities {
+                            CapabilityEvidence::Available(results) => Some(results.clone()),
+                            CapabilityEvidence::Unavailable => None,
+                        },
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let candidates = cohort.candidates.iter().map(|candidate| CandidateView {
                 key: candidate.key.clone(),
                 stable_id: sha256_hex(serde_json::to_string(&candidate.key).expect("candidate key serializes").as_bytes()),
@@ -4010,6 +5061,14 @@ fn analysis_cohorts(
                 recommended: cohort.recommendation.as_ref().is_some_and(|r| r.key == candidate.key),
                 decision: decision_label(&candidate.decision),
                 ineligibility: candidate.ineligibility.iter().map(|r| match r { IneligibilityReason::SchemaNotRecommendationEligible => "schema is descriptive-only", IneligibilityReason::ApiWorkloadRequired => "API workload is required", IneligibilityReason::EffectiveConfigurationUnavailable => "exact effective configuration unavailable", IneligibilityReason::CapabilityEvidenceUnavailable => "capability evidence unavailable", IneligibilityReason::CapabilityFailed => "one or more capabilities failed", IneligibilityReason::ProvenanceUnavailable => "provenance unavailable", IneligibilityReason::RequiredRepeatFailed => "required repeat failed", IneligibilityReason::RequiredRepeatMissing => "required repeat missing", IneligibilityReason::RequiredMeasurementMissing => "required measurement missing", IneligibilityReason::HostStorageEnvelopeExceeded => "host storage envelope exceeded", IneligibilityReason::ConflictingPooledSources => "pooled sources conflict", IneligibilityReason::CapabilityStatus { .. } => "individual capability did not pass" }.into()).collect(),
+                renderer_ineligibility: candidate.ineligibility.iter().map(|reason| match reason {
+                    IneligibilityReason::CapabilityStatus { capability, status } => format!(
+                        "capability {} has exact status {}",
+                        serde_json::to_value(capability).expect("capability serializes"),
+                        serde_json::to_value(status).expect("status serializes")
+                    ),
+                    other => match other { IneligibilityReason::SchemaNotRecommendationEligible => "schema is descriptive-only", IneligibilityReason::ApiWorkloadRequired => "API workload is required", IneligibilityReason::EffectiveConfigurationUnavailable => "exact effective configuration unavailable", IneligibilityReason::CapabilityEvidenceUnavailable => "capability evidence unavailable", IneligibilityReason::CapabilityFailed => "one or more capabilities failed", IneligibilityReason::ProvenanceUnavailable => "provenance unavailable", IneligibilityReason::RequiredRepeatFailed => "required repeat failed", IneligibilityReason::RequiredRepeatMissing => "required repeat missing", IneligibilityReason::RequiredMeasurementMissing => "required measurement missing", IneligibilityReason::HostStorageEnvelopeExceeded => "host storage envelope exceeded", IneligibilityReason::ConflictingPooledSources => "pooled sources conflict", IneligibilityReason::CapabilityStatus { .. } => unreachable!() }.into(),
+                }).collect(),
                 required_allocation_bytes: candidate.summary.required_allocation_bytes,
                 peak_allocation_bytes: candidate.summary.peak_allocation_bytes,
                 success_rate: candidate.summary.success_rate,
@@ -4201,8 +5260,10 @@ fn build_report_view(
                 .position(|label| label == &candidate_display(&summary.key))
                 .unwrap_or(usize::MAX)
         });
-        let labels =
-            summaries.iter().map(|s| s.label.clone()).collect::<Vec<_>>();
+        let labels = summaries
+            .iter()
+            .map(|summary| renderer_storage_label(&summary.label))
+            .collect::<Vec<_>>();
         let mut charts = vec![
             ChartView {
                 kind: ViewChartKind::GrossWrites,
@@ -4507,7 +5568,7 @@ fn build_report_view(
             let labels = cohort
                 .storage_summary
                 .iter()
-                .map(|row| row.label.clone())
+                .map(|row| renderer_storage_label(&row.label))
                 .collect::<Vec<_>>();
             let expose_chart_sample_counts = cohort_inputs
                 .iter()
@@ -4600,15 +5661,7 @@ fn build_report_view(
                     .iter()
                     .zip(&cohort.storage_summary)
                     .all(|(key, row)| key == &row.key)
-                && declared_keys.windows(2).all(|pair| {
-                    match (&pair[0], &pair[1]) {
-                        (
-                            CandidateKey::Storage(a),
-                            CandidateKey::Storage(b),
-                        ) => a.is_subset(b) && b.len() == a.len() + 1,
-                        _ => false,
-                    }
-                });
+                && verified_storage_ladder(cohort);
             if valid_ladder
                 && cohort.storage_summary.iter().all(|row| row.writes.is_some())
             {
@@ -4819,7 +5872,7 @@ fn build_report_view(
         }
         sections.push(ReportSectionView { kind: ExperimentKind::MinimumHardware, title: "Minimum hardware fixture evidence".into(), conclusion: "Capability, feasibility, allocation, RAM, launch, eligibility, and advisory decisions are grouped by cohort.".into(), warnings: Vec::new(), cohorts, descriptive_aggregate: None });
     }
-    Ok(ReportView { title: "Voxel performance report".into(), executive_conclusion: "Conclusions and recommendations are cohort-local; charts supplement the complete tables below.".into(), inputs: inputs_view, sections })
+    Ok(ReportView { title: "Voxel performance report".into(), executive_conclusion: "Conclusions and recommendations are cohort-local; charts supplement the complete tables below.".into(), inputs: inputs_view, sections, aggregation: None })
 }
 
 fn html_escape(text: &str) -> String {
@@ -4834,6 +5887,507 @@ fn html_escape(text: &str) -> String {
         };
         out
     })
+}
+
+const SVG_WIDTH: usize = 1200;
+const SVG_HEIGHT: usize = 800;
+// SVGs are derived from already-bounded report inputs. Keep independent finite
+// fail-closed limits, but do not make this optional publication layer narrower
+// than the 4096-input/repeat and 64 MiB JSON report contracts.
+const MAX_SVG_VISIBLE_ROWS: usize = 1_000_000;
+const MAX_SVG_VISIBLE_CATEGORIES: usize = 4096;
+const MAX_SVG_LABEL_BYTES: usize = 160;
+const MAX_SVG_ROW_LABEL_BYTES: usize = 120;
+const MAX_SVG_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SVG_ARTIFACTS: usize = 32_768;
+const MAX_SVG_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SVG_FILENAME_BYTES: usize = 96;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SvgLimits {
+    rows: usize,
+    categories: usize,
+    artifacts: usize,
+    individual_bytes: usize,
+    total_bytes: usize,
+}
+
+const SVG_LIMITS: SvgLimits = SvgLimits {
+    rows: MAX_SVG_VISIBLE_ROWS,
+    categories: MAX_SVG_VISIBLE_CATEGORIES,
+    artifacts: MAX_SVG_ARTIFACTS,
+    individual_bytes: MAX_SVG_BYTES,
+    total_bytes: MAX_SVG_TOTAL_BYTES,
+};
+
+/// Structural identity supplied by the report-view traversal. Indices, rather
+/// than presentation labels, keep filenames safe and collision-free.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SvgChartIdentity {
+    Cohort { section: usize, cohort: usize, chart: usize },
+    Aggregate { section: usize, chart: usize },
+}
+
+impl SvgChartIdentity {
+    fn cohort(section: usize, cohort: usize, chart: usize) -> Self {
+        Self::Cohort { section, cohort, chart }
+    }
+
+    fn aggregate(section: usize, chart: usize) -> Self {
+        Self::Aggregate { section, chart }
+    }
+
+    fn filename(self) -> Result<String> {
+        let indices = match self {
+            Self::Cohort { section, cohort, chart } => {
+                vec![section, cohort, chart]
+            }
+            Self::Aggregate { section, chart } => vec![section, chart],
+        };
+        if indices.iter().any(|index| *index > 999_999) {
+            bail!("SVG structural index exceeds 999999");
+        }
+        let filename = match self {
+            Self::Cohort { section, cohort, chart } => format!(
+                "section-{section:03}-cohort-{cohort:03}-chart-{chart:03}.svg"
+            ),
+            Self::Aggregate { section, chart } => {
+                format!("section-{section:03}-aggregate-chart-{chart:03}.svg")
+            }
+        };
+        if filename.len() > MAX_SVG_FILENAME_BYTES {
+            bail!("SVG filename exceeds {MAX_SVG_FILENAME_BYTES} byte limit");
+        }
+        Ok(filename)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SvgArtifact {
+    filename: String,
+    bytes: Vec<u8>,
+}
+
+/// Renders and validates a deterministic collection for later publication
+/// under `images/`. Charts without any plotted value intentionally produce no
+/// artifact, matching the report's definition of a non-empty chart.
+fn render_chart_svgs(
+    charts: &[(SvgChartIdentity, &ChartView)],
+) -> Result<Vec<SvgArtifact>> {
+    render_chart_svgs_with_limits(charts, SVG_LIMITS)
+}
+
+fn render_chart_svgs_with_limits(
+    charts: &[(SvgChartIdentity, &ChartView)],
+    limits: SvgLimits,
+) -> Result<Vec<SvgArtifact>> {
+    let mut artifacts = Vec::new();
+    let mut names = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for (identity, chart) in charts {
+        if !chart.fallback_rows.iter().any(|row| row.value.is_some()) {
+            continue;
+        }
+        if artifacts.len() == limits.artifacts {
+            bail!("SVG artifact count exceeds {}", limits.artifacts);
+        }
+        let filename = identity.filename()?;
+        if !names.insert(filename.clone()) {
+            bail!("duplicate SVG structural identity for {filename}");
+        }
+        let bytes = if limits == SVG_LIMITS {
+            render_chart_svg(chart)?
+        } else {
+            render_chart_svg_with_limits(chart, limits)?
+        }
+        .into_bytes();
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .context("SVG total byte count overflow")?;
+        if total_bytes > limits.total_bytes {
+            bail!(
+                "SVG artifacts exceed {} total byte limit",
+                limits.total_bytes
+            );
+        }
+        artifacts.push(SvgArtifact { filename, bytes });
+    }
+    artifacts.sort_by(|left, right| left.filename.cmp(&right.filename));
+    Ok(artifacts)
+}
+
+fn report_svg_charts(view: &ReportView) -> Vec<(SvgChartIdentity, &ChartView)> {
+    let mut charts = Vec::new();
+    for (section_index, section) in view.sections.iter().enumerate() {
+        if let Some(aggregate) = &section.descriptive_aggregate {
+            charts.extend(aggregate.charts.iter().enumerate().map(
+                |(chart, view)| {
+                    (SvgChartIdentity::aggregate(section_index, chart), view)
+                },
+            ));
+        }
+        for (cohort_index, cohort) in section.cohorts.iter().enumerate() {
+            charts.extend(cohort.charts.iter().enumerate().map(
+                |(chart, view)| {
+                    (
+                        SvgChartIdentity::cohort(
+                            section_index,
+                            cohort_index,
+                            chart,
+                        ),
+                        view,
+                    )
+                },
+            ));
+        }
+    }
+    charts
+}
+
+fn render_report_svgs(view: &ReportView) -> Result<Vec<SvgArtifact>> {
+    render_chart_svgs(&report_svg_charts(view))
+}
+
+fn svg_text(x: f64, y: f64, class: &str, text: &str) -> String {
+    let (width, height, baseline) = if class == "heading" {
+        (1120.0, 28.0, 22.0)
+    } else if class == "unit" {
+        (1120.0, 18.0, 13.0)
+    } else {
+        (880.0, 18.0, 13.0)
+    };
+    format!(
+        "<svg x=\"{x:.1}\" y=\"{:.1}\" width=\"{width:.1}\" height=\"{height:.1}\" overflow=\"hidden\"><text x=\"0\" y=\"{baseline:.1}\" class=\"{class}\">{}</text></svg>",
+        y - baseline,
+        html_escape(text)
+    )
+}
+
+fn svg_value(value: f64) -> String {
+    let magnitude = value.abs();
+    if magnitude != 0.0 && !(0.0001..1_000_000_000.0).contains(&magnitude) {
+        format!("{value:.6e}")
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+fn valid_xml_text(text: &str) -> bool {
+    text.chars().all(|character| {
+        matches!(character, '\u{9}' | '\u{a}' | '\u{d}')
+            || ('\u{20}'..='\u{d7ff}').contains(&character)
+            || ('\u{e000}'..='\u{fffd}').contains(&character)
+            || ('\u{10000}'..='\u{10ffff}').contains(&character)
+    })
+}
+
+fn check_svg_size(size: usize, limit: usize) -> Result<()> {
+    if size > limit {
+        bail!("SVG exceeds {limit} byte limit");
+    }
+    Ok(())
+}
+
+fn render_chart_svg(chart: &ChartView) -> Result<String> {
+    render_chart_svg_with_limits(chart, SVG_LIMITS)
+}
+
+fn render_chart_svg_with_limits(
+    chart: &ChartView,
+    limits: SvgLimits,
+) -> Result<String> {
+    if chart.fallback_rows.len() > limits.rows {
+        bail!("SVG chart has more than {} visible fallback rows", limits.rows);
+    }
+    for label in std::iter::once(chart.title.as_str())
+        .chain(std::iter::once(chart.unit.as_str()))
+        .chain(
+            chart
+                .fallback_rows
+                .iter()
+                .flat_map(|row| [row.category.as_str(), row.series.as_str()]),
+        )
+    {
+        if label.len() > MAX_SVG_LABEL_BYTES {
+            bail!("SVG label exceeds {MAX_SVG_LABEL_BYTES} byte limit");
+        }
+        if !valid_xml_text(label) {
+            bail!("SVG label contains a character forbidden by XML 1.0");
+        }
+    }
+    if chart.fallback_rows.iter().any(|row| {
+        row.category
+            .len()
+            .checked_add(row.series.len())
+            .is_none_or(|size| size > MAX_SVG_ROW_LABEL_BYTES)
+    }) {
+        bail!(
+            "SVG combined row label exceeds {MAX_SVG_ROW_LABEL_BYTES} byte limit"
+        );
+    }
+    if chart
+        .fallback_rows
+        .iter()
+        .filter_map(|row| row.value)
+        .any(|value| !value.is_finite())
+    {
+        bail!("SVG chart contains a non-finite fallback value");
+    }
+    let mut categories = Vec::<&str>::new();
+    let mut series = Vec::<&str>::new();
+    for row in &chart.fallback_rows {
+        if !categories.contains(&row.category.as_str()) {
+            categories.push(&row.category);
+        }
+        if !series.contains(&row.series.as_str()) {
+            series.push(&row.series);
+        }
+    }
+    if categories.len() > limits.categories {
+        bail!(
+            "SVG chart has more than {} visible categories",
+            limits.categories
+        );
+    }
+
+    let layout = match chart.kind {
+        ViewChartKind::Waterfall => "ladder",
+        ViewChartKind::Allocation => "grouped-bars",
+        ViewChartKind::Capabilities => "status-matrix",
+        _ => "samples-and-mean",
+    };
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{SVG_WIDTH}\" height=\"{SVG_HEIGHT}\" viewBox=\"0 0 {SVG_WIDTH} {SVG_HEIGHT}\" role=\"img\" aria-labelledby=\"title desc\"><title id=\"title\">{}</title><desc id=\"desc\">{} chart. Values are plotted from the report fallback rows; missing values are explicitly unavailable. Unit: {}.</desc><style>text{{font-family:monospace;font-size:12px;fill:#111}}.heading{{font-size:20px;font-weight:bold}}.axis,.zero-line{{stroke:#222;stroke-width:1}}.sample{{fill:#1769aa}}.mean{{fill:none;stroke:#111;stroke-width:3}}.positive{{fill:#397d49}}.negative{{fill:#b23a48}}.required{{fill:#356cb6}}.peak{{fill:#d17a22}}.missing{{fill:#fff;stroke:#555;stroke-dasharray:4 3}}.status{{stroke:#111;stroke-width:2}}</style><rect width=\"100%\" height=\"100%\" fill=\"white\"/><g data-layout=\"{layout}\">",
+        html_escape(&chart.title),
+        html_escape(layout),
+        html_escape(&chart.unit)
+    );
+    svg.push_str(&svg_text(40.0, 35.0, "heading", &chart.title));
+    svg.push_str(&svg_text(
+        40.0,
+        58.0,
+        "unit",
+        &format!("Unit: {}", chart.unit),
+    ));
+    svg.push_str("<path class=\"axis\" d=\"M220 90V750H1160\"/>");
+
+    let values = chart
+        .fallback_rows
+        .iter()
+        .filter_map(|row| row.value)
+        .collect::<Vec<_>>();
+    let minimum = values.iter().copied().fold(0.0_f64, f64::min);
+    let maximum = values.iter().copied().fold(0.0_f64, f64::max);
+    let raw_span = maximum - minimum;
+    if !minimum.is_finite() || !maximum.is_finite() || !raw_span.is_finite() {
+        bail!("SVG chart has a non-finite derived range");
+    }
+    let span = if raw_span == 0.0 { 1.0 } else { raw_span };
+    let value_y = |value: f64| 730.0 - ((value - minimum) / span * 610.0);
+    let count = chart.fallback_rows.len().max(1) as f64;
+    let mut mean_segments = Vec::<Vec<String>>::new();
+    let mut mean_points = Vec::new();
+
+    if chart.kind == ViewChartKind::Waterfall {
+        let zero_x = 690.0 + (0.0 - minimum) / span * 420.0;
+        if !zero_x.is_finite() || !(690.0..=1110.0).contains(&zero_x) {
+            bail!("SVG waterfall zero coordinate is outside the plot");
+        }
+        svg.push_str(&format!(
+            "<path class=\"zero-line\" d=\"M{zero_x:.1} 90V750\"/>"
+        ));
+    }
+
+    let ordered_rows = if chart.kind == ViewChartKind::Allocation {
+        categories
+            .iter()
+            .flat_map(|category| {
+                series.iter().filter_map(move |series_name| {
+                    chart.fallback_rows.iter().find(|row| {
+                        row.category == **category
+                            && row.series == **series_name
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        chart.fallback_rows.iter().collect::<Vec<_>>()
+    };
+
+    for (index, row) in ordered_rows.iter().enumerate() {
+        let category_index = categories
+            .iter()
+            .position(|category| *category == row.category)
+            .expect("projected category exists");
+        let x = if categories.len() <= 1 {
+            685.0
+        } else {
+            235.0
+                + category_index as f64
+                    * (900.0 / (categories.len() - 1) as f64)
+        };
+        let y = 105.0 + index as f64 * (620.0 / count);
+        let value_text =
+            row.value.map(svg_value).unwrap_or_else(|| "unavailable".into());
+        match chart.kind {
+            ViewChartKind::Capabilities => {
+                let (symbol, status, class, shape) = match row.value {
+                    Some(1.0) => (
+                        "●",
+                        "Pass",
+                        "positive status",
+                        format!(
+                            "<circle cx=\"250\" cy=\"{y:.1}\" r=\"7\" class=\"status\"/>"
+                        ),
+                    ),
+                    Some(0.0) => (
+                        "×",
+                        "Fail",
+                        "negative status",
+                        format!(
+                            "<path d=\"M243 {:.1}L257 {:.1}M257 {:.1}L243 {:.1}\" class=\"status\"/>",
+                            y - 7.0,
+                            y + 7.0,
+                            y - 7.0,
+                            y + 7.0
+                        ),
+                    ),
+                    Some(_) => (
+                        "◇",
+                        "Unavailable",
+                        "missing status",
+                        format!(
+                            "<path d=\"M250 {:.1}L257 {y:.1}L250 {:.1}L243 {y:.1}Z\" class=\"status\"/>",
+                            y - 8.0,
+                            y + 8.0
+                        ),
+                    ),
+                    None => (
+                        "?",
+                        "unavailable",
+                        "missing status",
+                        format!(
+                            "<rect x=\"243\" y=\"{:.1}\" width=\"14\" height=\"14\" class=\"status missing\"/>",
+                            y - 7.0
+                        ),
+                    ),
+                };
+                svg.push_str(&format!(
+                    "<rect x=\"225\" y=\"{:.1}\" width=\"900\" height=\"{:.1}\" class=\"{}\"/>",
+                    y - 15.0,
+                    (600.0 / count).max(2.0),
+                    class
+                ));
+                svg.push_str(&shape);
+                svg.push_str(&svg_text(
+                    240.0,
+                    y,
+                    "status-label",
+                    &format!(
+                        "{symbol} {status} — {} — {}: {value_text}",
+                        row.category, row.series
+                    ),
+                ));
+            }
+            ViewChartKind::Waterfall => {
+                if let Some(value) = row.value {
+                    let zero_x = 690.0 + (0.0 - minimum) / span * 420.0;
+                    let value_x = 690.0 + (value - minimum) / span * 420.0;
+                    let left = zero_x.min(value_x);
+                    let width = (value_x - zero_x).abs().max(1.0);
+                    let class =
+                        if value >= 0.0 { "positive" } else { "negative" };
+                    svg.push_str(&format!("<rect x=\"{left:.1}\" y=\"{:.1}\" width=\"{width:.1}\" height=\"14\" class=\"{class}\"/>", y - 12.0));
+                } else {
+                    svg.push_str(&format!("<rect x=\"690\" y=\"{:.1}\" width=\"420\" height=\"14\" class=\"missing\"/>", y - 12.0));
+                }
+                svg.push_str(&svg_text(
+                    240.0,
+                    y,
+                    "value",
+                    &format!(
+                        "{} — {}: {value_text} {}",
+                        row.category, row.series, chart.unit
+                    ),
+                ));
+            }
+            ViewChartKind::Allocation => {
+                let class =
+                    if row.series.to_ascii_lowercase().contains("required") {
+                        "required"
+                    } else {
+                        "peak"
+                    };
+                let width = row.value.map_or(0.0, |value| {
+                    if maximum > 0.0 {
+                        value.max(0.0) / maximum * 420.0
+                    } else {
+                        0.0
+                    }
+                });
+                if row.value.is_some() {
+                    svg.push_str(&format!("<rect x=\"690\" y=\"{:.1}\" width=\"{width:.1}\" height=\"14\" class=\"{class}\"/>", y - 12.0));
+                } else {
+                    svg.push_str(&format!("<rect x=\"690\" y=\"{:.1}\" width=\"14\" height=\"14\" class=\"missing\"/>", y - 12.0));
+                }
+                svg.push_str(&svg_text(
+                    240.0,
+                    y,
+                    "value",
+                    &format!(
+                        "{} — {}: {value_text} {}",
+                        row.category, row.series, chart.unit
+                    ),
+                ));
+            }
+            _ => {
+                if let Some(value) = row.value {
+                    let cy = value_y(value);
+                    if !cy.is_finite() || !(120.0..=730.0).contains(&cy) {
+                        bail!("SVG sample coordinate is outside the plot");
+                    }
+                    if row.series == "Mean" {
+                        mean_points.push(format!("{x:.1},{cy:.1}"));
+                    }
+                    svg.push_str(&format!(
+                        "<circle data-category-x=\"{x:.1}\" cx=\"{x:.1}\" cy=\"{cy:.1}\" r=\"{}\" class=\"{}\"/>",
+                        if row.series == "Mean" { 6 } else { 4 },
+                        if row.series == "Mean" {
+                            "mean"
+                        } else {
+                            "sample"
+                        }
+                    ));
+                } else {
+                    if row.series == "Mean" && !mean_points.is_empty() {
+                        mean_segments.push(std::mem::take(&mut mean_points));
+                    }
+                    svg.push_str(&format!("<rect x=\"{:.1}\" y=\"710\" width=\"12\" height=\"12\" class=\"missing\"/>", x - 6.0));
+                }
+                svg.push_str(&svg_text(
+                    240.0,
+                    y,
+                    "value",
+                    &format!(
+                        "{} — {}: {value_text} {}",
+                        row.category, row.series, chart.unit
+                    ),
+                ));
+            }
+        }
+    }
+    if !mean_points.is_empty() {
+        mean_segments.push(mean_points);
+    }
+    for mean_points in mean_segments {
+        svg.push_str(&format!(
+            "<polyline class=\"mean\" points=\"{}\"/>",
+            mean_points.join(" ")
+        ));
+    }
+    svg.push_str("</g></svg>");
+    check_svg_size(svg.len(), limits.individual_bytes)?;
+    Ok(svg)
 }
 
 fn script_json(value: &Value) -> Result<String> {
@@ -4851,32 +6405,6 @@ fn stable_html_json<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value)
         .map(|json| html_escape(&json))
         .context("serialize HTML evidence")
-}
-
-fn stats_label(value: Option<Stats>) -> String {
-    value
-        .map(|s| {
-            format!(
-                "n={}; mean={:.6}; median={:.6}; stddev={:.6}; CV={}",
-                s.n,
-                s.mean,
-                s.median,
-                s.stddev,
-                s.cv.map(|v| format!("{v:.6}"))
-                    .unwrap_or_else(|| "unavailable".into())
-            )
-        })
-        .unwrap_or_else(|| "unavailable".into())
-}
-
-fn u64_stats_label(values: &[u64], scale: f64) -> String {
-    let values =
-        values.iter().map(|value| *value as f64 / scale).collect::<Vec<_>>();
-    stats_label((!values.is_empty()).then(|| stats(&values)))
-}
-
-fn f64_stats_label(values: &[f64]) -> String {
-    stats_label((!values.is_empty()).then(|| stats(values)))
 }
 
 fn populate_storage_findings(cohort: &mut CohortView) {
@@ -4916,7 +6444,8 @@ fn populate_storage_findings(cohort: &mut CohortView) {
                     coverage.workload_blocked += 1
                 }
                 Some(
-                    WorkloadDisposition::Pending
+                    WorkloadDisposition::Legacy
+                    | WorkloadDisposition::Pending
                     | WorkloadDisposition::NotRequested,
                 )
                 | None => {
@@ -4994,7 +6523,7 @@ fn populate_storage_findings(cohort: &mut CohortView) {
             winner.launch_seconds.len()
         };
         BestSupportedRecommendationView {
-            candidate: winner.label.clone(),
+            candidate: renderer_storage_label(&winner.label),
             basis: if workload_requested {
                 format!(
                     "lowest observed mean workload writes ({first:.6} decimal GB) and workload duration ({second:.1} seconds), based on {sample_count} retained workload samples"
@@ -5014,7 +6543,7 @@ fn populate_storage_findings(cohort: &mut CohortView) {
                         summary.writes.is_none() || summary.launch_seconds.is_empty()
                     }
                 })
-                .map(|summary| summary.label.clone())
+                .map(|summary| renderer_storage_label(&summary.label))
                 .collect(),
         }
     });
@@ -5022,7 +6551,7 @@ fn populate_storage_findings(cohort: &mut CohortView) {
 
 fn chart_fallback_html(chart: &ChartView) -> Result<String> {
     let mut html = format!(
-        "<table data-chart-fallback=\"{}\"><caption>Chart data fallback — {} ({})</caption><thead><tr><th>Category</th><th>Series</th><th>Value</th></tr></thead><tbody>",
+        "<table data-chart-fallback=\"{}\"><caption>{} ({})</caption><thead><tr><th>Category</th><th>Series</th><th>Value</th></tr></thead><tbody>",
         html_escape(&format!("{:?}", chart.kind)),
         html_escape(&chart.title),
         html_escape(&chart.unit)
@@ -5041,14 +6570,93 @@ fn chart_fallback_html(chart: &ChartView) -> Result<String> {
     Ok(html)
 }
 
-fn render_report_html(report: &ReportView) -> Result<String> {
+fn condition_value_html(row: Option<&ConditionRow>) -> String {
+    let Some(row) = row else {
+        return "<span class=\"state missing\">absent</span>".into();
+    };
+    let value = html_escape(&row.value);
+    if row.code { format!("<code>{value}</code>") } else { value }
+}
+
+fn practical_stats(stats: Option<Stats>) -> String {
+    stats.map_or_else(
+        || "<span class=\"state unavailable\">unavailable</span>".into(),
+        |stats| {
+            format!(
+                "{:.3} ± {:.3} <small>(n={})</small>",
+                stats.mean, stats.stddev, stats.n
+            )
+        },
+    )
+}
+
+fn practical_values(values: impl IntoIterator<Item = f64>) -> String {
+    let values = values.into_iter().collect::<Vec<_>>();
+    practical_stats((!values.is_empty()).then(|| stats(&values)))
+}
+
+fn complete_stats(stats: Option<Stats>, unit: &str) -> String {
+    stats.map_or_else(
+        || "unavailable".into(),
+        |stats| {
+            format!(
+                "{} / {:.6} / {:.6} / {:.6} / {} ({unit})",
+                stats.n,
+                stats.mean,
+                stats.median,
+                stats.stddev,
+                stats
+                    .cv
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_else(|| "unavailable".into())
+            )
+        },
+    )
+}
+
+fn complete_values(values: &[u64], unit: &str) -> String {
+    complete_stats(
+        (!values.is_empty()).then(|| {
+            stats(&values.iter().map(|value| *value as f64).collect::<Vec<_>>())
+        }),
+        unit,
+    )
+}
+
+fn stage_diagnostics_html(row: &SampleRow) -> String {
+    [
+        ("Boundary failure", row.boundary_failure.as_deref()),
+        ("Launch failure", row.launch_failure.as_deref()),
+        (
+            "Prior launch attempt failures",
+            row.prior_launch_attempt_failures.as_deref(),
+        ),
+        ("Preparation failure", row.preparation_failure.as_deref()),
+        ("Workload failure", row.workload_failure.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(label, error)| {
+        error.map(|error| {
+            format!(
+                "<div><strong>{label}:</strong> {}</div>",
+                html_escape(error)
+            )
+        })
+    })
+    .collect()
+}
+
+fn render_ergonomic_report_html(report: &ReportView) -> Result<String> {
     const ECHARTS: &str = include_str!("../../assets/echarts-5.5.1.min.js");
+    let mut options = Vec::new();
     let mut body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>body{{font:16px system-ui;max-width:1200px;margin:auto;padding:2rem;color:#172033}}.warning{{border-left:4px solid #b45309;padding:.6rem;background:#fff7ed}}table{{border-collapse:collapse;width:100%;margin:1rem 0}}th,td{{border:1px solid #94a3b8;padding:.4rem;text-align:left}}.chart{{height:420px}}code{{overflow-wrap:anywhere}}</style></head><body><h1>{}</h1><p>{}</p>",
-        html_escape(&report.title),
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{0}</title><style>
+:root{{--ink:#172033;--muted:#526075;--line:#cbd5e1;--paper:#fff;--accent:#075985}}*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{font:15px/1.45 system-ui;max-width:1280px;margin:auto;padding:1.5rem;color:var(--ink);background:var(--paper)}}nav{{position:sticky;top:0;z-index:2;background:#fffffff2;border-bottom:1px solid var(--line);padding:.65rem 0;display:flex;gap:1rem;overflow:auto}}nav a{{color:var(--accent);white-space:nowrap}}nav a:focus-visible,summary:focus-visible{{outline:3px solid #38bdf8;outline-offset:2px}}section,article{{scroll-margin-top:4rem}}article{{border-top:2px solid var(--line);margin-top:2rem;padding-top:1rem}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));gap:.8rem;margin:1rem 0}}.card{{border:1px solid var(--line);border-radius:.4rem;padding:.8rem;background:#f8fafc}}.warning,.failed{{border-left:4px solid #b45309;padding:.6rem;background:#fff7ed}}.pending{{color:#854d0e}}.blocked{{color:#9a3412}}.unavailable,.missing{{color:var(--muted);font-style:italic}}table{{border-collapse:collapse;width:100%;margin:.7rem 0}}th,td{{border:1px solid var(--line);padding:.38rem;text-align:left;vertical-align:top}}thead th{{position:sticky;top:3rem;background:#e2e8f0;z-index:1}}.table-scroll{{overflow:auto}}.chart{{height:360px;min-width:280px}}code{{overflow-wrap:anywhere}}details{{margin:.7rem 0}}summary{{cursor:pointer;font-weight:600}}.ladder tbody th::before{{content:'↳ ';color:var(--accent)}}small{{color:var(--muted)}}@media(max-width:650px){{body{{padding:.7rem}}.chart{{height:300px}}th,td{{font-size:.85rem}}}}@media print{{nav{{display:none}}body{{max-width:none;padding:0}}.chart{{break-inside:avoid}}details{{break-inside:avoid}}thead th{{position:static}}}}
+</style></head><body><header id="top"><h1>{0}</h1><p>{1}</p></header><nav aria-label="Report sections"><a href="#findings">Findings</a><a href="#experiments">Experiments</a><a href="#appendix">Provenance appendix</a></nav>"##,
         html_escape(&report.title),
         html_escape(&report.executive_conclusion)
     );
+
     for input in &report.inputs {
         let warning = match input.evidence_state.as_deref() {
             Some("interrupted-current-snapshot") => Some(
@@ -5064,8 +6672,8 @@ fn render_report_html(report: &ReportView) -> Result<String> {
         };
         if let Some(warning) = warning {
             body.push_str(&format!(
-                "<p class=\"warning\"><strong>{}</strong> Input: {}{}</p>",
-                html_escape(warning),
+                "<p class=\"warning\"><strong>{}</strong> Input: <code>{}</code>{}</p>",
+                warning,
                 html_escape(&input.source),
                 input
                     .abort_error
@@ -5078,26 +6686,21 @@ fn render_report_html(report: &ReportView) -> Result<String> {
             ));
         }
     }
-    body.push_str("<h2>Input provenance</h2><table><thead><tr><th>Source</th><th>SHA-256</th><th>Run status / evidence state</th></tr></thead><tbody>");
-    for input in &report.inputs {
-        body.push_str(&format!(
-            "<tr><td>{}</td><td><code>{}</code></td><td>{} / {}</td></tr>",
-            html_escape(&input.source),
-            html_escape(input.sha256.as_deref().unwrap_or("not supplied")),
-            stable_html_json(&input.run_status)?,
-            html_escape(
-                input
-                    .evidence_state
-                    .as_deref()
-                    .unwrap_or("legacy / not supplied")
-            )
-        ));
-    }
-    body.push_str("</tbody></table>");
-    let mut options = Vec::new();
+
+    body.push_str("<main id=\"findings\"><div id=\"experiments\">");
     for section in &report.sections {
+        let section_id =
+            format!("section-{}", experiment_kind_id(section.kind));
+        let factored = factor_condition_rows(
+            &section
+                .cohorts
+                .iter()
+                .map(|cohort| cohort.conditions.clone())
+                .collect::<Vec<_>>(),
+        );
         body.push_str(&format!(
-            "<section><h2>{}</h2><p>{}</p>",
+            "<section id=\"{}\"><h2>{}</h2><p>{}</p>",
+            section_id,
             html_escape(&section.title),
             html_escape(&section.conclusion)
         ));
@@ -5107,203 +6710,407 @@ fn render_report_html(report: &ReportView) -> Result<String> {
                 html_escape(warning)
             ));
         }
+        if !factored.shared.is_empty() {
+            body.push_str(
+                "<details><summary>Settings shared by all cohorts</summary><table><tbody>",
+            );
+            for row in &factored.shared {
+                body.push_str(&format!(
+                    "<tr><th>{}</th><td>{}</td></tr>",
+                    html_escape(&row.label),
+                    condition_value_html(Some(row))
+                ));
+            }
+            body.push_str("</tbody></table></details>");
+        }
         if let Some(aggregate) = &section.descriptive_aggregate {
             body.push_str(&format!(
-                "<aside><h3>{}</h3><p class=\"warning\">{}</p><p>Inputs: {}</p>",
-                html_escape(&aggregate.label),
-                html_escape(&aggregate.disclaimer),
+                "<aside><h3>{}</h3><p class=\"warning\">{}</p><p><strong>Contributing inputs:</strong> {}</p><details><summary>Concise aggregate summary</summary><table><thead><tr><th>Candidate</th><th>Launch writes (decimal GB)</th><th>Launch duration (seconds)</th><th>Peak RAM (decimal GB)</th><th>Retained samples</th></tr></thead><tbody>",
+                html_escape(&aggregate.label), html_escape(&aggregate.disclaimer),
                 html_escape(&aggregate.inputs.join(", "))
             ));
-            for chart in &aggregate.charts {
-                let id = format!("chart-{}", options.len());
-                body.push_str(&format!("<h4>{}</h4><div id=\"{}\" class=\"chart\" role=\"img\" aria-label=\"{}\"></div>", html_escape(&chart.title), id, html_escape(&chart.title)));
-                body.push_str(&chart_fallback_html(chart)?);
-                options.push((id, script_json(&chart.option)?));
+            for summary in &aggregate.storage_summary {
+                body.push_str(&format!(
+                    "<tr><th>{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    html_escape(&renderer_storage_label(&summary.label)),
+                    practical_stats(summary.writes),
+                    practical_values(summary.launch_seconds.iter().map(|v| *v as f64)),
+                    practical_values(summary.peak_ram_decimal_gb.iter().copied()),
+                    summary.rows.len()
+                ));
             }
-            body.push_str("<h4>Legacy absolute-host-peak evidence (descriptive only)</h4><table><thead><tr><th>Combination</th><th>Writes summary</th><th>Launch samples</th><th>Legacy absolute host peak RAM (decimal GB)</th><th>Workload writes / duration</th><th>Samples / failures</th></tr></thead><tbody>");
-            for row in &aggregate.storage_summary {
-                let attribution = row
+            body.push_str("</tbody></table></details>");
+            body.push_str("<details><summary>Complete aggregate evidence</summary><table><thead><tr><th>Candidate</th><th>Launch writes n / mean / median / stddev / CV (decimal GB)</th><th>Launch samples (seconds)</th><th>Peak RAM samples (decimal GB)</th><th>Workload bytes</th><th>Workload duration (seconds)</th><th>Source / run / repeat / outcome</th></tr></thead><tbody>");
+            for summary in &aggregate.storage_summary {
+                let attribution = summary
                     .rows
                     .iter()
-                    .map(|sample| {
+                    .map(|row| {
                         format!(
-                            "{} / {} / {}: {}",
-                            sample.source,
-                            sample.run_id,
-                            sample.repeat_ordinal,
-                            match &sample.outcome {
-                                RepeatOutcome::Success => "success".into(),
-                                RepeatOutcome::Failure(error) =>
-                                    format!("failure: {error}"),
-                            }
+                            "{} / {} / {} / {}",
+                            html_escape(&row.source),
+                            html_escape(&row.run_id),
+                            row.repeat_ordinal,
+                            stable_html_json(&row.outcome)
+                                .unwrap_or_else(|_| "unavailable".into())
                         )
                     })
                     .collect::<Vec<_>>()
-                    .join("; ");
-                body.push_str(&format!("<tr><th scope=\"row\">{}</th><td>{}</td><td>{:?}</td><td>{:?}</td><td>{:?} / {:?}</td><td>{}</td></tr>", html_escape(&row.label), stats_label(row.writes), row.launch_seconds, row.peak_ram_decimal_gb, row.workload_bytes, row.workload_seconds, html_escape(&attribution)));
-            }
-            body.push_str("</tbody></table></aside>");
-        }
-        for cohort in &section.cohorts {
-            body.push_str(&format!(
-                "<article><h3>{}</h3><h4>Conditions</h4><table><thead><tr><th>Condition</th><th>Value</th></tr></thead><tbody>",
-                html_escape(&cohort.label),
-            ));
-            for condition in &cohort.conditions {
-                let value = html_escape(&condition.value);
+                    .join("<br>");
                 body.push_str(&format!(
-                    "<tr><th scope=\"row\">{}</th><td>{}</td></tr>",
-                    html_escape(&condition.label),
-                    if condition.code {
-                        format!("<code>{value}</code>")
-                    } else {
-                        value
-                    }
+                    "<tr><th>{}</th><td>{}</td><td>{:?}</td><td>{:?}</td><td>{:?}</td><td>{:?}</td><td>{}</td></tr>",
+                    html_escape(&renderer_storage_label(&summary.label)),
+                    complete_stats(summary.writes, "decimal GB"),
+                    summary.launch_seconds,
+                    summary.peak_ram_decimal_gb,
+                    summary.workload_bytes,
+                    summary.workload_seconds,
+                    attribution
                 ));
             }
-            body.push_str("</tbody></table>");
+            body.push_str("</tbody></table></details>");
+            for chart in aggregate.charts.iter().filter(|chart| {
+                chart.fallback_rows.iter().any(|row| row.value.is_some())
+            }) {
+                let id = format!("chart-{}", options.len());
+                body.push_str(&format!("<section><h4>{}</h4><div id=\"{}\" class=\"chart\" role=\"img\" aria-label=\"{}\"></div><details><summary>Tabulated results</summary>{}</details></section>", html_escape(&chart.title), id, html_escape(&chart.title), chart_fallback_html(chart)?));
+                options.push((id, script_json(&chart.option)?));
+            }
+            body.push_str("</aside>");
+        }
+        for (cohort_index, cohort) in section.cohorts.iter().enumerate() {
+            let cohort_id = cohort_anchor(&cohort.key);
+            let empty = cohort_has_no_measurements(cohort);
+            body.push_str(&format!("<article id=\"{}\"><h3>{}</h3><div class=\"cards\"><div class=\"card\"><h4>Verdict</h4><p>{}</p>", cohort_id, html_escape(&cohort.label), html_escape(&cohort.conclusion)));
+            if let Some(best) = &cohort.best_supported {
+                body.push_str(&format!(
+                    "<h5>Best-supported recommendation</h5><p><strong>{}</strong>: {}</p>",
+                    html_escape(&best.candidate),
+                    html_escape(&best.basis)
+                ));
+                if !best.missing_candidates.is_empty() {
+                    body.push_str(&format!(
+                        "<p class=\"warning\">Missing comparable measurements: {}</p>",
+                        html_escape(&best.missing_candidates.join(", "))
+                    ));
+                }
+            } else {
+                body.push_str("<h5>Best-supported recommendation</h5><p>No unique best-supported configuration can be identified from the available aggregate evidence.</p>");
+            }
+            body.push_str(
+                "</div><div class=\"card\"><h4>Evidence coverage</h4>",
+            );
+            body.push_str(&format!(
+                "<p>{} of {} planned launch samples retained.</p>",
+                cohort.coverage.launch_samples, cohort.coverage.planned_slots
+            ));
+            if cohort.coverage.workload_requested {
+                body.push_str(&format!("<p><span class=\"success\">{} succeeded</span>; <span class=\"failed\">{} failed</span>; <span class=\"blocked\">{} blocked</span>; <span class=\"pending\">{} pending or unresolved</span>.</p>", cohort.coverage.workload_succeeded, cohort.coverage.workload_failed, cohort.coverage.workload_blocked, cohort.coverage.unresolved));
+            } else {
+                body.push_str("<p>No API workload was requested.</p>");
+            }
+            body.push_str("</div></div>");
             if let Some(warning) = &cohort.warning {
                 body.push_str(&format!(
                     "<p class=\"warning\">{}</p>",
                     html_escape(warning)
                 ));
             }
-            if let Some(recommendation) = &cohort.best_supported {
-                body.push_str(&format!(
-                    "<h4>Best-supported recommendation</h4><p class=\"warning\"><strong>{}</strong> is the best-supported configuration from the available aggregate evidence: {}.</p>",
-                    html_escape(&recommendation.candidate),
-                    html_escape(&recommendation.basis),
-                ));
-                if !recommendation.missing_candidates.is_empty() {
+
+            if empty {
+                body.push_str("<p class=\"unavailable\"><strong>No repeat measurements are available for this cohort.</strong> Content-free repeat charts and the placeholder sample table are omitted.</p>");
+                for input in &report.inputs {
+                    let associated = cohort
+                        .candidates
+                        .iter()
+                        .flat_map(|candidate| &candidate.rows)
+                        .any(|row| row.source == input.source)
+                        || cohort
+                            .matrix_capabilities
+                            .iter()
+                            .any(|ledger| ledger.source == input.source);
+                    if associated {
+                        if let Some(reason) = &input.abort_error {
+                            body.push_str(&format!("<p class=\"warning\"><strong>Associated abort reason:</strong> {}</p>", html_escape(reason)));
+                        }
+                    }
+                }
+                body.push_str(
+                    "<details><summary>Formal retained evidence</summary>",
+                );
+            }
+
+            if let Some(settings) = candidate_setting_projection(cohort) {
+                body.push_str(if verified_storage_ladder(cohort) { "<h4>Verified storage lever ladder</h4><div class=\"table-scroll\"><table class=\"ladder\">" } else { "<h4>Candidate setting matrix</h4><div class=\"table-scroll\"><table>" });
+                body.push_str("<thead><tr><th>Candidate</th>");
+                for row in &settings.varying {
                     body.push_str(&format!(
-                        "<p>This conclusion is limited by missing comparable measurements for: {}. Those unmeasured configurations could alter the conclusion.</p>",
-                        html_escape(&recommendation.missing_candidates.join(", "))
+                        "<th>{}</th>",
+                        html_escape(&row.label)
                     ));
                 }
-            } else {
-                body.push_str("<h4>Best-supported recommendation</h4><p>No unique best-supported configuration can be identified from the available aggregate evidence.</p>");
-            }
-            body.push_str(&format!(
-                "<h4>Evidence coverage</h4><p>{} of {} planned launch samples retained.</p>",
-                cohort.coverage.launch_samples, cohort.coverage.planned_slots
-            ));
-            if cohort.coverage.workload_requested {
-                body.push_str(&format!(
-                    "<p>Of {} planned workload slots: {} succeeded; {} failed during workload execution; {} were blocked before workload execution; {} remain unresolved.</p>",
-                    cohort.coverage.planned_slots,
-                    cohort.coverage.workload_succeeded,
-                    cohort.coverage.workload_failed,
-                    cohort.coverage.workload_blocked,
-                    cohort.coverage.unresolved
-                ));
-            } else {
-                body.push_str("<p>No API workload was requested.</p>");
-            }
-            if !cohort.storage_summary.is_empty() {
-                let launch_ram_heading = if cohort
-                    .storage_summary
-                    .iter()
-                    .flat_map(|summary| &summary.rows)
-                    .any(|row| {
-                        row.metrics.peak_ram_semantics
-                            == Some(MemorySemantics::LaunchBaselineDelta)
-                    }) {
-                    "Launch RAM baseline-adjusted delta (decimal GB)"
-                } else {
-                    "Legacy absolute host peak RAM (decimal GB; descriptive only)"
-                };
-                body.push_str(&format!("<h4>Cohort storage metric summaries</h4><table><thead><tr><th>Candidate</th><th>Bring-up writes (decimal GB)</th><th>Launch duration (seconds)</th><th>{}</th><th>API workload RAM baseline-adjusted delta (decimal GB)</th><th>API workload writes (decimal GB)</th><th>API workload duration (seconds)</th><th>Failures</th></tr></thead><tbody>", html_escape(launch_ram_heading)));
-                for row in &cohort.storage_summary {
-                    body.push_str(&format!("<tr><th scope=\"row\">{}</th><td>Launch writes statistics: {}</td><td>Launch statistics: {}</td><td>Launch RAM statistics: {}</td><td>Workload RAM statistics: {}</td><td>Workload writes statistics: {}</td><td>Workload duration statistics: {}</td><td>{}</td></tr>", html_escape(&row.label), stats_label(row.writes), u64_stats_label(&row.launch_seconds, 1.0), f64_stats_label(&row.peak_ram_decimal_gb), f64_stats_label(&row.workload_ram_delta_decimal_gb), u64_stats_label(&row.workload_bytes, 1e9), u64_stats_label(&row.workload_seconds, 1.0), html_escape(&row.failed_repeats.join("; "))));
+                body.push_str("</tr></thead><tbody>");
+                for (index, candidate) in settings.candidates.iter().enumerate()
+                {
+                    body.push_str(&format!(
+                        "<tr><th>{}</th>",
+                        html_escape(candidate)
+                    ));
+                    for row in &settings.varying {
+                        body.push_str(&format!(
+                            "<td>{}</td>",
+                            condition_value_html(row.values[index].as_ref())
+                        ));
+                    }
+                    body.push_str("</tr>");
                 }
-                body.push_str("</tbody></table>");
+                body.push_str("</tbody></table></div>");
+                if !settings.shared.is_empty() {
+                    body.push_str("<details><summary>Settings shared by all candidates</summary><table><tbody>");
+                    for row in &settings.shared {
+                        body.push_str(&format!(
+                            "<tr><th>{}</th><td>{}</td></tr>",
+                            html_escape(&row.label),
+                            condition_value_html(Some(row))
+                        ));
+                    }
+                    body.push_str("</tbody></table></details>");
+                }
             }
-            if !cohort.charts.is_empty() {
-                body.push_str("<h4>Charts and chart data</h4><p>Charts are interactive in a JavaScript-capable browser. The plain HTML chart data fallback remains visible in macOS Preview and other non-JavaScript viewers.</p><noscript><p class=\"warning\">Interactive charts require JavaScript; use the chart data fallback tables below.</p></noscript>");
+
+            let visible_charts = cohort
+                .charts
+                .iter()
+                .filter(|chart| {
+                    chart.fallback_rows.iter().any(|row| row.value.is_some())
+                })
+                .collect::<Vec<_>>();
+            if !visible_charts.is_empty() {
+                body.push_str("<h4>Charts</h4><noscript><p class=\"warning\">Interactive charts require JavaScript; use Tabulated results.</p></noscript>");
             }
-            for chart in &cohort.charts {
+            for chart in visible_charts {
                 let id = format!("chart-{}", options.len());
-                body.push_str(&format!("<h5>{}</h5><div id=\"{}\" class=\"chart\" role=\"img\" aria-label=\"{}\"></div>", html_escape(&chart.title), id, html_escape(&chart.title)));
-                body.push_str(&chart_fallback_html(chart)?);
+                body.push_str(&format!("<section><h5>{}</h5><div id=\"{}\" class=\"chart\" role=\"img\" aria-label=\"{}\"></div><details><summary>Tabulated results</summary>{}</details></section>", html_escape(&chart.title), id, html_escape(&chart.title), chart_fallback_html(chart)?));
                 options.push((id, script_json(&chart.option)?));
             }
-            body.push_str(&format!(
-                "<h4>Strict matrix recommendation</h4><p>{}</p><h5>Formal recommendation eligibility</h5>",
-                html_escape(&cohort.conclusion)
-            ));
-            body.push_str("<table><thead><tr><th>Candidate / key / dimensions</th><th>Capacity; required / peak</th><th>Eligible / feasible / recommended</th><th>Reliability</th><th>Metric summaries</th><th>Decision / ineligibility</th></tr></thead><tbody>");
+
+            body.push_str("<h4>Formal recommendation eligibility</h4><div class=\"table-scroll\"><table><thead><tr><th>Candidate</th><th>Eligible</th><th>Feasible</th><th>Recommended</th><th>Successful repeats</th><th>Launch duration (seconds)</th><th>Peak RAM (bytes)</th><th>Launch writes (bytes)</th><th>Decision and exact ineligibility</th></tr></thead><tbody>");
             for candidate in &cohort.candidates {
-                body.push_str(&format!("<tr><th scope=\"row\">{}<br><code>{}</code><br><code>{}</code></th><td>{:?}; {:?} / {:?}</td><td>{} / {:?} / {}</td><td>{:.6}; success {}/{}; expected {}</td><td>launch: {}; RAM: {}; writes: {}; idle: {}</td><td>{}; {}</td></tr>", html_escape(&candidate.label), stable_html_json(&candidate.key)?, stable_html_json(&candidate.dimensions)?, candidate.host_storage_capacity_bytes, candidate.required_allocation_bytes, candidate.peak_allocation_bytes, candidate.eligible, candidate.feasible, candidate.recommended, candidate.success_rate, candidate.successful_repeats, candidate.completed_repeats, candidate.expected_repeats, stats_label(candidate.launch_duration), stats_label(candidate.peak_ram), stats_label(candidate.launch_writes), stats_label(candidate.idle_writes), html_escape(&candidate.decision), html_escape(&candidate.ineligibility.join(", "))));
+                body.push_str(&format!("<tr><th>{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}/{} ({:.1}%)</td><td>{}</td><td>{}</td><td>{}</td><td>{}{}</td></tr>", html_escape(&renderer_candidate_label(candidate)), candidate.eligible, candidate.feasible.map_or("—".into(), |v| v.to_string()), candidate.recommended, candidate.successful_repeats, candidate.expected_repeats, candidate.success_rate * 100.0, practical_stats(candidate.launch_duration), practical_stats(candidate.peak_ram), practical_stats(candidate.launch_writes), html_escape(&candidate.decision), if candidate.renderer_ineligibility.is_empty() { String::new() } else { format!("<ul>{}</ul>", candidate.renderer_ineligibility.iter().map(|reason| format!("<li>{}</li>", html_escape(reason))).collect::<String>()) }));
             }
-            body.push_str("</tbody></table>");
-            body.push_str("<h4>All sample rows and attribution</h4><table><thead><tr><th>Candidate key</th><th>Source / run / repeat</th><th>Outcome</th><th>Stage failures</th><th>Metrics</th></tr></thead><tbody>");
+            body.push_str("</tbody></table></div>");
+
+            body.push_str("<details><summary>Complete evidence</summary><table><thead><tr><th>Candidate</th><th>Host capacity (bytes)</th><th>Required allocation (bytes)</th><th>Peak allocation (bytes)</th><th>Completed repeats</th><th>Launch duration (seconds) n / mean / median / stddev / CV</th><th>Peak RAM (bytes) n / mean / median / stddev / CV</th><th>Launch writes (bytes) n / mean / median / stddev / CV</th><th>Idle writes (bytes) n / mean / median / stddev / CV</th><th>Workload writes (bytes) n / mean / median / stddev / CV</th><th>Workload duration (seconds) n / mean / median / stddev / CV</th><th>Workload peak RAM delta (bytes) n / mean / median / stddev / CV</th><th>Workload peak RAM semantics</th></tr></thead><tbody>");
             for candidate in &cohort.candidates {
-                for row in &candidate.rows {
-                    let stage = [
-                        ("Boundary failure", &row.boundary_failure),
-                        ("Launch failure", &row.launch_failure),
-                        ("Preparation failure", &row.preparation_failure),
-                        (
-                            "Prior launch attempt failures (warning)",
-                            &row.prior_launch_attempt_failures,
-                        ),
-                        ("Workload failure", &row.workload_failure),
-                    ]
-                    .into_iter()
-                    .filter_map(|(label, error)| {
-                        error.as_ref().map(|error| format!("{label}: {error}"))
+                let workload_bytes = candidate
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.workload_bytes)
+                    .collect::<Vec<_>>();
+                let workload_seconds = candidate
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.workload_duration_secs)
+                    .collect::<Vec<_>>();
+                let workload_peak_delta = candidate
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.workload_peak_delta_bytes)
+                    .collect::<Vec<_>>();
+                let workload_semantics = candidate
+                    .rows
+                    .iter()
+                    .filter_map(|row| {
+                        row.workload_peak_ram_semantics
+                            .map(|semantics| format!("{semantics:?}"))
                     })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
                     .collect::<Vec<_>>()
-                    .join("; ");
-                    body.push_str(&format!("<tr><td><code>{}</code></td><td>{} / {} / {}</td><td>{}</td><td>{}</td><td>launch duration seconds={:?}; launch RAM bytes={:?} ({:?}); launch writes bytes={:?}; idle writes bytes={:?}; API workload writes bytes={:?}; API workload duration seconds={:?}; API workload RAM baseline-adjusted delta bytes={:?} ({:?})</td></tr>", html_escape(&candidate.stable_id), html_escape(&row.source), html_escape(&row.run_id), row.repeat_ordinal, match &row.outcome { RepeatOutcome::Success => "success".into(), RepeatOutcome::Failure(error) => format!("failure: {}", html_escape(error)) }, html_escape(if stage.is_empty() { "none" } else { &stage }), row.metrics.launch_duration_secs, row.metrics.peak_ram_bytes, row.metrics.peak_ram_semantics, row.metrics.writes_bytes, row.metrics.idle_writes_bytes, row.workload_bytes, row.workload_duration_secs, row.workload_peak_delta_bytes, row.workload_peak_ram_semantics));
-                }
+                    .join(", ");
+                body.push_str(&format!("<tr><th>{}</th><td>{}</td><td>{}</td><td>{}</td><td>{} of {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>", html_escape(&renderer_candidate_label(candidate)), candidate.host_storage_capacity_bytes.map_or("unavailable".into(), |value| value.to_string()), candidate.required_allocation_bytes.map_or("unavailable".into(), |value| value.to_string()), candidate.peak_allocation_bytes.map_or("unavailable".into(), |value| value.to_string()), candidate.completed_repeats, candidate.expected_repeats, complete_stats(candidate.launch_duration, "seconds"), complete_stats(candidate.peak_ram, "bytes"), complete_stats(candidate.launch_writes, "bytes"), complete_stats(candidate.idle_writes, "bytes"), complete_values(&workload_bytes, "bytes"), complete_values(&workload_seconds, "seconds"), complete_values(&workload_peak_delta, "bytes"), if workload_semantics.is_empty() { "unavailable" } else { &workload_semantics }));
             }
             body.push_str("</tbody></table>");
-            if section.kind == ExperimentKind::StorageLevers {
-                body.push_str("<h4>Matrix-wide capability evidence</h4><p>A failed status records failure of that matrix-wide proof. Repeat-derived failures mean one or more applicable repeats failed; they do not imply every workload failed.</p><table><thead><tr><th>Source</th><th>Run</th><th>Capability</th><th>Status</th><th>Evidence / error / elapsed</th></tr></thead><tbody>");
-                for ledger in &cohort.matrix_capabilities {
-                    let Some(results) = &ledger.results else {
-                        body.push_str(&format!(
-                            "<tr><td>{}</td><td><code>{}</code></td><td colspan=\"3\">unavailable</td></tr>",
-                            html_escape(&ledger.source),
-                            html_escape(&ledger.run_id)
-                        ));
-                        continue;
-                    };
-                    for capability in results {
-                        body.push_str(&format!(
-                            "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{} / {} / {:?} ms</td></tr>",
-                            html_escape(&ledger.source),
-                            html_escape(&ledger.run_id),
-                            stable_html_json(&capability.capability)?,
-                            stable_html_json(&capability.status)?,
-                            stable_html_json(&capability.evidence)?,
-                            html_escape(capability.error.as_deref().unwrap_or("none")),
-                            capability.elapsed_millis
-                        ));
-                    }
+
+            if !cohort.storage_summary.is_empty() {
+                body.push_str("<details><summary>Metric and failure details</summary><table><thead><tr><th>Candidate</th><th>Launch writes (decimal GB)</th><th>Launch duration (seconds)</th><th>Peak RAM (decimal GB)</th><th>Failures</th></tr></thead><tbody>");
+                for row in &cohort.storage_summary {
+                    let failures = group_exact_failures(&row.failed_repeats);
+                    body.push_str(&format!(
+                        "<tr><th>{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        html_escape(&renderer_storage_label(&row.label)),
+                        practical_stats(row.writes),
+                        practical_values(row.launch_seconds.iter().map(|value| *value as f64)),
+                        practical_values(row.peak_ram_decimal_gb.iter().copied()),
+                        failures
+                            .iter()
+                            .map(|failure| format!(
+                                "<div class=\"failed\"><span title=\"{}\">{}</span> ×{}</div>",
+                                html_escape(&failure.message),
+                                html_escape(&failure.message),
+                                failure.count
+                            ))
+                            .collect::<String>()
+                    ));
                 }
-                body.push_str("</tbody></table>");
-            } else {
-                body.push_str("<h4>Capability evidence by candidate</h4><table><thead><tr><th>Candidate key</th><th>Capability</th><th>Status</th><th>Evidence / error / elapsed</th></tr></thead><tbody>");
+                body.push_str("</tbody></table></details>");
+            }
+            body.push_str("<h5>Capabilities and sample details</h5>");
+            if matches!(cohort.key, CohortKey::MinimumHardware(_)) {
                 for candidate in &cohort.candidates {
-                    if !candidate.capabilities_available {
-                        body.push_str(&format!(
-                            "<tr><td><code>{}</code></td><td colspan=\"3\">unavailable</td></tr>",
-                            html_escape(&candidate.stable_id)
-                        ));
+                    body.push_str(&format!(
+                        "<h5>{}</h5><p>Capability evidence: {}</p>",
+                        html_escape(&candidate.label),
+                        if candidate.capabilities_available {
+                            "available"
+                        } else {
+                            "<span class=\"unavailable\">unavailable</span>"
+                        }
+                    ));
+                    if !candidate.capabilities.is_empty() {
+                        body.push_str("<table><thead><tr><th>Capability</th><th>Status</th><th>Evidence</th><th>Error</th><th>Elapsed ms</th></tr></thead><tbody>");
+                        for capability in &candidate.capabilities {
+                            body.push_str(&format!("<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>", stable_html_json(&capability.capability)?, stable_html_json(&capability.status)?, stable_html_json(&capability.evidence)?, html_escape(capability.error.as_deref().unwrap_or("—")), capability.elapsed_millis.map_or("—".into(), |v| v.to_string())));
+                        }
+                        body.push_str("</tbody></table>");
                     }
-                    for capability in &candidate.capabilities {
-                        body.push_str(&format!("<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{} / {} / {:?} ms</td></tr>", html_escape(&candidate.stable_id), stable_html_json(&capability.capability)?, stable_html_json(&capability.status)?, stable_html_json(&capability.evidence)?, html_escape(capability.error.as_deref().unwrap_or("none")), capability.elapsed_millis));
+                }
+            }
+            let include_sample = |row: &SampleRow| {
+                !empty
+                    || row.launch_failure.is_some()
+                    || row.prior_launch_attempt_failures.is_some()
+                    || row.preparation_failure.is_some()
+                    || row.workload_failure.is_some()
+                    || row.boundary_failure.is_some()
+                    || matches!(row.outcome, RepeatOutcome::Failure(_))
+            };
+            if cohort
+                .candidates
+                .iter()
+                .flat_map(|candidate| &candidate.rows)
+                .any(include_sample)
+            {
+                body.push_str("<table><thead><tr><th>Candidate</th><th>Source / run / repeat</th><th>Outcome</th><th>Workload disposition</th><th>Common metrics (explicit byte and second fields)</th><th>Workload bytes / Workload duration (seconds) / peak delta (bytes) / semantics</th><th>Stage diagnostics</th></tr></thead><tbody>");
+                for candidate in &cohort.candidates {
+                    for row in
+                        candidate.rows.iter().filter(|row| include_sample(row))
+                    {
+                        body.push_str(&format!("<tr><th>{}</th><td><code>{}</code><br><code>{}</code><br>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>", html_escape(&renderer_candidate_label(candidate)), html_escape(&row.source), html_escape(&row.run_id), row.repeat_ordinal, stable_html_json(&row.outcome)?, stable_html_json(&row.workload_disposition)?, stable_html_json(&row.metrics)?, stable_html_json(&serde_json::json!({"bytes": row.workload_bytes, "duration_secs": row.workload_duration_secs, "peak_delta_bytes": row.workload_peak_delta_bytes, "peak_ram_semantics": row.workload_peak_ram_semantics}))?, stage_diagnostics_html(row)));
                     }
                 }
                 body.push_str("</tbody></table>");
+            }
+            if !cohort.matrix_capabilities.is_empty() {
+                body.push_str("<h5>Matrix-wide capability evidence</h5><p>A failed status records failure of that matrix-wide proof. Repeat-derived failures mean one or more applicable repeats failed; they do not imply every workload failed.</p>");
+            }
+            for ledger in &cohort.matrix_capabilities {
+                body.push_str(&format!(
+                    "<p>{} / <code>{}</code>: {}</p>",
+                    html_escape(&ledger.source),
+                    html_escape(&ledger.run_id),
+                    if ledger.results.is_some() {
+                        "capability ledger available"
+                    } else {
+                        "<span class=\"unavailable\">unavailable</span>"
+                    }
+                ));
+                if let Some(results) = &ledger.results {
+                    body.push_str("<table><thead><tr><th>Capability</th><th>Status</th><th>Evidence</th><th>Error</th><th>Elapsed ms</th></tr></thead><tbody>");
+                    for result in results {
+                        body.push_str(&format!("<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>", stable_html_json(&result.capability)?, stable_html_json(&result.status)?, stable_html_json(&result.evidence)?, html_escape(result.error.as_deref().unwrap_or("—")), result.elapsed_millis.map_or("—".into(), |v| v.to_string())));
+                    }
+                    body.push_str("</tbody></table>");
+                }
+            }
+            body.push_str("</details>");
+            if empty {
+                body.push_str("</details>");
+            }
+            if !factored.varying.is_empty() {
+                body.push_str(
+                    "<details><summary>Cohort-specific conditions</summary><table><tbody>",
+                );
+                for row in &factored.varying {
+                    body.push_str(&format!(
+                        "<tr><th>{}</th><td>{}</td></tr>",
+                        html_escape(&row.label),
+                        condition_value_html(row.values[cohort_index].as_ref())
+                    ));
+                }
+                body.push_str("</tbody></table></details>");
             }
             body.push_str("</article>");
         }
         body.push_str("</section>");
     }
-    body.push_str("<!-- Embedded Apache ECharts v5.5.1; no network resources. --><script>");
+    body.push_str("</div></main><section id=\"appendix\"><h2>Provenance and complete conditions</h2><table><thead><tr><th>Source</th><th>SHA-256</th><th>Run status</th><th>Evidence state</th></tr></thead><tbody>");
+    for input in &report.inputs {
+        body.push_str(&format!(
+            "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}{}</td></tr>",
+            html_escape(&input.source),
+            html_escape(input.sha256.as_deref().unwrap_or("not supplied")),
+            stable_html_json(&input.run_status)?,
+            html_escape(input.evidence_state.as_deref().unwrap_or("not supplied")),
+            input
+                .abort_error
+                .as_ref()
+                .map(|e| format!("<br><strong>Abort reason:</strong> {}", html_escape(e)))
+                .unwrap_or_default()
+        ));
+    }
+    body.push_str("</tbody></table>");
+    if let Some(aggregation) = &report.aggregation {
+        body.push_str(&format!("<h3>Aggregation provenance</h3><p>{} accepted; {} rejected; {} unique inputs; {} duplicates.</p>", aggregation.accepted_archives.len(), aggregation.rejected_archives.len(), aggregation.unique_input_count, aggregation.duplicate_count));
+        for path in &aggregation.accepted_archives {
+            body.push_str(&format!(
+                "<p>Accepted: <code>{}</code></p>",
+                html_escape(path)
+            ));
+        }
+        for rejected in &aggregation.rejected_archives {
+            body.push_str(&format!(
+                "<p class=\"warning\">Rejected: <code>{}</code> — {}</p>",
+                html_escape(&rejected.path),
+                html_escape(&rejected.reason)
+            ));
+        }
+        for digest in &aggregation.digest_order {
+            body.push_str(&format!(
+                "<details><summary><code>{}</code></summary>{}</details>",
+                html_escape(digest),
+                aggregation
+                    .origins
+                    .get(digest)
+                    .into_iter()
+                    .flatten()
+                    .map(|origin| format!(
+                        "<p><code>{}</code></p>",
+                        html_escape(origin)
+                    ))
+                    .collect::<String>()
+            ));
+        }
+    }
+    for section in &report.sections {
+        for cohort in &section.cohorts {
+            body.push_str(&format!(
+                "<details><summary>Complete conditions — {}</summary><table><tbody>",
+                html_escape(&cohort.label)
+            ));
+            for row in &cohort.conditions {
+                body.push_str(&format!(
+                    "<tr><th>{}</th><td>{}</td></tr>",
+                    html_escape(&row.label),
+                    condition_value_html(Some(row))
+                ));
+            }
+            body.push_str("</tbody></table></details>");
+        }
+    }
+    body.push_str(
+        "</section><!-- Embedded Apache ECharts v5.5.1; no network resources. --><script>",
+    );
     body.push_str(ECHARTS);
     body.push_str("</script><script>\n");
     for (id, option) in options {
@@ -5314,6 +7121,10 @@ fn render_report_html(report: &ReportView) -> Result<String> {
     }
     body.push_str("</script></body></html>");
     Ok(body)
+}
+
+fn render_report_html(report: &ReportView) -> Result<String> {
+    render_ergonomic_report_html(report)
 }
 
 #[cfg(test)]
@@ -5633,6 +7444,124 @@ mod tests {
     }
 
     #[test]
+    fn candidate_local_capability_failures_do_not_veto_successful_candidates() {
+        let mut input = partial_matrix_report();
+        input.identity.source_schema_version = 4;
+        input.provenance = Provenance::Available(ProvenanceFields {
+            voxel_revision: None,
+            omicron_revision: None,
+            image_id: None,
+            host_id: None,
+            voxel_build: Some("test-build".into()),
+            voxel_binary: Some("sha256:test".into()),
+            configured_image: Some("test-image".into()),
+            omicron_commit: Some("test-commit".into()),
+            host: Some("test-host".into()),
+        });
+        input.capability_contract_version = Some(CAPABILITY_CONTRACT_VERSION);
+        input.capabilities = CapabilityEvidence::Available(vec![
+            CapabilityResult {
+                capability: Capability::MatrixHostStorageScope,
+                status: CapabilityStatus::Fail,
+                evidence: None,
+                elapsed_millis: None,
+                error: Some(
+                    "another schema-v4 candidate was incomplete".into(),
+                ),
+            },
+            CapabilityResult {
+                capability: Capability::CleanLaunchTeardownBoundaries,
+                status: CapabilityStatus::Fail,
+                evidence: None,
+                elapsed_millis: None,
+                error: Some("another candidate had a dirty boundary".into()),
+            },
+            CapabilityResult {
+                capability: Capability::ApiDiskLifecycle,
+                status: CapabilityStatus::Fail,
+                evidence: None,
+                elapsed_millis: None,
+                error: Some("another candidate workload failed".into()),
+            },
+            CapabilityResult {
+                capability: Capability::SimulatedZpoolPreparation,
+                status: CapabilityStatus::Fail,
+                evidence: None,
+                elapsed_millis: None,
+                error: Some("another candidate preparation failed".into()),
+            },
+        ]);
+        let labels = match &input.dimensions {
+            Dimensions::StorageLevers(dimensions) => &dimensions.combinations,
+            Dimensions::MinimumHardware(_) => unreachable!(),
+        };
+        let configurations = labels
+            .iter()
+            .map(|label| (label.clone(), VoxelConfig::default()))
+            .collect::<BTreeMap<_, _>>();
+        let ExperimentPayload::StorageLevers(experiment) = &mut input.payload
+        else {
+            unreachable!()
+        };
+        experiment.run_status = None;
+        experiment.effective_candidate_configurations_identity = Some(
+            serde_json::to_string(&configurations)
+                .expect("test configurations serialize"),
+        );
+        experiment.effective_candidate_configurations = Some(configurations);
+        for repeat in input
+            .repeats
+            .iter_mut()
+            .filter(|repeat| repeat.candidate == "1+2+3")
+        {
+            repeat.outcome = RepeatOutcome::Success;
+            let RepeatPayload::StorageLevers(payload) = &mut repeat.payload
+            else {
+                unreachable!()
+            };
+            payload.workload_disposition = WorkloadDisposition::Succeeded;
+            payload.workload_bytes = Some(4);
+            payload.workload_duration_secs = Some(350);
+            payload.workload_peak_delta_bytes = Some(1024);
+            payload.workload_peak_ram_semantics =
+                Some(MemorySemantics::WorkloadBaselineDelta);
+            payload.workload_failure = None;
+        }
+
+        let analysis = analyze(std::slice::from_ref(&input));
+        let candidate = analysis.cohorts[0]
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate == "1+2+3")
+            .unwrap();
+        assert!(candidate.ineligibility.is_empty());
+
+        input.identity.source_schema_version = 5;
+        let ExperimentPayload::StorageLevers(experiment) = &mut input.payload
+        else {
+            unreachable!()
+        };
+        experiment.run_status = Some(RunStatus::Aborted);
+        let analysis = analyze(&[input]);
+        let candidate = analysis.cohorts[0]
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate == "1+2+3")
+            .unwrap();
+        assert!(
+            candidate
+                .ineligibility
+                .contains(&IneligibilityReason::CapabilityFailed)
+        );
+        assert!(candidate.ineligibility.contains(
+            &IneligibilityReason::CapabilityStatus {
+                capability: Capability::MatrixHostStorageScope,
+                status: CapabilityStatus::Fail,
+            }
+        ));
+    }
+
+    #[test]
     fn best_supported_recommendation_does_not_break_noise_ties() {
         let mut input = partial_matrix_report();
         for repeat in &mut input.repeats {
@@ -5671,13 +7600,13 @@ mod tests {
                 < html.find("Formal recommendation eligibility").unwrap()
         );
         assert!(
-            html.find("Chart data fallback").unwrap()
-                < html.find("All sample rows and attribution").unwrap()
+            html.find("Tabulated results").unwrap()
+                < html.find("Capabilities and sample details").unwrap()
         );
         assert!(html.contains("15 of 15 planned launch samples retained"));
-        assert!(html.contains(
-            "8 succeeded; 4 failed during workload execution; 3 were blocked"
-        ));
+        assert!(html.contains("8 succeeded"));
+        assert!(html.contains("4 failed"));
+        assert!(html.contains("3 blocked"));
         assert!(html.contains("Storage cohort 1 — 3 RSS sleds"));
         assert!(html.contains(
             "API disk lifecycle — 20 disks, parallelism 4, 1 GiB each, snapshots disabled"
@@ -5686,7 +7615,7 @@ mod tests {
             !html.contains("{&quot;kind&quot;:&quot;api-disk-lifecycle&quot;")
         );
         assert!(!html.contains("<strong>Conditions:</strong>"));
-        assert!(html.contains("interactive in a JavaScript-capable browser"));
+        assert!(html.contains("Interactive charts require JavaScript"));
         assert!(html.contains("<noscript>"));
         assert_eq!(
             html.matches("data-chart-fallback").count(),
@@ -5911,24 +7840,24 @@ mod tests {
                 .unwrap();
         let html = render_report_html(&view).unwrap();
         assert!(html.contains("Partial evidence"));
-        assert!(html.contains("Launch statistics: n=2"));
-        assert!(html.contains("Workload duration statistics: n=1"));
+        assert!(html.contains("(n=2)"));
+        assert!(html.contains("(n=1)"));
         assert!(html.contains("Workload failure: workload exploded"));
         assert!(!html.contains("Launch failure: workload exploded"));
         let cohort = &view.sections[0].cohorts[0];
         assert_eq!(
             chart(cohort, ViewChartKind::LaunchDuration).option["series"][0]["name"],
-            "none — none (n=2)"
+            "none (n=2)"
         );
         assert_eq!(
             chart(cohort, ViewChartKind::WorkloadDuration).option["series"][0]
                 ["name"],
-            "none — none (n=1)"
+            "none (n=1)"
         );
         assert_eq!(
             chart(cohort, ViewChartKind::WorkloadDuration).option["series"][0]
                 ["data"],
-            json!([["none — none", 11.0]])
+            json!([["none", 11.0]])
         );
         assert!(
             cohort.storage_summary[0].rows[0].workload_duration_secs.is_none()
@@ -7569,6 +9498,7 @@ mod tests {
             &[],
             b"html",
             &json!({}),
+            &[],
             Some(FailurePoint::DestinationBeforeDirectoryRename),
         )
         .unwrap_err();
@@ -7626,6 +9556,7 @@ mod tests {
             &[],
             b"html",
             &json!({}),
+            &[],
             Some(FailurePoint::DestinationBeforeArchivePersist),
         )
         .unwrap_err();
@@ -7659,6 +9590,7 @@ mod tests {
             &[],
             b"html",
             &json!({}),
+            &[],
             Some(FailurePoint::AfterHtml),
         )
         .unwrap_err();
@@ -7677,6 +9609,7 @@ mod tests {
             &[],
             b"html",
             &json!({}),
+            &[],
             Some(FailurePoint::DuringArchive),
         )
         .unwrap_err();
@@ -7684,6 +9617,42 @@ mod tests {
         assert!(!out.exists());
         assert!(!root.path().join("report.tar.gz").exists());
         assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn derived_write_failure_removes_directory_and_archive() {
+        let root = tempdir().unwrap();
+        let out = root.path().join("report");
+        let derived = [SvgArtifact {
+            filename: "section-000-aggregate-chart-000.svg".into(),
+            bytes: b"<svg/>".to_vec(),
+        }];
+        let error = publish_report_impl(
+            &out,
+            true,
+            &[],
+            b"html",
+            &json!({}),
+            &derived,
+            Some(FailurePoint::DuringDerivedWrite),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("derived artifact write failure")
+        );
+        assert!(!out.exists());
+        assert!(!root.path().join("report.tar.gz").exists());
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn ordinary_generation_does_not_publish_images() {
+        let root = tempdir().unwrap();
+        let input = root.path().join("ordinary.json");
+        write_json(&input, &matrix(2));
+        let out = root.path().join("ordinary-report");
+        run(&[input], &out, false).unwrap();
+        assert!(!out.join("images").exists());
     }
 
     #[test]
@@ -7980,6 +9949,254 @@ mod tests {
     }
 
     #[test]
+    fn condition_factoring_preserves_absent_and_distinct_rows() {
+        let first = vec![
+            condition("Shared", "same", false),
+            condition("Code", "same", true),
+            condition("Only first", "not supplied", false),
+        ];
+        let second = vec![
+            condition("Shared", "same", false),
+            condition("Code", "same", false),
+            condition("Only second", "value", true),
+        ];
+
+        let factored = factor_condition_rows(&[first, second]);
+
+        assert_eq!(factored.shared, vec![condition("Shared", "same", false)]);
+        assert_eq!(
+            factored
+                .varying
+                .iter()
+                .map(|row| (row.label.as_str(), row.values.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Code",
+                    vec![
+                        Some(condition("Code", "same", true)),
+                        Some(condition("Code", "same", false)),
+                    ],
+                ),
+                (
+                    "Only first",
+                    vec![
+                        Some(condition("Only first", "not supplied", false)),
+                        None
+                    ],
+                ),
+                (
+                    "Only second",
+                    vec![None, Some(condition("Only second", "value", true))],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn flattening_preserves_empty_objects_and_arrays_as_distinct_values() {
+        let mut rows = Vec::new();
+        flatten_typed_value("Object", &json!({}), &mut rows);
+        flatten_typed_value("Array", &json!([]), &mut rows);
+        flatten_typed_value("Null", &Value::Null, &mut rows);
+        assert_eq!(
+            rows,
+            vec![
+                condition("Object", "{}", true),
+                condition("Array", "[]", true),
+                condition("Null", "not supplied", false),
+            ]
+        );
+
+        let mut settings = Vec::new();
+        flatten_candidate_setting("Object", &json!({}), &mut settings);
+        flatten_candidate_setting("Array", &json!([]), &mut settings);
+        assert_eq!(
+            settings,
+            vec![
+                condition("Object", "{}", true),
+                condition("Array", "[]", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_projection_survives_missing_effective_configuration() {
+        let input =
+            storage_fixture(&[("none", &[], &[10]), ("sync", &[1], &[9])]);
+        let view = build_report_view(&[input.clone()], &analyze(&[input]), &[])
+            .unwrap();
+        let projection =
+            candidate_setting_projection(&view.sections[0].cohorts[0]).unwrap();
+        assert_eq!(projection.candidates, ["none", "sync"]);
+        assert!(
+            projection.varying.iter().any(|row| row.label == "Storage levers")
+        );
+    }
+
+    #[test]
+    fn storage_projection_retains_declared_v4_candidate_without_repeats() {
+        let mut value = matrix(3);
+        value["schema_version"] = json!(4);
+        value["combos"] = json!(["none", "1"]);
+        value["results"].as_array_mut().unwrap().push(json!({
+            "label": "1", "levers": [1], "error": "candidate setup failed", "repeats": []
+        }));
+        let input = load_value("partial-v4.json", value).unwrap();
+        let view = build_report_view(&[input.clone()], &analyze(&[input]), &[])
+            .unwrap();
+        let cohort = &view.sections[0].cohorts[0];
+        let projection = candidate_setting_projection(cohort).unwrap();
+
+        assert_eq!(projection.candidates, ["none", "1"]);
+        assert!(!verified_storage_ladder(cohort));
+        let html = render_report_html(&view).unwrap();
+        assert!(html.contains("candidate setup failed"));
+    }
+
+    #[test]
+    fn minimum_hardware_allocation_chart_does_not_require_repeat_metrics() {
+        let mut value = minimum_fixture("allocation-only", 10, 20, 30);
+        value["repeats"] = json!([]);
+        let input = load_value("allocation-only.json", value).unwrap();
+        let view = build_report_view(&[input.clone()], &analyze(&[input]), &[])
+            .unwrap();
+        let html = render_report_html(&view).unwrap();
+
+        assert!(html.contains("Required and peak allocation"));
+        assert!(html.contains("data-chart-fallback=\"Allocation\""));
+        assert!(!html.contains("data-chart-fallback=\"LaunchDuration\""));
+    }
+
+    #[test]
+    fn capability_disclosure_uses_storage_matrix_and_minimum_candidate_evidence()
+     {
+        let storage = partial_matrix_report();
+        let storage_view =
+            build_report_view(&[storage.clone()], &analyze(&[storage]), &[])
+                .unwrap();
+        let storage_html = render_report_html(&storage_view).unwrap();
+        assert!(storage_html.contains("Matrix-wide capability evidence"));
+        assert!(!storage_html.contains("Capability evidence: unavailable"));
+
+        let minimum =
+            load_value("minimum.json", minimum_fixture("minimum", 10, 20, 30))
+                .unwrap();
+        let minimum_view =
+            build_report_view(&[minimum.clone()], &analyze(&[minimum]), &[])
+                .unwrap();
+        let minimum_html = render_report_html(&minimum_view).unwrap();
+        assert!(minimum_html.contains("Capability evidence: available"));
+        assert!(minimum_html.contains("rack-readiness"));
+    }
+
+    #[test]
+    fn closed_complete_evidence_preserves_raw_and_statistical_semantics() {
+        let input = partial_matrix_report();
+        let view = build_report_view(&[input.clone()], &analyze(&[input]), &[])
+            .unwrap();
+        let html = render_report_html(&view).unwrap();
+
+        assert!(html.contains("<summary>Complete evidence</summary>"));
+        for text in [
+            "Host capacity (bytes)",
+            "Required allocation (bytes)",
+            "Peak allocation (bytes)",
+            "Completed repeats",
+            "Idle writes (bytes)",
+            "n / mean / median / stddev / CV",
+            "Source / run / repeat",
+            "Workload bytes",
+            "Workload duration (seconds)",
+            "Outcome",
+        ] {
+            assert!(
+                html.contains(text),
+                "missing complete evidence field: {text}"
+            );
+        }
+        assert!(!html.contains("Complete concise aggregate summary"));
+    }
+
+    #[test]
+    fn ergonomic_html_uses_stable_anchors_and_concise_storage_labels() {
+        let input =
+            storage_fixture(&[("none", &[], &[10]), ("sync", &[1], &[9])]);
+        let view = build_report_view(&[input.clone()], &analyze(&[input]), &[])
+            .unwrap();
+        let html = render_report_html(&view).unwrap();
+        assert!(html.contains("id=\"section-storage-levers\""));
+        assert!(html.contains("id=\"cohort-"));
+        assert!(!html.contains("section-0"));
+        assert!(!html.contains(">none — none<"));
+    }
+
+    #[test]
+    fn candidate_settings_factor_exact_storage_configuration() {
+        let mut input = partial_matrix_report();
+        let ExperimentPayload::StorageLevers(experiment) = &mut input.payload
+        else {
+            unreachable!()
+        };
+        let mut configurations = BTreeMap::new();
+        for (index, label) in
+            ["none", "1", "1+2", "1+2+3", "1+2+3+4"].into_iter().enumerate()
+        {
+            let mut configuration = VoxelConfig::default();
+            configuration.disk_wear.host_sync_disabled = index > 0;
+            configurations.insert(label.to_string(), configuration);
+        }
+        experiment.effective_candidate_configurations_identity =
+            Some(serde_json::to_string(&configurations).unwrap());
+        experiment.effective_candidate_configurations = Some(configurations);
+
+        let view = build_report_view(&[input.clone()], &analyze(&[input]), &[])
+            .unwrap();
+        let settings =
+            candidate_setting_projection(&view.sections[0].cohorts[0]).unwrap();
+
+        assert_eq!(
+            settings.candidates,
+            vec!["none", "1", "1+2", "1+2+3", "1+2+3+4"]
+        );
+        assert_eq!(
+            settings
+                .varying
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Disk wear / Host sync disabled"]
+        );
+        assert!(settings.shared.len() > 40);
+    }
+
+    #[test]
+    fn projection_detects_verified_ladders_empty_cohorts_and_exact_failures() {
+        let input = storage_fixture(&[
+            ("none", &[], &[]),
+            ("sync", &[1], &[]),
+            ("compressed", &[1, 2], &[]),
+        ]);
+        let view = build_report_view(&[input.clone()], &analyze(&[input]), &[])
+            .unwrap();
+        let cohort = &view.sections[0].cohorts[0];
+
+        assert!(!verified_storage_ladder(cohort));
+        assert!(cohort_has_no_measurements(cohort));
+        assert_eq!(
+            group_exact_failures(&[
+                "repeat is pending".into(),
+                "different".into(),
+                "repeat is pending".into(),
+            ]),
+            vec![
+                FailureGroup { message: "repeat is pending".into(), count: 2 },
+                FailureGroup { message: "different".into(), count: 1 },
+            ]
+        );
+    }
+
+    #[test]
     fn every_chart_fallback_preserves_visible_categories() {
         let storage = partial_matrix_report();
         let minimum =
@@ -8141,7 +10358,7 @@ mod tests {
         assert_eq!(section.cohorts.len(), 2);
         let html = render_report_html(&view).unwrap();
         let articles = html
-            .split("<article>")
+            .split("<article id=\"")
             .skip(1)
             .map(|s| s.split("</article>").next().unwrap())
             .collect::<Vec<_>>();
@@ -8150,7 +10367,14 @@ mod tests {
             assert!(article.contains(&html_escape(&cohort.label)));
             assert_eq!(
                 article.matches("class=\"chart\"").count(),
-                cohort.charts.len()
+                cohort
+                    .charts
+                    .iter()
+                    .filter(|chart| chart
+                        .fallback_rows
+                        .iter()
+                        .any(|row| row.value.is_some()))
+                    .count()
             );
         }
     }
@@ -8207,7 +10431,7 @@ mod tests {
         assert_eq!(row.failed_repeats, ["disk exploded"]);
         let html = render_report_html(&view).unwrap();
         assert!(html.contains("failed-source.json"));
-        assert!(html.contains("failure: disk exploded"));
+        assert!(html.contains("disk exploded"));
         assert!(html.contains("unavailable"));
     }
 
@@ -8302,11 +10526,9 @@ mod tests {
                 [0]["data"],
             json!([-1, -1, -1, -1, -1, -1, -1])
         );
-        assert!(
-            render_report_html(&fallback_view)
-                .unwrap()
-                .contains("colspan=\"3\">unavailable")
-        );
+        assert!(render_report_html(&fallback_view)
+            .unwrap()
+            .contains("Capability evidence: <span class=\"unavailable\">unavailable</span>"));
     }
 
     #[test]
@@ -8319,12 +10541,12 @@ mod tests {
         assert_eq!(cohort.storage_summary[0].workload_seconds, [9]);
         assert_eq!(
             chart(cohort, ViewChartKind::WorkloadWear).option["series"][0]["data"],
-            json!([["none — none", 0.000002048]])
+            json!([["none", 0.000002048]])
         );
         assert_eq!(
             chart(cohort, ViewChartKind::WorkloadDuration).option["series"][0]
                 ["data"],
-            json!([["none — none", 9.0]])
+            json!([["none", 9.0]])
         );
         let without = storage_fixture(&[("none", &[], &[10])]);
         let view =
@@ -8427,14 +10649,10 @@ mod tests {
         );
         assert_eq!(manifest.inputs[1].sha256, second_digest);
         let html = fs::read_to_string(out.join("report.html")).unwrap();
-        assert!(html.contains(&format!(
-            "<tr><td>{}</td><td><code>{first_digest}</code></td></tr>",
-            html_escape(&first.display().to_string())
-        )));
-        assert!(html.contains(&format!(
-            "<tr><td>{}</td><td><code>{second_digest}</code></td></tr>",
-            html_escape(&second.display().to_string())
-        )));
+        assert!(html.contains(&html_escape(&first.display().to_string())));
+        assert!(html.contains(&first_digest));
+        assert!(html.contains(&html_escape(&second.display().to_string())));
+        assert!(html.contains(&second_digest));
     }
 
     #[test]
@@ -8470,6 +10688,227 @@ mod tests {
         assert!(html.contains(&sha256_hex(&fs::read(&first).unwrap())));
         assert!(html.contains("Content-Security-Policy"));
         assert!(root.path().join("result.tar.gz").is_file());
+    }
+
+    #[test]
+    fn normalized_report_evidence_round_trips_through_replay_boundary() {
+        let root = tempdir().unwrap();
+        let input = root.path().join("input.json");
+        fs::write(&input, serde_json::to_vec(&matrix(2)).unwrap()).unwrap();
+        let out = root.path().join("result");
+        run(&[input], &out, false).unwrap();
+
+        let replay = parse_normalized_report_evidence(
+            &fs::read(out.join("report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].metadata.identity, replay[0].normalized.identity);
+    }
+
+    #[test]
+    fn normalized_report_replay_accepts_legacy_workload_dispositions() {
+        let root = tempdir().unwrap();
+        for (version, remove_metrics, expected) in [
+            (2, false, WorkloadDisposition::NotRequested),
+            (3, false, WorkloadDisposition::Succeeded),
+            (3, true, WorkloadDisposition::Pending),
+        ] {
+            let input = root
+                .path()
+                .join(format!("input-{version}-{remove_metrics}.json"));
+            fs::write(&input, serde_json::to_vec(&matrix(version)).unwrap())
+                .unwrap();
+            let out =
+                root.path().join(format!("result-{version}-{remove_metrics}"));
+            run(&[input], &out, false).unwrap();
+            let mut report: Value = serde_json::from_slice(
+                &fs::read(out.join("report.json")).unwrap(),
+            )
+            .unwrap();
+            let payload = &mut report["normalized_inputs"][0]["repeats"][0]["payload"]
+                ["data"];
+            payload.as_object_mut().unwrap().remove("workload_disposition");
+            if remove_metrics {
+                payload["workload_bytes"] = Value::Null;
+                payload["workload_duration_secs"] = Value::Null;
+            }
+
+            let replay = parse_normalized_report_evidence(
+                &serde_json::to_vec(&report).unwrap(),
+            )
+            .unwrap();
+            let RepeatPayload::StorageLevers(payload) =
+                &replay[0].normalized.repeats[0].payload
+            else {
+                panic!("expected storage repeat")
+            };
+            assert_eq!(payload.workload_disposition, expected);
+        }
+
+        let input = root.path().join("explicit.json");
+        fs::write(&input, serde_json::to_vec(&matrix(3)).unwrap()).unwrap();
+        let out = root.path().join("explicit-report");
+        run(&[input], &out, false).unwrap();
+        let mut report: Value =
+            serde_json::from_slice(&fs::read(out.join("report.json")).unwrap())
+                .unwrap();
+        report["normalized_inputs"][0]["repeats"][0]["payload"]["data"]["workload_disposition"] =
+            json!("pending");
+        let replay = parse_normalized_report_evidence(
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        let RepeatPayload::StorageLevers(payload) =
+            &replay[0].normalized.repeats[0].payload
+        else {
+            panic!("expected storage repeat")
+        };
+        assert_eq!(payload.workload_disposition, WorkloadDisposition::Pending);
+    }
+
+    #[test]
+    fn normalized_report_replay_accepts_full_configuration_identity() {
+        let root = tempdir().unwrap();
+        let input = root.path().join("input.json");
+        fs::write(&input, serde_json::to_vec(&matrix(2)).unwrap()).unwrap();
+        let out = root.path().join("result");
+        run(&[input], &out, false).unwrap();
+        let mut report: Value =
+            serde_json::from_slice(&fs::read(out.join("report.json")).unwrap())
+                .unwrap();
+        let identity = json!({
+            "none": {"generated-padding": "x".repeat(MAX_REPLAY_STRING_BYTES)}
+        })
+        .to_string();
+        assert!(identity.len() > MAX_REPLAY_STRING_BYTES);
+        report["normalized_inputs"][0]["payload"]["data"]["effective_candidate_configurations_identity"] =
+            json!(identity);
+
+        parse_normalized_report_evidence(&serde_json::to_vec(&report).unwrap())
+            .unwrap();
+
+        report["normalized_inputs"][0]["payload"]["data"]["effective_candidate_configurations_identity"] =
+            json!("x".repeat(MAX_NORMALIZED_INPUT_BYTES));
+        let error = parse_normalized_report_evidence(
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("normalized input exceeds"));
+    }
+
+    #[test]
+    fn normalized_report_replay_rejects_semantically_malformed_evidence() {
+        let root = tempdir().unwrap();
+        let input = root.path().join("input.json");
+        fs::write(&input, serde_json::to_vec(&matrix(2)).unwrap()).unwrap();
+        let out = root.path().join("result");
+        run(&[input], &out, false).unwrap();
+        let report = fs::read(out.join("report.json")).unwrap();
+
+        for (name, mutate, expected) in [
+            ("digest", ("inputs", "sha256", json!("ABC")), "SHA-256"),
+            (
+                "candidate",
+                ("normalized_inputs", "candidate", json!("not-canonical")),
+                "candidate",
+            ),
+            (
+                "memory",
+                ("normalized_inputs", "peak_ram_semantics", Value::Null),
+                "memory semantics",
+            ),
+        ] {
+            let mut value: Value = serde_json::from_slice(&report).unwrap();
+            match mutate {
+                ("inputs", field, replacement) => {
+                    value["inputs"][0][field] = replacement
+                }
+                ("normalized_inputs", "candidate", replacement) => {
+                    value["normalized_inputs"][0]["repeats"][0]["candidate"] =
+                        replacement
+                }
+                ("normalized_inputs", field, replacement) => {
+                    value["normalized_inputs"][0]["repeats"][0]["metrics"]
+                        [field] = replacement
+                }
+                _ => unreachable!(),
+            }
+            let error = parse_normalized_report_evidence(
+                &serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{name}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_report_replay_rejects_unbounded_counts_and_diagnostics() {
+        let root = tempdir().unwrap();
+        let storage_input = root.path().join("storage.json");
+        fs::write(&storage_input, serde_json::to_vec(&matrix(2)).unwrap())
+            .unwrap();
+        let storage_out = root.path().join("storage-report");
+        run(&[storage_input], &storage_out, false).unwrap();
+        let storage: Value = serde_json::from_slice(
+            &fs::read(storage_out.join("report.json")).unwrap(),
+        )
+        .unwrap();
+
+        let mut huge_repeats = storage.clone();
+        huge_repeats["normalized_inputs"][0]["payload"]["data"]["requested_repeats"] =
+            json!(usize::MAX);
+        let error = parse_normalized_report_evidence(
+            &serde_json::to_vec(&huge_repeats).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("requested_repeats"));
+
+        let mut huge_failure = storage;
+        huge_failure["normalized_inputs"][0]["repeats"][0]["outcome"] = json!({
+            "status": "failure",
+            "error": "x".repeat(MAX_REPLAY_STRING_BYTES + 1),
+        });
+        let error = parse_normalized_report_evidence(
+            &serde_json::to_vec(&huge_failure).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("repeat failure"));
+
+        let minimum_input = root.path().join("minimum.json");
+        fs::write(
+            &minimum_input,
+            serde_json::to_vec(&minimum_fixture("minimum", 1, 2, 3)).unwrap(),
+        )
+        .unwrap();
+        let minimum_out = root.path().join("minimum-report");
+        run(&[minimum_input], &minimum_out, false).unwrap();
+        let mut minimum: Value = serde_json::from_slice(
+            &fs::read(minimum_out.join("report.json")).unwrap(),
+        )
+        .unwrap();
+        minimum["normalized_inputs"][0]["payload"]["data"]["expected_repeats"] =
+            json!(usize::MAX);
+        let error = parse_normalized_report_evidence(
+            &serde_json::to_vec(&minimum).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("expected_repeats"));
+
+        let mut missing_configuration: Value = serde_json::from_slice(
+            &fs::read(minimum_out.join("report.json")).unwrap(),
+        )
+        .unwrap();
+        missing_configuration["normalized_inputs"][0]["effective_configuration"] =
+            json!({"availability": "unavailable"});
+        let error = parse_normalized_report_evidence(
+            &serde_json::to_vec(&missing_configuration).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("effective configuration"));
     }
 
     #[test]
@@ -8875,5 +11314,426 @@ mod tests {
         assert!(warnings.iter().any(|w| {
             w.as_str().unwrap().contains("Legacy or incomplete provenance")
         }));
+    }
+
+    fn svg_chart(
+        kind: ViewChartKind,
+        rows: Vec<ChartFallbackRow>,
+    ) -> ChartView {
+        ChartView {
+            kind,
+            title: "A <chart> & its results".into(),
+            unit: "MiB/s & more".into(),
+            option: Value::Null,
+            fallback_rows: rows,
+        }
+    }
+
+    fn svg_row(
+        category: &str,
+        series: &str,
+        value: Option<f64>,
+    ) -> ChartFallbackRow {
+        ChartFallbackRow {
+            category: category.into(),
+            series: series.into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn standalone_svg_covers_every_layout_and_fallback_value() {
+        let cases = [
+            svg_chart(
+                ViewChartKind::GrossWrites,
+                vec![
+                    svg_row("alpha", "Sample 1", Some(1.25)),
+                    svg_row("alpha", "Mean", Some(1.25)),
+                    svg_row("beta", "Mean", None),
+                ],
+            ),
+            svg_chart(
+                ViewChartKind::Waterfall,
+                vec![
+                    svg_row("up", "Delta", Some(2.5)),
+                    svg_row("down", "Delta", Some(-1.5)),
+                ],
+            ),
+            svg_chart(
+                ViewChartKind::Allocation,
+                vec![
+                    svg_row("candidate", "Required allocation", Some(1024.0)),
+                    svg_row(
+                        "candidate",
+                        "Peak observed allocation",
+                        Some(2048.0),
+                    ),
+                ],
+            ),
+            svg_chart(
+                ViewChartKind::Capabilities,
+                vec![
+                    svg_row("rack / metrics", "Capability status", Some(1.0)),
+                    svg_row("rack / api", "Capability status", Some(0.0)),
+                    svg_row("rack / old", "Capability status", None),
+                ],
+            ),
+        ];
+        for chart in cases {
+            let svg = render_chart_svg(&chart).unwrap();
+            assert!(svg.starts_with("<svg "));
+            assert!(
+                svg.contains(
+                    "<title>A &lt;chart&gt; &amp; its results</title>"
+                )
+            );
+            assert!(svg.contains("<desc>"));
+            assert!(svg.contains("MiB/s &amp; more"));
+            assert!(svg.contains("fill=\"white\""));
+            assert!(!svg.contains("<script"));
+            assert!(!svg.contains("href="));
+            for row in chart.fallback_rows {
+                assert!(svg.contains(&html_escape(&row.category)));
+                assert!(svg.contains(&html_escape(&row.series)));
+                assert!(svg.contains(
+                    &row.value.map_or_else(|| "unavailable".into(), svg_value)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn svg_preserves_fractional_geometry_and_text() {
+        let samples = svg_chart(
+            ViewChartKind::PeakRam,
+            vec![
+                svg_row("small", "Mean", Some(1e-9)),
+                svg_row("larger", "Mean", Some(2e-9)),
+            ],
+        );
+        let svg = render_chart_svg(&samples).unwrap();
+        assert!(svg.contains("cy=\"425.0\""));
+        assert!(svg.contains("cy=\"120.0\""));
+        assert!(svg.contains("1.000000e-9"));
+        assert!(svg.contains("2.000000e-9"));
+        assert!(!svg.contains(": 0.000000 MiB/s"));
+
+        let allocation = svg_chart(
+            ViewChartKind::Allocation,
+            vec![
+                svg_row("small", "Required allocation", Some(1e-9)),
+                svg_row("larger", "Peak allocation", Some(2e-9)),
+            ],
+        );
+        let svg = render_chart_svg(&allocation).unwrap();
+        assert!(
+            svg.contains("width=\"210.0\" height=\"14\" class=\"required\"")
+        );
+        assert!(svg.contains("width=\"420.0\" height=\"14\" class=\"peak\""));
+    }
+
+    #[test]
+    fn svg_clips_exact_visible_strings_to_the_fixed_canvas() {
+        let title = "t".repeat(MAX_SVG_LABEL_BYTES);
+        let unit = "u".repeat(MAX_SVG_LABEL_BYTES);
+        let category = "c".repeat(59);
+        let series = "s".repeat(61);
+        let chart = ChartView {
+            kind: ViewChartKind::PeakRam,
+            title: title.clone(),
+            unit: unit.clone(),
+            option: Value::Null,
+            fallback_rows: vec![svg_row(&category, &series, Some(f64::MAX))],
+        };
+        let svg = render_chart_svg(&chart).unwrap();
+        assert!(svg.contains(&format!("<title id=\"title\">{title}</title>")));
+        assert!(svg.contains(&format!("Unit: {unit}.")));
+        assert!(svg.contains("1.797693e308"));
+        assert!(
+            svg.contains(
+                "width=\"1120.0\" height=\"28.0\" overflow=\"hidden\""
+            )
+        );
+        assert!(
+            svg.contains(
+                "width=\"1120.0\" height=\"18.0\" overflow=\"hidden\""
+            )
+        );
+        assert!(
+            svg.contains("width=\"880.0\" height=\"18.0\" overflow=\"hidden\"")
+        );
+        assert!(
+            svg.contains(&format!(
+                "{category} — {series}: 1.797693e308 {unit}"
+            ))
+        );
+    }
+
+    #[test]
+    fn missing_mean_breaks_line_continuity() {
+        let chart = svg_chart(
+            ViewChartKind::PeakRam,
+            vec![
+                svg_row("A", "Mean", Some(1.0)),
+                svg_row("B", "Mean", None),
+                svg_row("C", "Mean", Some(3.0)),
+            ],
+        );
+        let svg = render_chart_svg(&chart).unwrap();
+        assert_eq!(svg.matches("<polyline class=\"mean\"").count(), 2);
+        assert!(!svg.contains("points=\"235.0,526.7 1135.0,120.0\""));
+    }
+
+    #[test]
+    fn standalone_svg_escapes_hostile_text_and_marks_status_without_color() {
+        let chart = svg_chart(
+            ViewChartKind::Capabilities,
+            vec![
+                svg_row(
+                    "</text><script>alert(1)</script>",
+                    "x & y",
+                    Some(-1.0),
+                ),
+                svg_row("missing", "status", None),
+            ],
+        );
+        let svg = render_chart_svg(&chart).unwrap();
+        assert!(
+            svg.contains("&lt;/text&gt;&lt;script&gt;alert(1)&lt;/script&gt;")
+        );
+        assert!(!svg.contains("<script"));
+        assert!(svg.contains("Unavailable"));
+        assert!(svg.contains("? unavailable"));
+        assert!(!svg.contains("file://"));
+        assert!(!svg.contains("href="));
+        assert!(!svg.contains("url("));
+        assert!(!svg.contains("<image"));
+        assert!(!svg.contains("<foreignObject"));
+    }
+
+    #[test]
+    fn svg_collection_has_deterministic_structural_names_and_skips_empty_charts()
+     {
+        let chart = svg_chart(
+            ViewChartKind::PeakRam,
+            vec![svg_row("arbitrary label", "Mean", Some(7.0))],
+        );
+        let empty = svg_chart(
+            ViewChartKind::PeakRam,
+            vec![svg_row("never plotted", "Mean", None)],
+        );
+        let input = [
+            (SvgChartIdentity::cohort(2, 3, 4), &chart),
+            (SvgChartIdentity::aggregate(2, 5), &empty),
+        ];
+        let first = render_chart_svgs(&input).unwrap();
+        let second = render_chart_svgs(&input).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].filename, "section-002-cohort-003-chart-004.svg");
+        assert!(first[0].filename.bytes().all(
+            |byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || byte == b'-'
+                || byte == b'.'
+        ));
+    }
+
+    #[test]
+    fn svg_collection_enforces_non_empty_count_and_total_bytes() {
+        let chart = svg_chart(
+            ViewChartKind::PeakRam,
+            vec![svg_row("category", "Mean", Some(7.0))],
+        );
+        let limits = SvgLimits { artifacts: 2, ..SVG_LIMITS };
+        let too_many = (0..=limits.artifacts)
+            .map(|chart_index| {
+                (SvgChartIdentity::aggregate(0, chart_index), &chart)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            render_chart_svgs_with_limits(&too_many, limits)
+                .unwrap_err()
+                .to_string()
+                .contains("artifact count")
+        );
+
+        let one = render_chart_svg(&chart).unwrap().len();
+        let total_limits =
+            SvgLimits { artifacts: 2, total_bytes: one * 2 - 1, ..SVG_LIMITS };
+        let enough = (0..2)
+            .map(|chart_index| {
+                (SvgChartIdentity::aggregate(0, chart_index), &chart)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            render_chart_svgs_with_limits(&enough, total_limits)
+                .unwrap_err()
+                .to_string()
+                .contains("total byte")
+        );
+    }
+
+    #[test]
+    fn svg_projects_production_row_order_by_category() {
+        let labels = vec!["first".to_string(), "second".to_string()];
+        let sample_rows =
+            sample_fallback_rows(&labels, &[vec![1.0, 3.0], vec![8.0]]);
+        let sample_svg =
+            render_chart_svg(&svg_chart(ViewChartKind::PeakRam, sample_rows))
+                .unwrap();
+        assert_eq!(sample_svg.matches("data-category-x=\"235.0\"").count(), 3);
+        assert_eq!(sample_svg.matches("data-category-x=\"1135.0\"").count(), 2);
+
+        let mut allocation_rows = series_fallback_rows(
+            &labels,
+            "Required allocation",
+            [Some(1.0), None],
+        );
+        allocation_rows.extend(series_fallback_rows(
+            &labels,
+            "Peak allocation",
+            [Some(2.0), Some(4.0)],
+        ));
+        let allocation_svg = render_chart_svg(&svg_chart(
+            ViewChartKind::Allocation,
+            allocation_rows,
+        ))
+        .unwrap();
+        let first_required =
+            allocation_svg.find("first — Required allocation").unwrap();
+        let first_peak =
+            allocation_svg.find("first — Peak allocation").unwrap();
+        let second_required =
+            allocation_svg.find("second — Required allocation").unwrap();
+        assert!(first_required < first_peak && first_peak < second_required);
+        assert_eq!(allocation_svg.matches("class=\"missing\"").count(), 1);
+        assert!(!allocation_svg.contains("width=\"0.0\""));
+    }
+
+    #[test]
+    fn svg_waterfall_uses_independent_zero_based_deltas() {
+        let chart = svg_chart(
+            ViewChartKind::Waterfall,
+            vec![
+                svg_row("positive one", "Delta", Some(5.0)),
+                svg_row("positive two", "Delta", Some(5.0)),
+                svg_row("negative one", "Delta", Some(-5.0)),
+                svg_row("negative two", "Delta", Some(-5.0)),
+            ],
+        );
+        let svg = render_chart_svg(&chart).unwrap();
+        assert!(svg.contains("class=\"zero-line\""));
+        assert_eq!(svg.matches("x=\"900.0\"").count(), 2);
+        assert_eq!(svg.matches("x=\"690.0\"").count(), 2);
+        assert!(!svg.contains("NaN"));
+        assert!(!svg.contains("inf"));
+    }
+
+    #[test]
+    fn svg_rejects_unrepresentable_ranges_layout_overflow_and_invalid_xml() {
+        let huge = svg_chart(
+            ViewChartKind::Waterfall,
+            vec![
+                svg_row("low", "Delta", Some(-f64::MAX)),
+                svg_row("high", "Delta", Some(f64::MAX)),
+            ],
+        );
+        assert!(render_chart_svg(&huge).is_err());
+        let too_many = svg_chart(
+            ViewChartKind::Capabilities,
+            (0..=2)
+                .map(|index| svg_row(&index.to_string(), "status", Some(1.0)))
+                .collect(),
+        );
+        assert!(
+            render_chart_svg_with_limits(
+                &too_many,
+                SvgLimits { rows: 2, ..SVG_LIMITS }
+            )
+            .is_err()
+        );
+        let combined_label = svg_chart(
+            ViewChartKind::PeakRam,
+            vec![svg_row(
+                &"c".repeat(MAX_SVG_ROW_LABEL_BYTES / 2 + 1),
+                &"s".repeat(MAX_SVG_ROW_LABEL_BYTES / 2 + 1),
+                Some(1.0),
+            )],
+        );
+        assert!(render_chart_svg(&combined_label).is_err());
+        for invalid in ["nul\0text", "control\u{1}text", "noncharacter\u{fffe}"]
+        {
+            let chart = svg_chart(
+                ViewChartKind::PeakRam,
+                vec![svg_row(invalid, "Mean", Some(1.0))],
+            );
+            assert!(render_chart_svg(&chart).is_err());
+        }
+        assert!(check_svg_size(MAX_SVG_BYTES + 1, MAX_SVG_BYTES).is_err());
+    }
+
+    #[test]
+    fn svg_limits_labels_counts_values_and_output_size() {
+        let mut long = svg_chart(
+            ViewChartKind::LaunchDuration,
+            vec![svg_row(
+                &"x".repeat(MAX_SVG_LABEL_BYTES + 1),
+                "Mean",
+                Some(1.0),
+            )],
+        );
+        assert!(render_chart_svg(&long).is_err());
+        long.fallback_rows = vec![
+            svg_row("one", "Mean", Some(1.0)),
+            svg_row("two", "Mean", Some(2.0)),
+        ];
+        assert!(
+            render_chart_svg_with_limits(
+                &long,
+                SvgLimits { categories: 1, ..SVG_LIMITS }
+            )
+            .is_err()
+        );
+        long.fallback_rows =
+            vec![svg_row("finite", "Mean", Some(f64::INFINITY))];
+        assert!(render_chart_svg(&long).is_err());
+        let normal = svg_chart(
+            ViewChartKind::LaunchDuration,
+            vec![svg_row("finite", "Mean", Some(1.0))],
+        );
+        let normal_size = render_chart_svg(&normal).unwrap().len();
+        assert!(
+            render_chart_svg_with_limits(
+                &normal,
+                SvgLimits { individual_bytes: normal_size - 1, ..SVG_LIMITS }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn svg_renders_45_fallback_samples_deterministically_in_bounds() {
+        let rows = (0..45)
+            .map(|index| {
+                svg_row(
+                    "retained",
+                    &format!("Sample {index}"),
+                    Some(index as f64 + 0.25),
+                )
+            })
+            .collect::<Vec<_>>();
+        let chart = svg_chart(ViewChartKind::PeakRam, rows.clone());
+
+        let first = render_chart_svg(&chart).unwrap();
+        let second = render_chart_svg(&chart).unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.len() <= MAX_SVG_BYTES);
+        assert_eq!(first.matches("class=\"sample\"").count(), rows.len());
+        for row in rows {
+            assert!(first.contains(&html_escape(&row.series)));
+            assert!(first.contains(&svg_value(row.value.unwrap())));
+        }
     }
 }

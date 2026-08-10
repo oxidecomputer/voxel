@@ -25,6 +25,11 @@
 //!   drive-lifetime projections (per lever combination), with a headline total
 //!   scoped to the drives backing the falcon pool (unrelated OS/other-pool
 //!   writes on shared drives are shown per-device but excluded from the total).
+//! * `report` — normalize one or more raw perftest results into a portable
+//!   interactive report and optional archive.
+//! * `superreport` — combine portable report archives, deduplicate their
+//!   underlying result digests, and recompute cohort-local recommendations over
+//!   the larger aggregate sample.
 //! * `preflight` — destructively prove that the API disk lifecycle workload can
 //!   provision, probe, and cleanly tear down before running a matrix.
 //! * `smooth` — the "feels snappy" axis: measure the per-operation *latency
@@ -109,6 +114,18 @@ pub enum PerftestCmd {
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
         /// Directory where report artifacts will be published.
+        #[arg(long, value_name = "DIRECTORY")]
+        out: PathBuf,
+        /// Also publish `<DIRECTORY>.tar.gz`.
+        #[arg(long)]
+        archive: bool,
+    },
+    /// Aggregate evidence from one or more native report archives.
+    Superreport {
+        /// Archives produced by `perftest report` or `perftest superreport`.
+        #[arg(required = true)]
+        reports: Vec<PathBuf>,
+        /// Directory where aggregate report artifacts will be published.
         #[arg(long, value_name = "DIRECTORY")]
         out: PathBuf,
         /// Also publish `<DIRECTORY>.tar.gz`.
@@ -223,6 +240,9 @@ pub async fn run(
         }
         PerftestCmd::Report { inputs, out, archive } => {
             report::run(inputs, out, *archive)
+        }
+        PerftestCmd::Superreport { reports, out, archive } => {
+            report::superreport::run(reports, out, *archive)
         }
         PerftestCmd::Preflight { workload, oxide_auth_helper } => {
             cmd_preflight(cfg, name, *workload, oxide_auth_helper.as_deref())
@@ -6545,6 +6565,31 @@ mod tests {
             PerftestCli::try_parse_from(["test", "report", "one.json"])
                 .is_err()
         );
+
+        let parsed = PerftestCli::try_parse_from([
+            "test",
+            "superreport",
+            "one.tar.gz",
+            "two.tar.gz",
+            "--out",
+            "aggregate",
+            "--archive",
+        ])
+        .unwrap();
+        match parsed.command {
+            PerftestCmd::Superreport { reports, out, archive } => {
+                assert_eq!(
+                    reports,
+                    vec![
+                        PathBuf::from("one.tar.gz"),
+                        PathBuf::from("two.tar.gz")
+                    ]
+                );
+                assert_eq!(out, PathBuf::from("aggregate"));
+                assert!(archive);
+            }
+            _ => panic!("expected superreport command"),
+        }
     }
 
     #[test]
