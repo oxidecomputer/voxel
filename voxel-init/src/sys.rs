@@ -53,12 +53,7 @@ pub fn read_external_net() -> Option<ExternalNet> {
     if ip_cidr.is_empty() || gateway.is_empty() {
         return None;
     }
-    Some(ExternalNet {
-        ip_cidr,
-        gateway,
-        dns,
-        iface,
-    })
+    Some(ExternalNet { ip_cidr, gateway, dns, iface })
 }
 
 /// A progress line (mirrors the scripts' `echo [tag] ...`).

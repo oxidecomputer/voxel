@@ -59,7 +59,9 @@ pub(crate) struct BuilderNetwork {
 /// here and the builder gets the stub plus a static address derived from
 /// `host_ip - 1`. In lan mode falcon's default link and DHCP already work, so
 /// this is empty.
-pub(crate) fn builder_network(external: Option<&voxel_config::External>) -> Result<BuilderNetwork> {
+pub(crate) fn builder_network(
+    external: Option<&voxel_config::External>,
+) -> Result<BuilderNetwork> {
     let Some(x) = external.filter(|x| x.isolated()) else {
         return Ok(BuilderNetwork::default());
     };
@@ -92,7 +94,8 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     // an image from voxel's workdir would wipe a live rack's pid files, orphan
     // its propolis processes, and leave its VNICs busy.
     let workspace = repo_root()?.join("voxel-image");
-    std::env::set_current_dir(&workspace).with_context(|| format!("cd {workspace}"))?;
+    std::env::set_current_dir(&workspace)
+        .with_context(|| format!("cd {workspace}"))?;
 
     let mut d = Runner::new(o.deploy);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
@@ -100,9 +103,9 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 
     match o.network.interface.as_deref() {
         Some(ifx) => d.ext_link(ifx, node),
-        None => d
-            .default_ext_link(node)
-            .map_err(|e| anyhow::anyhow!("find default external interface: {e}"))?,
+        None => d.default_ext_link(node).map_err(|e| {
+            anyhow::anyhow!("find default external interface: {e}")
+        })?,
     }
 
     // illumos guests use mount(); linux guests need mount_linux() (the guest-side
@@ -115,16 +118,16 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     } else {
         d.mount(o.cargo_bay.as_str(), "/opt/cargo-bay", node)
     };
-    mounted.map_err(|e| anyhow::anyhow!("mount cargo-bay ({}): {e}", o.cargo_bay))?;
+    mounted.map_err(|e| {
+        anyhow::anyhow!("mount cargo-bay ({}): {e}", o.cargo_bay)
+    })?;
 
     eprintln!(
         "[voxel] booting builder {}, role {}",
         o.base_image,
         o.role.unwrap_or("none")
     );
-    d.launch()
-        .await
-        .map_err(|e| anyhow::anyhow!("launch builder: {e}"))?;
+    d.launch().await.map_err(|e| anyhow::anyhow!("launch builder: {e}"))?;
 
     // An agent role, or an arbitrary command, or neither (boot-only smoke test).
     // The cargo-bay arrives without the exec bit, so the agent is copied to
@@ -214,10 +217,13 @@ pub(crate) async fn create_frr(
         bail!("cross-compiling voxel-init for {FRR_TARGET} failed");
     }
 
-    std::fs::create_dir_all(&cargo_bay).with_context(|| format!("mkdir {cargo_bay}"))?;
-    let agent_src = root.join(format!("target/{FRR_TARGET}/release/voxel-init"));
+    std::fs::create_dir_all(&cargo_bay)
+        .with_context(|| format!("mkdir {cargo_bay}"))?;
+    let agent_src =
+        root.join(format!("target/{FRR_TARGET}/release/voxel-init"));
     let agent_dst = cargo_bay.join("voxel-init");
-    std::fs::copy(&agent_src, &agent_dst).with_context(|| format!("stage agent {agent_src}"))?;
+    std::fs::copy(&agent_src, &agent_dst)
+        .with_context(|| format!("stage agent {agent_src}"))?;
     // The 9p mount drops the exec bit in-guest anyway, but keep it host-side.
     let _ = Command::new("chmod").args(["+x"]).arg(&agent_dst).status();
 
@@ -247,9 +253,8 @@ pub(crate) fn toolchain_bin(name: &str) -> Utf8PathBuf {
     if let Ok(p) = std::env::var(name.to_uppercase()) {
         return Utf8PathBuf::from(p);
     }
-    for home in [std::env::var("HOME").ok(), Some("/root".into())]
-        .into_iter()
-        .flatten()
+    for home in
+        [std::env::var("HOME").ok(), Some("/root".into())].into_iter().flatten()
     {
         let candidate = Utf8PathBuf::from(home).join(".cargo/bin").join(name);
         if candidate.exists() {
@@ -287,7 +292,10 @@ pub(crate) fn repo_root() -> Result<Utf8PathBuf> {
 /// builds, and a leftover `builder-net` makes a later LAN build apply the
 /// isolated static address to its DHCP-serving VNIC, losing package and DNS
 /// access.
-fn stage_builder_net(cargo_bay: &Utf8Path, explicit: Option<&str>) -> Result<()> {
+fn stage_builder_net(
+    cargo_bay: &Utf8Path,
+    explicit: Option<&str>,
+) -> Result<()> {
     let path = cargo_bay.join("builder-net");
     let from_env = std::env::var("VOXEL_BUILDER_NET").ok();
     match explicit.map(str::to_string).or(from_env) {
@@ -364,7 +372,8 @@ fn falcon_dir() -> &'static Utf8Path {
 /// a stray or truncated pidfile cannot turn into a `kill` against something
 /// unrelated.
 fn read_pidfile(name: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(falcon_dir().join(format!("{name}.pid"))).ok()?;
+    let raw = std::fs::read_to_string(falcon_dir().join(format!("{name}.pid")))
+        .ok()?;
     let pid = raw.trim();
     if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
         return None;
@@ -386,7 +395,8 @@ fn hyperstop(name: &str) {
     let _ = std::fs::remove_file(&pidfile);
     // The clean halt above usually already tore the VM down, so bhyvectl's
     // "could not be opened" is the normal case, not an error worth printing.
-    if let Ok(uuid) = std::fs::read_to_string(dir.join(format!("{name}.uuid"))) {
+    if let Ok(uuid) = std::fs::read_to_string(dir.join(format!("{name}.uuid")))
+    {
         let uuid = uuid.trim();
         if !uuid.is_empty() {
             let _ = Command::new("pfexec")
@@ -443,7 +453,9 @@ fn rename(from: &Dataset, to: &Dataset) -> Result<()> {
     let status = Command::new("pfexec")
         .args(["zfs", "rename", from.as_str(), to.as_str()])
         .status()
-        .with_context(|| format!("run zfs rename {} {}", from.as_str(), to.as_str()))?;
+        .with_context(|| {
+            format!("run zfs rename {} {}", from.as_str(), to.as_str())
+        })?;
     if !status.success() {
         bail!("zfs rename {} -> {} failed", from.as_str(), to.as_str());
     }
@@ -540,10 +552,7 @@ fn send_recv(from_snapshot: &str, to: &Dataset) -> Result<()> {
         .context("spawn zfs send")?;
     let recv = Command::new("pfexec")
         .args(["zfs", "recv", to.as_str()])
-        .stdin(
-            send.stdout
-                .ok_or_else(|| anyhow::anyhow!("zfs send stdout"))?,
-        )
+        .stdin(send.stdout.ok_or_else(|| anyhow::anyhow!("zfs send stdout"))?)
         .status()
         .context("run zfs recv")?;
     if !recv.success() {

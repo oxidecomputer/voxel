@@ -18,7 +18,9 @@
 //! form -- the one fiddly bit is the flat-string serializations
 //! (`address = "addrconf"`, `addr = "unnumbered"`), validated against live wicketd.
 
-use crate::net::{SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin};
+use crate::net::{
+    SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, ssh_capture, zlogin,
+};
 use anyhow::{Context, Result, anyhow};
 use camino::Utf8Path;
 use libfalcon::{NodeRef, Runner};
@@ -35,7 +37,10 @@ const CONFIG_PUT_ATTEMPTS: u32 = 10;
 /// Offline check (hidden `voxel wicket-dryrun`): parse a config-rss.toml and
 /// print the wicketd `PutRssUserConfigInsensitive` body it would PUT, so the
 /// reshape can be validated against live wicketd without a relaunch.
-pub(crate) fn dryrun(config_rss_path: &Utf8Path, num_sleds: usize) -> Result<()> {
+pub(crate) fn dryrun(
+    config_rss_path: &Utf8Path,
+    num_sleds: usize,
+) -> Result<()> {
     let config_rss = std::fs::read_to_string(config_rss_path)
         .with_context(|| format!("read {}", config_rss_path))?;
     // Offline check assumes a single rack (slots 0..n); the live multi-rack slot
@@ -57,8 +62,12 @@ pub(crate) fn dryrun(config_rss_path: &Utf8Path, num_sleds: usize) -> Result<()>
 /// the MGS sim reports each gimlet at `location = ["sled", global_index]`. Passing
 /// a wrong/`0..n` set leaves wicketd unable to correlate rack 1's sleds and it
 /// never initializes.
-fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, String)> {
-    let v: toml::Value = toml::from_str(config_rss).context("parse config-rss.toml")?;
+fn build_bodies(
+    config_rss: &str,
+    bootstrap_slots: &[u16],
+) -> Result<(String, String)> {
+    let v: toml::Value =
+        toml::from_str(config_rss).context("parse config-rss.toml")?;
     let arr = |k: &str| -> serde_json::Value {
         toml_to_json(v.get(k).cloned().unwrap_or(toml::Value::Array(vec![])))
     };
@@ -73,10 +82,8 @@ fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, St
     let mut switch1 = serde_json::Map::new();
     if let Some(ports) = rnc.get("ports").and_then(|p| p.as_array()) {
         for p in ports {
-            let switch = p
-                .get("switch")
-                .and_then(|s| s.as_str())
-                .unwrap_or("switch0");
+            let switch =
+                p.get("switch").and_then(|s| s.as_str()).unwrap_or("switch0");
             let port = p
                 .get("port")
                 .and_then(|s| s.as_str())
@@ -124,7 +131,9 @@ fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, St
         .get("recovery_silo")
         .and_then(|r| r.get("user_password_hash"))
         .and_then(|h| h.as_str())
-        .ok_or_else(|| anyhow!("config-rss has no recovery_silo.user_password_hash"))?
+        .ok_or_else(|| {
+            anyhow!("config-rss has no recovery_silo.user_password_hash")
+        })?
         .to_string();
 
     Ok((serde_json::to_string(&body)?, pw_hash))
@@ -204,9 +213,9 @@ fn toml_to_json(v: toml::Value) -> serde_json::Value {
         toml::Value::Array(a) => {
             serde_json::Value::Array(a.into_iter().map(toml_to_json).collect())
         }
-        toml::Value::Table(t) => {
-            serde_json::Value::Object(t.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect())
-        }
+        toml::Value::Table(t) => serde_json::Value::Object(
+            t.into_iter().map(|(k, v)| (k, toml_to_json(v))).collect(),
+        ),
     }
 }
 
@@ -221,7 +230,8 @@ fn gen_cert(zone: &str) -> Result<(String, String)> {
     let san = format!("DNS:*.sys.{zone},DNS:*.{zone},DNS:{zone}");
     let status = std::process::Command::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-sha256",
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+            "-sha256",
         ])
         .arg("-keyout")
         .arg(&key)
@@ -234,10 +244,7 @@ fn gen_cert(zone: &str) -> Result<(String, String)> {
     if !status.success() {
         return Err(anyhow!("openssl cert generation failed"));
     }
-    Ok((
-        std::fs::read_to_string(&cert)?,
-        std::fs::read_to_string(&key)?,
-    ))
+    Ok((std::fs::read_to_string(&cert)?, std::fs::read_to_string(&key)?))
 }
 
 /// JSON-encode a string body (`TypedBody<String>` -- the cert/key endpoints take
@@ -249,7 +256,13 @@ fn json_string(s: &str) -> String {
 /// Ship `body` into the switch zone and `curl` it to wicketd with `method`,
 /// returning the HTTP status code. Bodies go via a file (`--data @`) to dodge
 /// shell quoting; `name` is the in-zone temp filename.
-fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> Result<u32> {
+fn wicketd_call(
+    ip: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    name: &str,
+) -> Result<u32> {
     let local = crate::util::temp_dir().join(name);
     std::fs::write(&local, body).with_context(|| format!("write {name}"))?;
     let zone_path = format!("{SWITCH_ZONE_ROOT}/var/tmp/{name}");
@@ -260,7 +273,8 @@ fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> R
         "curl -s -o /dev/null -w '%{{http_code}}' -X {method} \
          -H content-type:application/json --data @/var/tmp/{name} {WICKETD}{path}"
     ));
-    let code = ssh_capture(ip, &curl).ok_or_else(|| anyhow!("ssh curl {path} failed"))?;
+    let code = ssh_capture(ip, &curl)
+        .ok_or_else(|| anyhow!("ssh curl {path} failed"))?;
     code.trim()
         .parse::<u32>()
         .map_err(|_| anyhow!("{path}: unexpected response {code:?}"))
@@ -268,19 +282,28 @@ fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> R
 
 /// Poll wicketd until it's up and reports the rack's sleds on the bootstrap
 /// network (each entry a baseboard id plus bootstrap ip).
-fn wait_wicketd_ready(ip: &str, num_sleds: usize, log: &slog::Logger) -> Result<()> {
+fn wait_wicketd_ready(
+    ip: &str,
+    num_sleds: usize,
+    log: &slog::Logger,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(300);
     let curl = zlogin(&format!("curl -s {WICKETD}/bootstrap-sleds"));
     loop {
         if let Some(out) = ssh_capture(ip, &curl) {
             let found = out.matches("\"serial_number\"").count();
             if found >= num_sleds {
-                info!(log, "wicket-setup: wicketd ready, {found} sleds discovered");
+                info!(
+                    log,
+                    "wicket-setup: wicketd ready, {found} sleds discovered"
+                );
                 return Ok(());
             }
         }
         if Instant::now() >= deadline {
-            return Err(anyhow!("wicketd not ready / SPs not discovered within 5m"));
+            return Err(anyhow!(
+                "wicketd not ready / SPs not discovered within 5m"
+            ));
         }
         std::thread::sleep(Duration::from_secs(8));
     }
@@ -395,7 +418,8 @@ pub(crate) async fn drive(
     // Trigger init. `post_run_rack_setup` assembles the RackInitializeRequest from
     // the uploaded config + the discovered bootstrap_sleds and calls the
     // bootstrap-agent -- after this the normal /rack-initialize status reflects it.
-    let run = wicketd_call(&ip, "POST", "/rack-setup", "{}", "wsetup-run.json")?;
+    let run =
+        wicketd_call(&ip, "POST", "/rack-setup", "{}", "wsetup-run.json")?;
     if !(200..300).contains(&run) {
         return Err(anyhow!("POST /rack-setup -> HTTP {run}"));
     }

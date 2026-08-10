@@ -46,10 +46,8 @@ pub(crate) async fn resolve_external_ip(
     is_router: bool,
 ) -> anyhow::Result<String> {
     if cfg.external.isolated()
-        && let Some((_, ip)) = cfg
-            .static_external_ips()
-            .into_iter()
-            .find(|(name, _)| name == node)
+        && let Some((_, ip)) =
+            cfg.static_external_ips().into_iter().find(|(name, _)| name == node)
     {
         return Ok(ip);
     }
@@ -141,7 +139,11 @@ fn ensure_askpass() -> Option<camino::Utf8PathBuf> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o755)).ok()?;
+            std::fs::set_permissions(
+                &askpass,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .ok()?;
         }
     }
     Some(askpass)
@@ -260,7 +262,10 @@ pub(crate) fn wait_external_reachable(
                 return;
             }
             Some(true) => {
-                info!(log, "{label}: external network reachable (dns {dns_ip})");
+                info!(
+                    log,
+                    "{label}: external network reachable (dns {dns_ip})"
+                );
                 return;
             }
             Some(false) => {
@@ -298,7 +303,9 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
         ])
         .output()
     {
-        Ok(o) => Some(o.status.success() && !o.stdout.iter().all(u8::is_ascii_whitespace)),
+        Ok(o) => Some(
+            o.status.success() && !o.stdout.iter().all(u8::is_ascii_whitespace),
+        ),
         Err(_) => None,
     }
 }
@@ -346,10 +353,7 @@ pub(crate) async fn set_external_route(
     };
 
     if !apply {
-        info!(
-            d.log,
-            "external route (dry-run): route add {} {}", prefix, ip
-        );
+        info!(d.log, "external route (dry-run): route add {} {}", prefix, ip);
         return Ok(());
     }
     // Drop ALL stale routes for this prefix, then point it at the live ce.
@@ -371,7 +375,9 @@ pub(crate) async fn set_external_route(
             .args(["delete", prefix])
             .output();
         let gone = match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).contains("not in table"),
+            Ok(o) => {
+                String::from_utf8_lossy(&o.stdout).contains("not in table")
+            }
             Err(_) => true,
         };
         if gone {

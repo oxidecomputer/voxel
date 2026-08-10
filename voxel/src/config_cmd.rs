@@ -7,7 +7,10 @@ use voxel_config::{VoxelConfig, config as vcfg};
 
 use crate::{ConfigCmd, config_text, load_config};
 
-pub(crate) fn cmd_config(path: &Utf8Path, cmd: &ConfigCmd) -> anyhow::Result<()> {
+pub(crate) fn cmd_config(
+    path: &Utf8Path,
+    cmd: &ConfigCmd,
+) -> anyhow::Result<()> {
     match cmd {
         ConfigCmd::Show => {
             print!("{}", load_config(path)?.to_toml());
@@ -22,16 +25,21 @@ pub(crate) fn cmd_config(path: &Utf8Path, cmd: &ConfigCmd) -> anyhow::Result<()>
         ConfigCmd::Set { key, value } => {
             // Seed the file with defaults if it doesn't exist yet, so edits stick.
             let text = config_text(path)?;
-            let updated = vcfg::set(&text, key, value).map_err(|e| anyhow!(e))?;
+            let updated =
+                vcfg::set(&text, key, value).map_err(|e| anyhow!(e))?;
             ensure_parent_dir(path)?;
-            fs::write(path, &updated).with_context(|| format!("write {}", path))?;
+            fs::write(path, &updated)
+                .with_context(|| format!("write {}", path))?;
             println!("{key} = {value}");
         }
         ConfigCmd::Load { file } => {
-            let text = fs::read_to_string(file).with_context(|| format!("read {}", file))?;
-            VoxelConfig::from_toml(&text).map_err(|e| anyhow!("invalid config {}: {e}", file))?;
+            let text = fs::read_to_string(file)
+                .with_context(|| format!("read {}", file))?;
+            VoxelConfig::from_toml(&text)
+                .map_err(|e| anyhow!("invalid config {}: {e}", file))?;
             ensure_parent_dir(path)?;
-            fs::write(path, &text).with_context(|| format!("write {}", path))?;
+            fs::write(path, &text)
+                .with_context(|| format!("write {}", path))?;
             println!("loaded {} -> {}", file, path);
         }
     }

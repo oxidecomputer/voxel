@@ -5,7 +5,9 @@
 //! switch1 identity for the 2nd scrimlet, then activates the control plane (which
 //! kicks RSS on the RSS node).
 
-use crate::sys::{note, read_external_net, replace_in_file, run, run_env, run_quiet, warn};
+use crate::sys::{
+    note, read_external_net, replace_in_file, run, run_env, run_quiet, warn,
+};
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
 use indoc::{formatdoc, indoc};
@@ -24,11 +26,7 @@ const PATCHED_CFG: &str = "/tmp/sled-config.toml";
 /// "dev cargo-bay wins, baked image otherwise" rule used to source every sp-emu
 /// artifact.
 fn pick(staged: String, baked: String) -> String {
-    if Utf8Path::new(&staged).exists() {
-        staged
-    } else {
-        baked
-    }
+    if Utf8Path::new(&staged).exists() { staged } else { baked }
 }
 
 /// Poll `f` every 2s until it returns true or `max_s` seconds elapse; returns
@@ -55,7 +53,8 @@ pub fn bring_up() -> Result<()> {
     if !Utf8Path::new(OMICRON).exists() {
         bail!("{OMICRON} not baked into the image");
     }
-    std::env::set_current_dir(OMICRON).with_context(|| format!("cd {OMICRON}"))?;
+    std::env::set_current_dir(OMICRON)
+        .with_context(|| format!("cd {OMICRON}"))?;
     let xtask_bin = format!("{OMICRON}/xtask");
     let xtask_dl = format!("{OMICRON}/xtask-downloader");
 
@@ -72,10 +71,7 @@ pub fn bring_up() -> Result<()> {
     if !run_env(
         "./omicron-package",
         &["activate"],
-        &[
-            ("XTASK_BIN", &xtask_bin),
-            ("XTASK_DOWNLOADER_BIN", &xtask_dl),
-        ],
+        &[("XTASK_BIN", &xtask_bin), ("XTASK_DOWNLOADER_BIN", &xtask_dl)],
     ) {
         warn("omicron-package activate failed");
     }
@@ -159,9 +155,7 @@ fn detect_underlay() -> (Vec<String>, Vec<String>) {
             other.push(nic);
         }
     }
-    note(format!(
-        "underlay(jumbo)={underlay:?} ext-candidates={other:?}"
-    ));
+    note(format!("underlay(jumbo)={underlay:?} ext-candidates={other:?}"));
     (underlay, other)
 }
 
@@ -170,7 +164,8 @@ fn detect_underlay() -> (Vec<String>, Vec<String>) {
 /// WORKSPACE config (`smf/sled-agent/non-gimlet/config.toml`) that
 /// virtual-hardware reads. Uses `toml_edit`—no `sed`.
 fn patch_sled_config(underlay: &[String]) -> Result<()> {
-    let text = fs::read_to_string(SLED_CFG).with_context(|| format!("read {SLED_CFG}"))?;
+    let text = fs::read_to_string(SLED_CFG)
+        .with_context(|| format!("read {SLED_CFG}"))?;
     let mut doc: toml_edit::DocumentMut =
         text.parse().with_context(|| format!("parse {SLED_CFG}"))?;
     if let Some(first) = underlay.first() {
@@ -190,10 +185,12 @@ fn patch_sled_config(underlay: &[String]) -> Result<()> {
             *dl = toml_edit::value(devices);
         }
     }
-    fs::write(PATCHED_CFG, doc.to_string()).with_context(|| format!("write {PATCHED_CFG}"))?;
+    fs::write(PATCHED_CFG, doc.to_string())
+        .with_context(|| format!("write {PATCHED_CFG}"))?;
     // xtask virtual-hardware reads the workspace config (vdevs + sled_mode).
     let workspace = "smf/sled-agent/non-gimlet/config.toml";
-    fs::copy(PATCHED_CFG, workspace).with_context(|| format!("seed {workspace}"))?;
+    fs::copy(PATCHED_CFG, workspace)
+        .with_context(|| format!("seed {workspace}"))?;
     Ok(())
 }
 
@@ -207,11 +204,8 @@ fn patch_sled_config(underlay: &[String]) -> Result<()> {
 /// resolver.
 fn setup_external_networking(other: &[String]) {
     if let Some(ext) = read_external_net() {
-        let resolv: String = ext
-            .dns
-            .iter()
-            .map(|s| format!("nameserver {s}\n"))
-            .collect();
+        let resolv: String =
+            ext.dns.iter().map(|s| format!("nameserver {s}\n")).collect();
         if let Err(e) = fs::write("/etc/resolv.conf", resolv) {
             warn(format!("resolv.conf: {e}"));
         }
@@ -246,7 +240,9 @@ fn setup_external_networking(other: &[String]) {
                 clear_persistent_defaults();
                 run("route", &["-p", "add", "default", &ext.gateway]);
             }
-            None => warn("external-net staged but no external NIC candidate found"),
+            None => {
+                warn("external-net staged but no external NIC candidate found")
+            }
         }
         return;
     }
@@ -264,10 +260,7 @@ fn setup_external_networking(other: &[String]) {
         // a prior isolated run's static address persists across relaunches
         // and blocks the `-T dhcp` create). Silent on absence.
         run_quiet("ipadm", &["delete-addr", &format!("{ifc}/v4")]);
-        run(
-            "ipadm",
-            &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")],
-        );
+        run("ipadm", &["create-addr", "-T", "dhcp", &format!("{ifc}/v4")]);
     }
 }
 
@@ -337,15 +330,18 @@ fn unplumb_softnpu_source() {
     run_quiet("ipadm", &["delete-if", "vioif0"]);
 }
 
-const SWITCH_ZONE_MGS: &str = "/zone/oxz_switch/root/var/svc/manifest/site/mgs/config.toml";
-const SWITCH_ZONE_SP: &str = "/zone/oxz_switch/root/var/svc/manifest/site/sp-sim/config.toml";
+const SWITCH_ZONE_MGS: &str =
+    "/zone/oxz_switch/root/var/svc/manifest/site/mgs/config.toml";
+const SWITCH_ZONE_SP: &str =
+    "/zone/oxz_switch/root/var/svc/manifest/site/sp-sim/config.toml";
 
 // sp-emu staging: `stage_config` drops the binary + a `<base_port>.flash` per
 // emulated SP into this scrimlet's cargo-bay; voxel-init copies them into the
 // switch zone and runs each as an SMF contract daemon.
 const SP_EMU_CARGO_DIR: &str = "/opt/cargo-bay/sp-emu";
 const SP_EMU_ZONE_DIR: &str = "/zone/oxz_switch/root/opt/oxide/sp-emu";
-const SP_EMU_MANIFEST: &str = "/zone/oxz_switch/root/var/svc/manifest/site/voxel-sp-emu.xml";
+const SP_EMU_MANIFEST: &str =
+    "/zone/oxz_switch/root/var/svc/manifest/site/voxel-sp-emu.xml";
 // Each SP gets its OWN rot-serve (one RoT per SP — not shared). The rot-serve for
 // SP base-port `P` listens on the zone-local port `P - SP_EMU_ROT_PORT_OFFSET`
 // (e.g. 33300 -> 19300), clear of the SP base-port + ereport ranges.
@@ -370,7 +366,8 @@ fn maybe_start_switch_enforcer() -> Result<()> {
         return Ok(());
     };
     let exe = std::env::current_exe().context("current_exe")?;
-    let log = fs::File::create("/tmp/switch-enforcer.log").context("enforcer log")?;
+    let log =
+        fs::File::create("/tmp/switch-enforcer.log").context("enforcer log")?;
     let mut cmd = Command::new(exe);
     cmd.arg("switch-enforcer")
         .arg(slot.to_string())
@@ -400,9 +397,8 @@ fn staged_switch_slot() -> Option<u8> {
         let name = entry.file_name();
         let name = name.to_str()?;
         if let Some(rest) = name.strip_prefix("mgs-config-switch")
-            && let Some(slot) = rest
-                .strip_suffix(".toml")
-                .and_then(|d| d.parse::<u8>().ok())
+            && let Some(slot) =
+                rest.strip_suffix(".toml").and_then(|d| d.parse::<u8>().ok())
         {
             return Some(slot);
         }
@@ -499,8 +495,10 @@ fn setup_sp_emu() {
         Err(_) => Vec::new(),
     };
     // Manifest: a `rot <0|1>` line then `<port> <role>` lines.
-    let manifest = fs::read_to_string(format!("{SP_EMU_CARGO_DIR}/ports")).unwrap_or_default();
-    let mut roles: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+    let manifest = fs::read_to_string(format!("{SP_EMU_CARGO_DIR}/ports"))
+        .unwrap_or_default();
+    let mut roles: std::collections::BTreeMap<u16, String> =
+        std::collections::BTreeMap::new();
     let mut rot_from_manifest = false;
     for line in manifest.lines() {
         let mut it = line.split_whitespace();
@@ -529,10 +527,8 @@ fn setup_sp_emu() {
         return;
     }
     let bin_to = format!("{SP_EMU_ZONE_DIR}/sp-emu");
-    let bin_src = pick(
-        format!("{SP_EMU_CARGO_DIR}/sp-emu"),
-        format!("{BAKED}/sp-emu"),
-    );
+    let bin_src =
+        pick(format!("{SP_EMU_CARGO_DIR}/sp-emu"), format!("{BAKED}/sp-emu"));
     if let Err(e) = fs::copy(&bin_src, &bin_to) {
         warn(format!("copy sp-emu binary from {bin_src}: {e}"));
         return;
@@ -563,11 +559,15 @@ fn setup_sp_emu() {
     let rot_enabled = Utf8Path::new(&staged_rot).exists() || rot_from_manifest;
     if rot_enabled {
         let rot_src = pick(staged_rot, format!("{BAKED}/rot.flash"));
-        if let Err(e) = fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash")) {
+        if let Err(e) =
+            fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash"))
+        {
             warn(format!("copy rot.flash from {rot_src}: {e}"));
         }
     }
-    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports, rot_enabled)) {
+    if let Err(e) =
+        fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports, rot_enabled))
+    {
         warn(format!("write sp-emu manifest: {e}"));
         return;
     }
@@ -588,13 +588,7 @@ fn setup_sp_emu() {
     });
     run(
         "zlogin",
-        &[
-            "oxz_switch",
-            "svcadm",
-            "disable",
-            "-s",
-            "svc:/oxide/sp-sim:default",
-        ],
+        &["oxz_switch", "svcadm", "disable", "-s", "svc:/oxide/sp-sim:default"],
     );
     run(
         "zlogin",
@@ -669,11 +663,7 @@ fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
         "#});
     }
     for &port in ports {
-        let board = if port == SIDECAR_SP_PORT {
-            "sidecar"
-        } else {
-            "gimlet"
-        };
+        let board = if port == SIDECAR_SP_PORT { "sidecar" } else { "gimlet" };
         s.push_str(&formatdoc! {r#"
             <instance name="sp{port}" enabled="true">
               <exec_method type="method" name="start" exec="/opt/oxide/sp-emu/sp-emu gdb a 340000000" timeout_seconds="0">
@@ -735,7 +725,9 @@ pub fn switch_enforcer_svc() {
             note(format!("switch-enforcer-svc: enforcing switch{slot}"));
             switch_enforcer(slot);
         }
-        None => note("switch-enforcer-svc: no switch slot staged (gimlet); nothing to do"),
+        None => note(
+            "switch-enforcer-svc: no switch slot staged (gimlet); nothing to do",
+        ),
     }
 }
 

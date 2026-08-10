@@ -5,7 +5,8 @@
 //! its upstream).
 
 use crate::sys::{
-    ExternalNet, capture, note, read_external_net, replace_in_file, run, run_quiet, warn,
+    ExternalNet, capture, note, read_external_net, replace_in_file, run,
+    run_quiet, warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -27,12 +28,7 @@ pub fn bring_up() -> Result<()> {
     // apt-daily timers can wipe FRR state (disabled at bake; belt + braces).
     run(
         "systemctl",
-        &[
-            "disable",
-            "--now",
-            "apt-daily-upgrade.timer",
-            "apt-daily.timer",
-        ],
+        &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"],
     );
 
     // rp_filter drops the rack's asymmetric / unnumbered transit traffic.
@@ -109,7 +105,8 @@ fn apply_static_edge_ip() {
         warn("static edge IP: no uplink found");
         return;
     };
-    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
+    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc])
+        .unwrap_or_default();
     if cur
         .split_whitespace()
         .any(|t| t == ip || t.starts_with(&format!("{ip}/")))
@@ -142,7 +139,9 @@ fn ensure_unique_uplink_lease() {
     // is no lease to dedupe. Keep networkd's DHCP client off the uplink that
     // `apply_static_external` configures by hand.
     if read_external_net().is_some() {
-        note("isolated mode: static external address, skipping DHCP lease pinning");
+        note(
+            "isolated mode: static external address, skipping DHCP lease pinning",
+        );
         return;
     }
     let Some(ifc) = uplink_iface() else {
@@ -160,7 +159,9 @@ fn ensure_unique_uplink_lease() {
         ClientIdentifier=mac
         RouteMetric=100
     "};
-    if let Err(e) = fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg) {
+    if let Err(e) =
+        fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg)
+    {
         warn(format!("unique-lease: write networkd config: {e}"));
         return;
     }
@@ -260,17 +261,15 @@ fn nat_rack_egress() {
 ///
 /// No-op in `lan` mode (no file staged).
 fn apply_static_external() {
-    let Some(ExternalNet {
-        ip_cidr,
-        gateway,
-        dns,
-        iface,
-    }) = read_external_net()
+    let Some(ExternalNet { ip_cidr, gateway, dns, iface }) =
+        read_external_net()
     else {
         return;
     };
     let Some(ifc) = iface else {
-        warn("external-net staged without an iface line; router bring-up needs it");
+        warn(
+            "external-net staged without an iface line; router bring-up needs it",
+        );
         return;
     };
 
@@ -282,19 +281,18 @@ fn apply_static_external() {
         return;
     }
     run("ip", &["link", "set", &ifc, "up"]);
-    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc]).unwrap_or_default();
+    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc])
+        .unwrap_or_default();
     let already = cur.split_whitespace().any(|t| t == ip_cidr);
     if already {
         note(format!("static external {ip_cidr} already on {ifc}"));
     } else {
         run("ip", &["addr", "add", &ip_cidr, "dev", &ifc]);
     }
-    run(
-        "ip",
-        &["route", "replace", "default", "via", &gateway, "dev", &ifc],
-    );
+    run("ip", &["route", "replace", "default", "via", &gateway, "dev", &ifc]);
 
-    let resolv: String = dns.iter().map(|s| format!("nameserver {s}\n")).collect();
+    let resolv: String =
+        dns.iter().map(|s| format!("nameserver {s}\n")).collect();
     if !resolv.is_empty() {
         // Replace the systemd-resolved symlink with a static file so our
         // nameservers stick (isolated mode has no DHCP to populate resolved).
@@ -343,7 +341,9 @@ fn uplink_iface() -> Option<String> {
         return link_exists(&ifc).then_some(ifc);
     }
     for _ in 0..30 {
-        if let Some(line) = capture("ip", &["-o", "-4", "route", "show", "default"]) {
+        if let Some(line) =
+            capture("ip", &["-o", "-4", "route", "show", "default"])
+        {
             // "default via <gw> dev <iface> ...", so the iface is whitespace field 5.
             if let Some(dev) = line.split_whitespace().nth(4)
                 && !dev.is_empty()

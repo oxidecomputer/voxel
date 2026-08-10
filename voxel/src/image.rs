@@ -57,7 +57,10 @@ pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
 /// the generated switch1. One SP fleet drives both the MGS port table and
 /// sp-sim's side, so they agree by construction; baked images use the sim
 /// backend.
-pub(crate) fn render_smf(omicron_root: &Utf8Path, gimlets: usize) -> anyhow::Result<()> {
+pub(crate) fn render_smf(
+    omicron_root: &Utf8Path,
+    gimlets: usize,
+) -> anyhow::Result<()> {
     let scrimlets = [0usize, gimlets.saturating_sub(1)];
     let fleet = voxel_config::sp::SpFleet::sim(gimlets);
     let writes = [
@@ -81,7 +84,10 @@ pub(crate) fn render_smf(omicron_root: &Utf8Path, gimlets: usize) -> anyhow::Res
     Ok(())
 }
 
-pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Result<()> {
+pub(crate) fn cmd_image(
+    cmd: &ImageCmd,
+    active: Option<String>,
+) -> anyhow::Result<()> {
     match cmd {
         ImageCmd::Ls => {
             // Image bundles are falcon base images at <dataset>/img/<name>@base.
@@ -117,10 +123,11 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             let mut bundles: Vec<String> = Vec::new();
             for line in text.lines() {
                 let mut f = line.split('\t');
-                let (name, used, creation, ty) = match (f.next(), f.next(), f.next(), f.next()) {
-                    (Some(n), Some(u), Some(c), Some(t)) => (n, u, c, t),
-                    _ => continue,
-                };
+                let (name, used, creation, ty) =
+                    match (f.next(), f.next(), f.next(), f.next()) {
+                        (Some(n), Some(u), Some(c), Some(t)) => (n, u, c, t),
+                        _ => continue,
+                    };
                 match ty {
                     "volume" => {
                         if let Some(short) = name.strip_prefix(&prefix) {
@@ -240,7 +247,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             }
             Ok(())
         }
-        ImageCmd::Create { .. } => bail!("internal: `image create` is dispatched in main"),
+        ImageCmd::Create { .. } => {
+            bail!("internal: `image create` is dispatched in main")
+        }
         ImageCmd::Export { name, out, raw } => {
             let dataset = falcon_dataset();
             let snap = format!("{dataset}/img/{name}@base");
@@ -267,9 +276,8 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                     format!("zfs send {snap} | zstd -T0 -c"),
                 )
             };
-            let out = out
-                .clone()
-                .unwrap_or_else(|| Utf8PathBuf::from(default_out));
+            let out =
+                out.clone().unwrap_or_else(|| Utf8PathBuf::from(default_out));
             eprintln!("[voxel] exporting {snap} -> {}", out);
             let status = std::process::Command::new("bash")
                 .arg("-c")
@@ -289,7 +297,8 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
             let dataset = falcon_dataset();
             let fname = file.file_name().context("bad file path")?;
             // Derive image name + decompressor from the extension.
-            let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst") {
+            let (name, decomp) = if let Some(n) = fname.strip_suffix(".zfs.zst")
+            {
                 (
                     n.to_string(),
                     format!("zstd -dc {}", shell_quote(file.as_str())),
@@ -300,7 +309,9 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                      Export as a zfs stream instead: those (.zfs.zst) import directly."
                 );
             } else {
-                bail!("unrecognized extension on {fname} (want .zfs.zst or .raw.xz)");
+                bail!(
+                    "unrecognized extension on {fname} (want .zfs.zst or .raw.xz)"
+                );
             };
             let dst = format!("{dataset}/img/{name}");
             eprintln!("[voxel] importing {} -> {dst}", file);
@@ -310,9 +321,13 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
                 .status()
                 .context("import")?;
             if !status.success() {
-                bail!("import failed (need zstd + zfs; {dst} must not already exist)");
+                bail!(
+                    "import failed (need zstd + zfs; {dst} must not already exist)"
+                );
             }
-            println!("imported {dst}@base (use: voxel config set image.cp {name})");
+            println!(
+                "imported {dst}@base (use: voxel config set image.cp {name})"
+            );
             Ok(())
         }
         ImageCmd::Rm { name, yes } => {
@@ -341,12 +356,17 @@ pub(crate) fn cmd_image(cmd: &ImageCmd, active: Option<String>) -> anyhow::Resul
         }
         // `image patch` needs the loaded config (for the default source image),
         // so it's dispatched in `main` before delegating the rest here.
-        ImageCmd::Patch { .. } => bail!("internal: `image patch` is dispatched in main"),
-        ImageCmd::Bake { .. } => bail!("internal: `image bake` is dispatched in main"),
-        ImageCmd::CreateFrr { .. } => bail!("internal: `image create-frr` is dispatched in main"),
-        ImageCmd::RenderSmf {
-            omicron_root,
-            gimlets,
-        } => render_smf(omicron_root, *gimlets),
+        ImageCmd::Patch { .. } => {
+            bail!("internal: `image patch` is dispatched in main")
+        }
+        ImageCmd::Bake { .. } => {
+            bail!("internal: `image bake` is dispatched in main")
+        }
+        ImageCmd::CreateFrr { .. } => {
+            bail!("internal: `image create-frr` is dispatched in main")
+        }
+        ImageCmd::RenderSmf { omicron_root, gimlets } => {
+            render_smf(omicron_root, *gimlets)
+        }
     }
 }

@@ -90,8 +90,9 @@ pub(crate) async fn watch_rss(
     cap: Duration,
     known_ip: Option<String>,
 ) {
-    let curl =
-        format!("curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null");
+    let curl = format!(
+        "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
+    );
 
     info!(d.log, "{tag}: watching RSS progress on the RSS node ...");
 
@@ -117,7 +118,11 @@ pub(crate) async fn watch_rss(
 /// Serial-console IP discovery (`lan` mode). Bounded; `None` if the IP never
 /// appears within the window - the caller stops watching and the rack keeps
 /// converging on its own.
-async fn discover_rss_ip(d: &Runner, rss: NodeRef, tag: &str) -> Option<String> {
+async fn discover_rss_ip(
+    d: &Runner,
+    rss: NodeRef,
+    tag: &str,
+) -> Option<String> {
     let ip_deadline = Instant::now() + Duration::from_secs(60);
     let rss_ip = loop {
         match tokio::time::timeout(
@@ -151,7 +156,13 @@ async fn discover_rss_ip(d: &Runner, rss: NodeRef, tag: &str) -> Option<String> 
 
 /// Poll the bootstrap-agent's `/rack-initialize` over SSH until it initializes,
 /// fails, or the cap expires. Emits step transitions + a periodic heartbeat.
-async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: Duration) {
+async fn watch_rss_loop(
+    d: &Runner,
+    tag: &str,
+    curl: &str,
+    rss_ip: String,
+    cap: Duration,
+) {
     const POLL_INTERVAL: Duration = Duration::from_secs(8);
     const HEARTBEAT: Duration = Duration::from_secs(90);
     let start = Instant::now();
@@ -181,7 +192,8 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
                 // schema drift) and stop, instead of the 15-minute hang.
                 if last.is_empty()
                     && start.elapsed() > Duration::from_secs(20)
-                    && let Some(x) = crate::net::ssh_capture(&rss_ip, "svcs -x 2>/dev/null")
+                    && let Some(x) =
+                        crate::net::ssh_capture(&rss_ip, "svcs -x 2>/dev/null")
                     && x.contains("maintenance")
                 {
                     warn!(
@@ -195,7 +207,11 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
                         "tail -6 /var/svc/log/oxide-sled-agent:default.log 2>/dev/null",
                     ) && !t.trim().is_empty()
                     {
-                        warn!(d.log, "{tag}: sled-agent log tail:\n{}", t.trim());
+                        warn!(
+                            d.log,
+                            "{tag}: sled-agent log tail:\n{}",
+                            t.trim()
+                        );
                     }
                     warn!(
                         d.log,
@@ -212,7 +228,10 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
                     } else {
                         format!("last seen: {}", rss_step_display(&last).1)
                     };
-                    info!(d.log, "{tag}: still watching, {mins}m elapsed - {where_}");
+                    info!(
+                        d.log,
+                        "{tag}: still watching, {mins}m elapsed - {where_}"
+                    );
                     last_emit = Instant::now();
                 }
                 continue;
@@ -223,7 +242,13 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
                 let step = json_step(&out);
                 if !step.is_empty() && step != last {
                     let (idx, label) = rss_step_display(&step);
-                    info!(d.log, "{tag} [{}/{}]: {}", idx, RSS_STEPS.len(), label);
+                    info!(
+                        d.log,
+                        "{tag} [{}/{}]: {}",
+                        idx,
+                        RSS_STEPS.len(),
+                        label
+                    );
                     last = step;
                     last_emit = Instant::now();
                     step_start = Instant::now();
@@ -264,7 +289,11 @@ async fn watch_rss_loop(d: &Runner, tag: &str, curl: &str, rss_ip: String, cap: 
                 break;
             }
             "initialization_failed" => {
-                warn!(d.log, "{tag} FAILED: {}", json_str_field(&out, "message"));
+                warn!(
+                    d.log,
+                    "{tag} FAILED: {}",
+                    json_str_field(&out, "message")
+                );
                 break;
             }
             _ => {} // not serving yet / other - keep waiting
@@ -328,8 +357,7 @@ mod tests {
     #[test]
     fn strip_ansi_yields_clean_ip() {
         // ip(8) colorizes: ESC[36menp0s10ESC[0m ... ESC[35m192.168.68.171ESC[0m/22
-        let colored =
-            "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
+        let colored = "\x1b[36menp0s10\x1b[0m \x1b[32mUP\x1b[0m \x1b[35m192.168.68.171\x1b[0m/22 metric 100";
         let clean = strip_ansi(colored);
         let ip = clean
             .split_whitespace()

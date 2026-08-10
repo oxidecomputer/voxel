@@ -8,12 +8,13 @@ use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 
-use crate::imagebuild::{BakeOpts, bake, builder_network, repo_root, toolchain_bin};
+use crate::imagebuild::{
+    BakeOpts, bake, builder_network, repo_root, toolchain_bin,
+};
 
 /// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
 const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
-const SIDECAR_URL: &str =
-    "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
+const SIDECAR_URL: &str = "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
 
 /// Build flags matching the validated recipe for building omicron on Helios.
 /// pg_config (libpq) comes from /opt/ooce/bin, added to PATH below.
@@ -58,7 +59,9 @@ pub(crate) async fn create(
                 .canonicalize_utf8()
                 .with_context(|| format!("resolve --src {s}"))?;
             if !s.join("package-manifest.toml").exists() {
-                bail!("{s} doesn't look like an omicron checkout (no package-manifest.toml)");
+                bail!(
+                    "{s} doesn't look like an omicron checkout (no package-manifest.toml)"
+                );
             }
             let label = match commit {
                 Some(l) => l.to_string(),
@@ -77,7 +80,9 @@ pub(crate) async fn create(
                 }
                 None => bail!("a <COMMIT> is required (or pass --src <path>)"),
             };
-            if !PINNED_OMICRON_REV.is_empty() && !PINNED_OMICRON_REV.starts_with(&commit) {
+            if !PINNED_OMICRON_REV.is_empty()
+                && !PINNED_OMICRON_REV.starts_with(&commit)
+            {
                 eprintln!(
                     "[voxel] WARN: {commit} is not the omicron rev voxel is pinned to \
                      ({PINNED_OMICRON_REV}); the generated config-rss may not match this image"
@@ -89,7 +94,8 @@ pub(crate) async fn create(
                     std::env::var("HOME").unwrap_or_else(|_| "/root".into())
                 )
             });
-            let src = Utf8PathBuf::from(build_root).join(format!("omicron-{commit}"));
+            let src =
+                Utf8PathBuf::from(build_root).join(format!("omicron-{commit}"));
             (commit, src, false)
         }
     };
@@ -133,8 +139,9 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
                 std::fs::create_dir_all(parent).ok();
             }
             eprintln!("[voxel] cloning omicron -> {src}");
-            let repo = std::env::var("OMICRON_REPO")
-                .unwrap_or_else(|_| "https://github.com/oxidecomputer/omicron".into());
+            let repo = std::env::var("OMICRON_REPO").unwrap_or_else(|_| {
+                "https://github.com/oxidecomputer/omicron".into()
+            });
             run(
                 Command::new("git").arg("clone").arg(&repo).arg(src),
                 "git clone omicron",
@@ -177,7 +184,9 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     )?;
 
     // --- 3. build the package tools ------------------------------------------
-    eprintln!("[voxel] cargo build --release omicron-package xtask xtask-downloader");
+    eprintln!(
+        "[voxel] cargo build --release omicron-package xtask xtask-downloader"
+    );
     run(
         omicron_cmd(src, toolchain_bin("cargo").as_str()).args([
             "build",
@@ -221,7 +230,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let stage = cargo_bay.join("omicron");
     eprintln!("[voxel] staging omicron build -> {stage}");
     let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage).with_context(|| format!("mkdir {stage}"))?;
+    std::fs::create_dir_all(&stage)
+        .with_context(|| format!("mkdir {stage}"))?;
     let mut rsync = omicron_cmd(src, "rsync");
     rsync.args([
         "-a",
@@ -251,11 +261,16 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
     // --- 7b. build + stage the in-guest agent --------------------------------
     // Native illumos build: this box is the gimlet's OS.
-    eprintln!("[voxel] building voxel-init (native illumos) for the gimlet image");
+    eprintln!(
+        "[voxel] building voxel-init (native illumos) for the gimlet image"
+    );
     run(
-        Command::new(toolchain_bin("cargo"))
-            .current_dir(&root)
-            .args(["build", "-p", "voxel-init", "--release"]),
+        Command::new(toolchain_bin("cargo")).current_dir(&root).args([
+            "build",
+            "-p",
+            "voxel-init",
+            "--release",
+        ]),
         "cargo build voxel-init",
     )?;
     let agent = cargo_bay.join("voxel-init");
@@ -288,16 +303,15 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 /// stage them for the image. The builder VM may not reach buildomat.eng - only
 /// the host does - so this happens here rather than in-guest.
 fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
-    let rev = std::env::var("SIDECAR_LITE_REV").unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
+    let rev = std::env::var("SIDECAR_LITE_REV")
+        .unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
     let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
-    std::fs::create_dir_all(&cache).with_context(|| format!("mkdir {cache}"))?;
+    std::fs::create_dir_all(&cache)
+        .with_context(|| format!("mkdir {cache}"))?;
     std::fs::create_dir_all(dest).with_context(|| format!("mkdir {dest}"))?;
     for artifact in ["scadm", "libsidecar_lite.so"] {
         let cached = cache.join(artifact);
-        if std::fs::metadata(&cached)
-            .map(|m| m.len() == 0)
-            .unwrap_or(true)
-        {
+        if std::fs::metadata(&cached).map(|m| m.len() == 0).unwrap_or(true) {
             eprintln!("[voxel] fetching {artifact} @ {rev}");
             run(
                 Command::new("curl")
@@ -308,7 +322,8 @@ fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
             )?;
         }
         let _ = Command::new("chmod").arg("+x").arg(&cached).status();
-        std::fs::copy(&cached, dest.join(artifact)).with_context(|| format!("stage {artifact}"))?;
+        std::fs::copy(&cached, dest.join(artifact))
+            .with_context(|| format!("stage {artifact}"))?;
     }
     eprintln!("[voxel] staged scadm + libsidecar_lite.so -> {dest}");
     Ok(())
