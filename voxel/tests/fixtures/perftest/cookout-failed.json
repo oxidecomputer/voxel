@@ -1,0 +1,121 @@
+{
+  "variants": [
+    "levers-none",
+    "levers-1"
+  ],
+  "runs": [
+    {
+      "id": "levers-none-repeat-1",
+      "outcome": "failed",
+      "phases": [
+        {
+          "name": "pre-boundary",
+          "status": "completed",
+          "metrics": []
+        },
+        {
+          "name": "launch",
+          "status": "failed",
+          "metrics": []
+        },
+        {
+          "name": "preparation",
+          "status": "incomplete",
+          "metrics": []
+        },
+        {
+          "name": "workload",
+          "status": "incomplete",
+          "metrics": []
+        },
+        {
+          "name": "cleanup",
+          "status": "completed",
+          "metrics": []
+        }
+      ],
+      "guardrail": null
+    },
+    {
+      "id": "levers-1-repeat-1",
+      "outcome": "failed",
+      "phases": [
+        {
+          "name": "pre-boundary",
+          "status": "completed",
+          "metrics": []
+        },
+        {
+          "name": "launch",
+          "status": "completed",
+          "metrics": [
+            "launch.bytes_written",
+            "launch.duration",
+            "launch.peak_ram_delta"
+          ]
+        },
+        {
+          "name": "preparation",
+          "status": "completed",
+          "metrics": []
+        },
+        {
+          "name": "workload",
+          "status": "completed",
+          "metrics": [
+            "workload.bytes_written",
+            "workload.duration",
+            "workload.peak_ram_delta"
+          ]
+        },
+        {
+          "name": "cleanup",
+          "status": "failed",
+          "metrics": []
+        }
+      ],
+      "guardrail": null
+    }
+  ],
+  "target_dimensions": {
+    "cpu": null,
+    "memory": null,
+    "storage": null,
+    "devices": null,
+    "network": null,
+    "namespaced": {
+      "oxide.rss_sleds": {
+        "kind": "count",
+        "value": 3
+      }
+    }
+  },
+  "constraints": [
+    {
+      "constraint_kind": "capability",
+      "capability": "matrix_host_storage_scope",
+      "required": true
+    },
+    {
+      "constraint_kind": "capability",
+      "capability": "clean_launch_teardown_boundaries",
+      "required": true
+    },
+    {
+      "constraint_kind": "capability",
+      "capability": "api_disk_lifecycle",
+      "required": true
+    },
+    {
+      "constraint_kind": "capability",
+      "capability": "simulated_zpool_preparation",
+      "required": true
+    }
+  ],
+  "extensions": {
+    "oxide.voxel": {
+      "capabilities": null,
+      "session": null
+    }
+  }
+}

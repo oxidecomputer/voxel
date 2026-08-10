@@ -1,0 +1,87 @@
+{
+  "schema_version": 5,
+  "checkpoint_sequence": 9,
+  "status": "aborted",
+  "abort_error": "synthetic matrix stopped after cleanup failure",
+  "name": "synthetic-rack",
+  "started": 1700000000,
+  "updated": 1700000240,
+  "ended": 1700000240,
+  "rated_tbw": 1200.0,
+  "workload": {
+    "kind": "api-disk-lifecycle",
+    "count": 20,
+    "parallel": 4,
+    "size_bytes": 1073741824,
+    "snapshot": false
+  },
+  "oxide_session": null,
+  "scope_proof": {
+    "status": "fail",
+    "evidence": "synthetic run did not complete every planned boundary"
+  },
+  "report_evidence": null,
+  "rss_sleds": 3,
+  "repeat": 1,
+  "combos": [
+    {
+      "label": "none",
+      "levers": [],
+      "effective_config": {},
+      "repeats": [
+        {
+          "index": 0,
+          "pre_boundary": { "status": "clean" },
+          "launch": {
+            "status": "failure",
+            "attempt_failures": [
+              {
+                "error": "synthetic launch attempt one failed",
+                "clean_boundary": { "status": "clean" }
+              },
+              {
+                "error": "synthetic launch attempt two failed",
+                "clean_boundary": { "status": "clean" }
+              }
+            ]
+          },
+          "preparation": { "status": "pending" },
+          "workload": { "status": "pending" },
+          "post_boundary": { "status": "clean" }
+        }
+      ]
+    },
+    {
+      "label": "1",
+      "levers": [1],
+      "effective_config": {},
+      "repeats": [
+        {
+          "index": 0,
+          "pre_boundary": { "status": "clean" },
+          "launch": {
+            "status": "success",
+            "metrics": {
+              "bringup_bytes": 39000,
+              "launch_secs": 110,
+              "peak_ram_bytes": 7340032
+            }
+          },
+          "preparation": { "status": "success" },
+          "workload": {
+            "status": "success",
+            "metrics": {
+              "workload_bytes": 78000,
+              "workload_secs": 55,
+              "workload_peak_delta_bytes": 3145728
+            }
+          },
+          "post_boundary": {
+            "status": "failure",
+            "error": "synthetic cleanup boundary failed"
+          }
+        }
+      ]
+    }
+  ]
+}

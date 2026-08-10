@@ -19,7 +19,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const API_COMMAND_TIMEOUT: Duration = Duration::from_secs(310);
 const API_TIMEOUT_SECONDS: &str = "300";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const BUILTIN_TIMEOUT: Duration = Duration::from_secs(60);
+const BUILTIN_TIMEOUT: Duration = Duration::from_secs(120);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const HELPER_TIMEOUT: Duration = Duration::from_secs(120);
 const RESOLVER_ATTEMPTS: u32 = 3;
@@ -1057,7 +1057,7 @@ fn query_resolve(dns_server: &str, hostname: &str) -> Result<Ipv4Addr> {
         "+timeout=3",
         "+tries=1",
         &format!("@{dns_server}"),
-        &hostname,
+        hostname,
         "A",
     ]);
     let output = command_output_timeout(command, RESOLVER_COMMAND_TIMEOUT).ok_or_else(|| {
@@ -1241,12 +1241,14 @@ fn require_private_file(path: &Path, name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
+    use std::sync::LazyLock;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
 
-    static ENVIRONMENT: Mutex<()> = Mutex::new(());
+    static ENVIRONMENT: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn api_status_classification_uses_only_exact_first_stdout_line() {
@@ -1319,8 +1321,7 @@ mod tests {
 
     #[test]
     fn api_request_ignores_stderr_digits_and_redacts_process_output() {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let script = bin.path().join("oxide");
@@ -1646,7 +1647,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 4096];
-            stream.read(&mut request).unwrap();
+            let _ = stream.read(&mut request).unwrap();
             stream.write_all(response.as_bytes()).unwrap();
         });
         (host, server)
@@ -1659,6 +1660,20 @@ mod tests {
             helper_timeout: Duration::from_millis(100),
             request_timeout: Duration::from_millis(50),
         }
+    }
+
+    fn retry_test_timing() -> ProviderTiming {
+        ProviderTiming {
+            deadline: Duration::from_secs(30),
+            retry_delay: Duration::ZERO,
+            helper_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn production_provisioning_deadline_allows_slow_recovery() {
+        assert_eq!(PROVIDER_TIMING.deadline, Duration::from_secs(120));
     }
 
     fn test_resolver(host: &str) -> OxideResolve {
@@ -1806,6 +1821,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_auth_retries_server_error_then_succeeds() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let host = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let replies = [
@@ -1817,10 +1833,29 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"access_token\":\"t\"}",
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{\"id\":\"u\"}",
             ];
-            for reply in replies {
-                let (mut stream, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            for (index, reply) in replies.into_iter().enumerate() {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            break stream;
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "mock auth server received only {index} of 7 expected requests"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!(
+                            "mock auth server failed accepting request {} of 7: {error}",
+                            index + 1
+                        ),
+                    }
+                };
                 let mut request = [0; 4096];
-                stream.read(&mut request).unwrap();
+                let _ = stream.read(&mut request).unwrap();
                 stream.write_all(reply.as_bytes()).unwrap();
             }
         });
@@ -1828,7 +1863,7 @@ mod tests {
             &VoxelConfig::default(),
             &host,
             &test_resolver(&host),
-            test_timing(),
+            retry_test_timing(),
         )
         .await;
         server.join().unwrap();
@@ -1848,7 +1883,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 4096];
-            stream.read(&mut request).unwrap();
+            let _ = stream.read(&mut request).unwrap();
             stream.write_all(response.as_bytes()).unwrap();
         });
         let error = match builtin_credentials(
@@ -1916,8 +1951,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_helper_creates_exact_private_profile_and_authenticates() {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let host = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -1994,6 +2028,7 @@ mod tests {
                 .map(|(name, _)| (*name, std::env::var_os(name)))
                 .collect();
             for (name, value) in values {
+                // Tests serialize access to these process-global variables.
                 unsafe { std::env::set_var(name, value) };
             }
             Self { saved }
@@ -2004,6 +2039,7 @@ mod tests {
         fn drop(&mut self) {
             for (name, value) in &self.saved {
                 match value {
+                    // Tests serialize access to these process-global variables.
                     Some(value) => unsafe { std::env::set_var(name, value) },
                     None => unsafe { std::env::remove_var(name) },
                 }
@@ -2035,8 +2071,7 @@ mod tests {
     #[tokio::test]
     async fn resolver_discovery_uses_rack1_authoritative_dns_and_first_a_record()
      {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.lock().await;
         let bin = tempfile::tempdir().unwrap();
         let script = bin.path().join("dig");
         fs::write(
@@ -2067,8 +2102,7 @@ mod tests {
     #[tokio::test]
     async fn resolver_discovery_retries_then_rejects_output_without_a_valid_ipv4_record()
      {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.lock().await;
         let bin = tempfile::tempdir().unwrap();
         let script = bin.path().join("dig");
         fs::write(
@@ -2087,23 +2121,22 @@ mod tests {
         )
         .await
         .unwrap_err();
-        let error = format!("{error:#}");
+        let detail = provision_error_detail(&error);
 
-        assert!(error.contains("authoritative DNS 198.51.100.20"), "{error}");
+        assert!(detail.contains("authoritative DNS 198.51.100.20"), "{detail}");
         assert!(
-            error.contains(
+            detail.contains(
                 "no valid A record for recovery.sys.rack1.oxide.test"
             ),
-            "{error}"
+            "{detail}"
         );
-        assert!(!error.contains("distinctive-diagnostic"));
+        assert!(!detail.contains("distinctive-diagnostic"));
     }
 
     #[tokio::test]
     async fn resolver_discovery_retries_transient_dns_output_on_the_same_rack()
     {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.lock().await;
         let bin = tempfile::tempdir().unwrap();
         let count = bin.path().join("count");
         let script = bin.path().join("dig");
@@ -2149,7 +2182,7 @@ mod tests {
 
         assert!(matches!(error, ProvisionError::Permanent(_)));
         assert!(
-            format!("{error:#}")
+            provision_error_detail(&error)
                 .contains("no authoritative external DNS server")
         );
     }
@@ -2232,8 +2265,7 @@ mod tests {
                 "version"
             ]
         );
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let script = bin.path().join("oxide");
@@ -2259,8 +2291,7 @@ mod tests {
 
     #[test]
     fn static_preflight_rejects_an_unusable_dig_before_launch() {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let oxide = bin.path().join("oxide");
@@ -2443,8 +2474,7 @@ mod tests {
 
     #[test]
     fn api_request_uses_complete_known_working_post_argv() {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let output = root.path().join("seen");
@@ -2476,8 +2506,7 @@ mod tests {
 
     #[test]
     fn api_request_without_body_omits_json_content_type() {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let output = root.path().join("seen");
@@ -2506,8 +2535,7 @@ mod tests {
     #[test]
     fn api_request_failure_identifies_the_operation_without_exposing_the_response()
      {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let script = bin.path().join("oxide");
@@ -2538,8 +2566,7 @@ mod tests {
 
     #[test]
     fn api_request_non_utf8_output_identifies_the_operation() {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let script = bin.path().join("oxide");
@@ -2576,8 +2603,7 @@ mod tests {
 
     #[test]
     fn command_is_explicit_and_removes_inherited_auth() {
-        let _lock =
-            ENVIRONMENT.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = ENVIRONMENT.blocking_lock();
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let output = root.path().join("seen");

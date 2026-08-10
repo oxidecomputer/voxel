@@ -1,0 +1,61 @@
+{
+  "schema_version": 5,
+  "checkpoint_sequence": 4,
+  "status": "running",
+  "abort_error": null,
+  "name": "synthetic-rack",
+  "started": 1700000000,
+  "updated": 1700000120,
+  "ended": null,
+  "rated_tbw": 1200.0,
+  "workload": {
+    "kind": "api-disk-lifecycle",
+    "count": 20,
+    "parallel": 4,
+    "size_bytes": 1073741824,
+    "snapshot": false
+  },
+  "oxide_session": null,
+  "scope_proof": {
+    "status": "pass",
+    "evidence": "synthetic controller inventory matched the bounded pool scope"
+  },
+  "report_evidence": null,
+  "rss_sleds": 3,
+  "repeat": 2,
+  "combos": [
+    {
+      "label": "none",
+      "levers": [],
+      "effective_config": {},
+      "repeats": [
+        {
+          "index": 0,
+          "pre_boundary": { "status": "clean" },
+          "launch": {
+            "status": "success",
+            "metrics": {
+              "bringup_bytes": 42000,
+              "launch_secs": 120,
+              "peak_ram_bytes": 8388608
+            }
+          },
+          "preparation": { "status": "success" },
+          "workload": {
+            "status": "failure",
+            "error": "synthetic workload request failed"
+          },
+          "post_boundary": { "status": "clean" }
+        },
+        {
+          "index": 1,
+          "pre_boundary": { "status": "pending" },
+          "launch": { "status": "pending" },
+          "preparation": { "status": "pending" },
+          "workload": { "status": "pending" },
+          "post_boundary": { "status": "pending" }
+        }
+      ]
+    }
+  ]
+}

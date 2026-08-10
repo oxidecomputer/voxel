@@ -574,25 +574,13 @@ dependencies = [
 
 [[package]]
 name = "charming"
-version = "0.6.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df19cf7d4540f4db08203dce5171421fdfc5e83ea3f14d7b5329f0dbff3bf3c2"
+checksum = "f4c6b6990238a64b4ae139e7085ce2a11815cb67a0c066a3333ce40f3a329be3"
 dependencies = [
- "charming_macros",
+ "handlebars",
  "serde",
  "serde_json",
- "serde_with",
-]
-
-[[package]]
-name = "charming_macros"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2398273c047c67d69794a924b1a2a5c14a5fab6bcbe8b24e86a0df9328e5e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -790,6 +778,23 @@ name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
+
+[[package]]
+name = "cookout"
+version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/cookout.git#b36c0afe91e94c39ec70317e1f2efdfaf9f66803"
+dependencies = [
+ "anyhow",
+ "charming",
+ "clap",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "core-foundation"
@@ -1717,6 +1722,20 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "zerocopy",
+]
+
+[[package]]
+name = "handlebars"
+version = "4.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faa67bab9ff362228eb3d00bd024a4965d8231bbb7921167f0cfa66c6626b225"
+dependencies = [
+ "log",
+ "pest",
+ "pest_derive",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5791,9 +5810,8 @@ dependencies = [
  "anyhow",
  "attest-mock",
  "camino",
- "charming",
  "clap",
- "flate2",
+ "cookout",
  "futures",
  "indoc",
  "libc",
@@ -5806,7 +5824,6 @@ dependencies = [
  "sha2",
  "slog",
  "sprockets-tls-test-utils",
- "tar",
  "tempfile",
  "tokio",
  "toml 0.9.12+spec-1.1.0",

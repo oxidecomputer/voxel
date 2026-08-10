@@ -1,0 +1,45 @@
+{
+  "schema_version": 5,
+  "checkpoint_sequence": 3,
+  "status": "running",
+  "abort_error": null,
+  "name": "synthetic-rack",
+  "started": 1700000000,
+  "updated": 1700000060,
+  "ended": null,
+  "rated_tbw": null,
+  "workload": null,
+  "oxide_session": null,
+  "scope_proof": {
+    "status": "unavailable",
+    "reason": "synthetic scope sample has not completed"
+  },
+  "report_evidence": null,
+  "rss_sleds": 3,
+  "repeat": 1,
+  "combos": [
+    {
+      "label": "none",
+      "levers": [],
+      "effective_config": {},
+      "repeats": [
+        {
+          "index": 0,
+          "pre_boundary": { "status": "clean" },
+          "launch": {
+            "status": "failure",
+            "attempt_failures": [
+              {
+                "error": "synthetic launch attempt is awaiting cleanup",
+                "clean_boundary": { "status": "pending" }
+              }
+            ]
+          },
+          "preparation": { "status": "not_requested" },
+          "workload": { "status": "not_requested" },
+          "post_boundary": { "status": "pending" }
+        }
+      ]
+    }
+  ]
+}

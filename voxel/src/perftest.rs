@@ -54,15 +54,16 @@
 
 use crate::net::{node_external_ip, ssh_output_timeout, zlogin};
 use crate::topo::build_topo;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Subcommand;
+use cookout::{CounterSample, ProjectionPolicy, project_samples};
 use oxide_session::{OxideSession, ProvisionError};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -72,8 +73,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use voxel_config::VoxelConfig;
 
+mod cookout_adapter;
+mod cookout_commands;
 mod oxide_session;
-mod report;
 
 /// NVMe spec: one "data unit" written/read = 1000 * 512 = 512000 bytes.
 const DATA_UNIT_BYTES: u64 = 512_000;
@@ -239,10 +241,10 @@ pub async fn run(
             cmd_report(before, after, *rated_tbw)
         }
         PerftestCmd::Report { inputs, out, archive } => {
-            report::run(inputs, out, *archive)
+            cookout_commands::run_report(inputs, out, *archive)
         }
         PerftestCmd::Superreport { reports, out, archive } => {
-            report::superreport::run(reports, out, *archive)
+            cookout_commands::run_superreport(reports, out, *archive)
         }
         PerftestCmd::Preflight { workload, oxide_auth_helper } => {
             cmd_preflight(cfg, name, *workload, oxide_auth_helper.as_deref())
@@ -291,7 +293,7 @@ pub async fn run(
             .await
         }
         PerftestCmd::Compare { baseline, candidate } => {
-            cmd_compare(baseline, candidate)
+            cookout_commands::run_compare(baseline, candidate)
         }
     }
 }
@@ -568,8 +570,8 @@ enum RunStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum BoundaryOutcome {
-    Pending,
-    Clean,
+    Pending {},
+    Clean {},
     Failure { error: String },
 }
 
@@ -591,7 +593,7 @@ struct LaunchMetrics {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum LaunchOutcome {
-    Pending,
+    Pending {},
     Success {
         metrics: LaunchMetrics,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -613,8 +615,8 @@ struct WorkloadMetrics {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum WorkloadOutcome {
-    Pending,
-    NotRequested,
+    Pending {},
+    NotRequested {},
     Success { metrics: WorkloadMetrics },
     Failure { error: String },
 }
@@ -622,9 +624,9 @@ enum WorkloadOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum PreparationOutcome {
-    Pending,
-    NotRequested,
-    Success,
+    Pending {},
+    NotRequested {},
+    Success {},
     Failure { error: String },
 }
 
@@ -718,7 +720,7 @@ where
         publish(repeat)?;
         return Err(error).context("pre-repeat clean boundary");
     }
-    repeat.pre_boundary = BoundaryOutcome::Clean;
+    repeat.pre_boundary = BoundaryOutcome::Clean {};
     publish(repeat)?;
 
     let mut prior_attempt_failures = Vec::new();
@@ -728,7 +730,7 @@ where
             Err(error) => {
                 prior_attempt_failures.push(LaunchAttemptFailure {
                     error: format!("{error:#}"),
-                    clean_boundary: BoundaryOutcome::Pending,
+                    clean_boundary: BoundaryOutcome::Pending {},
                 });
                 repeat.launch = LaunchOutcome::Failure {
                     attempt_failures: prior_attempt_failures.clone(),
@@ -750,12 +752,12 @@ where
                         .context("post-launch-failure clean boundary");
                 }
                 prior_attempt_failures.last_mut().unwrap().clean_boundary =
-                    BoundaryOutcome::Clean;
+                    BoundaryOutcome::Clean {};
                 repeat.launch = LaunchOutcome::Failure {
                     attempt_failures: prior_attempt_failures.clone(),
                 };
                 if prior_attempt_failures.len() == MATRIX_REPEAT_ATTEMPTS {
-                    repeat.post_boundary = BoundaryOutcome::Clean;
+                    repeat.post_boundary = BoundaryOutcome::Clean {};
                     publish(repeat)?;
                     return Ok(CheckpointedRepeatOutcome {
                         launch_data: None,
@@ -779,7 +781,7 @@ where
         match prepare(launch_data.as_ref().unwrap().clone()).await {
             Ok(returned_launch_data) => {
                 launch_data = Some(returned_launch_data);
-                repeat.preparation = PreparationOutcome::Success;
+                repeat.preparation = PreparationOutcome::Success {};
             }
             Err(error) => {
                 let error = format!("{error:#}");
@@ -793,7 +795,7 @@ where
                 };
             }
         }
-        if matches!(repeat.preparation, PreparationOutcome::Success) {
+        if matches!(repeat.preparation, PreparationOutcome::Success {}) {
             publish(repeat)?;
             repeat.workload =
                 match workload(launch_data.as_ref().unwrap().clone()).await {
@@ -808,12 +810,10 @@ where
                 };
         }
     } else {
-        repeat.preparation = PreparationOutcome::NotRequested;
-        repeat.workload = WorkloadOutcome::NotRequested;
+        repeat.preparation = PreparationOutcome::NotRequested {};
+        repeat.workload = WorkloadOutcome::NotRequested {};
     }
-    if workload_requested {
-        publish(repeat)?;
-    }
+    publish(repeat)?;
 
     if let Err(error) = boundary().await {
         repeat.post_boundary =
@@ -821,7 +821,7 @@ where
         publish(repeat)?;
         return Err(error).context("post-repeat clean boundary");
     }
-    repeat.post_boundary = BoundaryOutcome::Clean;
+    repeat.post_boundary = BoundaryOutcome::Clean {};
     publish(repeat)?;
     Ok(CheckpointedRepeatOutcome { launch_data, workload_metadata })
 }
@@ -848,17 +848,100 @@ struct FileIdentity {
     ino: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FileOwner {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+fn requested_artifact_owner<'a>(
+    destinations: impl IntoIterator<Item = &'a Path>,
+) -> Result<Option<FileOwner>> {
+    const OWNER_ENV: &str = "VOXEL_PERFTEST_ARTIFACT_OWNER";
+    let value = match std::env::var(OWNER_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error).context(format!("read {OWNER_ENV}")),
+    };
+    let (uid, gid) = value
+        .split_once(':')
+        .with_context(|| format!("{OWNER_ENV} must be UID:GID"))?;
+    let owner = FileOwner {
+        uid: uid
+            .parse()
+            .with_context(|| format!("parse UID in {OWNER_ENV}"))?,
+        gid: gid
+            .parse()
+            .with_context(|| format!("parse GID in {OWNER_ENV}"))?,
+    };
+    for destination in destinations {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let metadata = std::fs::metadata(parent).with_context(|| {
+            format!("stat artifact parent {}", parent.display())
+        })?;
+        if metadata.uid() != owner.uid || metadata.gid() != owner.gid {
+            bail!(
+                "{OWNER_ENV} {value} does not own artifact parent {}",
+                parent.display()
+            );
+        }
+    }
+    Ok(Some(owner))
+}
+
+fn write_artifact_sibling(
+    parent: &Path,
+    bytes: &[u8],
+    owner: Option<FileOwner>,
+    artifact: &str,
+) -> Result<tempfile::NamedTempFile> {
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).with_context(|| {
+            format!("create {artifact} sibling in {}", parent.display())
+        })?;
+    temporary.write_all(bytes).with_context(|| {
+        format!("write {artifact} sibling in {}", parent.display())
+    })?;
+    if let Some(owner) = owner {
+        // Bind the privileged ownership handoff to the open inode after all
+        // bytes are present, before its final name becomes visible.
+        let result = unsafe {
+            libc::fchown(temporary.as_raw_fd(), owner.uid, owner.gid)
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("set {artifact} owner in {}", parent.display())
+            });
+        }
+    }
+    temporary.as_file().sync_all().with_context(|| {
+        format!("sync {artifact} sibling in {}", parent.display())
+    })?;
+    Ok(temporary)
+}
+
 impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self { dev: metadata.dev(), ino: metadata.ino() }
+    }
+
     fn read(path: &Path) -> Result<Self> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("stat checkpoint {}", path.display()))?;
-        Ok(Self { dev: metadata.dev(), ino: metadata.ino() })
+        Ok(Self::from_metadata(&metadata))
+    }
+
+    fn read_file(file: &std::fs::File) -> Result<Self> {
+        Ok(Self::from_metadata(
+            &file.metadata().context("stat owned checkpoint")?,
+        ))
     }
 }
 
 struct CheckpointPublisher {
     destination: PathBuf,
-    destination_identity: Option<FileIdentity>,
+    destination_file: Option<std::fs::File>,
+    owner: Option<FileOwner>,
     #[cfg(test)]
     fail_before_rename: bool,
     #[cfg(test)]
@@ -868,10 +951,11 @@ struct CheckpointPublisher {
 }
 
 impl CheckpointPublisher {
-    fn new(destination: &Path) -> Self {
+    fn new(destination: &Path, owner: Option<FileOwner>) -> Self {
         Self {
             destination: destination.to_owned(),
-            destination_identity: None,
+            destination_file: None,
+            owner,
             #[cfg(test)]
             fail_before_rename: false,
             #[cfg(test)]
@@ -879,6 +963,14 @@ impl CheckpointPublisher {
             #[cfg(test)]
             fail_parent_sync: false,
         }
+    }
+
+    fn write_sibling(
+        &self,
+        parent: &Path,
+        bytes: &[u8],
+    ) -> Result<tempfile::NamedTempFile> {
+        write_artifact_sibling(parent, bytes, self.owner, "checkpoint")
     }
 
     fn publish(&mut self, checkpoint: &mut MatrixCheckpoint) -> Result<()> {
@@ -892,7 +984,7 @@ impl CheckpointPublisher {
             .context("serialize matrix checkpoint")?;
         bytes.push(b'\n');
 
-        if self.destination_identity.is_none() {
+        if self.destination_file.is_none() {
             self.publish_initial(&bytes)?;
         } else {
             self.publish_replacement(&bytes)?;
@@ -904,39 +996,33 @@ impl CheckpointPublisher {
     fn publish_initial(&mut self, bytes: &[u8]) -> Result<()> {
         let parent =
             self.destination.parent().unwrap_or_else(|| Path::new("."));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| {
-                format!("create checkpoint sibling in {}", parent.display())
-            })?;
-        temporary
-            .write_all(bytes)
-            .and_then(|()| temporary.as_file().sync_all())
-            .with_context(|| {
-                format!("write checkpoint sibling in {}", parent.display())
-            })?;
+        let temporary = self.write_sibling(parent, bytes)?;
 
         #[cfg(test)]
         if self.fail_before_initial_install {
             return Err(anyhow!("injected checkpoint pre-install failure"));
         }
 
-        temporary.persist_noclobber(&self.destination).map_err(|error| {
+        let destination_file = temporary
+            .persist_noclobber(&self.destination)
+            .map_err(|error| {
             anyhow!(
                 "install initial checkpoint {} (refusing overwrite): {}",
                 self.destination.display(),
                 error.error
             )
         })?;
-        self.destination_identity =
-            Some(FileIdentity::read(&self.destination)?);
+        self.destination_file = Some(destination_file);
         self.sync_parent_after_install()?;
         Ok(())
     }
 
     fn publish_replacement(&mut self, bytes: &[u8]) -> Result<()> {
-        let expected = self
-            .destination_identity
-            .expect("replacement requires a published destination identity");
+        let expected = FileIdentity::read_file(
+            self.destination_file
+                .as_ref()
+                .expect("replacement requires a published destination file"),
+        )?;
         let actual = FileIdentity::read(&self.destination)?;
         if actual != expected {
             return Err(anyhow!(
@@ -946,16 +1032,7 @@ impl CheckpointPublisher {
         }
         let parent =
             self.destination.parent().unwrap_or_else(|| Path::new("."));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| {
-                format!("create checkpoint sibling in {}", parent.display())
-            })?;
-        temporary
-            .write_all(bytes)
-            .and_then(|()| temporary.as_file().sync_all())
-            .with_context(|| {
-                format!("write checkpoint sibling in {}", parent.display())
-            })?;
+        let temporary = self.write_sibling(parent, bytes)?;
 
         #[cfg(test)]
         if self.fail_before_rename {
@@ -969,15 +1046,15 @@ impl CheckpointPublisher {
                 self.destination.display()
             ));
         }
-        temporary.persist(&self.destination).map_err(|error| {
-            anyhow!(
-                "replace checkpoint {}: {}",
-                self.destination.display(),
-                error.error
-            )
-        })?;
-        self.destination_identity =
-            Some(FileIdentity::read(&self.destination)?);
+        let destination_file =
+            temporary.persist(&self.destination).map_err(|error| {
+                anyhow!(
+                    "replace checkpoint {}: {}",
+                    self.destination.display(),
+                    error.error
+                )
+            })?;
+        self.destination_file = Some(destination_file);
         self.sync_parent_after_install()?;
         Ok(())
     }
@@ -1031,7 +1108,7 @@ fn checkpoint_capability_ledger(
                 LaunchOutcome::Failure { attempt_failures } => {
                     attempt_failures.as_slice()
                 }
-                LaunchOutcome::Pending => &[],
+                LaunchOutcome::Pending {} => &[],
             }
             .iter()
             .any(|attempt| {
@@ -1044,8 +1121,8 @@ fn checkpoint_capability_ledger(
     let all_boundaries_clean = checkpoint.status == RunStatus::Completed
         && checkpoint.combos.iter().flat_map(|combo| &combo.repeats).all(
             |repeat| {
-                matches!(repeat.pre_boundary, BoundaryOutcome::Clean)
-                    && matches!(repeat.post_boundary, BoundaryOutcome::Clean)
+                matches!(repeat.pre_boundary, BoundaryOutcome::Clean {})
+                    && matches!(repeat.post_boundary, BoundaryOutcome::Clean {})
                     && match &repeat.launch {
                         LaunchOutcome::Success {
                             prior_attempt_failures,
@@ -1054,11 +1131,14 @@ fn checkpoint_capability_ledger(
                         LaunchOutcome::Failure { attempt_failures } => {
                             attempt_failures.as_slice()
                         }
-                        LaunchOutcome::Pending => &[],
+                        LaunchOutcome::Pending {} => &[],
                     }
                     .iter()
                     .all(|attempt| {
-                        matches!(attempt.clean_boundary, BoundaryOutcome::Clean)
+                        matches!(
+                            attempt.clean_boundary,
+                            BoundaryOutcome::Clean {}
+                        )
                     })
             },
         );
@@ -1070,14 +1150,16 @@ fn checkpoint_capability_ledger(
         );
     let preparations_complete = checkpoint.status == RunStatus::Completed
         && checkpoint.combos.iter().flat_map(|combo| &combo.repeats).all(
-            |repeat| matches!(repeat.preparation, PreparationOutcome::Success),
+            |repeat| {
+                matches!(repeat.preparation, PreparationOutcome::Success {})
+            },
         );
     let workload_failure = checkpoint
         .combos
         .iter()
         .flat_map(|combo| &combo.repeats)
         .any(|repeat| {
-            matches!(repeat.preparation, PreparationOutcome::Success)
+            matches!(repeat.preparation, PreparationOutcome::Success {})
                 && matches!(repeat.workload, WorkloadOutcome::Failure { .. })
         });
     let workloads_complete = checkpoint.status == RunStatus::Completed
@@ -1155,7 +1237,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct MatrixRun {
+pub(super) struct MatrixRun {
     schema_version: u32,
     name: String,
     /// Unix seconds at the start / end of the whole matrix run.
@@ -1329,68 +1411,64 @@ fn preflight_output_paths(
         return Err(anyhow!("--out and --json-out must name different paths"));
     }
     for (flag, path) in [("--out", out), ("--json-out", json_out)] {
-        if let Some(path) = path {
-            if path.try_exists().with_context(|| {
+        if let Some(path) = path
+            && path.try_exists().with_context(|| {
                 format!("check {flag} path {}", path.display())
-            })? {
-                return Err(anyhow!(
-                    "{flag} path {} already exists; refusing to overwrite",
-                    path.display()
-                ));
-            }
+            })?
+        {
+            return Err(anyhow!(
+                "{flag} path {} already exists; refusing to overwrite",
+                path.display()
+            ));
         }
     }
     Ok(())
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| {
-        format!("create new output {} (refusing overwrite)", path.display())
+fn write_new(
+    path: &Path,
+    bytes: &[u8],
+    owner: Option<FileOwner>,
+) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = write_artifact_sibling(parent, bytes, owner, "output")?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        anyhow!(
+            "install output {} (refusing overwrite): {}",
+            path.display(),
+            error.error
+        )
     })?;
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.flush()) {
-        drop(file);
-        let remove = std::fs::remove_file(path);
-        return match remove {
-            Ok(()) => {
-                Err(error).with_context(|| format!("write {}", path.display()))
-            }
-            Err(cleanup) => Err(anyhow!(
-                "write {} failed: {error}; removing partial output also failed: {cleanup}",
-                path.display()
-            )),
-        };
-    }
+    sync_parent(path).with_context(|| {
+        format!("sync output parent for {}", path.display())
+    })?;
     Ok(())
 }
 
 fn publish_matrix_outputs(
     csv: Option<(&Path, &[u8])>,
     json: Option<(&Path, &[u8])>,
+    owner: Option<FileOwner>,
 ) -> Result<()> {
     let mut csv_created = None;
     if let Some((path, bytes)) = csv {
-        write_new(path, bytes).context("publish matrix CSV")?;
+        write_new(path, bytes, owner).context("publish matrix CSV")?;
         csv_created = Some(path);
     }
-    if let Some((path, bytes)) = json {
-        if let Err(error) =
-            write_new(path, bytes).context("publish matrix JSON")
-        {
-            if let Some(csv_path) = csv_created {
-                return match std::fs::remove_file(csv_path) {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(anyhow!(
-                        "{error:#}; removing previously published CSV {} also failed: {cleanup}",
-                        csv_path.display()
-                    )),
-                };
-            }
-            return Err(error);
+    if let Some((path, bytes)) = json
+        && let Err(error) =
+            write_new(path, bytes, owner).context("publish matrix JSON")
+    {
+        if let Some(csv_path) = csv_created {
+            return match std::fs::remove_file(csv_path) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(anyhow!(
+                    "{error:#}; removing previously published CSV {} also failed: {cleanup}",
+                    csv_path.display()
+                )),
+            };
         }
+        return Err(error);
     }
     Ok(())
 }
@@ -1492,11 +1570,407 @@ fn validate_publishable_matrix_run(run: &MatrixRun) -> Result<()> {
     match validate_matrix_run(run) {
         Ok(()) => Ok(()),
         Err(_) if run.results.iter().any(|result| result.error.is_some()) => {
-            report::validate_report_failed_matrix(run)
+            validate_report_failed_matrix(run)
                 .context("validate retained failed storage matrix")
         }
         Err(error) => Err(error),
     }
+}
+
+/// Reporting may retain a matrix aggregate that stopped after an execution
+/// failure. Compare and normal matrix readers intentionally remain strict.
+fn validate_report_failed_matrix(matrix: &MatrixRun) -> Result<()> {
+    if matrix.repeat == 0 || matrix.results.len() != matrix.combos.len() {
+        bail!("retained failed matrix has invalid repeat or result count");
+    }
+    for (result, label) in matrix.results.iter().zip(&matrix.combos) {
+        if result.label != *label
+            || result.label != canonical_combo_label(&result.levers)
+        {
+            bail!("retained failed matrix combo identity mismatch");
+        }
+        for (index, repeat) in result.repeats.iter().enumerate() {
+            if repeat.peak_ram_bytes.is_none() {
+                bail!(
+                    "combo '{}' repeat {} is missing Helios peak_ram_bytes",
+                    result.label,
+                    index + 1
+                );
+            }
+            let workload = [
+                repeat.workload_bytes.is_some(),
+                repeat.workload_secs.is_some(),
+                repeat.workload_peak_delta_bytes.is_some(),
+            ];
+            if workload.iter().any(|present| *present != workload[0])
+                || matrix.workload.is_some() != workload[0]
+            {
+                bail!(
+                    "combo '{}' repeat {} has invalid workload metrics",
+                    result.label,
+                    index + 1
+                );
+            }
+        }
+        match result.error.as_deref() {
+            None if result.repeats.len() == matrix.repeat => {}
+            Some(error)
+                if !error.is_empty()
+                    && result.repeats.len() < matrix.repeat => {}
+            _ => bail!(
+                "retained failed matrix results must be complete successes or carry an error with fewer than expected repeats"
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn validate_matrix_checkpoint(matrix: &MatrixCheckpoint) -> Result<()> {
+    if matrix.repeat == 0 || matrix.combos.is_empty() {
+        bail!("schema-v5 matrix must request at least one combo and repeat");
+    }
+    match matrix.status {
+        RunStatus::Running if matrix.ended.is_some() => {
+            bail!("running matrix cannot have ended")
+        }
+        RunStatus::Completed | RunStatus::Aborted if matrix.ended.is_none() => {
+            bail!("terminal matrix must have ended")
+        }
+        _ => {}
+    }
+    match (&matrix.status, matrix.abort_error.as_deref()) {
+        (RunStatus::Aborted, Some(error)) if !error.is_empty() => {}
+        (RunStatus::Aborted, _) => {
+            bail!("aborted matrix requires a nonempty abort_error")
+        }
+        (_, None) => {}
+        _ => bail!("only an aborted matrix may contain abort_error"),
+    }
+    let completed = matrix.status == RunStatus::Completed;
+    let mut labels = std::collections::BTreeSet::new();
+    for combo in &matrix.combos {
+        if combo.label != canonical_combo_label(&combo.levers)
+            || !labels.insert(&combo.label)
+        {
+            bail!("schema-v5 matrix combo identity is not exact and canonical");
+        }
+        if combo.repeats.len() != matrix.repeat {
+            bail!(
+                "combo '{}' does not contain every requested repeat slot",
+                combo.label
+            );
+        }
+        for (index, repeat) in combo.repeats.iter().enumerate() {
+            if repeat.index != index {
+                bail!(
+                    "combo '{}' repeat slot index is not canonical",
+                    combo.label
+                );
+            }
+            let has_pending =
+                matches!(repeat.pre_boundary, BoundaryOutcome::Pending {})
+                    || matches!(repeat.launch, LaunchOutcome::Pending {})
+                    || (matches!(
+                        repeat.preparation,
+                        PreparationOutcome::Pending {}
+                    ) && !matches!(
+                        repeat.launch,
+                        LaunchOutcome::Failure { .. }
+                    ))
+                    || (matches!(repeat.workload, WorkloadOutcome::Pending {})
+                        && !matches!(
+                            repeat.launch,
+                            LaunchOutcome::Failure { .. }
+                        ))
+                    || matches!(
+                        repeat.post_boundary,
+                        BoundaryOutcome::Pending {}
+                    )
+                    || match &repeat.launch {
+                        LaunchOutcome::Success {
+                            prior_attempt_failures,
+                            ..
+                        } => prior_attempt_failures.iter().any(|failure| {
+                            matches!(
+                                failure.clean_boundary,
+                                BoundaryOutcome::Pending {}
+                            )
+                        }),
+                        LaunchOutcome::Failure { attempt_failures } => {
+                            attempt_failures.iter().any(|failure| {
+                                matches!(
+                                    failure.clean_boundary,
+                                    BoundaryOutcome::Pending {}
+                                )
+                            })
+                        }
+                        LaunchOutcome::Pending {} => false,
+                    };
+            if completed && has_pending {
+                bail!("completed matrix contains a pending repeat stage");
+            }
+            let boundary_has_empty_failure = |boundary: &BoundaryOutcome| matches!(boundary, BoundaryOutcome::Failure { error } if error.is_empty());
+            let workload_is_expected_pre_launch =
+                |workload: &WorkloadOutcome| {
+                    matches!(
+                        (&matrix.workload, workload),
+                        (Some(_), WorkloadOutcome::Pending {})
+                            | (None, WorkloadOutcome::NotRequested {})
+                    )
+                };
+            match (
+                &matrix.workload,
+                &repeat.preparation,
+                &repeat.workload,
+                &repeat.launch,
+            ) {
+                (
+                    None,
+                    PreparationOutcome::NotRequested {},
+                    WorkloadOutcome::NotRequested {},
+                    _,
+                ) => {}
+                (
+                    Some(_),
+                    PreparationOutcome::Pending {},
+                    WorkloadOutcome::Pending {},
+                    LaunchOutcome::Pending {} | LaunchOutcome::Success { .. },
+                ) => {}
+                (
+                    Some(_),
+                    PreparationOutcome::Success {},
+                    WorkloadOutcome::Pending {}
+                    | WorkloadOutcome::Success { .. }
+                    | WorkloadOutcome::Failure { .. },
+                    LaunchOutcome::Success { .. },
+                ) => {}
+                (
+                    Some(_),
+                    PreparationOutcome::Failure { error },
+                    WorkloadOutcome::Pending {},
+                    LaunchOutcome::Success { .. },
+                ) if !completed
+                    && !error.is_empty()
+                    && matches!(
+                        repeat.post_boundary,
+                        BoundaryOutcome::Pending {}
+                    ) => {}
+                (
+                    Some(_),
+                    PreparationOutcome::Failure { error },
+                    WorkloadOutcome::Failure { error: workload_error },
+                    LaunchOutcome::Success { .. },
+                ) if !error.is_empty()
+                    && workload_error.contains(
+                        "blocked by simulated zpool preparation failure",
+                    ) => {}
+                (
+                    Some(_),
+                    PreparationOutcome::Pending {},
+                    WorkloadOutcome::Pending {},
+                    LaunchOutcome::Failure { .. },
+                ) => {}
+                _ => bail!(
+                    "preparation/workload ordering or requested state is invalid"
+                ),
+            }
+            if boundary_has_empty_failure(&repeat.pre_boundary)
+                || boundary_has_empty_failure(&repeat.post_boundary)
+            {
+                bail!("repeat boundary failure has empty error text");
+            }
+            if matches!(repeat.pre_boundary, BoundaryOutcome::Pending {})
+                && (!matches!(repeat.launch, LaunchOutcome::Pending {})
+                    || !workload_is_expected_pre_launch(&repeat.workload)
+                    || !matches!(
+                        repeat.post_boundary,
+                        BoundaryOutcome::Pending {}
+                    ))
+            {
+                bail!("pending pre-boundary cannot have later stage evidence");
+            }
+            if matches!(repeat.pre_boundary, BoundaryOutcome::Failure { .. })
+                && (!matches!(repeat.launch, LaunchOutcome::Pending {})
+                    || !workload_is_expected_pre_launch(&repeat.workload)
+                    || !matches!(
+                        repeat.post_boundary,
+                        BoundaryOutcome::Pending {}
+                    ))
+            {
+                bail!(
+                    "failed pre-boundary cannot have launch or workload evidence"
+                );
+            }
+            match &repeat.launch {
+                LaunchOutcome::Pending {}
+                    if !workload_is_expected_pre_launch(&repeat.workload)
+                        || !matches!(
+                            repeat.post_boundary,
+                            BoundaryOutcome::Pending {}
+                        ) =>
+                {
+                    bail!("pending launch cannot have later stage evidence")
+                }
+                LaunchOutcome::Failure { attempt_failures } => {
+                    if attempt_failures.is_empty()
+                        || attempt_failures.len() > MATRIX_REPEAT_ATTEMPTS
+                        || attempt_failures.iter().any(|failure| {
+                            failure.error.is_empty()
+                                || boundary_has_empty_failure(
+                                    &failure.clean_boundary,
+                                )
+                        })
+                        || !workload_is_expected_pre_launch(&repeat.workload)
+                    {
+                        bail!(
+                            "failed launch has invalid attempt or workload evidence"
+                        );
+                    }
+                    if attempt_failures[..attempt_failures.len() - 1]
+                        .iter()
+                        .any(|failure| {
+                            !matches!(
+                                failure.clean_boundary,
+                                BoundaryOutcome::Clean {}
+                            )
+                        })
+                    {
+                        bail!(
+                            "failed launch has a dirty non-final attempt boundary"
+                        );
+                    }
+                    match &attempt_failures.last().unwrap().clean_boundary {
+                        BoundaryOutcome::Pending {}
+                            if !completed
+                                && matches!(
+                                    repeat.post_boundary,
+                                    BoundaryOutcome::Pending {}
+                                ) => {}
+                        BoundaryOutcome::Failure { error }
+                            if matches!(
+                                &repeat.post_boundary,
+                                BoundaryOutcome::Failure { error: post_error }
+                                    if post_error == error
+                            ) => {}
+                        BoundaryOutcome::Clean {}
+                            if attempt_failures.len()
+                                == MATRIX_REPEAT_ATTEMPTS
+                                && matches!(
+                                    repeat.post_boundary,
+                                    BoundaryOutcome::Clean {}
+                                ) => {}
+                        BoundaryOutcome::Clean {}
+                            if !completed
+                                && attempt_failures.len()
+                                    < MATRIX_REPEAT_ATTEMPTS
+                                && matches!(
+                                    repeat.post_boundary,
+                                    BoundaryOutcome::Pending {}
+                                ) => {}
+                        _ => bail!(
+                            "failed launch has an invalid final attempt boundary"
+                        ),
+                    }
+                }
+                LaunchOutcome::Success { prior_attempt_failures, .. } => {
+                    if prior_attempt_failures.iter().any(|failure| {
+                        failure.error.is_empty()
+                            || !matches!(
+                                failure.clean_boundary,
+                                BoundaryOutcome::Clean {}
+                            )
+                    }) || prior_attempt_failures.len()
+                        >= MATRIX_REPEAT_ATTEMPTS
+                    {
+                        bail!(
+                            "successful launch has invalid prior-attempt failure evidence"
+                        );
+                    }
+                    match (&matrix.workload, &repeat.workload) {
+                        (None, WorkloadOutcome::NotRequested {})
+                        | (Some(_), WorkloadOutcome::Pending {})
+                        | (Some(_), WorkloadOutcome::Success { .. }) => {}
+                        (Some(_), WorkloadOutcome::Failure { error })
+                            if !error.is_empty() => {}
+                        _ => bail!(
+                            "workload outcome disagrees with requested workload"
+                        ),
+                    }
+                    if matrix.workload.is_some()
+                        && matches!(
+                            repeat.workload,
+                            WorkloadOutcome::Pending {}
+                        )
+                        && !matches!(
+                            repeat.post_boundary,
+                            BoundaryOutcome::Pending {}
+                        )
+                    {
+                        bail!(
+                            "pending requested workload requires a pending post-boundary"
+                        );
+                    }
+                }
+                LaunchOutcome::Pending {} => {}
+            }
+            if completed
+                && (!matches!(repeat.pre_boundary, BoundaryOutcome::Clean {})
+                    || matches!(repeat.launch, LaunchOutcome::Pending {})
+                    || !matches!(
+                        repeat.post_boundary,
+                        BoundaryOutcome::Clean {}
+                    ))
+            {
+                bail!(
+                    "completed matrix requires every pre and post boundary to be clean"
+                );
+            }
+        }
+    }
+    if let Some(evidence) = &matrix.report_evidence {
+        if evidence.evidence_version != 1
+            || evidence.capabilities.ledger_version != 1
+            || evidence.session.workload != matrix.workload
+            || evidence.session.oxide_session != matrix.oxide_session
+        {
+            bail!(
+                "report evidence version/session disagrees with checkpoint configuration"
+            );
+        }
+        if evidence.combos.len() != matrix.combos.len() {
+            bail!("report evidence combo count disagrees with checkpoint plan");
+        }
+        for (planned, reported) in matrix.combos.iter().zip(&evidence.combos) {
+            if planned.label != reported.label
+                || planned.levers != reported.levers
+                || planned.effective_config != reported.effective_config
+            {
+                bail!(
+                    "report evidence combo identity/configuration disagrees with checkpoint plan"
+                );
+            }
+            if planned.effective_config.recovery_silo.user_password_hash
+                != REDACTED_CREDENTIAL
+            {
+                bail!(
+                    "checkpoint effective configuration contains an unredacted credential"
+                );
+            }
+        }
+        if evidence.base_config.recovery_silo.user_password_hash
+            != REDACTED_CREDENTIAL
+        {
+            bail!(
+                "checkpoint report evidence contains an unredacted credential"
+            );
+        }
+        if evidence.capabilities != checkpoint_capability_ledger(matrix) {
+            bail!(
+                "report evidence capability ledger disagrees with checkpoint stages"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_report_evidence(
@@ -2156,7 +2630,7 @@ async fn cmd_matrix(
     };
     validate_publishable_matrix_run(&run)
         .context("matrix result completeness validation")?;
-    println!("\n{}", render_table(&run.results, rated_tbw));
+    println!("\n{}", render_table(&run.results, rated_tbw)?);
 
     let csv = out.map(|_| render_csv(&run.results));
     let json = json_out
@@ -2168,6 +2642,7 @@ async fn cmd_matrix(
     publish_matrix_outputs(
         out.zip(csv.as_deref().map(str::as_bytes)),
         json_out.zip(json.as_deref().map(str::as_bytes)),
+        None,
     )?;
     if let Some(path) = out {
         println!("[perftest] wrote CSV -> {}", path.display());
@@ -2234,25 +2709,26 @@ async fn cmd_matrix_checkpointed(
                 repeats: (0..repeat_count)
                     .map(|index| MatrixCheckpointRepeat {
                         index,
-                        pre_boundary: BoundaryOutcome::Pending,
-                        launch: LaunchOutcome::Pending,
+                        pre_boundary: BoundaryOutcome::Pending {},
+                        launch: LaunchOutcome::Pending {},
                         preparation: if workload.is_some() {
-                            PreparationOutcome::Pending
+                            PreparationOutcome::Pending {}
                         } else {
-                            PreparationOutcome::NotRequested
+                            PreparationOutcome::NotRequested {}
                         },
                         workload: if workload.is_some() {
-                            WorkloadOutcome::Pending
+                            WorkloadOutcome::Pending {}
                         } else {
-                            WorkloadOutcome::NotRequested
+                            WorkloadOutcome::NotRequested {}
                         },
-                        post_boundary: BoundaryOutcome::Pending,
+                        post_boundary: BoundaryOutcome::Pending {},
                     })
                     .collect(),
             })
             .collect(),
     };
-    let mut publisher = Some(CheckpointPublisher::new(json_out));
+    let owner = requested_artifact_owner(std::iter::once(json_out).chain(out))?;
+    let mut publisher = Some(CheckpointPublisher::new(json_out, owner));
     publish_checkpoint(&mut publisher, &mut checkpoint)?;
 
     let fatal = async {
@@ -2381,7 +2857,7 @@ async fn cmd_matrix_checkpointed(
         checkpoint.status = RunStatus::Completed;
         checkpoint.ended = Some(ended);
         publish_checkpoint(&mut publisher, &mut checkpoint)?;
-        println!("\n{}", render_table(&results, rated_tbw));
+        println!("\n{}", render_table(&results, rated_tbw)?);
         Ok((results, out.map(Path::to_path_buf)))
     }
     .await;
@@ -2403,6 +2879,7 @@ async fn cmd_matrix_checkpointed(
             publish_matrix_outputs(
                 Some((&path, render_csv(&results).as_bytes())),
                 None,
+                owner,
             )
         })?;
     }
@@ -2438,7 +2915,7 @@ const ZPOOL_SET_SENTINEL: &str = "__VOXEL_ZPOOL_SET_DONE__";
 const REGION_ALLOCATION_SENTINEL: &str = "__VOXEL_REGION_ALLOCATION_DONE__";
 
 fn expected_simulated_zpool_count_per_rack(cfg: &VoxelConfig) -> usize {
-    cfg.topology.sleds * SIMULATED_U2_ZPOOLS_PER_SLED
+    cfg.topology.rss_count() * SIMULATED_U2_ZPOOLS_PER_SLED
 }
 
 fn omdb_zpool_capability_command() -> String {
@@ -2649,23 +3126,23 @@ fn prepare_simulated_zpools_on_rack(
             &omdb_switch_zone_command(&omdb_zpool_list_command()),
             remaining.min(ZPOOL_PREPARATION_COMMAND_TIMEOUT),
         );
-        if let Some(output) = output {
-            if has_unique_terminal_sentinel(&output, ZPOOL_LIST_SENTINEL) {
-                let ids = parse_omdb_zpool_ids(&output).map_err(|error| {
-                    ClassifiedFailure::Permanent(error.context(format!(
-                        "{rack_name}: malformed `omdb db zpool list -i` output"
-                    )))
-                })?;
-                let observed = ids.len();
-                if last_observed != Some(observed) {
-                    eprintln!(
-                        "[perftest] {rack_name}: observed {observed}/{expected} simulated U.2 zpools"
-                    );
-                    last_observed = Some(observed);
-                }
-                if observed == expected {
-                    break ids;
-                }
+        if let Some(output) = output
+            && has_unique_terminal_sentinel(&output, ZPOOL_LIST_SENTINEL)
+        {
+            let ids = parse_omdb_zpool_ids(&output).map_err(|error| {
+                ClassifiedFailure::Permanent(error.context(format!(
+                    "{rack_name}: malformed `omdb db zpool list -i` output"
+                )))
+            })?;
+            let observed = ids.len();
+            if last_observed != Some(observed) {
+                eprintln!(
+                    "[perftest] {rack_name}: observed {observed}/{expected} simulated U.2 zpools"
+                );
+                last_observed = Some(observed);
+            }
+            if observed == expected {
+                break ids;
             }
         }
 
@@ -3457,7 +3934,11 @@ fn describe_levers(set: &BTreeSet<u8>) -> String {
 /// baseline-adjusted launch/workload RAM peaks. Columns adapt to what was
 /// measured; values are the per-combo mean over repeats (identical to the single
 /// value at `--repeat 1`).
-fn render_table(results: &[ComboAggregate], rated_tbw: Option<f64>) -> String {
+fn render_table(
+    results: &[ComboAggregate],
+    rated_tbw: Option<f64>,
+) -> Result<String> {
+    let policy = projection_policy(rated_tbw)?;
     let any_workload = results.iter().any(|r| r.has_workload());
     let any_workload_ram =
         results.iter().any(|r| r.workload_peak_delta_bytes().n >= 1);
@@ -3546,17 +4027,22 @@ fn render_table(results: &[ComboAggregate], rated_tbw: Option<f64>) -> String {
             };
             row.push_str(&format!("  {cell:>14}"));
         }
-        if let Some(t) = rated_tbw {
-            let years = project(bytes, secs, Some(t))
-                .years
-                .map(|y| format!("{y:.2}"))
-                .unwrap_or_else(|| "-".to_string());
+        if rated_tbw.is_some() {
+            let years = project_samples(
+                &CounterSample { timestamp_seconds: 0, value: 0 },
+                &CounterSample { timestamp_seconds: secs, value: bytes },
+                &policy,
+            )
+            .context("project matrix drive lifetime")?
+            .rated_years
+            .map(|y| format!("{y:.2}"))
+            .unwrap_or_else(|| "-".to_string());
             row.push_str(&format!("  {years:>10}"));
         }
         s.push_str(&row);
         s.push('\n');
     }
-    s
+    Ok(s)
 }
 
 /// Render the results as CSV (one row per combo; lever columns are 0/1) for
@@ -3605,96 +4091,7 @@ fn render_csv(results: &[ComboAggregate]) -> String {
     s
 }
 
-// ---------------------------------------------------------------------------
-// compare — A/B two matrix runs
-// ---------------------------------------------------------------------------
-
-/// `k` in the significance test: a metric delta counts as real when
-/// `|Δmean| > k·sqrt(σ_baseline² + σ_candidate²)`.
-pub(super) const COMPARE_SIGNIFICANCE_K: f64 = 2.0;
-
-pub(super) fn combined_noise_threshold(a: Stats, b: Stats) -> Option<f64> {
-    (a.n >= 2 && b.n >= 2).then(|| {
-        COMPARE_SIGNIFICANCE_K * (a.stddev.powi(2) + b.stddev.powi(2)).sqrt()
-    })
-}
-
-/// Whether a metric's baseline→candidate change is distinguishable from noise.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Sig {
-    /// |Δmean| exceeds `k·sqrt(σ_b²+σ_c²)`.
-    Significant,
-    /// Change is within the combined noise band.
-    NotSignificant,
-    /// Either run had < 2 samples, so noise can't be estimated.
-    NoiseUnknown,
-}
-
-impl Sig {
-    fn marker(self) -> &'static str {
-        match self {
-            Sig::Significant => "[*]",
-            Sig::NotSignificant => "[ ]",
-            Sig::NoiseUnknown => "[?]",
-        }
-    }
-}
-
-/// Decide whether the mean shifted beyond the combined per-run noise. Needs
-/// >= 2 samples on both sides to estimate noise, else [`Sig::NoiseUnknown`].
-fn significance(base: Stats, cand: Stats) -> Sig {
-    let Some(noise) = combined_noise_threshold(base, cand) else {
-        return Sig::NoiseUnknown;
-    };
-    if (cand.mean - base.mean).abs() > noise {
-        Sig::Significant
-    } else {
-        Sig::NotSignificant
-    }
-}
-
-fn read_matrix_run(path: &Path) -> Result<MatrixRun> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let run: MatrixRun = serde_json::from_str(&text).with_context(|| {
-        format!(
-            "parse matrix run {} (from `matrix --json-out`)",
-            path.display()
-        )
-    })?;
-    validate_matrix_run(&run).with_context(|| {
-        format!("validate complete matrix run {}", path.display())
-    })?;
-    Ok(run)
-}
-
-/// The metrics `compare` diffs, with a display name and whether the value is a
-/// byte count (formatted with `human_bytes`) vs a plain number (seconds).
-#[allow(clippy::type_complexity)]
-fn compare_metrics() -> [(&'static str, bool, fn(&ComboAggregate) -> Stats); 5]
-{
-    [
-        ("bring-up", true, ComboAggregate::bringup_bytes),
-        ("launch", false, ComboAggregate::launch_secs),
-        ("launch-delta-ram", true, ComboAggregate::peak_ram_bytes),
-        ("workload", true, ComboAggregate::workload_bytes),
-        ("workload-delta-ram", true, ComboAggregate::workload_peak_delta_bytes),
-    ]
-}
-
-fn cmd_compare(baseline: &Path, candidate: &Path) -> Result<()> {
-    let base = read_matrix_run(baseline)?;
-    let cand = read_matrix_run(candidate)?;
-
-    validate_comparison_compatibility(&base, &cand)?;
-
-    for line in compare_report(&base, &cand) {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-fn validate_comparison_compatibility(
+pub(super) fn validate_comparison_compatibility(
     base: &MatrixRun,
     candidate: &MatrixRun,
 ) -> Result<()> {
@@ -3704,89 +4101,6 @@ fn validate_comparison_compatibility(
         ));
     }
     Ok(())
-}
-
-/// Render the baseline→candidate comparison as lines. Combos are matched by
-/// label (baseline order first, then any candidate-only combos); each metric
-/// shows baseline mean, candidate mean, relative delta, and a noise flag.
-fn compare_report(base: &MatrixRun, cand: &MatrixRun) -> Vec<String> {
-    let mut lines = vec![
-        format!(
-            "perftest compare: baseline '{}' -> candidate '{}'",
-            base.name, cand.name
-        ),
-        format!(
-            "  baseline: {} combo(s), repeat {}    candidate: {} combo(s), repeat {}",
-            base.results.len(),
-            base.repeat,
-            cand.results.len(),
-            cand.repeat
-        ),
-        format!(
-            "  noise flag: [*] delta > {COMPARE_SIGNIFICANCE_K:.0}*sqrt(sd_b^2+sd_c^2)   [ ] within noise   [?] variance unknown (repeat<2)"
-        ),
-    ];
-
-    // Baseline order first, then any labels only present in the candidate.
-    let mut labels: Vec<&str> =
-        base.results.iter().map(|r| r.label.as_str()).collect();
-    for r in &cand.results {
-        if !labels.contains(&r.label.as_str()) {
-            labels.push(r.label.as_str());
-        }
-    }
-
-    let metrics = compare_metrics();
-    for label in labels {
-        let b = base.results.iter().find(|r| r.label == label);
-        let c = cand.results.iter().find(|r| r.label == label);
-        match (b, c) {
-            (Some(b), Some(c)) => {
-                lines.push(format!("\ncombo '{label}':"));
-                for (name, is_bytes, f) in metrics {
-                    let bs = f(b);
-                    let cs = f(c);
-                    if bs.n == 0 && cs.n == 0 {
-                        continue; // metric not measured on either side
-                    }
-                    lines.push(format_metric_delta(name, is_bytes, bs, cs));
-                }
-            }
-            (Some(_), None) => lines
-                .push(format!("\ncombo '{label}': only in baseline (skipped)")),
-            (None, Some(_)) => lines.push(format!(
-                "\ncombo '{label}': only in candidate (skipped)"
-            )),
-            (None, None) => {}
-        }
-    }
-    lines
-}
-
-/// One metric row: `  bring-up   12.00 GB -> 9.00 GB   -25.0%  [*]`.
-fn format_metric_delta(
-    name: &str,
-    is_bytes: bool,
-    base: Stats,
-    cand: Stats,
-) -> String {
-    let fmt = |v: f64| {
-        if is_bytes { human_bytes(v as u64) } else { format!("{v:.0}s") }
-    };
-    let delta = cand.mean - base.mean;
-    let rel = if base.mean != 0.0 {
-        format!("{:+.1}%", delta / base.mean * 100.0)
-    } else if cand.mean != 0.0 {
-        "new".to_string()
-    } else {
-        "0.0%".to_string()
-    };
-    format!(
-        "  {name:<10} {:>12} -> {:>12}   {rel:>8}  {}",
-        fmt(base.mean),
-        fmt(cand.mean),
-        significance(base, cand).marker()
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4152,12 +4466,12 @@ fn parse_nvme_disk_map(list: &str) -> BTreeMap<String, String> {
         // holds model/serial, not a blkdev name).
         if let Some((head, _)) = line.split_once(':') {
             let h = head.trim();
-            if let Some(rest) = h.strip_prefix("nvme") {
-                if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
-                {
-                    current = Some(h.to_string());
-                    continue;
-                }
+            if let Some(rest) = h.strip_prefix("nvme")
+                && !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_digit())
+            {
+                current = Some(h.to_string());
+                continue;
             }
         }
         // Otherwise this is a child (namespace) line: map any disk name on it to
@@ -4258,7 +4572,7 @@ fn cmd_report(
 ) -> Result<()> {
     let b = read_sample(before)?;
     let a = read_sample(after)?;
-    for line in report(&b, &a, rated_tbw) {
+    for line in report(&b, &a, rated_tbw)? {
         println!("{line}");
     }
     Ok(())
@@ -4271,33 +4585,26 @@ fn read_sample(path: &Path) -> Result<Value> {
         .with_context(|| format!("parse sample {}", path.display()))
 }
 
-struct Projection {
-    rate: f64,
-    gb_day: f64,
-    tb_year: f64,
-    years: Option<f64>,
-}
-
-/// Project a bytes-written delta over a window into a rate and, given a rated
-/// TBW, a drive lifetime. Decimal units (GB = 1e9, TB = 1e12).
-fn project(
-    delta_bytes: u64,
-    window_secs: u64,
-    rated_tbw: Option<f64>,
-) -> Projection {
-    let secs = window_secs.max(1) as f64;
-    let rate = delta_bytes as f64 / secs;
-    let gb_day = rate * 86_400.0 / 1e9;
-    let tb_year = rate * 86_400.0 * 365.0 / 1e12;
-    let years = rated_tbw.and_then(|t| (tb_year > 0.0).then_some(t / tb_year));
-    Projection { rate, gb_day, tb_year, years }
+fn projection_policy(rated_tbw: Option<f64>) -> Result<ProjectionPolicy> {
+    let rated_total = rated_tbw
+        .map(|rating| {
+            let total = rating * 1e12;
+            if !rating.is_finite() || rating <= 0.0 || !total.is_finite() || total > u64::MAX as f64
+            {
+                bail!("rated TBW must be finite, positive, and representable in bytes");
+            }
+            Ok(total)
+        })
+        .transpose()?;
+    Ok(ProjectionPolicy { rated_total })
 }
 
 fn report(
     before: &Value,
     after: &Value,
     rated_tbw: Option<f64>,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
+    let policy = projection_policy(rated_tbw).context("validate rated TBW")?;
     let window = after_time(after).saturating_sub(after_time(before)).max(1);
     let mut lines = vec![
         format!(
@@ -4326,7 +4633,12 @@ fn report(
         if in_pool {
             scoped_bytes += bytes;
         }
-        let p = project(bytes, window, rated_tbw);
+        let p = project_samples(
+            &CounterSample { timestamp_seconds: 0, value: 0 },
+            &CounterSample { timestamp_seconds: window, value: bytes },
+            &policy,
+        )
+        .with_context(|| format!("project write rate for device {name}"))?;
         let tag = if in_pool { "  <- falcon pool" } else { "" };
         lines.push(format!(
             "{name}: wrote {} over window{tag}",
@@ -4334,16 +4646,16 @@ fn report(
         ));
         lines.push(format!(
             "      rate {}/s   ({:.2} GB/day, {:.2} TB/year)",
-            human_bytes(p.rate as u64),
-            p.gb_day,
-            p.tb_year
+            human_bytes(p.units_per_second as u64),
+            p.giga_units_per_day,
+            p.tera_units_per_year
         ));
         if let (Some(bu), Some(au)) =
             (percentage(before, name), percentage(after, name))
         {
             lines.push(format!("      Used%: {bu} -> {au}"));
         }
-        if let (Some(years), Some(rated)) = (p.years, rated_tbw) {
+        if let (Some(years), Some(rated)) = (p.rated_years, rated_tbw) {
             lines.push(format!(
                 "      endurance: {rated:.0} TBW rated -> ~{years:.2} years (~{:.0} days) at this rate",
                 years * 365.0
@@ -4356,7 +4668,12 @@ fn report(
     if let Some(s) = &scope {
         let pool = after["falcon_pool"].as_str().unwrap_or("?");
         let drives: Vec<&str> = s.iter().map(String::as_str).collect();
-        let p = project(scoped_bytes, window, rated_tbw);
+        let p = project_samples(
+            &CounterSample { timestamp_seconds: 0, value: 0 },
+            &CounterSample { timestamp_seconds: window, value: scoped_bytes },
+            &policy,
+        )
+        .context("project falcon pool write rate")?;
         lines.push("-".repeat(62));
         lines.push(format!(
             "falcon pool '{pool}' total: {} over window   ({} drive(s): {})",
@@ -4366,11 +4683,11 @@ fn report(
         ));
         lines.push(format!(
             "      rate {}/s   ({:.2} GB/day, {:.2} TB/year)",
-            human_bytes(p.rate as u64),
-            p.gb_day,
-            p.tb_year
+            human_bytes(p.units_per_second as u64),
+            p.giga_units_per_day,
+            p.tera_units_per_year
         ));
-        if let (Some(years), Some(rated)) = (p.years, rated_tbw) {
+        if let (Some(years), Some(rated)) = (p.rated_years, rated_tbw) {
             lines.push(format!(
                 "      endurance: {rated:.0} TBW rated -> ~{years:.2} years (~{:.0} days) at this rate",
                 years * 365.0
@@ -4409,7 +4726,7 @@ fn report(
         lines
             .push("tip: pass --rated-tbw <TB> to project drive lifetime at this rate.".to_string());
     }
-    lines
+    Ok(lines)
 }
 
 fn after_time(v: &Value) -> u64 {
@@ -4464,9 +4781,12 @@ enum DiskStyle {
 
 const AMBIGUOUS_CREATE_RECONCILE_ATTEMPTS: u32 = 90;
 const PROJECT_CREATE_POST_ATTEMPTS: u32 = 3;
-const EXPLICIT_PROJECT_CREATE_ABSENCE_POLLS: u32 = 5;
+const DISK_CREATE_POST_ATTEMPTS: u32 = 3;
+const EXPLICIT_CREATE_ABSENCE_POLLS: u32 = 5;
+const QUOTA_UPDATE_ATTEMPTS: u32 = 3;
 const PROJECT_DELETE_RECONCILE_ATTEMPTS: u32 = 150;
-const DISK_DELETE_ATTEMPTS: u32 = 3;
+const DISK_DELETE_ATTEMPTS: u32 = 10;
+const DISK_SETTLEMENT_ATTEMPTS: u32 = 150;
 const NETWORK_DELETE_ATTEMPTS: u32 = 3;
 
 #[derive(Debug)]
@@ -4536,28 +4856,42 @@ impl LifecycleApi for OxideSession {
 fn set_disk_lifecycle_storage_quota(
     api: &dyn LifecycleApi,
     silo: &str,
+    retry_delay: Duration,
 ) -> ClassifiedResult<()> {
     let endpoint = format!("/v1/system/silos/{silo}/quotas");
     let body =
         json!({"storage": DISK_LIFECYCLE_STORAGE_QUOTA_BYTES}).to_string();
-    let response = match api.request(&endpoint, "PUT", Some(&body)) {
-        Ok(response) => response,
-        Err(error) if error.status == Some(404) => {
-            return Err(ClassifiedFailure::Permanent(error.into()));
+    for attempt in 1..=QUOTA_UPDATE_ATTEMPTS {
+        let response = match api.request(&endpoint, "PUT", Some(&body)) {
+            Ok(response) => response,
+            Err(error) if error.status == Some(404) => {
+                return Err(ClassifiedFailure::Permanent(error.into()));
+            }
+            Err(error)
+                if error.kind == oxide_session::ApiErrorKind::Retryable
+                    && attempt < QUOTA_UPDATE_ATTEMPTS =>
+            {
+                std::thread::sleep(retry_delay);
+                continue;
+            }
+            Err(error) => return Err(ClassifiedFailure::api(error)),
+        };
+        let quota: Value =
+            serde_json::from_str(&response).map_err(|error| {
+                ClassifiedFailure::Permanent(
+                    anyhow!(error)
+                        .context("parse recovery silo quota update response"),
+                )
+            })?;
+        if quota["storage"].as_u64() != Some(DISK_LIFECYCLE_STORAGE_QUOTA_BYTES)
+        {
+            return Err(ClassifiedFailure::permanent(
+                "recovery silo quota update response did not confirm 20 GiB of storage",
+            ));
         }
-        Err(error) => return Err(ClassifiedFailure::api(error)),
-    };
-    let quota: Value = serde_json::from_str(&response).map_err(|error| {
-        ClassifiedFailure::Permanent(
-            anyhow!(error).context("parse recovery silo quota update response"),
-        )
-    })?;
-    if quota["storage"].as_u64() != Some(DISK_LIFECYCLE_STORAGE_QUOTA_BYTES) {
-        return Err(ClassifiedFailure::permanent(
-            "recovery silo quota update response did not confirm 20 GiB of storage",
-        ));
+        return Ok(());
     }
-    Ok(())
+    unreachable!("quota update loop always returns")
 }
 
 struct DiskLifecycleOwner {
@@ -4646,7 +4980,7 @@ impl<'a> PreparedDiskLifecycle<'a> {
         silo: &str,
         poll_delay: Duration,
     ) -> ClassifiedResult<Self> {
-        set_disk_lifecycle_storage_quota(api, silo)?;
+        set_disk_lifecycle_storage_quota(api, silo, poll_delay)?;
         let owner = DiskLifecycleOwner::new(uuid::Uuid::new_v4(), "probe");
         let style = prepare_owned_style(api, &owner, poll_delay)?;
         Ok(Self { api, style, poll_delay })
@@ -4810,7 +5144,7 @@ fn create_owned_project(
         // project-name uniqueness constraint makes a late first create collide
         // rather than create a second live project.
         let mut absence_proven = true;
-        for poll_attempt in 1..=EXPLICIT_PROJECT_CREATE_ABSENCE_POLLS {
+        for poll_attempt in 1..=EXPLICIT_CREATE_ABSENCE_POLLS {
             let listed = match api.request("/v1/projects", "GET", None) {
                 Ok(listed) => listed,
                 Err(poll_error)
@@ -4829,7 +5163,7 @@ fn create_owned_project(
                 Ok(false) => {}
                 Err(error) => return Err(ClassifiedFailure::Permanent(error)),
             }
-            if poll_attempt < EXPLICIT_PROJECT_CREATE_ABSENCE_POLLS {
+            if poll_attempt < EXPLICIT_CREATE_ABSENCE_POLLS {
                 std::thread::sleep(reconcile_delay);
             }
         }
@@ -4842,7 +5176,7 @@ fn create_owned_project(
             );
         }
         eprintln!(
-            "[perftest] project {} create attempt {create_attempt}/{PROJECT_CREATE_POST_ATTEMPTS} returned an explicit server failure and remained absent after {EXPLICIT_PROJECT_CREATE_ABSENCE_POLLS} polls; retrying the identical nonce-owned create: {error}",
+            "[perftest] project {} create attempt {create_attempt}/{PROJECT_CREATE_POST_ATTEMPTS} returned an explicit server failure and remained absent after {EXPLICIT_CREATE_ABSENCE_POLLS} polls; retrying the identical nonce-owned create: {error}",
             owner.project_name,
         );
     }
@@ -4905,33 +5239,78 @@ fn create_owned_disk(
 ) -> ClassifiedResult<()> {
     owner.require_owned_disk(name).map_err(ClassifiedFailure::Permanent)?;
     let endpoint = format!("/v1/disks?project={}", owner.project_name);
-    match api.request(&endpoint, "POST", Some(&disk_body(name, 1 << 30, style)))
-    {
-        Ok(json)
-            if serde_json::from_str::<Value>(&json)
-                .ok()
-                .and_then(|v| v["name"].as_str().map(str::to_owned))
-                .as_deref()
-                == Some(name) =>
-        {
-            Ok(())
+    let body = disk_body(name, 1 << 30, style);
+    for create_attempt in 1..=DISK_CREATE_POST_ATTEMPTS {
+        let error = match api.request(&endpoint, "POST", Some(&body)) {
+            Ok(json)
+                if serde_json::from_str::<Value>(&json)
+                    .ok()
+                    .and_then(|v| v["name"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some(name) =>
+            {
+                return Ok(());
+            }
+            Ok(_) => {
+                return Err(ClassifiedFailure::permanent(
+                    "incompatible disk create response",
+                ));
+            }
+            Err(error)
+                if error.kind == oxide_session::ApiErrorKind::ShapeRejected
+                    && probe =>
+            {
+                return Err(ClassifiedFailure::api(error));
+            }
+            Err(error)
+                if error.kind != oxide_session::ApiErrorKind::Retryable =>
+            {
+                return Err(ClassifiedFailure::api(error));
+            }
+            Err(error) => error,
+        };
+        let retry_explicit_server_failure =
+            error.status.is_some_and(|status| (500..=599).contains(&status))
+                && create_attempt < DISK_CREATE_POST_ATTEMPTS;
+        if !retry_explicit_server_failure {
+            return reconcile_ambiguous_disk(
+                api,
+                owner,
+                name,
+                reconcile_delay,
+                error,
+            );
         }
-        Ok(_) => Err(ClassifiedFailure::permanent(
-            "incompatible disk create response",
-        )),
-        Err(error)
-            if error.kind == oxide_session::ApiErrorKind::ShapeRejected
-                && probe =>
-        {
-            Err(ClassifiedFailure::api(error))
+
+        let mut absence_proven = true;
+        for poll_attempt in 1..=EXPLICIT_CREATE_ABSENCE_POLLS {
+            match disk_exists(api, owner, name) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(ClassifiedFailure::Retryable(_)) => {
+                    absence_proven = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+            if poll_attempt < EXPLICIT_CREATE_ABSENCE_POLLS {
+                std::thread::sleep(reconcile_delay);
+            }
         }
-        Err(error) if error.kind != oxide_session::ApiErrorKind::Retryable => {
-            Err(ClassifiedFailure::api(error))
+        if !absence_proven {
+            return reconcile_ambiguous_disk(
+                api,
+                owner,
+                name,
+                reconcile_delay,
+                error,
+            );
         }
-        Err(error) => {
-            reconcile_ambiguous_disk(api, owner, name, reconcile_delay, error)
-        }
+        eprintln!(
+            "[perftest] disk {name} create attempt {create_attempt}/{DISK_CREATE_POST_ATTEMPTS} returned an explicit server failure and remained absent after {EXPLICIT_CREATE_ABSENCE_POLLS} polls; retrying the identical nonce-owned create: {error}"
+        );
     }
+    unreachable!("disk create loop always returns")
 }
 
 fn reconcile_ambiguous_disk(
@@ -4970,7 +5349,7 @@ fn disk_exists(
         )
         .map_err(ClassifiedFailure::api)?;
     Ok(item_names(&text)
-        .map_err(|e| ClassifiedFailure::Permanent(e))?
+        .map_err(ClassifiedFailure::Permanent)?
         .iter()
         .any(|n| n == name))
 }
@@ -4988,7 +5367,7 @@ fn wait_owned_disk(
     delay: Duration,
     mode: DiskWaitMode,
 ) -> ClassifiedResult<()> {
-    for _ in 0..60 {
+    for attempt in 1..=DISK_SETTLEMENT_ATTEMPTS {
         let endpoint =
             format!("/v1/disks/{name}?project={}", owner.project_name);
         let text = match api.request(&endpoint, "GET", None) {
@@ -5014,7 +5393,10 @@ fn wait_owned_disk(
                     "disk entered faulted state",
                 ));
             }
-            DiskSettlement::Pending => std::thread::sleep(delay),
+            DiskSettlement::Pending if attempt < DISK_SETTLEMENT_ATTEMPTS => {
+                std::thread::sleep(delay)
+            }
+            DiskSettlement::Pending => {}
         }
     }
     Err(ClassifiedFailure::Retryable(anyhow!("disk settlement timed out")))
@@ -5946,14 +6328,969 @@ mod tests {
                 repeats: (0..3)
                     .map(|index| MatrixCheckpointRepeat {
                         index,
-                        pre_boundary: BoundaryOutcome::Pending,
-                        launch: LaunchOutcome::Pending,
-                        preparation: PreparationOutcome::NotRequested,
-                        workload: WorkloadOutcome::NotRequested,
-                        post_boundary: BoundaryOutcome::Pending,
+                        pre_boundary: BoundaryOutcome::Pending {},
+                        launch: LaunchOutcome::Pending {},
+                        preparation: PreparationOutcome::NotRequested {},
+                        workload: WorkloadOutcome::NotRequested {},
+                        post_boundary: BoundaryOutcome::Pending {},
                     })
                     .collect(),
             }],
+        }
+    }
+
+    fn schema_v5_fixture(name: &str) -> MatrixCheckpoint {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/perftest")
+            .join(name);
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn cookout_report_wrapper_publishes_multiple_checkpoint_states() {
+        let root = tempfile::tempdir().unwrap();
+        let inputs = [
+            "matrix-complete-v5.json",
+            "matrix-partial-v5.json",
+            "matrix-failed-v5.json",
+        ]
+        .map(|name| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/perftest")
+                .join(name)
+        });
+        let out = root.path().join("report");
+        cookout_commands::run_report(&inputs, &out, true).unwrap();
+        assert!(out.join("report.json").is_file());
+        assert!(root.path().join("report.tar.gz").is_file());
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(out.join("report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["schema"], "cookout.report.v2");
+        assert!(
+            report["issues"]
+                .as_array()
+                .is_some_and(|issues| !issues.is_empty())
+        );
+        let report_text = serde_json::to_string(&report).unwrap();
+        assert!(report_text.contains("required repeat failed"));
+        assert!(report_text.contains("required measurement missing"));
+        for index in 0..inputs.len() {
+            let archived =
+                std::fs::read(out.join(format!("evidence-{index:04}.json")))
+                    .unwrap();
+            let envelope = cookout::validate_evidence(
+                &archived,
+                &cookout::Limits::default(),
+            )
+            .unwrap();
+            assert_eq!(envelope.adapter.id, "oxide.voxel.perftest");
+        }
+        let retained: Value = serde_json::from_slice(
+            &std::fs::read(out.join("evidence-0000.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retained["schema"], "cookout.evidence.v1");
+        assert_eq!(retained["adapter"]["id"], "oxide.voxel.perftest");
+        assert_eq!(
+            retained["source"]["value"]["source_schema"],
+            "matrix_checkpoint"
+        );
+        assert!(
+            !serde_json::to_string(&retained)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("password")
+        );
+
+        let error =
+            cookout_commands::run_report(&inputs, &out, false).unwrap_err();
+        assert!(format!("{error:#}").contains("destination"));
+    }
+
+    #[test]
+    fn cookout_report_wrapper_rejects_malformed_and_unknown_schema_with_source()
+    {
+        let root = tempfile::tempdir().unwrap();
+        for (name, contents) in [
+            ("malformed.json", b"{".as_slice()),
+            ("future.json", br#"{"schema_version":999}"#.as_slice()),
+        ] {
+            let input = root.path().join(name);
+            std::fs::write(&input, contents).unwrap();
+            let error = cookout_commands::run_report(
+                std::slice::from_ref(&input),
+                &root.path().join(format!("out-{name}")),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(&input.display().to_string()));
+        }
+    }
+
+    #[test]
+    fn cookout_report_wrapper_rejects_semantically_malformed_failed_matrix() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("failed-v4.json");
+        let mut run = run_with("failed", &[("none", &[], &[1, 2])]);
+        run.results[0].repeats.pop();
+        run.results[0].repeats[0].peak_ram_bytes = Some(1);
+        run.results[0].error = Some(String::new());
+        std::fs::write(&input, serde_json::to_vec(&run).unwrap()).unwrap();
+
+        let error = cookout_commands::run_report(
+            std::slice::from_ref(&input),
+            &root.path().join("report"),
+            false,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&input.display().to_string()));
+        assert!(message.contains("validate retained failed storage matrix"));
+    }
+
+    #[test]
+    fn cookout_report_wrapper_rejects_semantically_malformed_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("checkpoint-v5.json");
+        let mut checkpoint = planned_schema_v5_checkpoint();
+        checkpoint.combos[0].label = "noncanonical".into();
+        std::fs::write(&input, serde_json::to_vec(&checkpoint).unwrap())
+            .unwrap();
+
+        let error = cookout_commands::run_report(
+            std::slice::from_ref(&input),
+            &root.path().join("report"),
+            false,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&input.display().to_string()));
+        assert!(message.contains(
+            "validate schema-v5 storage matrix checkpoint semantics"
+        ));
+    }
+
+    #[test]
+    fn cookout_superreport_wrapper_delegates_archive_deduplication() {
+        let root = tempfile::tempdir().unwrap();
+        let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/perftest/matrix-complete-v5.json");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        cookout_commands::run_report(
+            std::slice::from_ref(&input),
+            &first,
+            true,
+        )
+        .unwrap();
+        cookout_commands::run_report(&[input], &second, true).unwrap();
+        let archives = [
+            root.path().join("first.tar.gz"),
+            root.path().join("second.tar.gz"),
+        ];
+        let out = root.path().join("aggregate");
+        cookout_commands::run_superreport(&archives, &out, true).unwrap();
+        let report: Value = serde_json::from_slice(
+            &std::fs::read(out.join("report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["aggregation"]["unique_input_count"], 1);
+        assert_eq!(report["aggregation"]["duplicate_count"], 1);
+        assert_eq!(report["aggregation"]["normalization"], "adapter_replay");
+        assert_eq!(report["schema"], "cookout.report.v2");
+        let retained: Value = serde_json::from_slice(
+            &std::fs::read(out.join("evidence-0000.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retained["schema"], "cookout.evidence.v1");
+        assert_eq!(retained["adapter"]["id"], "oxide.voxel.perftest");
+        assert!(root.path().join("aggregate.tar.gz").is_file());
+    }
+
+    #[test]
+    fn cookout_adapter_maps_complete_checkpoint_contract() {
+        let source = Path::new("matrix-complete-v5.json");
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &schema_v5_fixture("matrix-complete-v5.json"),
+            source,
+        )
+        .unwrap();
+        assert_eq!(document.variants.len(), 1);
+        assert_eq!(document.runs.len(), 1);
+        assert_eq!(
+            document.variants[0].configuration,
+            Some(cookout::model::VariantConfiguration::StorageLevers {
+                levers: BTreeSet::new(),
+            })
+        );
+        assert_eq!(
+            document.runs[0].outcome,
+            cookout::model::RunOutcome::Completed
+        );
+        assert!(document.runs[0]
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.observations)
+            .any(|observation| observation.metric == "launch.bytes_written"));
+    }
+
+    #[test]
+    fn cookout_adapter_retains_replayable_source_and_actionable_issues() {
+        for source in [
+            "matrix-complete-v5.json",
+            "matrix-partial-v5.json",
+            "matrix-failed-v5.json",
+            "checkpoint-in-progress-v5.json",
+        ] {
+            let evidence = cookout_adapter::matrix_checkpoint_to_evidence(
+                &schema_v5_fixture(source),
+                Path::new(source),
+            )
+            .unwrap();
+            let bytes = serde_json::to_vec(&evidence).unwrap();
+            cookout::validate_evidence(&bytes, &cookout::Limits::default())
+                .unwrap();
+            let text = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
+            assert!(!text.contains("password"), "{source}");
+            assert!(
+                evidence.issues.iter().all(|issue| issue
+                    .code
+                    .starts_with("oxide.voxel.perftest."))
+            );
+
+            if source == "matrix-failed-v5.json" {
+                assert!(evidence.issues.iter().any(|issue| {
+                    issue.code == "oxide.voxel.perftest.stage_failure"
+                        && issue.description.contains("Candidate")
+                        && issue.description.contains("repeat")
+                        && matches!(
+                            issue.scope,
+                            cookout::IssueScope::Run { .. }
+                        )
+                }));
+            }
+            if source == "checkpoint-in-progress-v5.json" {
+                assert!(
+                    evidence.issues.iter().any(|issue| {
+                        issue.code == "oxide.voxel.perftest.repeat_pending"
+                            && issue.impact == cookout::IssueImpact::Blocking
+                    }),
+                    "{:#?}",
+                    evidence.issues
+                );
+            }
+        }
+
+        let mut run = run_with("complete-v4", &[("none", &[], &[1, 2])]);
+        for repeat in &mut run.results[0].repeats {
+            repeat.peak_ram_bytes = Some(1);
+        }
+        let evidence = cookout_adapter::matrix_run_to_evidence(
+            &run,
+            Path::new("matrix-v4.json"),
+        )
+        .unwrap();
+        assert_eq!(evidence.adapter.source_schema_version, 1);
+        assert_eq!(evidence.source.value["source_schema"], "matrix_run");
+    }
+
+    fn storage_cohort(checkpoint: &MatrixCheckpoint, source: &Path) -> String {
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            checkpoint, source,
+        )
+        .unwrap();
+        match document
+            .target
+            .dimensions
+            .namespaced
+            .get("oxide.voxel.storage_cohort")
+            .unwrap()
+        {
+            cookout::model::DimensionValue::Text(value) => value.clone(),
+            value => {
+                panic!("storage cohort must be opaque text, got {value:?}")
+            }
+        }
+    }
+
+    fn checkpoint_with_complete_cohort_evidence() -> MatrixCheckpoint {
+        let mut checkpoint = schema_v5_fixture("matrix-complete-v5.json");
+        let plan = checkpoint
+            .combos
+            .iter()
+            .map(|combo| (combo.label.clone(), combo.levers.clone()))
+            .collect::<Vec<_>>();
+        let mut evidence = build_report_evidence(
+            &checkpoint.combos[0].effective_config,
+            &plan,
+            checkpoint.rss_sleds,
+            checkpoint.workload.clone(),
+            checkpoint.oxide_session.clone(),
+            &[],
+            checkpoint.repeat,
+        );
+        for (field, value) in [
+            (&mut evidence.provenance.voxel_build, "voxel-build"),
+            (&mut evidence.provenance.voxel_binary, "sha256:voxel-binary"),
+            (&mut evidence.provenance.configured_image, "configured-image"),
+            (&mut evidence.provenance.omicron_commit, "omicron-commit"),
+            (&mut evidence.provenance.host, "host-id"),
+        ] {
+            *field = EvidenceValue::Available { value: value.into() };
+        }
+        checkpoint.report_evidence = Some(evidence);
+        checkpoint
+    }
+
+    #[test]
+    fn cookout_adapter_storage_cohort_ignores_results_status_and_metrics() {
+        let checkpoint = checkpoint_with_complete_cohort_evidence();
+        let expected = storage_cohort(&checkpoint, Path::new("same.json"));
+
+        let mut changed = checkpoint.clone();
+        let evidence = changed.report_evidence.as_mut().unwrap();
+        evidence.capabilities.api_disk_lifecycle =
+            CapabilityStatus::Fail { evidence: "irrelevant result".into() };
+        if let LaunchOutcome::Success { metrics, .. } =
+            &mut changed.combos[0].repeats[0].launch
+        {
+            metrics.launch_secs += 1;
+            metrics.bringup_bytes += 1;
+        }
+        changed.status = RunStatus::Running;
+        assert_eq!(storage_cohort(&changed, Path::new("same.json")), expected);
+    }
+
+    #[test]
+    fn cookout_adapter_storage_cohort_splits_on_every_identity_fact() {
+        let checkpoint = checkpoint_with_complete_cohort_evidence();
+        let expected = storage_cohort(&checkpoint, Path::new("same.json"));
+        let assert_split =
+            |name: &str, mutate: &mut dyn FnMut(&mut MatrixCheckpoint)| {
+                let mut changed = checkpoint.clone();
+                mutate(&mut changed);
+                assert_ne!(
+                    storage_cohort(&changed, Path::new("same.json")),
+                    expected,
+                    "{name}"
+                );
+            };
+
+        assert_split("RSS sled count", &mut |value| value.rss_sleds += 1);
+        assert_split("ordered combination labels", &mut |value| {
+            value.combos[0].label = "different".into()
+        });
+        assert_split("workload", &mut |value| {
+            value.workload.as_mut().unwrap().count += 1
+        });
+        assert_split("full Oxide session", &mut |value| {
+            value.oxide_session = Some(OxideSessionMetadata {
+                profile: "profile".into(),
+                host: "host".into(),
+                provider: OxideAuthProviderMetadata::Helper {
+                    path: PathBuf::from("/helper"),
+                },
+                oxide_cli_version: "cli-version".into(),
+            })
+        });
+        assert_split("effective candidate configuration", &mut |value| {
+            value.report_evidence.as_mut().unwrap().combos[0]
+                .effective_config
+                .disk_wear
+                .host_sync_disabled = true
+        });
+        assert_split("capability contract version", &mut |value| {
+            value.report_evidence.as_mut().unwrap().evidence_version += 1
+        });
+        for (name, field) in [
+            ("Voxel build", 0),
+            ("Voxel binary digest", 1),
+            ("configured image", 2),
+            ("Omicron commit", 3),
+            ("host", 4),
+        ] {
+            assert_split(name, &mut |value| {
+                let provenance =
+                    &mut value.report_evidence.as_mut().unwrap().provenance;
+                let target = match field {
+                    0 => &mut provenance.voxel_build,
+                    1 => &mut provenance.voxel_binary,
+                    2 => &mut provenance.configured_image,
+                    3 => &mut provenance.omicron_commit,
+                    _ => &mut provenance.host,
+                };
+                *target = EvidenceValue::Available {
+                    value: format!("different-{field}"),
+                };
+            });
+        }
+        assert!(expected.starts_with("v1:sha256:"));
+        assert_eq!(expected.len(), "v1:sha256:".len() + 64);
+    }
+
+    #[test]
+    fn cookout_adapter_partial_provenance_uses_source_and_run_identity() {
+        let mut checkpoint = checkpoint_with_complete_cohort_evidence();
+        checkpoint.report_evidence.as_mut().unwrap().provenance.host =
+            EvidenceValue::Unavailable { reason: "not observable".into() };
+        let first = storage_cohort(&checkpoint, Path::new("first/input.json"));
+        assert_ne!(
+            first,
+            storage_cohort(&checkpoint, Path::new("second/input.json"))
+        );
+        checkpoint.name = "another-run".into();
+        assert_ne!(
+            first,
+            storage_cohort(&checkpoint, Path::new("first/input.json"))
+        );
+    }
+
+    #[test]
+    fn cookout_adapter_preserves_completed_matrix_with_failed_repeats() {
+        let mut checkpoint = schema_v5_fixture("matrix-partial-v5.json");
+        checkpoint.status = RunStatus::Completed;
+        checkpoint.ended = Some(checkpoint.updated);
+        checkpoint.repeat = 1;
+        checkpoint.combos[0].repeats.truncate(1);
+
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &checkpoint,
+            Path::new("completed-with-failures-v5.json"),
+        )
+        .unwrap();
+        let context = document.report_context.as_ref().unwrap();
+        assert_eq!(
+            context.execution_state,
+            cookout::model::ExecutionState::Completed
+        );
+        assert_eq!(context.abort_error, None);
+        assert!(
+            document
+                .runs
+                .iter()
+                .any(|run| run.outcome == cookout::model::RunOutcome::Failed)
+        );
+    }
+
+    fn cookout_golden(name: &str, document: &cookout::ExperimentDocument) {
+        let mut target_dimensions = document.target.dimensions.clone();
+        let cohort = target_dimensions
+            .namespaced
+            .remove("oxide.voxel.storage_cohort")
+            .expect("storage cohort dimension");
+        assert!(matches!(
+            cohort,
+            cookout::model::DimensionValue::Text(value)
+                if value.starts_with("v1:sha256:")
+                    && value.len() == "v1:sha256:".len() + 64
+        ));
+        let actual = json!({
+            "variants": document.variants.iter().map(|variant| &variant.id).collect::<Vec<_>>(),
+            "runs": document.runs.iter().map(|run| json!({
+                "id": run.id,
+                "outcome": run.outcome,
+                "phases": run.phases.iter().map(|phase| json!({
+                    "name": phase.name,
+                    "status": phase.status,
+                    "metrics": phase.observations.iter().map(|observation| &observation.metric).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "guardrail": run.guardrail,
+            })).collect::<Vec<_>>(),
+            // The opaque cohort is covered independently because its digest deliberately
+            // changes whenever the cohort identity contract changes.
+            "target_dimensions": target_dimensions,
+            "constraints": document.target.constraints,
+            "extensions": document.target.extensions,
+        });
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/perftest")
+            .join(name);
+        let expected: Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn cookout_adapter_checkpoint_goldens_are_deterministic_and_truthful() {
+        for (source, golden) in [
+            ("matrix-complete-v5.json", "cookout-complete.json"),
+            ("matrix-partial-v5.json", "cookout-partial.json"),
+            ("matrix-failed-v5.json", "cookout-failed.json"),
+            ("checkpoint-in-progress-v5.json", "cookout-checkpoint.json"),
+        ] {
+            let document = cookout_adapter::matrix_checkpoint_to_experiment(
+                &schema_v5_fixture(source),
+                Path::new(source),
+            )
+            .unwrap();
+            cookout_golden(golden, &document);
+            let serialized = serde_json::to_vec(&document).unwrap();
+            let text =
+                String::from_utf8(serialized).unwrap().to_ascii_lowercase();
+            for forbidden in ["password", "bearer "] {
+                assert!(
+                    !text.contains(forbidden),
+                    "Cookout evidence leaked {forbidden}"
+                );
+            }
+            assert!(document.runs.iter().all(|run| {
+                run.outcome != cookout::model::RunOutcome::GuardrailAborted
+                    && run.guardrail.is_none()
+            }));
+        }
+    }
+
+    #[test]
+    fn cookout_adapter_preserves_typed_report_context() {
+        let cases = [
+            (
+                "matrix-complete-v5.json",
+                cookout::model::ExecutionState::Completed,
+                1,
+                cookout::model::WorkloadDisposition::Succeeded,
+                None,
+            ),
+            (
+                "matrix-partial-v5.json",
+                cookout::model::ExecutionState::Running,
+                2,
+                cookout::model::WorkloadDisposition::Failed,
+                Some("synthetic workload request failed"),
+            ),
+            (
+                "matrix-failed-v5.json",
+                cookout::model::ExecutionState::Failed,
+                2,
+                cookout::model::WorkloadDisposition::Blocked,
+                Some(
+                    "synthetic launch attempt one failed; synthetic launch attempt two failed",
+                ),
+            ),
+            (
+                "checkpoint-in-progress-v5.json",
+                cookout::model::ExecutionState::Running,
+                1,
+                cookout::model::WorkloadDisposition::NotRequested,
+                Some("synthetic launch attempt is awaiting cleanup"),
+            ),
+        ];
+        for (source, state, planned, disposition, failure) in cases {
+            let document = cookout_adapter::matrix_checkpoint_to_experiment(
+                &schema_v5_fixture(source),
+                Path::new(source),
+            )
+            .unwrap();
+            let context = document.report_context.as_ref().unwrap();
+            assert_eq!(context.execution_state, state, "{source}");
+            assert_eq!(context.planned_repeats, planned, "{source}");
+            assert_eq!(
+                context.source_display.as_deref(),
+                Some(source),
+                "{source}"
+            );
+            assert!(document.variants.iter().all(|variant| {
+                variant
+                    .report_context
+                    .as_ref()
+                    .is_some_and(|context| !context.conditions.is_empty())
+            }));
+            let run = &document.runs[0];
+            let run_context = run.report_context.as_ref().unwrap();
+            assert_eq!(
+                run_context.workload_disposition, disposition,
+                "{source}"
+            );
+            assert_eq!(
+                run.failure.as_ref().map(|record| record.message.as_str()),
+                failure
+            );
+            assert!(
+                document
+                    .variants
+                    .iter()
+                    .flat_map(|variant| &variant
+                        .report_context
+                        .as_ref()
+                        .unwrap()
+                        .conditions)
+                    .all(|condition| !condition
+                        .label
+                        .to_ascii_lowercase()
+                        .contains("password"))
+            );
+        }
+    }
+
+    #[test]
+    fn cookout_adapter_maps_matrix_run_repeats() {
+        let run = run_with(
+            "ignored-source-name",
+            &[("none", &[], &[10, 20]), ("1", &[1], &[8, 9])],
+        );
+        let document = cookout_adapter::matrix_run_to_experiment(
+            &run,
+            Path::new("matrix.json"),
+        )
+        .unwrap();
+        assert_eq!(document.variants.len(), 2);
+        assert_eq!(document.runs.len(), 4);
+        assert!(document
+            .runs
+            .iter()
+            .all(|run| run.outcome == cookout::model::RunOutcome::Completed));
+        assert_eq!(document.identity.name, "Voxel");
+        assert_eq!(
+            document.report_context.as_ref().unwrap().source_display,
+            Some("matrix.json".into())
+        );
+    }
+
+    #[test]
+    fn cookout_adapter_preserves_schema_v4_partial_aggregate_failure() {
+        let mut run = run_with("partial", &[("none", &[], &[10, 20])]);
+        run.repeat = 3;
+        run.results[0].error = Some("third repeat failed".into());
+
+        let document = cookout_adapter::matrix_run_to_experiment(
+            &run,
+            Path::new("matrix.json"),
+        )
+        .unwrap();
+        let context = document.report_context.as_ref().unwrap();
+        assert_eq!(
+            context.execution_state,
+            cookout::model::ExecutionState::Failed
+        );
+        assert_eq!(context.planned_repeats, 3);
+        assert_eq!(
+            document.variants[0]
+                .report_context
+                .as_ref()
+                .unwrap()
+                .expected_repeats,
+            3
+        );
+        assert_eq!(document.runs.len(), 3);
+        assert_eq!(document.runs[2].attempt, 3);
+        assert_eq!(
+            document.runs[2].outcome,
+            cookout::model::RunOutcome::Failed
+        );
+        assert_eq!(
+            document.runs[2].report_context.as_ref().unwrap().launch_failure,
+            None
+        );
+        assert_eq!(
+            document.runs[2].failure.as_ref().unwrap().message,
+            "third repeat failed"
+        );
+    }
+
+    #[test]
+    fn cookout_adapter_does_not_invent_schema_v4_failed_slots() {
+        let mut run = run_with("failed", &[("none", &[], &[])]);
+        run.repeat = 3;
+        run.results[0].error = Some("first attempt failed".into());
+
+        let document = cookout_adapter::matrix_run_to_experiment(
+            &run,
+            Path::new("matrix.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            document.report_context.as_ref().unwrap().planned_repeats,
+            3
+        );
+        assert_eq!(document.runs.len(), 1);
+        assert_eq!(document.runs[0].attempt, 1);
+        assert_eq!(
+            document.runs[0].outcome,
+            cookout::model::RunOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn cookout_adapter_preserves_partial_provenance_without_credentials() {
+        let mut checkpoint = schema_v5_fixture("matrix-complete-v5.json");
+        let plan = checkpoint
+            .combos
+            .iter()
+            .map(|combo| (combo.label.clone(), combo.levers.clone()))
+            .collect::<Vec<_>>();
+        checkpoint.report_evidence = Some(build_report_evidence(
+            &checkpoint.combos[0].effective_config,
+            &plan,
+            checkpoint.rss_sleds,
+            checkpoint.workload.clone(),
+            checkpoint.oxide_session.clone(),
+            &[],
+            checkpoint.repeat,
+        ));
+        let evidence = checkpoint.report_evidence.as_mut().unwrap();
+        evidence.provenance.host =
+            EvidenceValue::Unavailable { reason: "host capture failed".into() };
+        checkpoint.oxide_session = Some(OxideSessionMetadata {
+            profile: "synthetic-profile".into(),
+            host: "distinctive-password-hash".into(),
+            provider: OxideAuthProviderMetadata::Helper {
+                path: PathBuf::from("/tmp/distinctive-secret-token"),
+            },
+            oxide_cli_version: "0.0.0-test".into(),
+        });
+
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &checkpoint,
+            Path::new("matrix-complete-v5.json"),
+        )
+        .unwrap();
+        let context = document.report_context.as_ref().unwrap();
+        assert_eq!(
+            context.provenance_state,
+            cookout::model::ProvenanceState::Unavailable
+        );
+        assert!(
+            context
+                .conditions
+                .iter()
+                .any(|condition| condition.label == "Voxel build"
+                    && condition.value != "unavailable")
+        );
+        assert!(
+            context
+                .conditions
+                .iter()
+                .any(|condition| condition.label == "Host"
+                    && condition.value == "unavailable: host capture failed")
+        );
+        let serialized = serde_json::to_string(&document).unwrap();
+        for forbidden in
+            ["distinctive-password-hash", "distinctive-secret-token"]
+        {
+            assert!(
+                !serialized.contains(forbidden),
+                "Cookout evidence leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn cookout_adapter_keeps_failure_stages_and_measurement_semantics_distinct()
+    {
+        let mut preparation_failed =
+            schema_v5_fixture("matrix-partial-v5.json");
+        let repeat = &mut preparation_failed.combos[0].repeats[0];
+        repeat.preparation =
+            PreparationOutcome::Failure { error: "preparation failed".into() };
+        repeat.workload =
+            WorkloadOutcome::Failure { error: "workload was blocked".into() };
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &preparation_failed,
+            Path::new("matrix-partial-v5.json"),
+        )
+        .unwrap();
+        let context = document.runs[0].report_context.as_ref().unwrap();
+        assert_eq!(
+            context.preparation_failure.as_deref(),
+            Some("preparation failed")
+        );
+        assert_eq!(context.workload_failure, None);
+        assert_eq!(
+            context.workload_disposition,
+            cookout::model::WorkloadDisposition::Blocked
+        );
+
+        let mut cleanup_failed = schema_v5_fixture("matrix-complete-v5.json");
+        cleanup_failed.status = RunStatus::Aborted;
+        cleanup_failed.abort_error = Some("cleanup failed".into());
+        cleanup_failed.combos[0].repeats[0].post_boundary =
+            BoundaryOutcome::Failure { error: "cleanup failed".into() };
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &cleanup_failed,
+            Path::new("matrix-complete-v5.json"),
+        )
+        .unwrap();
+        let context = document.runs[0].report_context.as_ref().unwrap();
+        assert_eq!(context.boundary_failure.as_deref(), Some("cleanup failed"));
+        assert_eq!(
+            context.launch_memory_semantics.as_deref(),
+            Some("launch-baseline-delta")
+        );
+        assert_eq!(
+            context.workload_memory_semantics.as_deref(),
+            Some("workload-baseline-delta")
+        );
+    }
+
+    #[test]
+    fn cookout_adapter_accepts_independent_boundary_failures() {
+        let mut launch_only = schema_v5_fixture("matrix-complete-v5.json");
+        launch_only.status = RunStatus::Aborted;
+        launch_only.abort_error = Some("cleanup failed".into());
+        launch_only.workload = None;
+        let repeat = &mut launch_only.combos[0].repeats[0];
+        repeat.preparation = PreparationOutcome::NotRequested {};
+        repeat.workload = WorkloadOutcome::NotRequested {};
+        repeat.post_boundary =
+            BoundaryOutcome::Failure { error: "cleanup failed".into() };
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &launch_only,
+            Path::new("launch-only.json"),
+        )
+        .unwrap();
+        let context = document.runs[0].report_context.as_ref().unwrap();
+        assert_eq!(
+            context.workload_disposition,
+            cookout::model::WorkloadDisposition::NotRequested
+        );
+        assert_eq!(context.boundary_failure.as_deref(), Some("cleanup failed"));
+
+        let mut workload_failed = schema_v5_fixture("matrix-complete-v5.json");
+        workload_failed.status = RunStatus::Aborted;
+        workload_failed.abort_error =
+            Some("workload and cleanup failed".into());
+        let repeat = &mut workload_failed.combos[0].repeats[0];
+        repeat.workload =
+            WorkloadOutcome::Failure { error: "workload failed".into() };
+        repeat.post_boundary =
+            BoundaryOutcome::Failure { error: "cleanup failed".into() };
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &workload_failed,
+            Path::new("workload-failed.json"),
+        )
+        .unwrap();
+        let context = document.runs[0].report_context.as_ref().unwrap();
+        assert_eq!(
+            context.workload_disposition,
+            cookout::model::WorkloadDisposition::Failed
+        );
+        assert_eq!(
+            context.workload_failure.as_deref(),
+            Some("workload failed")
+        );
+        assert_eq!(context.boundary_failure.as_deref(), Some("cleanup failed"));
+    }
+
+    #[test]
+    fn cookout_adapter_redacts_sensitive_diagnostics_without_losing_the_state()
+    {
+        let mut checkpoint = schema_v5_fixture("matrix-failed-v5.json");
+        checkpoint.abort_error = Some("Bearer distinctive-secret-token".into());
+        let LaunchOutcome::Failure { attempt_failures } =
+            &mut checkpoint.combos[0].repeats[0].launch
+        else {
+            panic!("failed fixture must contain a failed launch")
+        };
+        attempt_failures[0].error =
+            "$argon2id$distinctive-password-hash".into();
+
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &checkpoint,
+            Path::new("matrix-failed-v5.json"),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&document).unwrap();
+        for forbidden in
+            ["distinctive-secret-token", "distinctive-password-hash", "bearer "]
+        {
+            assert!(
+                !serialized.to_ascii_lowercase().contains(forbidden),
+                "Cookout evidence leaked {forbidden}"
+            );
+        }
+        assert_eq!(
+            document.report_context.as_ref().unwrap().execution_state,
+            cookout::model::ExecutionState::Failed
+        );
+        assert!(
+            document.runs[0]
+                .report_context
+                .as_ref()
+                .unwrap()
+                .launch_failure
+                .as_deref()
+                .is_some_and(|message| message.contains("redacted"))
+        );
+    }
+
+    #[test]
+    fn schema_v5_parity_fixtures_capture_durable_stage_semantics() {
+        let complete = schema_v5_fixture("matrix-complete-v5.json");
+        assert_eq!(complete.status, RunStatus::Completed);
+        assert_eq!(complete.name, "synthetic-rack");
+        assert!(matches!(
+            complete.combos[0].repeats[0].launch,
+            LaunchOutcome::Success {
+                metrics: LaunchMetrics {
+                    bringup_bytes: 42_000,
+                    launch_secs: 120,
+                    peak_ram_bytes: 8_388_608,
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            complete.combos[0].repeats[0].workload,
+            WorkloadOutcome::Success {
+                metrics: WorkloadMetrics {
+                    workload_bytes: 84_000,
+                    workload_secs: 60,
+                    workload_peak_delta_bytes: 4_194_304,
+                }
+            }
+        ));
+
+        let partial = schema_v5_fixture("matrix-partial-v5.json");
+        assert_eq!(partial.status, RunStatus::Running);
+        assert!(matches!(
+            partial.combos[0].repeats[1].launch,
+            LaunchOutcome::Pending {}
+        ));
+
+        let failed = schema_v5_fixture("matrix-failed-v5.json");
+        assert_eq!(failed.status, RunStatus::Aborted);
+        assert!(matches!(
+            failed.combos[0].repeats[0].launch,
+            LaunchOutcome::Failure { ref attempt_failures }
+                if attempt_failures.len() == MATRIX_REPEAT_ATTEMPTS
+        ));
+        assert!(matches!(
+            failed.combos[1].repeats[0].post_boundary,
+            BoundaryOutcome::Failure { .. }
+        ));
+
+        let checkpoint = schema_v5_fixture("checkpoint-in-progress-v5.json");
+        assert_eq!(checkpoint.status, RunStatus::Running);
+        assert!(matches!(
+            checkpoint.combos[0].repeats[0].launch,
+            LaunchOutcome::Failure { ref attempt_failures }
+                if matches!(attempt_failures[0].clean_boundary, BoundaryOutcome::Pending {})
+        ));
+    }
+
+    #[test]
+    fn schema_v5_parity_fixtures_are_synthetic_and_sanitized() {
+        for name in [
+            "matrix-complete-v5.json",
+            "matrix-partial-v5.json",
+            "matrix-failed-v5.json",
+            "checkpoint-in-progress-v5.json",
+        ] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/perftest")
+                .join(name);
+            let raw = std::fs::read_to_string(path).unwrap();
+            let lowercase = raw.to_ascii_lowercase();
+            assert!(raw.contains("synthetic-rack"));
+            for forbidden in
+                ["password_hash", "token", "secret", "recovery.sys"]
+            {
+                assert!(
+                    !lowercase.contains(forbidden),
+                    "{name} contains {forbidden}"
+                );
+            }
         }
     }
 
@@ -5962,7 +7299,7 @@ mod tests {
         let mut checkpoint = planned_schema_v5_checkpoint();
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("storage-levers.json");
-        CheckpointPublisher::new(&destination)
+        CheckpointPublisher::new(&destination, None)
             .publish(&mut checkpoint)
             .unwrap();
 
@@ -5997,7 +7334,7 @@ mod tests {
         let mut checkpoint = planned_schema_v5_checkpoint();
 
         assert!(
-            CheckpointPublisher::new(&destination)
+            CheckpointPublisher::new(&destination, None)
                 .publish(&mut checkpoint)
                 .is_err()
         );
@@ -6013,7 +7350,7 @@ mod tests {
      {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("storage-levers.json");
-        let mut publisher = CheckpointPublisher::new(&destination);
+        let mut publisher = CheckpointPublisher::new(&destination, None);
         let mut checkpoint = planned_schema_v5_checkpoint();
 
         publisher.fail_before_initial_install = true;
@@ -6028,7 +7365,7 @@ mod tests {
      {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("storage-levers.json");
-        let mut publisher = CheckpointPublisher::new(&destination);
+        let mut publisher = CheckpointPublisher::new(&destination, None);
         let mut checkpoint = planned_schema_v5_checkpoint();
         publisher.fail_parent_sync = true;
 
@@ -6051,7 +7388,7 @@ mod tests {
     fn schema_v5_checkpoint_replacement_increments_sequence() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("storage-levers.json");
-        let mut publisher = CheckpointPublisher::new(&destination);
+        let mut publisher = CheckpointPublisher::new(&destination, None);
         let mut checkpoint = planned_schema_v5_checkpoint();
 
         publisher.publish(&mut checkpoint).unwrap();
@@ -6065,6 +7402,29 @@ mod tests {
     }
 
     #[test]
+    fn schema_v5_checkpoint_hands_off_the_open_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("storage-levers.json");
+        let parent = std::fs::metadata(directory.path()).unwrap();
+        let owner = FileOwner { uid: parent.uid(), gid: parent.gid() };
+        let mut publisher = CheckpointPublisher::new(&destination, Some(owner));
+        let mut checkpoint = planned_schema_v5_checkpoint();
+
+        publisher.publish(&mut checkpoint).unwrap();
+        let installed = std::fs::metadata(&destination).unwrap();
+        assert_eq!(installed.uid(), owner.uid);
+        assert_eq!(installed.gid(), owner.gid);
+        assert_eq!(installed.mode() & 0o777, 0o600);
+
+        publisher.publish(&mut checkpoint).unwrap();
+
+        let installed = std::fs::metadata(destination).unwrap();
+        assert_eq!(installed.uid(), owner.uid);
+        assert_eq!(installed.gid(), owner.gid);
+        assert_eq!(installed.mode() & 0o777, 0o600);
+    }
+
+    #[test]
     fn schema_v5_checkpoint_rejects_unknown_fields() {
         let mut value =
             serde_json::to_value(planned_schema_v5_checkpoint()).unwrap();
@@ -6075,13 +7435,63 @@ mod tests {
             serde_json::to_value(planned_schema_v5_checkpoint()).unwrap();
         value["combos"][0]["repeats"][0]["launch"]["unexpected"] = json!(true);
         assert!(serde_json::from_value::<MatrixCheckpoint>(value).is_err());
+
+        macro_rules! assert_rejects_unknown_field {
+            ($outcome:ty, $($value:expr),+ $(,)?) => {
+                $(assert!(serde_json::from_value::<$outcome>($value).is_err());)+
+            };
+        }
+        assert_rejects_unknown_field!(
+            BoundaryOutcome,
+            json!({"status":"pending","unexpected":true}),
+            json!({"status":"clean","unexpected":true}),
+        );
+        assert_rejects_unknown_field!(
+            LaunchOutcome,
+            json!({"status":"pending","unexpected":true}),
+        );
+        assert_rejects_unknown_field!(
+            WorkloadOutcome,
+            json!({"status":"pending","unexpected":true}),
+            json!({"status":"not_requested","unexpected":true}),
+        );
+        assert_rejects_unknown_field!(
+            PreparationOutcome,
+            json!({"status":"pending","unexpected":true}),
+            json!({"status":"not_requested","unexpected":true}),
+            json!({"status":"success","unexpected":true}),
+        );
+
+        let strict_variants = [
+            serde_json::to_value(BoundaryOutcome::Pending {}).unwrap(),
+            serde_json::to_value(BoundaryOutcome::Clean {}).unwrap(),
+            serde_json::to_value(LaunchOutcome::Pending {}).unwrap(),
+            serde_json::to_value(WorkloadOutcome::Pending {}).unwrap(),
+            serde_json::to_value(WorkloadOutcome::NotRequested {}).unwrap(),
+            serde_json::to_value(PreparationOutcome::Pending {}).unwrap(),
+            serde_json::to_value(PreparationOutcome::NotRequested {}).unwrap(),
+            serde_json::to_value(PreparationOutcome::Success {}).unwrap(),
+        ];
+        assert_eq!(
+            strict_variants,
+            [
+                json!({"status":"pending"}),
+                json!({"status":"clean"}),
+                json!({"status":"pending"}),
+                json!({"status":"pending"}),
+                json!({"status":"not_requested"}),
+                json!({"status":"pending"}),
+                json!({"status":"not_requested"}),
+                json!({"status":"success"}),
+            ]
+        );
     }
 
     #[test]
     fn schema_v5_checkpoint_pre_rename_failure_preserves_prior_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("storage-levers.json");
-        let mut publisher = CheckpointPublisher::new(&destination);
+        let mut publisher = CheckpointPublisher::new(&destination, None);
         let mut checkpoint = planned_schema_v5_checkpoint();
         publisher.publish(&mut checkpoint).unwrap();
         let prior = std::fs::read(&destination).unwrap();
@@ -6097,7 +7507,7 @@ mod tests {
     fn schema_v5_checkpoint_refuses_recreated_owned_destination() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("storage-levers.json");
-        let mut publisher = CheckpointPublisher::new(&destination);
+        let mut publisher = CheckpointPublisher::new(&destination, None);
         let mut checkpoint = planned_schema_v5_checkpoint();
         publisher.publish(&mut checkpoint).unwrap();
         std::fs::remove_file(&destination).unwrap();
@@ -6179,7 +7589,7 @@ mod tests {
         assert_eq!(launches.get(), 1);
         assert!(matches!(repeat.launch, LaunchOutcome::Success { .. }));
         assert!(matches!(repeat.workload, WorkloadOutcome::Failure { .. }));
-        assert!(matches!(repeat.post_boundary, BoundaryOutcome::Clean));
+        assert!(matches!(repeat.post_boundary, BoundaryOutcome::Clean {}));
         assert_eq!(
             *events.borrow(),
             [
@@ -6194,8 +7604,8 @@ mod tests {
      {
         let mut repeat =
             planned_schema_v5_checkpoint().combos.remove(0).repeats.remove(0);
-        repeat.preparation = PreparationOutcome::Pending;
-        repeat.workload = WorkloadOutcome::Pending;
+        repeat.preparation = PreparationOutcome::Pending {};
+        repeat.workload = WorkloadOutcome::Pending {};
         let publications = RefCell::new(Vec::new());
         let workload_calls = Cell::new(0);
         checkpointed_repeat_with::<(), (), _, _, _, _, _, _, _, _, _>(
@@ -6205,6 +7615,7 @@ mod tests {
                 publications.borrow_mut().push((
                     repeat.preparation.clone(),
                     repeat.workload.clone(),
+                    repeat.post_boundary.clone(),
                 ));
                 Ok(())
             },
@@ -6239,22 +7650,30 @@ mod tests {
         let preparation_failure_publications = publications
             .borrow()
             .iter()
-            .filter(|(preparation, _)| {
+            .filter(|(preparation, _, _)| {
                 matches!(preparation, PreparationOutcome::Failure { .. })
             })
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(preparation_failure_publications.len(), 2);
         assert!(matches!(
-            preparation_failure_publications[0],
-            (PreparationOutcome::Failure { .. }, WorkloadOutcome::Pending)
-        ));
-        assert!(matches!(
-            preparation_failure_publications[1],
-            (
-                PreparationOutcome::Failure { .. },
-                WorkloadOutcome::Failure { .. }
-            )
+            preparation_failure_publications.as_slice(),
+            [
+                (
+                    PreparationOutcome::Failure { .. },
+                    WorkloadOutcome::Pending {},
+                    BoundaryOutcome::Pending {}
+                ),
+                (
+                    PreparationOutcome::Failure { .. },
+                    WorkloadOutcome::Failure { .. },
+                    BoundaryOutcome::Pending {}
+                ),
+                (
+                    PreparationOutcome::Failure { .. },
+                    WorkloadOutcome::Failure { .. },
+                    BoundaryOutcome::Clean {}
+                ),
+            ]
         ));
     }
 
@@ -6315,9 +7734,9 @@ mod tests {
         assert_eq!(prior_attempt_failures[0].error, "first");
         assert_eq!(
             prior_attempt_failures[0].clean_boundary,
-            BoundaryOutcome::Clean
+            BoundaryOutcome::Clean {}
         );
-        assert_eq!(repeat.post_boundary, BoundaryOutcome::Clean);
+        assert_eq!(repeat.post_boundary, BoundaryOutcome::Clean {});
     }
 
     #[tokio::test]
@@ -6384,7 +7803,7 @@ mod tests {
             3,
             "pre-boundary plus one cleanup per attempt"
         );
-        assert_eq!(repeat.post_boundary, BoundaryOutcome::Clean);
+        assert_eq!(repeat.post_boundary, BoundaryOutcome::Clean {});
     }
 
     #[test]
@@ -6510,10 +7929,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("dirty"));
+        assert!(format!("{error:#}").contains("dirty"));
         assert!(matches!(
             repeat.post_boundary,
-            BoundaryOutcome::Failure { .. }
+            BoundaryOutcome::Failure { ref error } if error == "dirty"
         ));
     }
 
@@ -6803,11 +8222,14 @@ mod tests {
     }
 
     #[test]
-    fn simulated_zpool_count_is_five_per_sled_in_each_rack() {
+    fn simulated_zpool_count_is_five_per_rss_participant_in_each_rack() {
         let mut cfg = VoxelConfig::default();
         cfg.topology.sleds = 4;
         cfg.topology.racks = 2;
         assert_eq!(expected_simulated_zpool_count_per_rack(&cfg), 20);
+
+        cfg.topology.rss_sleds = 3;
+        assert_eq!(expected_simulated_zpool_count_per_rack(&cfg), 15);
     }
 
     #[test]
@@ -7243,17 +8665,82 @@ mod tests {
     #[test]
     fn projection_math() {
         // 100 GB (decimal) written over 100s = 1 GB/s.
-        let p = project(100_000_000_000, 100, Some(1200.0));
-        assert!((p.rate - 1e9).abs() < 1.0);
-        assert!((p.gb_day - 86_400.0).abs() < 1.0); // 1e9 B/s * 86400 / 1e9
+        let p = project_samples(
+            &CounterSample { timestamp_seconds: 0, value: 0 },
+            &CounterSample { timestamp_seconds: 100, value: 100_000_000_000 },
+            &projection_policy(Some(1200.0)).unwrap(),
+        )
+        .unwrap();
+        assert!((p.units_per_second - 1e9).abs() < 1.0);
+        assert!((p.giga_units_per_day - 86_400.0).abs() < 1.0); // 1e9 B/s * 86400 / 1e9
         // 1e9 B/s -> 31.536 PB/yr = 31536 TB/yr; 1200 TBW / that ~= 0.038 yr.
-        assert!((p.tb_year - 31_536.0).abs() < 1.0);
-        let years = p.years.unwrap();
+        assert!((p.tera_units_per_year - 31_536.0).abs() < 1.0);
+        let years = p.rated_years.unwrap();
         assert!((years - 1200.0 / 31_536.0).abs() < 1e-6);
-        // No rating -> no lifetime.
-        assert!(project(1, 1, None).years.is_none());
-        // Zero writes -> zero rate, and no divide-by-zero lifetime.
-        assert_eq!(project(0, 60, Some(1200.0)).years, None);
+    }
+
+    #[test]
+    fn projection_policy_rejects_invalid_and_unrepresentable_ratings() {
+        for rating in
+            [0.0, -1.0, f64::NAN, f64::INFINITY, u64::MAX as f64 / 1e12 + 1.0]
+        {
+            assert!(
+                projection_policy(Some(rating)).is_err(),
+                "accepted {rating}"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_without_rating_and_writes_has_zero_rate_and_no_lifetime() {
+        let projection = project_samples(
+            &CounterSample { timestamp_seconds: 10, value: 7 },
+            &CounterSample { timestamp_seconds: 20, value: 7 },
+            &projection_policy(None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projection.units_per_second, 0.0);
+        assert_eq!(projection.rated_years, None);
+    }
+
+    #[test]
+    fn projection_uses_one_second_for_equal_or_reversed_timestamps() {
+        for (before, after) in [(10, 10), (11, 10)] {
+            let projection = project_samples(
+                &CounterSample { timestamp_seconds: before, value: 0 },
+                &CounterSample { timestamp_seconds: after, value: 25 },
+                &projection_policy(None).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(projection.units_per_second, 25.0);
+        }
+    }
+
+    #[test]
+    fn report_preserves_zero_delta_text() {
+        let before = json!({
+            "label": "before", "unix_time": 20,
+            "devices": [{ "name": "nvme0", "data_units_written": 9 }],
+            "pools": [],
+        });
+        let after = json!({
+            "label": "after", "unix_time": 10,
+            "devices": [{ "name": "nvme0", "data_units_written": 9 }],
+            "pools": [],
+        });
+        let text = report(&before, &after, None).unwrap().join("\n");
+        assert!(
+            text.contains("window: 1s   [before] -> [after]"),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("nvme0: wrote 0.00 B over window"),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("rate 0.00 B/s   (0.00 GB/day, 0.00 TB/year)"),
+            "got:\n{text}"
+        );
     }
 
     #[test]
@@ -7369,7 +8856,7 @@ mod tests {
             "devices": [{ "name": "nvme0", "data_units_written": 3000, "percentage_used": 5, "power_on_hours": 100 }],
             "pools": [{ "name": "rpool", "alloc_bytes": 1_500_000 }],
         });
-        let lines = report(&before, &after, Some(1200.0)).join("\n");
+        let lines = report(&before, &after, Some(1200.0)).unwrap().join("\n");
         assert!(lines.contains("window: 100s"));
         assert!(lines.contains("[baseline] -> [lever3]"));
         assert!(lines.contains("nvme0: wrote 1.02 GB"), "got:\n{lines}");
@@ -7387,7 +8874,7 @@ mod tests {
             "devices": [{ "name": "nvme9", "data_units_written": 500, "percentage_used": null, "power_on_hours": null }],
             "pools": [],
         });
-        let lines = report(&before, &after, None).join("\n");
+        let lines = report(&before, &after, None).unwrap().join("\n");
         // Unmatched device -> zero delta, not a 500-unit spike.
         assert!(lines.contains("nvme9: wrote 0.00 B"), "got:\n{lines}");
     }
@@ -7895,10 +9382,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             "name": owner.project_name,
             "description": owner.project_description,
         }]});
-        assert_eq!(
-            owner.reconcile_project(&matching.to_string()).unwrap(),
-            true
-        );
+        assert!(owner.reconcile_project(&matching.to_string()).unwrap());
         let foreign = json!({"items": [{
             "name": owner.project_name,
             "description": "wrong nonce",
@@ -8004,7 +9488,11 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         }
 
         assert!(matches!(
-            set_disk_lifecycle_storage_quota(&MissingQuotaApi, "recovery"),
+            set_disk_lifecycle_storage_quota(
+                &MissingQuotaApi,
+                "recovery",
+                Duration::ZERO
+            ),
             Err(ClassifiedFailure::Permanent(_))
         ));
     }
@@ -8130,6 +9618,60 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
     }
 
     #[test]
+    fn quota_update_retries_retryable_failure() {
+        let endpoint = "/v1/system/silos/recovery/quotas";
+        let api = ScriptedLifecycleApi::new(vec![
+            err_status(
+                "PUT",
+                endpoint,
+                oxide_session::ApiErrorKind::Retryable,
+                500,
+                "quota service failed",
+            ),
+            ok(
+                "PUT",
+                endpoint,
+                json!({"storage": DISK_LIFECYCLE_STORAGE_QUOTA_BYTES})
+                    .to_string(),
+            ),
+        ]);
+
+        set_disk_lifecycle_storage_quota(&api, "recovery", Duration::ZERO)
+            .unwrap();
+
+        api.done();
+        assert_eq!(api.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn quota_update_retry_exhaustion_remains_retryable() {
+        let endpoint = "/v1/system/silos/recovery/quotas";
+        let api = ScriptedLifecycleApi::new(
+            (0..QUOTA_UPDATE_ATTEMPTS)
+                .map(|_| {
+                    err(
+                        "PUT",
+                        endpoint,
+                        oxide_session::ApiErrorKind::Retryable,
+                        "quota update timed out",
+                    )
+                })
+                .collect(),
+        );
+
+        let error =
+            set_disk_lifecycle_storage_quota(&api, "recovery", Duration::ZERO)
+                .unwrap_err();
+
+        api.done();
+        assert!(matches!(error, ClassifiedFailure::Retryable(_)));
+        assert_eq!(
+            api.calls.lock().unwrap().len(),
+            QUOTA_UPDATE_ATTEMPTS as usize
+        );
+    }
+
+    #[test]
     fn project_create_checks_exact_absence_then_reconciles_ambiguous_success() {
         let owner = fixed_owner("probe");
         let project =
@@ -8172,7 +9714,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             ),
         ];
         steps.extend(
-            (0..EXPLICIT_PROJECT_CREATE_ABSENCE_POLLS)
+            (0..EXPLICIT_CREATE_ABSENCE_POLLS)
                 .map(|_| ok("GET", "/v1/projects", r#"{"items":[]}"#)),
         );
         steps.push(ok("POST", "/v1/projects", created));
@@ -8210,7 +9752,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             ),
         ];
         steps.extend(
-            (0..EXPLICIT_PROJECT_CREATE_ABSENCE_POLLS)
+            (0..EXPLICIT_CREATE_ABSENCE_POLLS)
                 .map(|_| ok("GET", "/v1/projects", r#"{"items":[]}"#)),
         );
         steps.extend([
@@ -8289,7 +9831,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
                 &format!("create server failure {attempt}"),
             ));
             let polls = if attempt < PROJECT_CREATE_POST_ATTEMPTS {
-                EXPLICIT_PROJECT_CREATE_ABSENCE_POLLS
+                EXPLICIT_CREATE_ABSENCE_POLLS
             } else {
                 AMBIGUOUS_CREATE_RECONCILE_ATTEMPTS
             };
@@ -8559,6 +10101,194 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
                 .filter(|call| call.starts_with("POST "))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn explicit_disk_create_server_failure_retries_after_absence_proof() {
+        let owner = fixed_owner("probe");
+        let name = owner.disk_name(0, 0);
+        let endpoint = format!("/v1/disks?project={}", owner.project_name);
+        let mut steps = vec![err_status(
+            "POST",
+            &endpoint,
+            oxide_session::ApiErrorKind::Retryable,
+            500,
+            "first create failed before committing",
+        )];
+        steps.extend(
+            (0..EXPLICIT_CREATE_ABSENCE_POLLS)
+                .map(|_| ok("GET", &endpoint, r#"{"items":[]}"#)),
+        );
+        steps.push(ok("POST", &endpoint, json!({"name":name}).to_string()));
+        let api = ScriptedLifecycleApi::new(steps);
+
+        create_owned_disk(
+            &api,
+            &owner,
+            &name,
+            DiskStyle::New,
+            true,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        api.done();
+        assert_eq!(
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("POST "))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn explicit_disk_create_retry_collision_is_reconciled_without_third_post() {
+        let owner = fixed_owner("probe");
+        let name = owner.disk_name(0, 0);
+        let endpoint = format!("/v1/disks?project={}", owner.project_name);
+        let disks = format!(r#"{{"items":[{{"name":"{name}"}}]}}"#);
+        let mut steps = vec![err_status(
+            "POST",
+            &endpoint,
+            oxide_session::ApiErrorKind::Retryable,
+            500,
+            "first create failed before committing",
+        )];
+        steps.extend(
+            (0..EXPLICIT_CREATE_ABSENCE_POLLS)
+                .map(|_| ok("GET", &endpoint, r#"{"items":[]}"#)),
+        );
+        steps.extend([
+            err_status(
+                "POST",
+                &endpoint,
+                oxide_session::ApiErrorKind::Retryable,
+                409,
+                "first create committed before retry",
+            ),
+            ok("GET", &endpoint, disks),
+        ]);
+        let api = ScriptedLifecycleApi::new(steps);
+
+        create_owned_disk(
+            &api,
+            &owner,
+            &name,
+            DiskStyle::New,
+            true,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        api.done();
+        assert_eq!(
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("POST "))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn uncertain_disk_absence_does_not_resubmit_after_server_failure() {
+        let owner = fixed_owner("probe");
+        let name = owner.disk_name(0, 0);
+        let endpoint = format!("/v1/disks?project={}", owner.project_name);
+        let disks = format!(r#"{{"items":[{{"name":"{name}"}}]}}"#);
+        let api = ScriptedLifecycleApi::new(vec![
+            err_status(
+                "POST",
+                &endpoint,
+                oxide_session::ApiErrorKind::Retryable,
+                500,
+                "explicit server failure",
+            ),
+            err(
+                "GET",
+                &endpoint,
+                oxide_session::ApiErrorKind::Retryable,
+                "absence could not be proven",
+            ),
+            ok("GET", &endpoint, disks),
+        ]);
+
+        create_owned_disk(
+            &api,
+            &owner,
+            &name,
+            DiskStyle::New,
+            true,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        api.done();
+        assert_eq!(
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("POST "))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn explicit_disk_create_server_failure_exhaustion_remains_retryable() {
+        let owner = fixed_owner("probe");
+        let name = owner.disk_name(0, 0);
+        let endpoint = format!("/v1/disks?project={}", owner.project_name);
+        let mut steps = Vec::new();
+        for attempt in 1..=DISK_CREATE_POST_ATTEMPTS {
+            steps.push(err_status(
+                "POST",
+                &endpoint,
+                oxide_session::ApiErrorKind::Retryable,
+                500,
+                &format!("disk create server failure {attempt}"),
+            ));
+            let polls = if attempt < DISK_CREATE_POST_ATTEMPTS {
+                EXPLICIT_CREATE_ABSENCE_POLLS
+            } else {
+                AMBIGUOUS_CREATE_RECONCILE_ATTEMPTS
+            };
+            steps.extend(
+                (0..polls).map(|_| ok("GET", &endpoint, r#"{"items":[]}"#)),
+            );
+        }
+        let api = ScriptedLifecycleApi::new(steps);
+
+        let error = create_owned_disk(
+            &api,
+            &owner,
+            &name,
+            DiskStyle::New,
+            true,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        let ClassifiedFailure::Retryable(error) = error else {
+            panic!("explicit disk create exhaustion must remain retryable");
+        };
+
+        assert!(error.to_string().contains("disk create server failure 3"));
+        api.done();
+        assert_eq!(
+            api.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("POST "))
+                .count(),
+            DISK_CREATE_POST_ATTEMPTS as usize
         );
     }
 
@@ -8931,6 +10661,32 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
 
         api.done();
         assert_eq!(api.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn disk_delete_recovers_after_three_service_failures() {
+        let owner = fixed_owner("measured");
+        let name = owner.disk_name(0, 0);
+        let endpoint =
+            format!("/v1/disks/{name}?project={}", owner.project_name);
+        let mut steps = (0..3)
+            .map(|_| {
+                err_status(
+                    "DELETE",
+                    &endpoint,
+                    oxide_session::ApiErrorKind::Retryable,
+                    503,
+                    "service unavailable",
+                )
+            })
+            .collect::<Vec<_>>();
+        steps.push(ok("DELETE", &endpoint, "{}"));
+        let api = ScriptedLifecycleApi::new(steps);
+
+        delete_owned_disk(&api, &owner, &name, Duration::ZERO).unwrap();
+
+        api.done();
+        assert_eq!(api.calls.lock().unwrap().len(), 4);
     }
 
     #[test]
@@ -9602,6 +11358,62 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         api.done();
     }
 
+    #[test]
+    fn disk_settlement_can_recover_after_two_minutes() {
+        let owner = fixed_owner("measured");
+        let name = owner.disk_name(0, 0);
+        let endpoint =
+            format!("/v1/disks/{name}?project={}", owner.project_name);
+        let mut steps = (0..60)
+            .map(|_| ok("GET", &endpoint, r#"{"state":{"state":"creating"}}"#))
+            .collect::<Vec<_>>();
+        steps.push(ok("GET", &endpoint, r#"{"state":{"state":"detached"}}"#));
+        let api = ScriptedLifecycleApi::new(steps);
+
+        wait_owned_disk(
+            &api,
+            &owner,
+            &name,
+            Duration::ZERO,
+            DiskWaitMode::Measured,
+        )
+        .unwrap();
+
+        api.done();
+        assert_eq!(api.calls.lock().unwrap().len(), 61);
+    }
+
+    #[test]
+    fn disk_settlement_exhaustion_uses_five_minute_bound() {
+        let owner = fixed_owner("measured");
+        let name = owner.disk_name(0, 0);
+        let endpoint =
+            format!("/v1/disks/{name}?project={}", owner.project_name);
+        let api = ScriptedLifecycleApi::new(
+            (0..DISK_SETTLEMENT_ATTEMPTS)
+                .map(|_| {
+                    ok("GET", &endpoint, r#"{"state":{"state":"creating"}}"#)
+                })
+                .collect(),
+        );
+
+        let error = wait_owned_disk(
+            &api,
+            &owner,
+            &name,
+            Duration::ZERO,
+            DiskWaitMode::Measured,
+        )
+        .unwrap_err();
+
+        api.done();
+        assert!(matches!(error, ClassifiedFailure::Retryable(_)));
+        assert_eq!(
+            api.calls.lock().unwrap().len(),
+            DISK_SETTLEMENT_ATTEMPTS as usize
+        );
+    }
+
     #[derive(Default)]
     struct PhaseConcurrency {
         active: std::sync::atomic::AtomicUsize,
@@ -9854,9 +11666,24 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         assert!(preflight_output_paths(Some(&a), Some(&a)).is_err());
         std::fs::write(&a, "old").unwrap();
         assert!(preflight_output_paths(Some(&a), Some(&b)).is_err());
-        assert!(write_new(&a, b"new").is_err());
+        assert!(write_new(&a, b"new", None).is_err());
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "old");
         std::fs::remove_file(&a).unwrap();
+    }
+
+    #[test]
+    fn matrix_csv_hands_off_the_open_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("storage-levers.csv");
+        let parent = std::fs::metadata(directory.path()).unwrap();
+        let owner = FileOwner { uid: parent.uid(), gid: parent.gid() };
+
+        write_new(&destination, b"csv", Some(owner)).unwrap();
+
+        let installed = std::fs::metadata(destination).unwrap();
+        assert_eq!(installed.uid(), owner.uid);
+        assert_eq!(installed.gid(), owner.gid);
+        assert_eq!(installed.mode() & 0o777, 0o600);
     }
 
     #[test]
@@ -9875,7 +11702,8 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         assert!(
             publish_matrix_outputs(
                 Some((&csv, b"csv")),
-                Some((&json, b"json"))
+                Some((&json, b"json")),
+                None
             )
             .is_err()
         );
@@ -9983,7 +11811,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             "falcon_pool": "voxel",
             "falcon_controllers": ["nvme2"],
         });
-        let lines = report(&before, &after, None).join("\n");
+        let lines = report(&before, &after, None).unwrap().join("\n");
         // The falcon-pool drive is tagged and totaled; the OS drive is not.
         assert!(lines.contains("nvme2: wrote"), "got:\n{lines}");
         assert!(lines.contains("<- falcon pool"), "got:\n{lines}");
@@ -10003,7 +11831,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             "devices": [{ "name": "nvme0", "data_units_written": 500 }],
             "pools": [],
         });
-        let lines = report(&before, &after, None).join("\n");
+        let lines = report(&before, &after, None).unwrap().join("\n");
         assert!(
             lines.contains("falcon pool drives unresolved"),
             "got:\n{lines}"
@@ -10070,15 +11898,17 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         }];
         // No workload, no rating, no RAM sample -> those columns absent, but
         // BRING-UP, RATE/s, and LAUNCH always show.
-        let plain = render_table(&results, None);
+        let plain = render_table(&results, None).unwrap();
         assert!(plain.contains("BRING-UP") && plain.contains("RATE/s"));
         assert!(plain.contains("LAUNCH"), "got:\n{plain}");
         assert!(plain.contains("1m40s"), "launch 100s -> 1m40s:\n{plain}"); // launch_secs 100
         assert!(!plain.contains("LAUNCH ΔRAM"), "no RAM sample:\n{plain}");
         assert!(!plain.contains("WORKLOAD") && !plain.contains("YEARS"));
         assert!(plain.contains("2.00 GB"), "got:\n{plain}");
-        // With a rating, the ~YEARS projection column appears.
-        assert!(render_table(&results, Some(1200.0)).contains("~YEARS"));
+        // 2 GB over 100s is 20 MB/s; 1200 TBW lasts about 1.90 years.
+        let projected = render_table(&results, Some(1200.0)).unwrap();
+        assert!(projected.contains("~YEARS"));
+        assert!(projected.contains("      1.90"), "got:\n{projected}");
 
         // Once any combo measured launch RAM delta, the LAUNCH ΔRAM column appears.
         let with_ram = vec![ComboAggregate {
@@ -10092,7 +11922,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             }],
             error: None,
         }];
-        let ram = render_table(&with_ram, None);
+        let ram = render_table(&with_ram, None).unwrap();
         assert!(ram.contains("LAUNCH ΔRAM"), "got:\n{ram}");
         assert!(ram.contains("8.00 GB"), "got:\n{ram}");
 
@@ -10109,7 +11939,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             }],
             error: None,
         }];
-        let workload = render_table(&with_workload, None);
+        let workload = render_table(&with_workload, None).unwrap();
         assert!(workload.contains("WORKLOAD ΔRAM"), "got:\n{workload}");
         assert!(workload.contains("3.00 GB"), "got:\n{workload}");
     }
@@ -10312,17 +12142,6 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
     }
 
     // ---- compare / JSON ----
-
-    /// A `Stats` with a chosen n/mean/stddev, for the significance tests.
-    fn st(n: usize, mean: f64, stddev: f64) -> Stats {
-        Stats {
-            n,
-            mean,
-            median: mean,
-            stddev,
-            cv: (mean != 0.0).then_some(stddev / mean),
-        }
-    }
 
     /// Build a `MatrixRun` from `(label, levers, bringup-bytes-per-repeat)`.
     fn run_with(name: &str, combos: &[(&str, &[u8], &[u64])]) -> MatrixRun {
@@ -10649,115 +12468,5 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             value["report_evidence"]["provenance"]["host"] = malformed;
             assert!(serde_json::from_value::<MatrixRun>(value).is_err());
         }
-    }
-
-    #[test]
-    fn significance_by_noise() {
-        // Big shift, tiny noise -> significant.
-        assert_eq!(
-            significance(st(3, 100.0, 1.0), st(3, 200.0, 1.0)),
-            Sig::Significant
-        );
-        // Small shift, big noise -> within the noise band.
-        assert_eq!(
-            significance(st(3, 100.0, 50.0), st(3, 105.0, 50.0)),
-            Sig::NotSignificant
-        );
-        // < 2 samples on either side -> can't estimate noise.
-        assert_eq!(
-            significance(st(1, 100.0, 0.0), st(3, 200.0, 1.0)),
-            Sig::NoiseUnknown
-        );
-        assert_eq!(
-            significance(st(3, 100.0, 1.0), st(1, 200.0, 0.0)),
-            Sig::NoiseUnknown
-        );
-    }
-
-    #[test]
-    fn compare_report_flags_and_handles_missing_combos() {
-        let mut base = run_with(
-            "base",
-            &[
-                ("none", &[], &[100, 100]),
-                ("1", &[1], &[80]),
-                ("3", &[3], &[5, 5]),
-            ],
-        );
-        let mut cand = run_with(
-            "cand",
-            &[
-                ("none", &[], &[50, 50]),
-                ("1", &[1], &[80]),
-                ("2", &[2], &[10, 10]),
-            ],
-        );
-        for run in [&mut base, &mut cand] {
-            for combo in &mut run.results {
-                for repeat in &mut combo.repeats {
-                    repeat.peak_ram_bytes = Some(10);
-                    repeat.workload_peak_delta_bytes = Some(5);
-                }
-            }
-        }
-        let report = compare_report(&base, &cand).join("\n");
-
-        // 'none' 100->50 with zero variance each side -> real change.
-        assert!(report.contains("combo 'none':"), "got:\n{report}");
-        assert!(
-            report.contains("[*]"),
-            "expected a significant flag:\n{report}"
-        );
-        // '1' has a single repeat each side -> variance unknown.
-        assert!(
-            report.contains("[?]"),
-            "expected a noise-unknown flag:\n{report}"
-        );
-        // Combos present on only one side are surfaced and skipped.
-        assert!(
-            report.contains("combo '3': only in baseline"),
-            "got:\n{report}"
-        );
-        assert!(
-            report.contains("combo '2': only in candidate"),
-            "got:\n{report}"
-        );
-        // Relative delta is shown for a matched combo.
-        assert!(
-            report.contains("-50.0%"),
-            "expected the none combo's relative delta:\n{report}"
-        );
-        assert!(report.contains("launch-delta-ram"), "got:\n{report}");
-        assert!(report.contains("workload-delta-ram"), "got:\n{report}");
-    }
-
-    #[test]
-    fn compare_report_rejects_nothing_but_orders_baseline_first() {
-        // Baseline order is preserved; candidate-only combos come last.
-        let base =
-            run_with("b", &[("1", &[1], &[10, 10]), ("2", &[2], &[10, 10])]);
-        let cand = run_with(
-            "c",
-            &[
-                ("2", &[2], &[10, 10]),
-                ("1", &[1], &[10, 10]),
-                ("3", &[3], &[10, 10]),
-            ],
-        );
-        let report = compare_report(&base, &cand);
-        let combo_lines: Vec<&String> =
-            report.iter().filter(|l| l.contains("combo '")).collect();
-        assert!(
-            combo_lines[0].contains("combo '1'"),
-            "baseline order first: {combo_lines:?}"
-        );
-        assert!(
-            combo_lines[1].contains("combo '2'"),
-            "baseline order first: {combo_lines:?}"
-        );
-        assert!(
-            combo_lines[2].contains("combo '3': only in candidate"),
-            "candidate-only last: {combo_lines:?}"
-        );
     }
 }
