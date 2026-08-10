@@ -110,7 +110,7 @@ fn build_bodies(config_rss: &str, bootstrap_slots: &[u16]) -> Result<(String, St
         "bootstrap_sleds": bootstrap_slots,
         "ntp_servers": arr("ntp_servers"),
         "dns_servers": arr("dns_servers"),
-        "internal_services_ip_pool_ranges": arr("internal_services_ip_pool_ranges"),
+        "service_ip_pools": arr("service_ip_pools"),
         "external_dns_ips": arr("external_dns_ips"),
         "external_dns_zone_name": v.get("external_dns_zone_name").and_then(|x| x.as_str()).unwrap_or(""),
         // Enable the fleet-wide jumbo-frames opt-in for voxel racks set up via
@@ -266,14 +266,14 @@ fn wicketd_call(ip: &str, method: &str, path: &str, body: &str, name: &str) -> R
         .map_err(|_| anyhow!("{path}: unexpected response {code:?}"))
 }
 
-/// Poll wicketd until it's up and has discovered the rack's SPs (so
-/// `bootstrap_sleds` is populated and a PUT will be accepted).
+/// Poll wicketd until it's up and reports the rack's sleds on the bootstrap
+/// network (each entry a baseboard id plus bootstrap ip).
 fn wait_wicketd_ready(ip: &str, num_sleds: usize, log: &slog::Logger) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(300);
     let curl = zlogin(&format!("curl -s {WICKETD}/bootstrap-sleds"));
     loop {
         if let Some(out) = ssh_capture(ip, &curl) {
-            let found = out.matches("\"identifier\"").count();
+            let found = out.matches("\"serial_number\"").count();
             if found >= num_sleds {
                 info!(log, "wicket-setup: wicketd ready, {found} sleds discovered");
                 return Ok(());
