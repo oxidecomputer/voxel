@@ -534,6 +534,12 @@ impl App {
                         vec![]
                     }
                 }
+                // `y` confirms ordinary dialogs; detach reserves it for the
+                // reattach-command clipboard fallback above.
+                (_, Action::CopyReattachCommand) => {
+                    self.session.confirmation = None;
+                    self.confirm(confirmation)
+                }
                 _ => vec![],
             };
         }
@@ -1443,6 +1449,22 @@ mod factual_outcome_tests {
         CommandOutcome::SpawnFailed {
             message: "cancelled child settled".into(),
         }
+    }
+
+    #[test]
+    fn confirmation_shortcut_confirms_launch() {
+        let mut app = App::new(vec![], 8, 8);
+        app.deployment.observed = ObservedDeploymentState::Stopped;
+        app.open_confirmation(Confirmation::Launch);
+
+        assert_eq!(
+            app.update(AppEvent::Action(Action::CopyReattachCommand)),
+            vec![Effect::Start {
+                request_id: OperationRequestId::FIRST,
+                kind: OperationKind::Launch,
+            }]
+        );
+        assert!(app.session.confirmation.is_none());
     }
 
     #[test]
