@@ -594,18 +594,25 @@ fn stage_sp_emu(
     // even when it boots from the image's BAKED /opt/oxide/sp-emu artifacts
     // (self-contained) rather than these staged copies. (The staged rot.flash was
     // previously the only signal of --emu-rot; the baked path needs it explicit.)
+    // Fleet manifest: `rot <0|1>` then `<base_port> <role> <serial> <part>` per
+    // SP. sp-emu 1.x sets the reported VPD from SP_EMU_VPD_SERIAL/PART, so voxel
+    // carries each SP's fleet identity here (the sidecar has no part number).
     let mut manifest = format!("rot {}\n", if emu_rot { 1 } else { 0 });
     for sp in &emu {
         let role =
             if sp.selector() == "sidecar" { "sidecar" } else { "gimlet" };
-        manifest.push_str(&format!("{} {}\n", sp.base_port, role));
+        let part = sp.part_number.as_deref().unwrap_or("-");
+        manifest.push_str(&format!(
+            "{} {} {} {}\n",
+            sp.base_port, role, sp.serial, part
+        ));
     }
     let ports_manifest = out.join("ports");
     fs::write(&ports_manifest, manifest)
         .with_context(|| format!("write {}", ports_manifest))?;
-    // Dev override: with [sp].emu_bin set, stage the binary + per-SP flashes from
+    // Dev override: with [sp].emu_bin set, stage the binary + hubris archives from
     // the local build for fast iteration (no rebake). Unset -> voxel-init uses the
-    // baked image artifacts (the per-SP flash from the baked per-role flash).
+    // baked image artifacts.
     let Some(emu_bin) = cfg.sp.emu_bin.as_deref() else {
         return Ok(());
     };
@@ -618,35 +625,31 @@ fn stage_sp_emu(
         fs::copy(faux, out.join("faux-mgs"))
             .with_context(|| format!("stage faux-mgs from {faux}"))?;
     }
-    // The sidecar SP runs oxide-rot-1 as a second emulated core (the sprot
-    // bridge) when --emu-rot is set, so MGS/Nexus see a real RoT. OFF by
-    // default: the two-core sidecar cannot answer MGS switch-id in time during
-    // RSS, which wedges the nexus handoff - attach the bridge after bring-up.
+    // Stage the RoT image so each SP can run oxide-rot-1 in-process over sprot
+    // (sp-emu 1.x runs the RoT inside the SP process, not as a separate service).
     if emu_rot {
         let rot = cfg.sp.rot_image.as_deref().ok_or_else(|| {
             anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
         })?;
-        fs::copy(rot, out.join("rot.flash"))
+        fs::copy(rot, out.join("rot.image"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
     }
+    // Stage each role's hubris archive; voxel-init flashes a per-instance state
+    // directory from it in the zone (sp-emu 1.x flashes from the archive, not a
+    // pre-built flash file). Gimlets share one archive; the sidecar has its own.
+    let mut staged = std::collections::BTreeSet::new();
     for sp in emu {
-        let sel = sp.selector();
-        let image = cfg.sp.image_for(&sel).ok_or_else(|| {
-            let key =
-                if sel == "sidecar" { "sidecar_image" } else { "gimlet_image" };
-            anyhow!("[sp].emu includes {sel} but [sp].{key} is unset")
-        })?;
-        let flash = out.join(format!("{}.flash", sp.base_port));
-        let status = std::process::Command::new(emu_bin)
-            .env("SP_EMU_FLASH", &flash)
-            .args(["flash", "a", image])
-            .status()
-            .with_context(|| format!("run {emu_bin} flash for {sel}"))?;
-        if !status.success() {
-            return Err(anyhow!(
-                "sp-emu flash failed for {sel} (image {image})"
-            ));
+        let role =
+            if sp.selector() == "sidecar" { "sidecar" } else { "gimlet" };
+        if !staged.insert(role) {
+            continue;
         }
+        let image = cfg.sp.image_for(&sp.selector()).ok_or_else(|| {
+            let key = format!("{role}_image");
+            anyhow!("[sp].emu includes {role} but [sp].{key} is unset")
+        })?;
+        fs::copy(image, out.join(format!("{role}.archive")))
+            .with_context(|| format!("stage {role} archive from {image}"))?;
     }
     Ok(())
 }

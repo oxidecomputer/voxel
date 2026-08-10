@@ -335,22 +335,26 @@ const SWITCH_ZONE_MGS: &str =
 const SWITCH_ZONE_SP: &str =
     "/zone/oxz_switch/root/var/svc/manifest/site/sp-sim/config.toml";
 
-// sp-emu staging: `stage_config` drops the binary + a `<base_port>.flash` per
-// emulated SP into this scrimlet's cargo-bay; voxel-init copies them into the
-// switch zone and runs each as an SMF contract daemon.
+// sp-emu staging: `stage_config` drops the binary + per-role hubris archives (and
+// the rot image) into this scrimlet's cargo-bay; voxel-init copies them into the
+// switch zone, flashes a per-SP state dir, and runs each SP as an SMF daemon.
 const SP_EMU_CARGO_DIR: &str = "/opt/cargo-bay/sp-emu";
 const SP_EMU_ZONE_DIR: &str = "/zone/oxz_switch/root/opt/oxide/sp-emu";
 const SP_EMU_MANIFEST: &str =
     "/zone/oxz_switch/root/var/svc/manifest/site/voxel-sp-emu.xml";
-// Each SP gets its OWN rot-serve (one RoT per SP — not shared). The rot-serve for
-// SP base-port `P` listens on the zone-local port `P - SP_EMU_ROT_PORT_OFFSET`
-// (e.g. 33300 -> 19300), clear of the SP base-port + ereport ranges.
-const SP_EMU_ROT_PORT_OFFSET: u16 = 14000;
 
-// The sidecar SP's MGS base port (voxel_config::sp::SP_PORT_BASE); every other
-// port in the fleet manifest is a gimlet. voxel-init is cross-compiled (musl) and
-// doesn't link voxel-config, so the value is mirrored here.
-const SIDECAR_SP_PORT: u16 = 33300;
+// The sp-emu dir as the switch zone sees it (SP_EMU_ZONE_DIR is the same tree
+// from the sled global zone). The SMF service runs in-zone, so its env paths
+// use this prefix.
+const SP_EMU_IN_ZONE: &str = "/opt/oxide/sp-emu";
+
+// One emulated SP in the fleet, from the `ports` manifest.
+struct EmuSp {
+    port: u16,
+    board: String,
+    serial: String,
+    part: String,
+}
 
 /// Bake-once: the image bakes switch0 + sp-sim for a fixed gimlet count, but this
 /// launch may run a different count, and the 2nd scrimlet must present as switchN
@@ -525,54 +529,37 @@ fn open_switch_zone_ssh() {
 /// with one contract-daemon instance per SP (startd supervises + restarts each,
 /// survives reboots). No-op when nothing's staged; idempotent once imported.
 fn setup_sp_emu() {
-    // The emu fleet's CONTENT (binary, per-SP flashes, rot.flash) is either STAGED
-    // in the cargo-bay (dev: [sp].emu_bin set -> topo flashes locally) or BAKED
-    // into the image at /opt/oxide/sp-emu (self-contained). Staged wins; baked is
-    // the fallback. The SP set + per-SP role + --emu-rot come from the `ports`
-    // manifest topo ALWAYS stages, so we know the fleet even on the baked path;
-    // for back-compat we also accept the legacy signal of staged `<port>.flash`
-    // filenames.
+    // The emu fleet (binary + per-role hubris archives + rot image) is STAGED in
+    // the cargo-bay (dev: [sp].emu_bin set) or BAKED at /opt/oxide/sp-emu. Staged
+    // wins; baked is the fallback. The SP set, per-SP role, VPD identity, and
+    // --emu-rot come from the `ports` manifest topo always stages.
     const BAKED: &str = "/opt/oxide/sp-emu";
-    let staged_flashes: Vec<u16> = match fs::read_dir(SP_EMU_CARGO_DIR) {
-        Ok(rd) => rd
-            .flatten()
-            .filter_map(|e| {
-                e.file_name()
-                    .to_str()
-                    .and_then(|n| n.strip_suffix(".flash"))
-                    .and_then(|p| p.parse::<u16>().ok())
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    // Manifest: a `rot <0|1>` line then `<port> <role>` lines.
     let manifest = fs::read_to_string(format!("{SP_EMU_CARGO_DIR}/ports"))
         .unwrap_or_default();
-    let mut roles: std::collections::BTreeMap<u16, String> =
-        std::collections::BTreeMap::new();
-    let mut rot_from_manifest = false;
+    let mut rot = false;
+    let mut fleet: Vec<EmuSp> = Vec::new();
     for line in manifest.lines() {
-        let mut it = line.split_whitespace();
-        match (it.next(), it.next()) {
-            (Some("rot"), Some(v)) => rot_from_manifest = v == "1",
-            (Some(p), Some(role)) => {
-                if let Ok(p) = p.parse::<u16>() {
-                    roles.insert(p, role.to_string());
+        let f: Vec<&str> = line.split_whitespace().collect();
+        match f.as_slice() {
+            ["rot", v] => rot = *v == "1",
+            [port, board, serial, part] => {
+                if let Ok(port) = port.parse::<u16>() {
+                    fleet.push(EmuSp {
+                        port,
+                        board: board.to_string(),
+                        serial: serial.to_string(),
+                        part: part.to_string(),
+                    });
                 }
             }
             _ => {}
         }
     }
-    let mut ports: Vec<u16> = if !staged_flashes.is_empty() {
-        staged_flashes
-    } else {
-        roles.keys().copied().collect()
-    };
-    if ports.is_empty() {
+    if fleet.is_empty() {
         return; // no emu SPs on this scrimlet
     }
-    ports.sort_unstable();
-    // Copy the binary + flash files into the zone (idempotent; safe to redo).
+    fleet.sort_by_key(|s| s.port);
+    // Copy the binary into the zone (idempotent; safe to redo).
     if let Err(e) = fs::create_dir_all(SP_EMU_ZONE_DIR) {
         warn(format!("mkdir {SP_EMU_ZONE_DIR}: {e}"));
         return;
@@ -585,40 +572,50 @@ fn setup_sp_emu() {
         return;
     }
     run("chmod", &["+x", &bin_to]);
-    for p in &ports {
-        // Staged <port>.flash wins; else the baked per-role flash. Gimlet flashes
-        // are identical (the per-SP serial is set at runtime from SP_EMU_BRIDGE),
-        // so one baked gimlet.flash serves every gimlet port; 33300 -> sidecar.
-        let role = roles.get(p).map(String::as_str).unwrap_or("gimlet");
+    // Copy each role's hubris archive; the SP is flashed from it below.
+    let roles: std::collections::BTreeSet<&str> =
+        fleet.iter().map(|s| s.board.as_str()).collect();
+    for role in &roles {
         let src = pick(
-            format!("{SP_EMU_CARGO_DIR}/{p}.flash"),
-            format!("{BAKED}/{role}.flash"),
+            format!("{SP_EMU_CARGO_DIR}/{role}.archive"),
+            format!("{BAKED}/{role}.archive"),
         );
-        if let Err(e) = fs::copy(&src, format!("{SP_EMU_ZONE_DIR}/{p}.flash")) {
-            warn(format!("copy {p}.flash from {src}: {e}"));
-        }
-    }
-    // Copy the RoT image too, if --emu-rot. Each SP gets its OWN out-of-process
-    // RoT: `sp_emu_manifest` emits one `voxel-rot-emu` rot-serve instance per SP
-    // (its own oxide-rot-1 on a dedicated zone-local port) and points each SP at
-    // it via SP_EMU_ROT_SERVICE. One sled/sidecar -> one SP -> one RoT (not
-    // shared, not in-process, not deferred). SPs stay single-core (RoT
-    // out-of-process), so they answer MGS `switch-id` during RSS and the RoT is
-    // live from boot -> MGS/Nexus pin the real RoT at rack-init. Enabled if a
-    // rot.flash is staged OR the manifest flags it (the baked path).
-    let staged_rot = format!("{SP_EMU_CARGO_DIR}/rot.flash");
-    let rot_enabled = Utf8Path::new(&staged_rot).exists() || rot_from_manifest;
-    if rot_enabled {
-        let rot_src = pick(staged_rot, format!("{BAKED}/rot.flash"));
         if let Err(e) =
-            fs::copy(&rot_src, format!("{SP_EMU_ZONE_DIR}/rot.flash"))
+            fs::copy(&src, format!("{SP_EMU_ZONE_DIR}/{role}.archive"))
         {
-            warn(format!("copy rot.flash from {rot_src}: {e}"));
+            warn(format!("copy {role}.archive from {src}: {e}"));
         }
     }
-    if let Err(e) =
-        fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&ports, rot_enabled))
-    {
+    // The RoT (oxide-rot-1) now runs in-process inside each SP over sprot, from
+    // this one image; there is no separate rot-serve service.
+    if rot {
+        let src = pick(
+            format!("{SP_EMU_CARGO_DIR}/rot.image"),
+            format!("{BAKED}/rot.image"),
+        );
+        if let Err(e) = fs::copy(&src, format!("{SP_EMU_ZONE_DIR}/rot.image")) {
+            warn(format!("copy rot.image from {src}: {e}"));
+        }
+    }
+    // Flash each SP a per-instance state dir from its archive. sp-emu is an
+    // illumos userland process, so run it here in the sled global zone, writing
+    // the zone-visible state path the in-zone service reads at runtime.
+    for sp in &fleet {
+        let state = format!("{SP_EMU_ZONE_DIR}/state/{}", sp.port);
+        if let Err(e) = fs::create_dir_all(&state) {
+            warn(format!("mkdir {state}: {e}"));
+            continue;
+        }
+        let archive = format!("{SP_EMU_ZONE_DIR}/{}.archive", sp.board);
+        if !run_env(
+            &bin_to,
+            &["flash", "a", &archive],
+            &[("SP_EMU_STATE_DIR", &state)],
+        ) {
+            warn(format!("sp-emu flash failed for port {}", sp.port));
+        }
+    }
+    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&fleet, rot)) {
         warn(format!("write sp-emu manifest: {e}"));
         return;
     }
@@ -650,91 +647,58 @@ fn setup_sp_emu() {
             "/var/svc/manifest/site/voxel-sp-emu.xml",
         ],
     );
+    let ports: Vec<u16> = fleet.iter().map(|s| s.port).collect();
     note(format!(
         "sp-emu fleet up ({} SP(s): {ports:?}); sp-sim disabled",
         ports.len()
     ));
 }
 
-/// SMF manifest for the emulated SP fleet, each instance running the locked
-/// sp-emu launch line in the FOREGROUND (no `&`/nohup) so startd's contract owns
-/// it -> restart-on-crash + reboot-safety. Board/flash/bridge are passed via the
-/// method environment. Port 33300 is the sidecar; any other port is a gimlet.
-///
-/// When `rot` is set (--emu-rot), the bundle also emits a `svc:/oxide/voxel-rot-emu`
-/// service with ONE rot-serve instance PER SP — each running its own oxide-rot-1
-/// on a dedicated zone-local port — and points each SP at ITS OWN RoT via
-/// SP_EMU_ROT_SERVICE (with a require_all dep so the RoTs start + prewarm first).
-/// One sled/sidecar -> one SP -> one RoT: separate process, own state — not
-/// shared, not in-process, not deferred. Each RoT runs out-of-process, so its SP
-/// stays single-core and answers MGS `switch-id` during RSS -> RoT live from boot,
-/// MGS/Nexus pin the real RoT at rack-init. When `rot` is false the SPs run with
-/// their canned RoT, as before.
-fn sp_emu_manifest(ports: &[u16], rot: bool) -> String {
+/// SMF manifest for the emulated SP fleet: one `svc:/oxide/voxel-sp-emu:sp<port>`
+/// instance per SP, running `sp-emu run a 0` in the foreground so startd's
+/// contract owns it (restart-on-crash, reboot-safe). Board, bridge, per-instance
+/// state dir, and VPD identity go through the method environment. With `rot` each
+/// SP runs oxide-rot-1 in-process over sprot from the shared rot image; there is
+/// no separate RoT service.
+fn sp_emu_manifest(fleet: &[EmuSp], rot: bool) -> String {
     let mut s = indoc! {r#"
         <?xml version="1.0"?>
         <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
         <service_bundle type="manifest" name="voxel-sp-emu">
-    "#}
-    .to_string();
-    // Per-SP RoT services: one oxide-rot-1 per SP, each on its own zone-local port.
-    if rot {
-        s.push_str(indoc! {r#"
-            <service name="oxide/voxel-rot-emu" type="service" version="1">
-              <dependency name="multi_user" grouping="require_all" restart_on="none" type="service">
-                <service_fmri value="svc:/milestone/multi-user:default"/>
-              </dependency>
-        "#});
-        for &port in ports {
-            let rport = port - SP_EMU_ROT_PORT_OFFSET;
-            s.push_str(&formatdoc! {r#"
-                <instance name="rot{port}" enabled="true">
-                  <exec_method type="method" name="start" exec="/opt/oxide/sp-emu/sp-emu rot-serve [::1]:{rport} /opt/oxide/sp-emu/rot.flash" timeout_seconds="0"/>
-                  <exec_method type="method" name="stop" exec=":kill" timeout_seconds="30"/>
-                  <property_group name="startd" type="framework">
-                    <propval name="duration" type="astring" value="child"/>
-                  </property_group>
-                </instance>
-            "#});
-        }
-        s.push_str("</service>\n");
-    }
-    s.push_str(indoc! {r#"
         <service name="oxide/voxel-sp-emu" type="service" version="1">
           <dependency name="multi_user" grouping="require_all" restart_on="none" type="service">
             <service_fmri value="svc:/milestone/multi-user:default"/>
           </dependency>
-    "#});
-    if rot {
-        // require_all on the whole RoT service: every per-SP rot-serve must be up.
-        s.push_str(indoc! {r#"
-            <dependency name="rot" grouping="require_all" restart_on="none" type="service">
-              <service_fmri value="svc:/oxide/voxel-rot-emu"/>
-            </dependency>
-        "#});
-    }
-    for &port in ports {
-        let board = if port == SIDECAR_SP_PORT { "sidecar" } else { "gimlet" };
+    "#}
+    .to_string();
+    for sp in fleet {
+        let EmuSp { port, board, serial, part } = sp;
         s.push_str(&formatdoc! {r#"
             <instance name="sp{port}" enabled="true">
-              <exec_method type="method" name="start" exec="/opt/oxide/sp-emu/sp-emu gdb a 340000000" timeout_seconds="0">
+              <exec_method type="method" name="start" exec="{SP_EMU_IN_ZONE}/sp-emu run a 0" timeout_seconds="0">
                 <method_context>
                   <method_environment>
+                    <envvar name="SP_EMU_STATE_DIR" value="{SP_EMU_IN_ZONE}/state/{port}"/>
                     <envvar name="SP_EMU_BOARD" value="{board}"/>
-                    <envvar name="SP_EMU_FLASH" value="/opt/oxide/sp-emu/{port}.flash"/>
                     <envvar name="SP_EMU_BRIDGE" value="[::1]:{port}"/>
+                    <envvar name="SP_EMU_VPD_SERIAL" value="{serial}"/>
+                    <envvar name="SP_EMU_NO_DEBUG" value="1"/>
         "#});
-        // Point the SP at ITS OWN rot-serve (one RoT per SP): single-core SP +
-        // out-of-process RoT, live from boot through RSS—no two-core wedge.
-        if rot {
-            let rport = port - SP_EMU_ROT_PORT_OFFSET;
+        // The sidecar carries no part number (stored as "-" in the manifest).
+        if part.as_str() != "-" {
             s.push_str(&format!(
-                "        <envvar name=\"SP_EMU_ROT_SERVICE\" value=\"[::1]:{rport}\"/>\n"
+                "<envvar name=\"SP_EMU_VPD_PART\" value=\"{part}\"/>\n"
             ));
         }
+        // In-process RoT over sprot; bootleby is skipped until the images are
+        // self-signed.
+        if rot {
+            s.push_str(&formatdoc! {r#"
+                <envvar name="SP_EMU_ROT_FLASH" value="{SP_EMU_IN_ZONE}/rot.image"/>
+                <envvar name="SP_EMU_ROT_NO_BOOTLEBY" value="1"/>
+            "#});
+        }
         s.push_str(indoc! {r#"
-                    <envvar name="SP_EMU_NO_DEBUG" value="1"/>
-                    <envvar name="SP_EMU_IDLE_MS" value="20"/>
                   </method_environment>
                 </method_context>
               </exec_method>
@@ -786,11 +750,26 @@ pub fn switch_enforcer_svc() {
 mod tests {
     use super::*;
 
+    fn emu(port: u16, board: &str, serial: &str, part: &str) -> EmuSp {
+        EmuSp {
+            port,
+            board: board.to_string(),
+            serial: serial.to_string(),
+            part: part.to_string(),
+        }
+    }
+
     #[test]
     fn sp_emu_manifest_structure_is_balanced() {
-        let m = sp_emu_manifest(&[33300, 33310], true);
+        let fleet = [
+            emu(33300, "sidecar", "SimSidecar0", "-"),
+            emu(33310, "gimlet", "2FAKE000", "913-0000019"),
+        ];
+        let m = sp_emu_manifest(&fleet, true);
         assert_eq!(m.matches("<instance name=\"sp").count(), 2);
-        assert_eq!(m.matches("<instance name=\"rot").count(), 2);
+        // In-process RoT: no separate rot service or instances.
+        assert!(!m.contains("voxel-rot-emu"));
+        assert_eq!(m.matches("<instance name=\"rot").count(), 0);
         assert_eq!(
             m.matches("<service ").count(),
             m.matches("</service>").count()
@@ -799,12 +778,17 @@ mod tests {
             m.matches("<instance ").count(),
             m.matches("</instance>").count()
         );
-        assert!(m.contains("SP_EMU_ROT_SERVICE"));
+        assert!(m.contains("SP_EMU_ROT_FLASH"));
+        assert!(m.contains("SP_EMU_VPD_SERIAL\" value=\"2FAKE000\""));
+        assert!(m.contains("SP_EMU_VPD_PART\" value=\"913-0000019\""));
+        // The sidecar has no part number, so no VPD_PART for it.
         assert!(m.contains("SP_EMU_BOARD\" value=\"sidecar\""));
 
-        let plain = sp_emu_manifest(&[33310], false);
-        assert!(!plain.contains("voxel-rot-emu"));
-        assert!(!plain.contains("SP_EMU_ROT_SERVICE"));
+        let plain = sp_emu_manifest(
+            &[emu(33310, "gimlet", "2FAKE000", "913-0000019")],
+            false,
+        );
+        assert!(!plain.contains("SP_EMU_ROT_FLASH"));
         assert!(plain.contains("SP_EMU_BOARD\" value=\"gimlet\""));
     }
 }
