@@ -62,7 +62,7 @@ fn ext_interface(d: &mut Runner, n: NodeRef, cfg_link: Option<&str>) -> anyhow::
 ///
 /// Serial and model must match what MGS reports for the sled's SP (sp-sim
 /// config or sp-emu VPD): wicketd correlates each sled's bootstrap address
-/// by BaseboardId, part number plus serial, so a mismatch leaves the sled's
+/// by BaseboardId: part number plus serial, so a mismatch leaves the sled's
 /// bootstrap address unknown in rack setup. Revision 2 matches the sp-emu
 /// VPD barcode rev 002; BaseboardId does not compare it.
 fn populate_smbios(d: &mut Runner, x: NodeRef, sled: &SledDesc) {
