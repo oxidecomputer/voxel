@@ -419,6 +419,9 @@ pub(crate) fn stage_config(
             .with_interconnects(cfg.topology.interconnect_count_for(s.index))
             .render(),
         )?;
+        if cfg.disk_wear.guest_zfs_tuning {
+            fs::write(dir.join("wear-guest-zfs"), "")?;
+        }
     }
 
     // One typed config-rss per rack, staged on that rack's RSS node (its first

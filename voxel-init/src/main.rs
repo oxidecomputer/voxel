@@ -41,6 +41,11 @@ enum Cmd {
     /// (spawned by `gimlet`)—swaps the launch-count MGS + sp-sim configs in.
     #[command(hide = true)]
     SwitchEnforcer { slot: u8 },
+    /// Internal: the detached guest ZFS wear tuner (spawned by `gimlet`) - sets
+    /// sync=disabled + compatible compression on each oxi_*/oxp_* pool as RSS
+    /// creates it.
+    #[command(hide = true)]
+    ZfsTuner,
     /// Internal: the baked `svc:/oxide/voxel-switch-enforcer` SMF method. Runs at
     /// every boot, reads this scrimlet's slot from the cargo-bay, and enforces
     /// it—the reboot/restart-safe path (no-op on gimlets / switch0).
@@ -68,6 +73,10 @@ fn main() {
         },
         Cmd::SwitchEnforcer { slot } => {
             gimlet::switch_enforcer(slot);
+            Ok(())
+        }
+        Cmd::ZfsTuner => {
+            gimlet::oxp_zfs_tuner();
             Ok(())
         }
         Cmd::SwitchEnforcerSvc => {

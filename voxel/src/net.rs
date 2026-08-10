@@ -1,9 +1,11 @@
 //! Host-LAN networking: discover a node's external IPv4 and (re)point the host
 //! route at the rack's external network.
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use libfalcon::{NodeRef, Runner};
-use slog::{info, warn};
+use slog::info;
+use std::future::Future;
+use std::io::Read;
 use std::time::Duration;
 
 use crate::rss::strip_ansi;
@@ -83,7 +85,10 @@ pub(crate) async fn node_external_ip(
     } else {
         "ipadm show-addr -p -o addr 2>/dev/null"
     };
-    let raw = d.exec(n, cmd).await.context("read external IP")?;
+    let raw = serial_exec_with_timeout(SERIAL_RESOLVE_TIMEOUT, async {
+        d.exec(n, cmd).await.map_err(anyhow::Error::from)
+    })
+    .await?;
     let out = strip_ansi(&raw);
     out.split_whitespace()
         .filter_map(|t| t.split('/').next()) // drop any CIDR suffix
@@ -94,6 +99,21 @@ pub(crate) async fn node_external_ip(
         })
         .map(str::to_string)
         .with_context(|| format!("no external IPv4 found (got {out:?})"))
+}
+
+async fn serial_exec_with_timeout<F>(
+    timeout: Duration,
+    exec: F,
+) -> anyhow::Result<String>
+where
+    F: Future<Output = anyhow::Result<String>>,
+{
+    tokio::time::timeout(timeout, exec)
+        .await
+        .with_context(|| {
+            format!("read external IP timed out after {timeout:?}")
+        })?
+        .context("read external IP")
 }
 
 /// Run `ssh root@<ip> <remote>` non-interactively and capture stdout, using the
@@ -163,6 +183,88 @@ pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
 /// only when ssh itself couldn't run or couldn't connect/authenticate (exit 255),
 /// i.e. the node really is unreachable - a non-255 exit means the command ran and
 /// its output (success or error) is meaningful.
+pub(crate) fn ssh_output_timeout(
+    ip: &str,
+    remote: &str,
+    timeout: Duration,
+) -> Option<String> {
+    command_output_timeout(ssh_command(ip, remote)?, timeout).and_then(|out| {
+        if out.status.code() == Some(255) {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+    })
+}
+
+fn ssh_command(ip: &str, remote: &str) -> Option<std::process::Command> {
+    let askpass = ensure_askpass()?;
+    let mut command = std::process::Command::new("ssh");
+    command
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .stdin(std::process::Stdio::null())
+        .args(EPHEMERAL_HOST_OPTS)
+        .args(PASSWORD_AUTH_OPTS)
+        .args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"])
+        .arg(format!("root@{ip}"))
+        .arg(remote);
+    Some(command)
+}
+
+pub(crate) fn command_output_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    use std::os::unix::process::CommandExt;
+    command
+        .process_group(0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let (Some(mut stdout), Some(mut stderr)) =
+        (child.stdout.take(), child.stderr.take())
+    else {
+        kill_process_group(&child);
+        let _ = child.wait();
+        return None;
+    };
+    let stdout_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Ok(None) | Err(_) => {
+                kill_process_group(&child);
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    kill_process_group(&child);
+    Some(std::process::Output {
+        status: status?,
+        stdout: stdout_reader.join().ok()?.ok()?,
+        stderr: stderr_reader.join().ok()?.ok()?,
+    })
+}
+
+fn kill_process_group(child: &std::process::Child) {
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+}
+
 pub(crate) fn ssh_output(ip: &str, remote: &str) -> Option<String> {
     let out = ssh_exec(ip, remote)?;
     if out.status.code() == Some(255) {
@@ -242,31 +344,29 @@ pub(crate) fn scp_from(ip: &str, remote: &str, local: &str) -> bool {
 /// host and waits, bounded, until it answers. With the shared transit, the second
 /// rack joining can briefly flap the first rack's path while BGP reconverges; this
 /// waits that out *here* instead of letting it surface to the operator as a dead
-/// DNS. Best-effort: logs the outcome, never fails the launch. No-op (with a note)
-/// if `dig` isn't installed.
+/// DNS. Missing host prerequisites and a bounded probe timeout both fail the
+/// launch rather than allowing an unusable rack to look ready.
 pub(crate) fn wait_external_reachable(
     log: &slog::Logger,
     dns_ip: &str,
     dns_zone: &str,
     label: &str,
-) {
+) -> anyhow::Result<()> {
     const ATTEMPTS: u32 = 30; // ~90s at 3s spacing
     const SPACING: Duration = Duration::from_secs(3);
     for attempt in 1..=ATTEMPTS {
         match dig_soa(dns_ip, dns_zone) {
             None => {
-                info!(
-                    log,
-                    "{label}: skipping external reachability check (dig unavailable)"
+                bail!(
+                    "{label}: required host command `dig` could not be executed; install `dig` to validate external DNS reachability"
                 );
-                return;
             }
             Some(true) => {
                 info!(
                     log,
                     "{label}: external network reachable (dns {dns_ip})"
                 );
-                return;
+                return Ok(());
             }
             Some(false) => {
                 if attempt == 1 {
@@ -279,12 +379,10 @@ pub(crate) fn wait_external_reachable(
             }
         }
     }
-    warn!(
-        log,
-        "{label}: external network not reachable after ~{}s (dns {dns_ip}) - the rack is up but \
-         its external path may still be converging; retry `voxel route` or `dig {dns_zone} SOA @{dns_ip}`",
+    bail!(
+        "{label}: external network not reachable after ~{}s (dns {dns_ip}); retry `voxel route` or `dig {dns_zone} SOA @{dns_ip}`",
         ATTEMPTS * SPACING.as_secs() as u32
-    );
+    )
 }
 
 /// `dig <zone> SOA @<dns_ip>`: `Some(true)` if the server answered, `Some(false)`
@@ -335,6 +433,14 @@ fn route_gateways(dest: &str) -> Vec<String> {
             (d == dest).then(|| gw.to_string())
         })
         .collect()
+}
+
+fn route_readback_confirms_nexthop(output: &str, nexthop: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("gateway:")
+            .is_some_and(|gateway| gateway.trim() == nexthop)
+    })
 }
 
 pub(crate) async fn set_external_route(
@@ -388,24 +494,70 @@ pub(crate) async fn set_external_route(
         .args(["add", prefix, &ip])
         .output()
         .context("route add")?;
-    let resolves = std::process::Command::new("route")
+    let readback = std::process::Command::new("route")
         .args(["-n", "get", dest])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&ip))
-        .unwrap_or(false);
-    if resolves {
+        .with_context(|| format!("route -n get {dest}"))?;
+    let readback_stdout = String::from_utf8_lossy(&readback.stdout);
+    if route_readback_confirms_nexthop(&readback_stdout, &ip) {
         info!(d.log, "external route set: {} -> {} (ce)", prefix, ip);
+        Ok(())
     } else {
-        warn!(
-            d.log,
-            "route {} -> {} not confirmed: {}{} - run: route add {} {}",
-            prefix,
-            ip,
+        bail!(
+            "route {prefix} -> {ip} was not confirmed by `route -n get {dest}`; route add output: {}{}; route readback: {}{}; run: route add {prefix} {ip}",
             String::from_utf8_lossy(&add.stdout).trim(),
             String::from_utf8_lossy(&add.stderr).trim(),
-            prefix,
-            ip
+            readback_stdout.trim(),
+            String::from_utf8_lossy(&readback.stderr).trim(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use std::future::pending;
+
+    #[tokio::test]
+    async fn serial_exec_times_out_when_pending() {
+        let error = serial_exec_with_timeout(
+            Duration::from_millis(1),
+            pending::<anyhow::Result<String>>(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn serial_exec_returns_completed_output() {
+        let output = serial_exec_with_timeout(
+            Duration::from_millis(1),
+            std::future::ready(Ok("198.51.100.1".to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, "198.51.100.1");
+    }
+
+    #[tokio::test]
+    async fn serial_exec_errors_retain_context() {
+        let error = serial_exec_with_timeout(
+            Duration::from_millis(1),
+            std::future::ready(Err(anyhow!("serial transport failed"))),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "read external IP");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "serial transport failed"),
+            "{error:#}"
         );
     }
-    Ok(())
 }

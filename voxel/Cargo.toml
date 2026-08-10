@@ -28,7 +28,16 @@ rack-init-config.workspace = true
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
 serde_json = "1"
+# perftest serializes matrix run documents for comparison and replay.
+serde = { workspace = true, features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
+charming = { version = "0.6", default-features = false }
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).

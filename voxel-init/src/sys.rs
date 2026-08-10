@@ -3,6 +3,7 @@
 //! every step is visible and best-effort steps log a warning instead of
 //! aborting. Mirror that—`run`/`run_quiet` never panic and return success.
 
+use anyhow::{Context, Result, anyhow};
 use std::process::{Command, Stdio};
 
 /// Parsed `/opt/cargo-bay/external-net` (voxel-managed isolated segment). All
@@ -22,11 +23,23 @@ pub struct ExternalNet {
     pub iface: Option<String>,
 }
 
-/// Read `/opt/cargo-bay/external-net`. `None` when the file is absent
-/// (`lan` mode). Missing required fields yield `None` too—the caller falls
-/// back to the DHCP path rather than crashing bring-up.
-pub fn read_external_net() -> Option<ExternalNet> {
-    let text = std::fs::read_to_string("/opt/cargo-bay/external-net").ok()?;
+/// Read `/opt/cargo-bay/external-net`. Absence selects LAN mode, while a
+/// present but unreadable or malformed file is fatal.
+pub fn read_external_net() -> Result<Option<ExternalNet>> {
+    let path = "/opt/cargo-bay/external-net";
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {path}"));
+        }
+    };
+    parse_external_net(&text).map(Some)
+}
+
+fn parse_external_net(text: &str) -> Result<ExternalNet> {
     let mut ip_cidr = String::new();
     let mut gateway = String::new();
     let mut dns: Vec<String> = Vec::new();
@@ -34,26 +47,38 @@ pub fn read_external_net() -> Option<ExternalNet> {
     for line in text.lines() {
         let mut it = line.split_whitespace();
         match it.next() {
-            Some("ip") => {
-                if let Some(v) = it.next() {
-                    ip_cidr = v.to_string();
-                }
-            }
+            Some("ip") => ip_cidr = one_value("ip", &mut it)?.to_string(),
             Some("gateway") => {
-                if let Some(v) = it.next() {
-                    gateway = v.to_string();
-                }
+                gateway = one_value("gateway", &mut it)?.to_string()
             }
             Some("dns") => dns = it.map(str::to_string).collect(),
-            Some("iface") => iface = it.next().map(str::to_string),
-            _ => {}
+            Some("iface") => {
+                iface = Some(one_value("iface", &mut it)?.to_string())
+            }
+            None => {}
+            Some(key) => {
+                return Err(anyhow!("unknown external-net field {key:?}"));
+            }
         }
     }
 
-    if ip_cidr.is_empty() || gateway.is_empty() {
-        return None;
+    if ip_cidr.is_empty() || gateway.is_empty() || dns.is_empty() {
+        return Err(anyhow!("external-net requires ip, gateway, and dns"));
     }
-    Some(ExternalNet { ip_cidr, gateway, dns, iface })
+    Ok(ExternalNet { ip_cidr, gateway, dns, iface })
+}
+
+fn one_value<'a>(
+    key: &str,
+    values: &mut impl Iterator<Item = &'a str>,
+) -> Result<&'a str> {
+    let value = values
+        .next()
+        .ok_or_else(|| anyhow!("external-net {key} requires a value"))?;
+    if values.next().is_some() {
+        return Err(anyhow!("external-net {key} accepts exactly one value"));
+    }
+    Ok(value)
 }
 
 /// A progress line (mirrors the scripts' `echo [tag] ...`).
@@ -109,6 +134,59 @@ pub fn run_env(cmd: &str, args: &[&str], envs: &[(&str, &str)]) -> bool {
     }
 }
 
+pub fn run_required(cmd: &str, args: &[&str]) -> Result<()> {
+    run_env_required(cmd, args, &[])
+}
+
+pub fn run_env_required(
+    cmd: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<()> {
+    let invocation = format!("{cmd} {}", args.join(" "));
+    println!("+ {invocation}");
+    let status = Command::new(cmd)
+        .args(args)
+        .envs(envs.iter().copied())
+        .status()
+        .with_context(|| format!("spawn required command `{invocation}`"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("required command `{invocation}` failed with {status}"))
+    }
+}
+
+pub fn capture_required(cmd: &str, args: &[&str]) -> Result<String> {
+    let invocation = format!("{cmd} {}", args.join(" "));
+    println!("+ {invocation}");
+    let output = Command::new(cmd)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn required command `{invocation}`"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(anyhow!(
+            "required command `{invocation}` failed with {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+pub fn run_status(
+    cmd: &str,
+    args: &[&str],
+) -> Result<std::process::ExitStatus> {
+    let invocation = format!("{cmd} {}", args.join(" "));
+    println!("+ {invocation}");
+    Command::new(cmd)
+        .args(args)
+        .status()
+        .with_context(|| format!("spawn required command probe `{invocation}`"))
+}
+
 /// Run a command silently (stdio to /dev/null), returning success. Mirrors the
 /// scripts' `... >/dev/null 2>&1` probes (e.g. `dladm show-link`, `iptables -C`).
 pub fn run_quiet(cmd: &str, args: &[&str]) -> bool {
@@ -130,5 +208,30 @@ pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_external_net, run_env_required};
+
+    #[test]
+    fn malformed_staged_external_config_is_an_error() {
+        let error =
+            parse_external_net("dns 1.1.1.1\n").unwrap_err().to_string();
+        assert!(error.contains("ip"), "{error}");
+        assert!(error.contains("gateway"), "{error}");
+    }
+
+    #[test]
+    fn required_environment_command_failure_is_reported() {
+        let error = run_env_required(
+            "sh",
+            &["-c", "test \"$VOXEL_TEST_VALUE\" = expected && exit 37"],
+            &[("VOXEL_TEST_VALUE", "expected")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("37"), "{error}");
     }
 }

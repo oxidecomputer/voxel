@@ -1,379 +1,424 @@
-//! Router/edge bring-up - replaces `router-launch.sh`. Runs in the voxel-frr
-//! debian guest. FRR (bgpd + bfdd) is pre-installed; this applies the generated
-//! `frr.conf` (unnumbered eBGP or static, per router_mode) and NATs rack egress
-//! out to the host LAN (the RSS time-sync path - the boundary NTP zone must reach
-//! its upstream).
+//! Fail-closed router/edge bring-up for the Debian FRR guest.
 
 use crate::sys::{
-    ExternalNet, capture, note, read_external_net, replace_in_file, run,
-    run_quiet, warn,
+    ExternalNet, capture_required, note, read_external_net, run, run_required,
+    run_status,
 };
-use anyhow::{Context, Result, bail};
-use camino::Utf8Path;
+use anyhow::{Context, Result, anyhow};
 use indoc::formatdoc;
-use std::fs;
-use std::time::Duration;
+use std::{fs, io::Write, path::Path, time::Duration};
 
-pub fn bring_up() -> Result<()> {
-    setup_ssh();
+const ROUTER_COMPLETE_SENTINEL: &str = "router bring-up complete";
+const STATIC_EDGE_IP: &str = "/opt/cargo-bay/ce-external-ip";
 
-    // Give the host-LAN uplink a UNIQUE DHCP lease before NAT depends on it.
-    ensure_unique_uplink_lease();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalMode {
+    Lan,
+    Isolated,
+}
 
-    // Forwarding is baked, but re-assert + stop lab-net RAs from clobbering us.
-    sysctl("net.ipv4.ip_forward", "1");
-    sysctl("net.ipv6.conf.all.forwarding", "1");
-    sysctl("net.ipv6.conf.all.accept_ra", "0");
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouterStep {
+    Ssh,
+    UniqueDhcpLease,
+    Forwarding,
+    AptTimers,
+    StaticExternal,
+    Nat,
+    StaticEdgeIp,
+    Frr,
+}
 
-    // apt-daily timers can wipe FRR state (disabled at bake; belt + braces).
-    run(
-        "systemctl",
-        &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"],
-    );
+fn router_plan(mode: ExternalMode) -> Vec<RouterStep> {
+    let mut plan = vec![RouterStep::Ssh];
+    if mode == ExternalMode::Lan {
+        plan.push(RouterStep::UniqueDhcpLease);
+    }
+    plan.extend([RouterStep::Forwarding, RouterStep::AptTimers]);
+    if mode == ExternalMode::Isolated {
+        plan.push(RouterStep::StaticExternal);
+    }
+    plan.extend([RouterStep::Nat, RouterStep::StaticEdgeIp, RouterStep::Frr]);
+    plan
+}
 
-    // rp_filter drops the rack's asymmetric / unnumbered transit traffic.
-    sysctl("net.ipv4.conf.all.rp_filter", "0");
-    sysctl("net.ipv4.conf.default.rp_filter", "0");
-
-    apply_static_external();
-    nat_rack_egress();
-    apply_static_edge_ip();
-    apply_frr()?;
-
-    note("router bring-up complete");
+fn execute_plan(
+    plan: &[RouterStep],
+    mut execute: impl FnMut(RouterStep) -> Result<()>,
+) -> Result<()> {
+    for step in plan {
+        execute(*step)?;
+    }
     Ok(())
 }
 
-/// SSH convenience for `voxel host login <router>`, the router-role counterpart
-/// of the gimlet agent's `setup_ssh`. `openssh-server` is already in the image
-/// (install-frr.sh), so this only appends any staged operator key and relaxes
-/// sshd_config: voxel authenticates as root with the rack's empty password, and
-/// Debian's stock `PermitRootLogin prohibit-password` refuses that.
-fn setup_ssh() {
+pub fn bring_up() -> Result<()> {
+    let external = read_external_net()?;
+    let mode = if external.is_some() {
+        ExternalMode::Isolated
+    } else {
+        ExternalMode::Lan
+    };
+    let result = execute_plan(&router_plan(mode), |step| match step {
+        RouterStep::Ssh => setup_ssh(),
+        RouterStep::UniqueDhcpLease => ensure_unique_uplink_lease(),
+        RouterStep::Forwarding => configure_forwarding(),
+        RouterStep::AptTimers => {
+            run(
+                "systemctl",
+                &[
+                    "disable",
+                    "--now",
+                    "apt-daily-upgrade.timer",
+                    "apt-daily.timer",
+                ],
+            );
+            Ok(())
+        }
+        RouterStep::StaticExternal => apply_static_external(
+            external.as_ref().expect("isolated plan has config"),
+        ),
+        RouterStep::Nat => nat_rack_egress(external.as_ref()),
+        RouterStep::StaticEdgeIp => apply_static_edge_ip(external.as_ref()),
+        RouterStep::Frr => apply_frr(),
+    });
+    finish_bring_up(result, |line| note(line))
+}
+
+fn finish_bring_up(
+    result: Result<()>,
+    mut emit: impl FnMut(&str),
+) -> Result<()> {
+    result?;
+    emit(ROUTER_COMPLETE_SENTINEL);
+    Ok(())
+}
+
+fn setup_ssh() -> Result<()> {
     let authorized = "/opt/cargo-bay/root_authorized_keys";
-    if Utf8Path::new(authorized).exists() {
-        let _ = fs::create_dir_all("/root/.ssh");
-        if let Ok(keys) = fs::read(authorized) {
-            use std::io::Write;
-            match fs::OpenOptions::new()
+    match fs::read(authorized) {
+        Ok(keys) => {
+            fs::create_dir_all("/root/.ssh")
+                .context("create root SSH directory")?;
+            fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open("/root/.ssh/authorized_keys")
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&keys) {
-                        warn(format!("authorized_keys: {e}"));
-                    }
-                }
-                Err(e) => warn(format!("authorized_keys: {e}")),
-            }
+                .context("open root authorized_keys")?
+                .write_all(&keys)
+                .context("append root authorized_keys")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("read staged root authorized_keys");
         }
     }
-
-    // Debian's stock sshd_config keeps PasswordAuthentication yes but defaults
-    // PermitRootLogin to prohibit-password. Flip it so serial-first debugging
-    // (blank root password) still lets you in over SSH.
-    replace_in_file(
-        "/etc/ssh/sshd_config",
-        &[
-            ("#PasswordAuthentication yes", "PasswordAuthentication yes"),
-            ("#PermitEmptyPasswords no", "PermitEmptyPasswords yes"),
-            ("#PermitRootLogin prohibit-password", "PermitRootLogin yes"),
-            ("PermitRootLogin prohibit-password", "PermitRootLogin yes"),
-        ],
-    );
-    run("systemctl", &["enable", "--now", "ssh"]);
-    run("systemctl", &["restart", "ssh"]);
+    let path = "/etc/ssh/sshd_config";
+    let mut config = fs::read_to_string(path).context("read sshd_config")?;
+    for (from, to) in [
+        ("#PasswordAuthentication yes", "PasswordAuthentication yes"),
+        ("#PermitEmptyPasswords no", "PermitEmptyPasswords yes"),
+        ("#PermitRootLogin prohibit-password", "PermitRootLogin yes"),
+        ("PermitRootLogin prohibit-password", "PermitRootLogin yes"),
+    ] {
+        config = config.replace(from, to);
+    }
+    fs::write(path, config).context("write sshd_config")?;
+    run_required("systemctl", &["enable", "--now", "ssh"])?;
+    run_required("systemctl", &["restart", "ssh"]).context("restart SSH")
 }
 
-/// If a static customer-edge address is staged (voxel `[topology].ce_external_ip`,
-/// written only into ce's cargo-bay), add it as a SECONDARY address on the uplink.
-/// DHCP keeps the primary address + default route (egress/NTP), so this is purely
-/// an extra fixed address that gives the host route to the rack a STABLE nexthop -
-/// no churn across launches, nothing to chase over the serial console. No-op on
-/// the cr* routers (only ce's cargo-bay carries the file). The prefix is taken
-/// from the uplink's current DHCP address so the secondary lands on the same LAN.
-fn apply_static_edge_ip() {
-    let ip = match fs::read_to_string("/opt/cargo-bay/ce-external-ip") {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return, // not configured / not the ce node
-    };
-    if ip.is_empty() {
-        return;
-    }
-    let Some(ifc) = uplink_iface() else {
-        warn("static edge IP: no uplink found");
-        return;
-    };
-    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc])
-        .unwrap_or_default();
-    if cur
-        .split_whitespace()
-        .any(|t| t == ip || t.starts_with(&format!("{ip}/")))
-    {
-        note(format!("static edge IP {ip} already on {ifc}"));
-        return;
-    }
-    // Prefix length from the uplink's DHCP address (token after "inet"), default /22.
-    let prefix = cur
-        .split_whitespace()
-        .skip_while(|t| *t != "inet")
-        .nth(1)
-        .and_then(|cidr| cidr.split('/').nth(1))
-        .unwrap_or("22");
-    let cidr = format!("{ip}/{prefix}");
-    run("ip", &["addr", "add", &cidr, "dev", &ifc]);
-    note(format!("static edge IP {cidr} added on {ifc}"));
+fn uplink_network_config(ifc: &str) -> String {
+    formatdoc!(
+        "[Match]\nName={ifc}\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nClientIdentifier=mac\nRouteMetric=100\n"
+    )
 }
 
-/// Every router boots from the same frr image with the same baked machine-id,
-/// so systemd-networkd derives an identical DHCP client-id (DUID) and the
-/// upstream server leases them all the SAME host-LAN IP. NAT return traffic then
-/// races to whichever router owns that IP's ARP entry, starving the others' rack
-/// egress: RSS time-sync in static mode took 18-28min or stalled. Pin the
-/// uplink's DHCP client-id to its (always-unique) MAC and re-DHCP, so each router
-/// gets a distinct lease. Scoped to the uplink interface only, leaving the
-/// FRR-managed transit links untouched.
-fn ensure_unique_uplink_lease() {
-    // Isolated mode stages a static address and runs no DHCP server, so there
-    // is no lease to dedupe. Keep networkd's DHCP client off the uplink that
-    // `apply_static_external` configures by hand.
-    if read_external_net().is_some() {
-        note(
-            "isolated mode: static external address, skipping DHCP lease pinning",
-        );
-        return;
-    }
-    let Some(ifc) = uplink_iface() else {
-        warn("unique-lease: no host-LAN uplink found; skipping");
-        return;
-    };
-    let cfg = formatdoc! {"
-        [Match]
-        Name={ifc}
-
-        [Network]
-        DHCP=yes
-
-        [DHCPv4]
-        ClientIdentifier=mac
-        RouteMetric=100
-    "};
-    if let Err(e) =
-        fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg)
-    {
-        warn(format!("unique-lease: write networkd config: {e}"));
-        return;
-    }
-    run("systemctl", &["restart", "systemd-networkd"]);
-    note(format!(
-        "pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"
-    ));
+fn ensure_unique_uplink_lease() -> Result<()> {
+    let ifc = uplink_iface(None)?;
+    fs::write(
+        "/etc/systemd/network/00-voxel-uplink.network",
+        uplink_network_config(&ifc),
+    )
+    .context("write unique uplink lease configuration")?;
+    run_required("systemctl", &["restart", "systemd-networkd"])
 }
 
-fn sysctl(key: &str, val: &str) {
-    run("sysctl", &["-w", &format!("{key}={val}")]);
+fn configure_forwarding() -> Result<()> {
+    for (key, value) in [
+        ("net.ipv4.ip_forward", "1"),
+        ("net.ipv6.conf.all.forwarding", "1"),
+        ("net.ipv6.conf.all.accept_ra", "0"),
+        ("net.ipv4.conf.all.rp_filter", "0"),
+        ("net.ipv4.conf.default.rp_filter", "0"),
+    ] {
+        run_required("sysctl", &["-w", &format!("{key}={value}")])
+            .with_context(|| format!("set {key}"))?;
+    }
+    Ok(())
 }
 
-/// NAT rack egress out this node's host-LAN uplink (the interface carrying its
-/// own default route) so the boundary NTP zone can reach its internet upstream.
-/// Excludes the directly-connected customer LAN: traffic there is the racks'
-/// external-service replies (Nexus/DNS/console) sourced from public service IPs,
-/// which must reach the host unchanged. Masquerading those rewrites the source to
-/// this router's uplink IP so the host drops the reply. Waits for the DHCP
-/// default to appear first.
-fn nat_rack_egress() {
-    match uplink_iface() {
-        Some(ifc) => {
-            // Skip NAT for the connected customer subnet (the external-service
-            // reply path) before masquerading the internet-bound rest (NTP).
-            if let Some(subnet) = uplink_subnet(&ifc)
-                && !run_quiet(
-                    "iptables",
-                    &[
-                        "-t",
-                        "nat",
-                        "-C",
-                        "POSTROUTING",
-                        "-o",
-                        &ifc,
-                        "-d",
-                        &subnet,
-                        "-j",
-                        "RETURN",
-                    ],
-                )
-            {
-                run(
-                    "iptables",
-                    &[
-                        "-t",
-                        "nat",
-                        "-I",
-                        "POSTROUTING",
-                        "1",
-                        "-o",
-                        &ifc,
-                        "-d",
-                        &subnet,
-                        "-j",
-                        "RETURN",
-                    ],
-                );
-            }
-            if !run_quiet(
-                "iptables",
-                &[
-                    "-t",
-                    "nat",
-                    "-C",
-                    "POSTROUTING",
-                    "-o",
-                    &ifc,
-                    "-j",
-                    "MASQUERADE",
-                ],
-            ) {
-                run(
-                    "iptables",
-                    &[
-                        "-t",
-                        "nat",
-                        "-A",
-                        "POSTROUTING",
-                        "-o",
-                        &ifc,
-                        "-j",
-                        "MASQUERADE",
-                    ],
-                );
-            }
-            note(format!("NAT rack egress via {ifc}"));
-        }
-        None => warn("no default-route uplink found; rack egress/NTP may fail"),
+fn apply_static_external(ext: &ExternalNet) -> Result<()> {
+    let ifc = ext
+        .iface
+        .as_deref()
+        .ok_or_else(|| anyhow!("external-net requires iface for router"))?;
+    capture_required("ip", &["-o", "link", "show", "dev", ifc])
+        .context("verify staged external interface")?;
+    run_required("ip", &["link", "set", ifc, "up"])?;
+    let addresses =
+        capture_required("ip", &["-o", "-4", "addr", "show", "dev", ifc])?;
+    if !addresses.split_whitespace().any(|token| token == ext.ip_cidr) {
+        run_required("ip", &["addr", "add", &ext.ip_cidr, "dev", ifc])?;
     }
-}
-
-/// Apply the voxel-managed static external address (isolated mode) before any
-/// downstream step consults the uplink. This means bringing the staged
-/// `iface` up, adding the address (mirroring `apply_static_edge_ip`), replacing
-/// the default route via `gateway`, and writing `/etc/resolv.conf` from `dns`.
-///
-/// No-op in `lan` mode (no file staged).
-fn apply_static_external() {
-    let Some(ExternalNet { ip_cidr, gateway, dns, iface }) =
-        read_external_net()
-    else {
-        return;
-    };
-    let Some(ifc) = iface else {
-        warn(
-            "external-net staged without an iface line; router bring-up needs it",
-        );
-        return;
-    };
-
-    if !link_exists(&ifc) {
-        warn(format!(
-            "external-net names {ifc}, which this router does not have; present links: {}",
-            link_names().join(" ")
-        ));
-        return;
-    }
-    run("ip", &["link", "set", &ifc, "up"]);
-    let cur = capture("ip", &["-o", "-4", "addr", "show", "dev", &ifc])
-        .unwrap_or_default();
-    let already = cur.split_whitespace().any(|t| t == ip_cidr);
-    if already {
-        note(format!("static external {ip_cidr} already on {ifc}"));
-    } else {
-        run("ip", &["addr", "add", &ip_cidr, "dev", &ifc]);
-    }
-    run("ip", &["route", "replace", "default", "via", &gateway, "dev", &ifc]);
-
+    run_required(
+        "ip",
+        &["route", "replace", "default", "via", &ext.gateway, "dev", ifc],
+    )?;
     let resolv: String =
-        dns.iter().map(|s| format!("nameserver {s}\n")).collect();
-    if !resolv.is_empty() {
-        // Replace the systemd-resolved symlink with a static file so our
-        // nameservers stick (isolated mode has no DHCP to populate resolved).
-        let _ = fs::remove_file("/etc/resolv.conf");
-        if let Err(e) = fs::write("/etc/resolv.conf", resolv) {
-            warn(format!("resolv.conf: {e}"));
+        ext.dns.iter().map(|dns| format!("nameserver {dns}\n")).collect();
+    match fs::remove_file("/etc/resolv.conf") {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("remove resolv.conf"),
+    }
+    fs::write("/etc/resolv.conf", resolv).context("write isolated DNS")
+}
+
+fn select_uplink<'a>(
+    override_ifc: Option<&'a str>,
+    staged: Option<&'a str>,
+    default: Option<&'a str>,
+) -> Option<&'a str> {
+    override_ifc.filter(|s| !s.is_empty()).or(staged).or(default)
+}
+
+fn uplink_iface(ext: Option<&ExternalNet>) -> Result<String> {
+    if let Some(ifc) = select_uplink(
+        std::env::var("UPSTREAM_IFACE").ok().as_deref(),
+        ext.and_then(|e| e.iface.as_deref()),
+        None,
+    ) {
+        capture_required("ip", &["-o", "link", "show", "dev", ifc])
+            .context("verify selected uplink")?;
+        return Ok(ifc.to_string());
+    }
+    for attempt in 1..=30 {
+        let routes =
+            capture_required("ip", &["-o", "-4", "route", "show", "default"])?;
+        if let Some(ifc) = parse_default_uplink(&routes) {
+            return Ok(ifc);
+        }
+        if attempt < 30 {
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
-    note(format!("static external {ip_cidr} on {ifc} (gw {gateway})"));
+    Err(anyhow!("no default-route uplink found after 30 attempts"))
 }
 
-/// Whether the kernel has `ifc`.
-///
-/// The staged external name is derived from falcon's link-creation order
-/// (`VoxelConfig::router_ext_iface`), so a change to that order surfaces as a device
-/// this router does not have.
-fn link_exists(ifc: &str) -> bool {
-    capture("ip", &["-o", "link", "show", "dev", ifc]).is_some()
+fn parse_default_uplink(routes: &str) -> Option<String> {
+    routes.lines().find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        (fields.first() == Some(&"default"))
+            .then(|| {
+                fields
+                    .windows(2)
+                    .find(|p| p[0] == "dev")
+                    .map(|p| p[1].to_string())
+            })
+            .flatten()
+    })
 }
 
-/// Every link name the kernel reports, for naming what is present when a staged
-/// interface is not.
-fn link_names() -> Vec<String> {
-    capture("ip", &["-o", "link", "show"])
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .map(|n| n.trim_end_matches(':').to_string())
-        .collect()
-}
-
-fn uplink_iface() -> Option<String> {
-    if let Ok(v) = std::env::var("UPSTREAM_IFACE")
-        && !v.is_empty()
-    {
-        return Some(v);
-    }
-    // Isolated mode dictates the uplink up front (no DHCP to poll for).
-    //
-    // We handle it before the `lan`-mode default-route poll, yielding nothing when
-    // the device is absent: a NAT rule against it would never match, and
-    // `apply_static_external` has already reported it.
-    if let Some(ext) = read_external_net()
-        && let Some(ifc) = ext.iface
-    {
-        return link_exists(&ifc).then_some(ifc);
-    }
-    for _ in 0..30 {
-        if let Some(line) =
-            capture("ip", &["-o", "-4", "route", "show", "default"])
-        {
-            // "default via <gw> dev <iface> ...", so the iface is whitespace field 5.
-            if let Some(dev) = line.split_whitespace().nth(4)
-                && !dev.is_empty()
-            {
-                return Some(dev.to_string());
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    None
-}
-
-/// The directly-connected IPv4 subnet on `ifc` (its kernel scope-link route,
-/// e.g. "192.168.68.0/24"), the customer LAN the host reaches the rack from.
-/// None if it can't be read.
-fn uplink_subnet(ifc: &str) -> Option<String> {
-    let line = capture(
+fn uplink_subnet(ifc: &str) -> Result<String> {
+    let routes = capture_required(
         "ip",
         &["-o", "-4", "route", "show", "dev", ifc, "scope", "link"],
     )?;
-    let cidr = line.split_whitespace().next()?;
-    (cidr.contains('/') && cidr.contains('.')).then(|| cidr.to_string())
+    routes
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|cidr| cidr.contains('.') && cidr.contains('/'))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("no directly connected IPv4 subnet on {ifc}"))
+}
+
+fn nat_rules<'a>(ifc: &'a str, subnet: &'a str) -> [Vec<&'a str>; 2] {
+    [
+        vec![
+            "-t",
+            "nat",
+            "POSTROUTING",
+            "-o",
+            ifc,
+            "-d",
+            subnet,
+            "-j",
+            "RETURN",
+        ],
+        vec!["-t", "nat", "POSTROUTING", "-o", ifc, "-j", "MASQUERADE"],
+    ]
+}
+
+fn nat_rack_egress(ext: Option<&ExternalNet>) -> Result<()> {
+    let ifc = uplink_iface(ext)?;
+    let subnet = uplink_subnet(&ifc)?;
+    for (index, rule) in nat_rules(&ifc, &subnet).iter().enumerate() {
+        let mut check = rule.clone();
+        check.insert(2, "-C");
+        let status = run_status("iptables", &check)?.code();
+        if iptables_check_needs_add(status)? {
+            let mut add = rule.clone();
+            add.insert(2, if index == 0 { "-I" } else { "-A" });
+            if index == 0 {
+                add.insert(4, "1");
+            }
+            run_required("iptables", &add)?;
+            run_required("iptables", &check)?;
+        }
+    }
+    note(format!("NAT rack egress via {ifc}"));
+    Ok(())
+}
+
+fn iptables_check_needs_add(status: Option<i32>) -> Result<bool> {
+    match status {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        Some(code) => Err(anyhow!("iptables check failed with status {code}")),
+        None => Err(anyhow!("iptables check terminated without status")),
+    }
+}
+
+fn apply_static_edge_ip(ext: Option<&ExternalNet>) -> Result<()> {
+    let contents = match fs::read_to_string(STATIC_EDGE_IP) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("read staged static edge IP"),
+    };
+    let Some(ip) = staged_static_edge_ip(contents.as_deref())? else {
+        return Ok(());
+    };
+    let ifc = uplink_iface(ext)?;
+    let addresses =
+        capture_required("ip", &["-o", "-4", "addr", "show", "dev", &ifc])?;
+    if addresses
+        .split_whitespace()
+        .any(|t| t == ip || t.starts_with(&format!("{ip}/")))
+    {
+        return Ok(());
+    }
+    let prefix = match ext {
+        Some(ext) => uplink_ipv4_prefix(&format!("inet {}", ext.ip_cidr))?,
+        None => uplink_ipv4_prefix(&addresses)?,
+    };
+    run_required("ip", &["addr", "add", &format!("{ip}/{prefix}"), "dev", &ifc])
+}
+
+fn staged_static_edge_ip(contents: Option<&str>) -> Result<Option<String>> {
+    contents
+        .map(|s| {
+            let ip = s.trim();
+            if ip.is_empty() {
+                Err(anyhow!("staged static edge IP is empty"))
+            } else {
+                Ok(ip.to_string())
+            }
+        })
+        .transpose()
+}
+
+fn uplink_ipv4_prefix(addresses: &str) -> Result<u8> {
+    for pair in addresses.split_whitespace().collect::<Vec<_>>().windows(2) {
+        if pair[0] == "inet"
+            && let Some((ip, prefix)) = pair[1].split_once('/')
+            && ip.parse::<std::net::Ipv4Addr>().is_ok()
+            && let Ok(prefix) = prefix.parse::<u8>()
+            && prefix <= 32
+        {
+            return Ok(prefix);
+        }
+    }
+    Err(anyhow!("uplink address output contains no valid IPv4 prefix"))
 }
 
 fn apply_frr() -> Result<()> {
     let src = "/opt/cargo-bay/frr.conf";
-    if !Utf8Path::new(src).exists() {
-        bail!("{src} not staged");
+    if !Path::new(src).try_exists().context("check staged FRR config")? {
+        return Err(anyhow!("{src} not staged"));
     }
     fs::copy(src, "/etc/frr/frr.conf").context("apply frr.conf")?;
-    run("systemctl", &["restart", "frr"]);
-    Ok(())
+    run_required("systemctl", &["restart", "frr"])
+        .context("restart required FRR")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn isolated_static_precedes_nat() {
+        let p = router_plan(ExternalMode::Isolated);
+        assert!(
+            p.iter().position(|s| *s == RouterStep::StaticExternal)
+                < p.iter().position(|s| *s == RouterStep::Nat)
+        );
+        assert!(!p.contains(&RouterStep::UniqueDhcpLease));
+    }
+    #[test]
+    fn lan_pins_client_id() {
+        let p = router_plan(ExternalMode::Lan);
+        assert_eq!(p[1], RouterStep::UniqueDhcpLease);
+        assert!(uplink_network_config("e0").contains("ClientIdentifier=mac"));
+    }
+    #[test]
+    fn staged_and_override_need_no_route() {
+        assert_eq!(
+            select_uplink(Some("override"), Some("staged"), None),
+            Some("override")
+        );
+        assert_eq!(select_uplink(None, Some("staged"), None), Some("staged"));
+    }
+    #[test]
+    fn return_precedes_masquerade() {
+        let r = nat_rules("e0", "192.0.2.0/24");
+        assert_eq!(r[0].last(), Some(&"RETURN"));
+        assert_eq!(r[1].last(), Some(&"MASQUERADE"));
+    }
+    #[test]
+    fn iptables_status_is_strict() {
+        assert!(!iptables_check_needs_add(Some(0)).unwrap());
+        assert!(iptables_check_needs_add(Some(1)).unwrap());
+        assert!(iptables_check_needs_add(Some(2)).is_err());
+        assert!(iptables_check_needs_add(None).is_err());
+    }
+    #[test]
+    fn sentinel_only_after_success() {
+        let mut out = vec![];
+        assert!(
+            finish_bring_up(Err(anyhow!("fail")), |s| out.push(s.to_string()))
+                .is_err()
+        );
+        assert!(out.is_empty());
+        finish_bring_up(Ok(()), |s| out.push(s.to_string())).unwrap();
+        assert_eq!(out, [ROUTER_COMPLETE_SENTINEL]);
+    }
+    #[test]
+    fn required_error_stops_plan() {
+        let mut seen = vec![];
+        let r = execute_plan(&router_plan(ExternalMode::Lan), |s| {
+            seen.push(s);
+            if s == RouterStep::Nat { Err(anyhow!("nat")) } else { Ok(()) }
+        });
+        assert!(r.is_err());
+        assert_eq!(seen.last(), Some(&RouterStep::Nat));
+        assert!(!seen.contains(&RouterStep::Frr));
+    }
+    #[test]
+    fn parses_prefix_and_default() {
+        assert_eq!(uplink_ipv4_prefix("inet 192.0.2.2/22").unwrap(), 22);
+        assert_eq!(
+            parse_default_uplink("default via 1.1.1.1 dev e0"),
+            Some("e0".into())
+        );
+    }
 }

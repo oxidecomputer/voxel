@@ -73,6 +73,33 @@ pub struct VoxelConfig {
     /// doesn't grow a section the operator never set.
     #[serde(default, skip_serializing_if = "External::is_default")]
     pub external: External,
+    pub disk_wear: DiskWear,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiskWear {
+    pub host_sync_disabled: bool,
+    pub host_compression: bool,
+    pub guest_zfs_tuning: bool,
+}
+
+impl DiskWear {
+    pub fn host_zfs_props(&self) -> Vec<&'static str> {
+        let mut props = Vec::new();
+        if self.host_sync_disabled {
+            props.push("sync=disabled");
+        }
+        if self.host_compression {
+            props.extend([
+                "compression=lz4",
+                "atime=off",
+                "logbias=throughput",
+                "redundant_metadata=most",
+            ]);
+        }
+        props
+    }
 }
 
 /// Provisioning mode for the nodes' external (host-LAN) links.
@@ -447,6 +474,18 @@ impl Topology {
     /// Sleds that join RSS: explicit `rss_sleds` if non-zero, else all sleds.
     pub fn rss_count(&self) -> usize {
         if self.rss_sleds > 0 { self.rss_sleds } else { self.sleds }
+    }
+
+    pub fn validate_rss_membership(&self) -> Result<(), String> {
+        let count = self.rss_count();
+        if count < 3 || count > self.sleds {
+            Err(format!(
+                "topology.rss_sleds resolves to {count}, but each {}-sled rack requires 3..={} RSS participants",
+                self.sleds, self.sleds
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Expand into per-sled descriptors across all racks. Rack `r` owns

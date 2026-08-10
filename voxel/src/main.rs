@@ -29,6 +29,7 @@ mod isolated_external;
 mod net;
 mod network;
 mod patch;
+mod perftest;
 mod rack;
 mod rss;
 mod rss_request;
@@ -196,6 +197,12 @@ enum Cmd {
         /// Arguments passed to Omicron commtest (place them after `--`).
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Run the internal disk-wear measurement harness.
+    #[command(hide = true)]
+    Perftest {
+        #[command(subcommand)]
+        cmd: perftest::PerftestCmd,
     },
 }
 
@@ -804,6 +811,9 @@ async fn main() -> Result<(), Error> {
                 passthrough: args,
             },
         ),
+        Cmd::Perftest { cmd } => {
+            perftest::run(cmd, cfg.as_ref(), &cli.name).await
+        }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
             ImageCmd::Patch { component, reference, image, out } => {
