@@ -1,4 +1,4 @@
-//! The Voxel configuration model - the single source of truth `voxel` renders
+//! The voxel configuration model—the single source of truth `voxel` renders
 //! every per-node config from, persisted as `voxel.toml`.
 //!
 //! This replaces both a4x2's static per-sled config files and the hardcoded
@@ -59,7 +59,7 @@ pub const SLED_SERIAL_PREFIX: &str = "2FAKE00";
 /// A hardcoded part number for all fake sleds
 pub const SLED_PART_NUMBER: &str = "913-0000019";
 
-/// Top-level Voxel configuration (`voxel.toml`).
+/// Top-level voxel configuration (`voxel.toml`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VoxelConfig {
@@ -264,6 +264,17 @@ pub struct Falcon {
     /// Exported as `BUILD_ROOT`. `None` -> env, else the `$HOME/voxel-builds`
     /// default. Lets a non-root user build images outside `/root`.
     pub build_root: Option<String>,
+    /// `propolis-server` binary the host runs each node under. `None` -> falcon's
+    /// own `<falcon_dir>/bin/propolis-server`, which it downloads on demand.
+    ///
+    /// Set this to run under a locally built propolis, e.g. when a device-model
+    /// fix has not reached a release yet. Falcon skips its download when the path
+    /// is set (`Runner::set_propolis_binary`), the equivalent of a4x2's
+    /// `FALCON_PROPOLIS_BINARY`.
+    ///
+    /// Applies to rack nodes only. The image-build VM keeps falcon's own
+    /// binary.
+    pub propolis_binary: Option<String>,
 }
 
 /// SP provider selection: which SPs (if any) run on the real-firmware emulator
@@ -671,7 +682,8 @@ pub struct Network {
     pub dns_servers: Vec<String>,
     /// IPv6 `/56`. Empty -> not emitted.
     pub rack_subnet: String,
-    /// `internal_services_ip_pool_ranges` (single range).
+    /// Service IP pool (single range). Rendered as the rack's sole
+    /// `service_ip_pools` entry.
     pub service_pool_first: String,
     pub service_pool_last: String,
     pub bgp_asn: u32,

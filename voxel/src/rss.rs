@@ -115,43 +115,43 @@ pub(crate) async fn watch_rss(
     watch_rss_loop(d, tag, &curl, rss_ip, cap).await;
 }
 
-/// Serial-console IP discovery (`lan` mode). Bounded; `None` if the IP never
-/// appears within the window - the caller stops watching and the rack keeps
-/// converging on its own.
+/// Serial-console IP discovery (`lan` mode).
+///
+/// Each read runs under [`crate::net::serial_bounded_within`], capped at the
+/// window's remainder so one slow read cannot stretch it, retrying while the
+/// window lasts (the DHCP lease can land a few seconds after bring-up).
+///
+/// Returns `None` if the IP never appears within the window, where the caller
+/// stops watching and the rack keeps converging on its own.
 async fn discover_rss_ip(
     d: &Runner,
     rss: NodeRef,
     tag: &str,
 ) -> Option<String> {
+    const RETRY_SPACING: Duration = Duration::from_secs(5);
     let ip_deadline = Instant::now() + Duration::from_secs(60);
-    let rss_ip = loop {
-        match tokio::time::timeout(
-            crate::net::SERIAL_RESOLVE_TIMEOUT,
+    loop {
+        match crate::net::serial_bounded_within(
+            &format!("{tag}: reading the RSS node's IP"),
+            ip_deadline,
             crate::net::node_external_ip(d, rss, false),
         )
         .await
         {
-            Ok(Ok(ip)) => break ip,
-            Ok(Err(e)) if Instant::now() >= ip_deadline => {
+            Ok(ip) => break Some(ip),
+            // Stop once the next attempt would start at or past the deadline,
+            // so a retry can't stretch the window by another full read.
+            Err(e) if Instant::now() + RETRY_SPACING >= ip_deadline => {
                 warn!(
                     d.log,
                     "{tag}: can't find the RSS node's IP to watch over SSH ({e}); \
                     bring-up continues - check `voxel status` / the console"
                 );
-                return None;
+                break None;
             }
-            Err(_) if Instant::now() >= ip_deadline => {
-                warn!(
-                    d.log,
-                    "{tag}: timed out finding the RSS node's IP; bring-up \
-                    continues - check `voxel status` / the console"
-                );
-                return None;
-            }
-            _ => tokio::time::sleep(Duration::from_secs(5)).await,
+            Err(_) => tokio::time::sleep(RETRY_SPACING).await,
         }
-    };
-    Some(rss_ip)
+    }
 }
 
 /// Poll the bootstrap-agent's `/rack-initialize` over SSH until it initializes,

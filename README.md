@@ -177,12 +177,13 @@ Operator commands (the same code paths launch uses):
 ```
 voxel network external up      # stand the segment up (--dry-run to preview)
 voxel network external check   # PASS/FAIL per item (uplink, links, NAT)
-voxel network external down    # remove VNIC + etherstub
+voxel network external down    # remove VNIC + etherstub + NAT rules
 ```
 
 Notes:
-- `down` leaves the ipnat rule and ipv4-forwarding in place: ipnat has no
-  single-rule delete, and flushing would drop unrelated rules.
+- `down` removes voxel's two map rules with `ipnat -r`, which deletes only
+  the matching rules, so unrelated rules survive. ipv4-forwarding stays
+  enabled, as it is a host-global setting.
 - Unlike the how-to-run recipe, voxel never persists the NAT rules to
   `/etc/ipf/ipnat.conf`: they are loaded at runtime only, so voxel doesn't
   own a shared system file. They don't survive a reboot, and the next

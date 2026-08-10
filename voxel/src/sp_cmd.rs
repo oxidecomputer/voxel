@@ -10,7 +10,7 @@
 //!    (`inventory`, `component-details`, `read-sensor-value`, `dump`,
 //!    `read-caboose`, `power-state`, `rot-boot-info`, ...).
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use indoc::formatdoc;
 use voxel_config::sp::{
@@ -21,8 +21,8 @@ use voxel_config::{SLED_SERIAL_PREFIX, VoxelConfig};
 use crate::SpCmd;
 use crate::access::resolve_switch;
 use crate::net::{
-    SERIAL_RESOLVE_TIMEOUT, SWITCH_ZONE_ROOT, resolve_external_ip, scp_from,
-    scp_to, ssh_capture, ssh_output, zlogin,
+    SWITCH_ZONE_ROOT, resolve_external_ip, scp_from, scp_to, serial_bounded,
+    ssh_capture, ssh_output, zlogin,
 };
 use crate::topo::{Topo, build_topo};
 use crate::util::shell_quote;
@@ -235,8 +235,8 @@ fn faux_on(
 /// The scrimlet host-LAN IP whose switch zone we drive faux-mgs in. Cached per
 /// scrimlet so repeated `sp` calls skip the serial-console IP lookup (the console
 /// wedges under RSS/console load; ssh to the cached IP is unaffected). The first
-/// lookup is bounded so a wedged console fails fast instead of hanging; a stale
-/// cache (after a relaunch) is cleared on the next ssh miss by the callers.
+/// lookup runs under [`serial_bounded`]'s two-stage deadline. A stale cache
+/// (after a relaunch) is cleared on the next ssh miss by the callers.
 async fn switch_ip(
     cfg: &VoxelConfig,
     topo: &Topo,
@@ -246,18 +246,14 @@ async fn switch_ip(
     if let Some(ip) = read_cached_ip(&sw) {
         return Ok((fleet, ip, sw));
     }
-    let ip = tokio::time::timeout(
-        SERIAL_RESOLVE_TIMEOUT,
+    let ip = serial_bounded(
+        &format!("resolving {sw}'s IP"),
         resolve_external_ip(cfg, &topo.runner, &sw, node, false),
     )
     .await
-    .map_err(|_| {
-        anyhow!(
-            "timed out resolving {sw}'s IP over the serial console (it can wedge under \
-                 console/RSS load). Retry shortly, or once `voxel host ls` works."
-        )
-    })?
-    .map_err(|e| anyhow!("{e} - is the rack up? (`voxel status`)"))?;
+    .context(
+        "is the rack up? (`voxel status`). Retry once `voxel host ls` works.",
+    )?;
     write_cached_ip(&sw, &ip);
     Ok((fleet, ip, sw))
 }

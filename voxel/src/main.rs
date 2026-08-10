@@ -159,7 +159,7 @@ enum Cmd {
     /// Build and run Omicron's commit-matched end-to-end connectivity test.
     ///
     /// Arguments after `--` are passed directly to commtest. If no command is
-    /// supplied, defaults to `run`; Voxel supplies the rack API and a test IP
+    /// supplied, defaults to `run`; voxel supplies the rack API and a test IP
     /// pool unless those are explicitly overridden.
     Commtest {
         /// Omicron commit/tag to test, or `main` for the latest upstream.
@@ -370,8 +370,8 @@ enum ExternalCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Tear the segment down (VNIC + etherstub ~ the ipnat rule and
-    /// ipv4-forwarding stay).
+    /// Tear the segment down (VNIC + etherstub + NAT rules ~ ipv4-forwarding
+    /// stays).
     Down {
         /// Print the host commands instead of running them.
         #[arg(long)]

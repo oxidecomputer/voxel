@@ -4,7 +4,8 @@
 use anyhow::Context;
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use crate::rss::strip_ansi;
 
@@ -12,6 +13,10 @@ use crate::rss::strip_ansi;
 /// in-zone path to reach the same file from the GZ (e.g. `{SWITCH_ZONE_ROOT}{p}`).
 /// Single source for the handful of GZ-rooted switch-zone paths voxel touches.
 pub(crate) const SWITCH_ZONE_ROOT: &str = "/zone/oxz_switch/root";
+
+/// Absolute path to `route`. Not all invoking shells carry /usr/sbin on PATH
+/// (commtest re-executes voxel under a fresh login), so spawn it absolutely.
+pub(crate) const ROUTE: &str = "/usr/sbin/route";
 
 /// The `zlogin` invocation prefix for the switch zone. Use [`zlogin`] to build a
 /// full command; this bare form is for the interactive login (no command).
@@ -24,10 +29,102 @@ pub(crate) fn zlogin(cmd: &str) -> String {
     format!("{ZLOGIN} {cmd}")
 }
 
-/// Bound on a serial-console IP resolution. The exec itself completes in a few
-/// seconds, so this only matters when the console is wedged, where callers
-/// should fail fast instead of hanging.
+/// Soft bound on a serial-console resolution. The exec itself completes in a
+/// few seconds, so blowing this means the console is slow or wedged.
+/// [`serial_bounded`] warns here and keeps waiting rather than cancelling,
+/// because cancelling the exec is what wedges the console.
 pub(crate) const SERIAL_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Hard bound on a serial-console resolution. Giving up here abandons the exec
+/// mid-flight, which can wedge the console, but a console this far past the
+/// few-second norm is already unusable.
+pub(crate) const SERIAL_RESOLVE_HARD_TIMEOUT: Duration =
+    Duration::from_secs(60);
+
+/// Run a serial-console exec under the two-stage deadline. Cancelling an
+/// in-flight falcon exec leaves the console wedged for every later exec (see
+/// [`resolve_external_ip`]), so a slow exec is not cancelled at
+/// [`SERIAL_RESOLVE_TIMEOUT`]. It gets a warning and keeps running to
+/// [`SERIAL_RESOLVE_HARD_TIMEOUT`], where only a console that is already
+/// unusable is abandoned. `what` names the operation in both messages.
+///
+/// The hard deadline is a deliberate trade-off: it still drops the exec
+/// mid-flight, and truly never cancelling would need a detached exec that
+/// falcon's serial API does not offer. These execs answer in a few seconds
+/// on a healthy console, so 60s of silence means the console is already
+/// wedged and there is nothing left for cancellation to break.
+///
+/// # Errors
+///
+/// Fails when the exec itself fails, or with a timeout error past the hard
+/// deadline.
+pub(crate) async fn serial_bounded<T>(
+    what: &str,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    serial_bounded_caps(
+        what,
+        SERIAL_RESOLVE_TIMEOUT,
+        SERIAL_RESOLVE_HARD_TIMEOUT,
+        fut,
+    )
+    .await
+}
+
+/// Like [`serial_bounded`], but never waits past `deadline`. Retry loops use
+/// this so one slow attempt cannot stretch their overall window: the hard
+/// deadline shrinks to the window's remainder. Abandoning at the window's
+/// edge carries the same wedge risk as the hard deadline, and these callers
+/// stop using the console once the window closes anyway.
+///
+/// # Errors
+///
+/// As [`serial_bounded`], with the timeout landing at `deadline` when that
+/// comes first.
+pub(crate) async fn serial_bounded_within<T>(
+    what: &str,
+    deadline: Instant,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    serial_bounded_caps(
+        what,
+        SERIAL_RESOLVE_TIMEOUT.min(remaining),
+        SERIAL_RESOLVE_HARD_TIMEOUT.min(remaining),
+        fut,
+    )
+    .await
+}
+
+/// Shared two-stage implementation: warn at `soft`, abandon at `hard`.
+async fn serial_bounded_caps<T>(
+    what: &str,
+    soft: Duration,
+    hard: Duration,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(fut);
+    if let Ok(res) = tokio::time::timeout(soft, &mut fut).await {
+        return res;
+    }
+    if hard > soft {
+        eprintln!(
+            "[voxel] {what}: no answer from the serial console after {}s. Waiting up to {}s \
+             rather than cancelling, since a cancelled exec wedges the console.",
+            soft.as_secs(),
+            hard.as_secs()
+        );
+        if let Ok(res) =
+            tokio::time::timeout(hard.saturating_sub(soft), &mut fut).await
+        {
+            return res;
+        }
+    }
+    anyhow::bail!(
+        "{what}: serial console unresponsive after {}s",
+        hard.as_secs()
+    )
+}
 
 /// Resolve a node's external IPv4 without entering the guest when possible.
 /// Isolated mode numbers every node deterministically
@@ -319,7 +416,7 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
 /// The gateways currently routing `dest` (an IPv4 network address like
 /// `198.51.100.0`), read from `netstat -rn -f inet`. Used to purge every stale
 /// route for a prefix - dead-ce gateways from prior launches pile up otherwise.
-fn route_gateways(dest: &str) -> Vec<String> {
+pub(crate) fn route_gateways(dest: &str) -> Vec<String> {
     let out = match std::process::Command::new("netstat")
         .args(["-rn", "-f", "inet"])
         .output()
@@ -349,7 +446,12 @@ pub(crate) async fn set_external_route(
     // lookup. Otherwise read ce's DHCP lease as before.
     let ip = match static_ip {
         Some(s) => s.to_string(),
-        None => node_external_ip(d, ce, true).await.context("ce")?,
+        None => serial_bounded(
+            "ce: reading its DHCP lease",
+            node_external_ip(d, ce, true),
+        )
+        .await
+        .context("ce")?,
     };
 
     if !apply {
@@ -366,14 +468,13 @@ pub(crate) async fn set_external_route(
     // confirm the final state.
     let dest = prefix.split('/').next().unwrap_or(prefix);
     for gw in route_gateways(dest) {
-        let _ = std::process::Command::new("route")
+        let _ = std::process::Command::new(ROUTE)
             .args(["delete", prefix, &gw])
             .output();
     }
     for _ in 0..8 {
-        let out = std::process::Command::new("route")
-            .args(["delete", prefix])
-            .output();
+        let out =
+            std::process::Command::new(ROUTE).args(["delete", prefix]).output();
         let gone = match out {
             Ok(o) => {
                 String::from_utf8_lossy(&o.stdout).contains("not in table")
@@ -384,11 +485,11 @@ pub(crate) async fn set_external_route(
             break;
         }
     }
-    let add = std::process::Command::new("route")
+    let add = std::process::Command::new(ROUTE)
         .args(["add", prefix, &ip])
         .output()
         .context("route add")?;
-    let resolves = std::process::Command::new("route")
+    let resolves = std::process::Command::new(ROUTE)
         .args(["-n", "get", dest])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(&ip))

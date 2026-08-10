@@ -292,7 +292,7 @@ pub(crate) async fn validate(
             .next()
             .unwrap_or(&net.infra_prefix)
             .to_string();
-        let gw = std::process::Command::new("route")
+        let gw = std::process::Command::new(crate::net::ROUTE)
             .args(["-n", "get", &dest])
             .output()
             .ok()

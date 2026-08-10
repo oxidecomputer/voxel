@@ -18,9 +18,9 @@
 //! boot. This is why the launch owns it.
 //!
 //! Everything here is idempotent (guarded by the matching `show-*` probe) and
-//! transient (`-t` flags), except the ipnat rule and IPv4 forwarding: ipnat
-//! has no single-rule delete and flushing would clobber unrelated rules, so
-//! `down` leaves both in place and says so.
+//! transient (`-t` flags). `down` removes the NAT rules with `ipnat -r`,
+//! which deletes only the rules matching the piped text, so unrelated rules
+//! survive. IPv4 forwarding stays enabled, as it is a host-global setting.
 //!
 //! [how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
 
@@ -235,19 +235,37 @@ fn nat_loaded(uplink: &str, subnet: &str) -> bool {
 /// Append the NAT rules via `ipnat -f -`. This is append-only and never
 /// flushes, so unrelated rules survive.
 fn load_nat(uplink: &str, subnet: &str, dry_run: bool) -> anyhow::Result<()> {
+    pipe_nat(uplink, subnet, &["ipnat", "-f", "-"], dry_run)
+}
+
+/// Remove the NAT rules via `ipnat -r -f -`. The `-r` flag deletes exactly
+/// the rules matching the piped text, so unrelated rules survive. Removing
+/// an absent rule prints a warning but exits 0, which keeps this idempotent.
+fn unload_nat(uplink: &str, subnet: &str, dry_run: bool) -> anyhow::Result<()> {
+    pipe_nat(uplink, subnet, &["ipnat", "-r", "-f", "-"], dry_run)
+}
+
+/// Pipe the subnet's rule text into `pfexec <args>` on stdin.
+fn pipe_nat(
+    uplink: &str,
+    subnet: &str,
+    args: &[&str],
+    dry_run: bool,
+) -> anyhow::Result<()> {
     let rules = nat_rules(uplink, subnet).join("\n");
+    let cmd = args.join(" ");
     if dry_run {
         eprintln!(
-            "+ printf '{}\\n' | pfexec ipnat -f -",
+            "+ printf '{}\\n' | pfexec {cmd}",
             rules.replace('\n', "\\n")
         );
         return Ok(());
     }
     let mut child = Command::new("pfexec")
-        .args(["ipnat", "-f", "-"])
+        .args(args)
         .stdin(Stdio::piped())
         .spawn()
-        .context("spawning pfexec ipnat -f -")?;
+        .with_context(|| format!("spawning pfexec {cmd}"))?;
     child
         .stdin
         .take()
@@ -256,7 +274,7 @@ fn load_nat(uplink: &str, subnet: &str, dry_run: bool) -> anyhow::Result<()> {
         .context("writing NAT rules to ipnat")?;
     let st = child.wait().context("waiting for ipnat")?;
     if !st.success() {
-        bail!("ipnat -f - failed ({st})");
+        bail!("{cmd} failed ({st})");
     }
     Ok(())
 }
@@ -356,8 +374,8 @@ pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Tear the segment down, including address, interface, VNIC, etherstub. The
-/// ipnat rule and IPv4 forwarding stay around (see module doc).
+/// Tear the segment down, including address, interface, VNIC, etherstub, and
+/// the NAT rules. IPv4 forwarding stays enabled (see module doc).
 ///
 /// # Errors
 ///
@@ -385,9 +403,9 @@ pub(crate) fn down(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
     if let Some(uplink) = x.uplink.as_deref()
         && nat_loaded(uplink, &x.subnet)
     {
+        unload_nat(uplink, &x.subnet, dry_run)?;
         eprintln!(
-            "[voxel] external: leaving ipnat rule + ipv4-forwarding in place \
-             (ipnat has no single-rule delete; flushing would drop unrelated rules)"
+            "[voxel] external: leaving ipv4-forwarding enabled (host-global setting)"
         );
     }
     Ok(())

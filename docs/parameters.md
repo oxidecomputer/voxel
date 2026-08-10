@@ -36,7 +36,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
-| `disks_schema` | enum | unset | `vdevs` or `external_disks`. Unset auto-detects from the image. |
+| `disks_schema` | enum | unset | `vdevs`, `external_disks`, or `hardcoded` (omicron#10948). Unset auto-detects from the image. |
 
 ## [network]
 
@@ -101,6 +101,7 @@ Runtime paths. Each unset value resolves via env then built-in default.
 | `dataset` | string | `$FALCON_DATASET`, else `rpool/falcon` | ZFS dataset. |
 | `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/` and `.falcon/` live under. Absolute. |
 | `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkouts). |
+| `propolis_binary` | string | unset | `propolis-server` the host runs each node under. Unset leaves falcon's own binary, which it downloads on demand. Set it to run a locally built propolis, e.g. for a device-model fix that has not reached a release. Rack nodes only, as the image-build VM keeps falcon's binary. |
 
 ## [sp]
 
