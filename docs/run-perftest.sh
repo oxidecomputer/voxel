@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 
-# Run a storage matrix, or combine completed matrices with Voxel's native
-# reporting command.  This deliberately requires Bash for printf %q.
+# Run a storage matrix, or adapt completed matrices and publish them through
+# Cookout via Voxel's compatibility command. This deliberately requires Bash
+# for printf %q.
+
+# Matrix checkpoints can contain operational diagnostics. Keep the run
+# directory, logs, invocation, and reports private regardless of the caller's
+# ambient umask.
+umask 077
 
 usage() {
 	cat >&2 <<'EOF'
@@ -69,6 +75,8 @@ run_matrix() {
 	local -a options=("$@")
 	make_output_dir perftest "$label"
 	printf '%s\n' "$$" > "$OUTPUT_DIR/batch.pid" || die 'could not write batch PID'
+	local artifact_owner
+	artifact_owner=$(id -u):$(id -g) || die 'could not identify artifact owner'
 
 	local -a command defaults=() canonical_options=()
 	has_option --workload "${options[@]}" || defaults+=(--workload api-disk-lifecycle)
@@ -86,7 +94,7 @@ run_matrix() {
 
 	if {
 		printf '[batch] started: %s pid=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$$"
-		"${command[@]}"
+		VOXEL_PERFTEST_ARTIFACT_OWNER=$artifact_owner "${command[@]}"
 	} > "$OUTPUT_DIR/storage-levers.log" 2>&1; then
 		matrix_rc=0
 	else

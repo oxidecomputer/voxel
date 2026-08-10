@@ -19,8 +19,36 @@ optional follow-up for the finalists:
 | --- | --- | --- |
 | wear | NVMe bytes written, scoped to the Falcon pool's drives | `matrix` `BRING-UP` and optional `WORKLOAD` columns |
 | fast | rack bring-up time | `matrix` `LAUNCH` column |
-| fits | peak host RAM | `matrix` `PEAK-RAM` column |
+| fits | peak launch-window host RAM increase above baseline | `matrix` `LAUNCH ΔRAM` column; optional workload increase is `WORKLOAD ΔRAM` |
 | smooth | control-plane operation latency and jitter | optional `perftest smooth` follow-up |
+
+## Voxel and Cookout boundary
+
+Voxel owns the platform-specific side of the workflow: rack lifecycle,
+Falcon and ZFS state, NVMe and host-memory collection, `omdb` and Oxide API
+workloads, durable matrix checkpoints, cleanup, and validation and conversion
+of supported Voxel result artifacts into Cookout evidence. Cookout is a
+platform-neutral library and CLI. It validates that evidence and owns reusable
+cohorting, statistics, comparison, projection, report publication, archive
+replay, and aggregation.
+
+`voxel perftest report`, `superreport`, and `compare` are compatibility entry
+points. They adapt Voxel matrix artifacts and delegate the reusable work to
+Cookout while retaining Voxel's existing command syntax and compare output.
+Cookout does not launch a rack, inspect a host, invoke Falcon, ZFS, NVMe,
+`omdb`, or the Oxide CLI, or read credentials.
+
+Voxel follows the default branch of the reviewed Cookout repository:
+
+```toml
+cookout = { git = "https://github.com/oxidecomputer/cookout.git" }
+```
+
+`Cargo.lock` records the exact Cookout commit resolved for a given Voxel
+revision. Updating the dependency advances that lock entry to the latest
+default-branch commit. The development and reporting commands do not push
+either repository, create remotes, alter repository history, or otherwise
+perform network operations at runtime.
 
 `matrix` runs the normal fail-closed launch path. A successful repeat therefore
 requires the router and gimlet completion milestones, RSS completion, external
@@ -40,12 +68,33 @@ immediately rather than continuing from uncertain state.
 ### 1. Build and retain the exact Voxel binary under test
 
 ```sh
-cargo build -p voxel
-cargo test -p voxel perftest::       # run on Helios
+cargo fmt --all -- --check
+cargo clippy --locked -p voxel --all-targets -- -D warnings
+cargo test --locked -p voxel         # includes cookout_report_parity; run on Helios
+cargo build --release --locked -p voxel
+VOXEL_BIN="$PWD/target/release/voxel"
 ```
 
-Do not rebuild or switch Voxel revisions during the benchmark. Record the
-binary version or source revision with the results.
+Do not rebuild or switch Voxel revisions during the benchmark. Keep
+`VOXEL_BIN` pointed at that retained release binary, and record its source
+revision with the results. The package-wide test command is intentional: a
+`perftest::` name filter does not run the `cookout_report_parity` integration
+test.
+
+Cookout itself is portable. In its checkout, run the complete ordinary-host
+gate before copying Voxel to Helios:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
+Voxel links Helios platform libraries. `cargo check -p voxel --tests` is useful
+for source validation on a development host, but run Voxel perftest tests,
+Voxel Clippy, and all rack- or host-interacting Voxel commands in this runbook
+on Helios. Cookout's standalone validation, reporting, comparison, and
+aggregation commands are portable.
 
 ### 2. Use a dedicated measurement pool
 
@@ -113,12 +162,30 @@ unset EXT_INTERFACE EXT_EXCLUSIVE
 ### 4. Dry-run the initial topology
 
 Before starting the matrix, launch and destroy the configured topology once to
-catch setup problems that would otherwise invalidate multiple runs:
+catch setup problems that would otherwise invalidate multiple runs. Do not skip
+this on a fresh workdir: normal launch creates the per-node `cargo-bay/`
+directories that the matrix's initial clean-boundary check expects.
 
 ```sh
-pfexec voxel launch
-pfexec voxel destroy
+pfexec "$VOXEL_BIN" launch
+pfexec "$VOXEL_BIN" network validate
+pfexec "$VOXEL_BIN" destroy
 ```
+
+When the matrix will use `api-disk-lifecycle`, also run its destructive
+end-to-end preflight once. It proves a clean initial boundary, launches the
+rack, provisions the isolated recovery-silo profile, executes the fixed 20-disk
+API lifecycle, and restores the final boundary:
+
+```sh
+pfexec "$VOXEL_BIN" perftest preflight \
+  --workload api-disk-lifecycle
+```
+
+Pass the same `--oxide-auth-helper PATH` that the matrix will use when the
+configured recovery credentials require it. A normal launch/destroy proves the
+rack lifecycle; `preflight` additionally proves the API workload. Neither is a
+performance sample.
 
 ## Run the storage-lever matrix
 
@@ -141,12 +208,33 @@ PFEXEC=/usr/bin/pfexec \
   docs/run-perftest.sh run api-lifecycle
 ```
 
+Voxel's global options are accepted after `perftest matrix`, so they may be
+passed through the wrapper with the matrix options. Use explicit paths for a
+disposable checkout or isolated smoke environment rather than relying on
+configuration discovery:
+
+```sh
+VOXEL_BIN=$HOME/bin/voxel-under-test \
+  docs/run-perftest.sh run isolated-smoke \
+  --config /var/tmp/voxel-smoke/voxel.toml \
+  --workdir /var/tmp/voxel-smoke/voxel-image \
+  --dataset testbed/falcon-smoke \
+  --repeat 1 \
+  --combos none
+```
+
+The workdir must be the project root under which Voxel manages `cargo-bay/`
+and `.falcon/`; it is not the results directory. The explicit dataset overrides
+`[falcon].dataset` for that invocation. Complete the launch/destroy preparation
+above in the same workdir before starting its first matrix.
+
 Labels may contain only ASCII letters, digits, dots, underscores, and hyphens.
 By default `run` supplies `--workload api-disk-lifecycle`, `--repeat 3`, and
 `--keep-going`. The operator wrapper always enables Voxel's presence-only
 `--keep-going` flag: it removes every exact caller-supplied `--keep-going` and
-appends one canonical flag, so Voxel always receives exactly one. Boolean
-assignment forms are not wrapper controls.
+appends one canonical flag. Do not use an assignment form such as
+`--keep-going=true`: the wrapper forwards it in addition to the canonical flag,
+and Voxel rejects it because `--keep-going` takes no value.
 It also uses the matrix's built-in cumulative ladder because it does not supply
 `--combos`. Any matrix option may follow the label. The workload and repeat
 defaults are overrideable: supplying `--workload` or `--repeat` explicitly
@@ -168,11 +256,27 @@ exclusively as:
 $RESULTS_ROOT/perftest-YYYYMMDD-HHMMSS-LABEL-PID/
 ├── batch.pid
 ├── invocation.txt
+├── report.log
+├── report/
+├── report.tar.gz
 ├── storage-levers.csv
 ├── storage-levers.json
 ├── storage-levers.log
 └── batch.status
 ```
+
+`report.log`, `report/`, and `report.tar.gz` are conditional. Whenever
+`storage-levers.json` exists, the wrapper attempts an unprivileged
+Cookout-backed Voxel report and archive even if the matrix exits nonzero.
+`batch.status` records the matrix exit status, not the report status; the report
+status is recorded in `storage-levers.log`. If the matrix succeeds but report
+generation fails, the wrapper exits with the report status. After the
+privileged matrix finishes each private checkpoint or the final CSV, it
+transfers the open temporary file to the invoking user before atomically
+installing it. Reporting therefore needs no privileged pathname operation and
+the artifacts are never world-readable. The wrapper sets `umask 077`, so the
+run/comparison directories, logs, invocation metadata, and reports are private
+even when the invoking shell has a permissive umask.
 
 `invocation.txt` is the shell-escaped effective command. Standard output and
 standard error, including `[batch]` start and finish records, go to
@@ -203,6 +307,15 @@ Launch retry errors remain bounded prior-attempt evidence on the requested
 repeat. Boundary outcomes are `pending`, `clean`, or `failure`; launch outcomes
 are `pending`, `success`, or `failure`; workload outcomes are `pending`,
 `not_requested`, `success`, or `failure`.
+
+Workloads are not rerun after failure, but the API disk lifecycle has bounded
+operation-local recovery. Idempotent quota updates receive three attempts;
+owned disk deletes receive ten. Disk creation retries an explicit HTTP 5xx at
+most twice and only after five successful inventory reads prove the exact
+nonce-owned disk remains absent. Status-less create failures are never
+resubmitted and instead use bounded reconciliation. Provisioning has a
+120-second deadline, and disk settlement is polled for about five minutes in
+both the measured operation and cleanup.
 
 The matrix checkpoints after every meaningful transition, including:
 
@@ -254,7 +367,9 @@ The default ladder tests `none`, `1`, `1+2`, `1+2+3`, and `all` (`1+2+3+4`):
 
 1. host `sync=disabled`;
 2. host compression and metadata tuning;
-3. guest `rpool` plus `oxi_*`/`oxp_*` tuning; and
+3. guest ZFS tuning: the bounded tuner attempts `rpool` and every non-`rpool`
+   pool it discovers, while matrix evidence verifies `rpool` and the
+   `oxi_*`/`oxp_*` pools; and
 4. reduced RSS participation.
 
 Each combination is exact: named levers are enabled and omitted levers are
@@ -272,23 +387,34 @@ does not update guest-side lever behavior; after changing `voxel-init`, rebuild
 or reimport the configured CP image before running the matrix.
 
 Select a workload with `--workload <name>`. The wrapper's default,
-`api-disk-lifecycle`, requires an authenticated `oxide` CLI and adds a separate
-`WORKLOAD` result for each combination. Use the matrix help to select a
-different supported workload explicitly.
+`api-disk-lifecycle`, provisions an isolated temporary `oxide` profile from the
+configured recovery silo and adds a separate `WORKLOAD` result for each
+combination. For a custom recovery password hash, pass `--oxide-auth-helper` to
+populate that private profile. The workflow never consumes a pre-authenticated
+global CLI profile. Use the matrix help to select a different supported
+workload explicitly.
 
 ## Choose the result
 
-The table reports mean `BRING-UP`, `RATE/s`, `LAUNCH`, and `PEAK-RAM` values,
-plus `CV%` for bring-up wear when a combination has repeated samples. Choose the
-combination with the lowest `BRING-UP` wear whose launch time and peak RAM are
-acceptable. If the difference between combinations is comparable to their
-run-to-run variation, increase `--repeat` before calling a winner.
+At completion, `perftest matrix` prints an immediate terminal summary table and
+writes the raw CSV and JSON artifacts. That table reports mean `BRING-UP`,
+`RATE/s`, `LAUNCH`, and `LAUNCH ΔRAM` values, plus `CV%` for bring-up wear when
+a combination has repeated samples. The wrapper then feeds the JSON artifact to
+Cookout to produce the durable report described below. Use the terminal table
+for live operator feedback; use the Cookout report, including its eligibility,
+cohort, and decision-trace evidence, for review and final decisions.
+
+Choose the combination with the lowest `BRING-UP` wear whose launch time and
+baseline-adjusted launch-window RAM increase are acceptable. If the difference
+between combinations is comparable to their run-to-run variation, increase
+`--repeat` before calling a winner.
 
 When a workload is selected, use `WORKLOAD` to evaluate runtime writes
-separately from bring-up. A workload failure does not erase valid launch
-measurements. A failed launch produces no launch metrics, and a failed boundary
-retains prior measurements only as descriptive evidence from an invalid
-boundary.
+and `WORKLOAD ΔRAM` to evaluate runtime writes and baseline-adjusted memory
+growth separately from bring-up. A workload failure does not erase valid
+launch measurements. A failed launch produces no launch metrics, and a failed
+boundary retains prior measurements only as descriptive evidence from an
+invalid boundary.
 
 ### Generate a portable report
 
@@ -317,9 +443,12 @@ $RESULTS_ROOT/comparison-YYYYMMDD-HHMMSS-LABEL-PID/
 ├── invocation.txt
 ├── report.log
 └── report/
+    ├── section-NNN-cohort-NNN-chart-NNN.svg
+    ├── cohorts.csv
+    ├── evidence-NNNN.json
+    ├── manifest.json
     ├── report.html
-    ├── report.json
-    └── manifest.json
+    └── report.json
 ```
 
 `inputs.txt` records the resolved JSON paths in exactly the supplied directory
@@ -331,16 +460,20 @@ interruption or wrapper failure.
 
 The report directory contains:
 
-- `report.html`, a self-contained interactive report with vendored ECharts;
-- `report.json`, the normalized inputs, analysis, recommendations, and chart
-  options; and
-- `manifest.json`, including input and artifact SHA-256 digests.
+- `report.html`, a self-contained static report;
+- `report.json`, the normalized analysis and recommendations;
+- `cohorts.csv`, a tabular export of cohort metrics;
+- `section-NNN-cohort-NNN-chart-NNN.svg` for every rendered chart (for example,
+  `section-000-cohort-000-chart-000.svg`);
+- `evidence-NNNN.json`, the normalized Cookout evidence used to build the
+  report; and
+- `manifest.json`, including artifact media types, sizes, and SHA-256 digests.
 
-The HTML starts with cohort-local verdicts, coverage, candidate differences,
-and non-empty charts. Detailed statistics, tabulated chart results, capability
-evidence, samples, complete conditions, and provenance remain available in
-disclosures and appendices. Empty cohorts are reduced to their coverage and
-failure evidence rather than displaying empty charts and placeholder tables.
+The HTML summarizes experiments, cohort metrics, exclusions, recommendations,
+and decision traces. The JSON retains the complete normalized analysis, and the
+evidence files retain the validated inputs. Empty cohorts remain visible with
+their outcome counts and an explicit absence of scalar observations rather
+than placeholder metric rows or SVGs.
 
 Add `--archive` anywhere after the report label to request the native sibling
 archive, `report.tar.gz`, alongside `report/` in the comparison directory:
@@ -351,14 +484,16 @@ docs/run-perftest.sh report before-after --archive \
   "$RESULTS_ROOT/perftest-20260728-030000-after-5678"
 ```
 
-The archive contains the same three files beneath one top-level directory.
-This native Rust/Charming workflow is offline and headless; it does not require
-a browser, display server, network access, Python, or Pillow during generation.
+The archive contains `manifest.json` and the same manifest-inventoried files
+beneath the fixed top-level `report/` directory. This Cookout workflow is
+offline and headless; it does not require a browser, display server, network
+access, Python, Pillow, or ECharts during generation.
 
 Helios machines are commonly headless. Generate an archive there, copy it to a
 workstation (for example, `scp helios:/path/to/report.tar.gz .`), extract it,
-and open `report.html` locally in a graphical browser. Keep all three files
-together so operators can inspect normalized evidence and verify the manifest.
+and open `report/report.html` locally in a graphical browser. Keep the extracted
+directory together so operators can inspect normalized evidence and verify the
+manifest.
 
 ### Aggregate report archives
 
@@ -377,26 +512,24 @@ voxel perftest superreport \
   --archive
 ```
 
-This publishes `aggregate-report/` with the same `report.html`, `report.json`,
-and `manifest.json` contract as an ordinary report, plus an `images/` directory
-containing one standalone SVG for every non-empty chart in the recomputed
-superreport:
+This publishes `aggregate-report/` with the same contract as an ordinary
+Cookout report:
 
 ```text
 aggregate-report/
-├── images/
-│   └── section-NNN-…-chart-NNN.svg
+├── section-NNN-cohort-NNN-chart-NNN.svg # zero or more
+├── cohorts.csv
+├── evidence-NNNN.json    # one or more
 ├── manifest.json
 ├── report.html
 └── report.json
 ```
 
 The SVG files are inert, dependency-free derived exports intended for direct
-viewing or attachment. They are not referenced by `report.html`, are not
-canonical evidence or manifest artifacts, and are not included in
-`aggregate-report.tar.gz`. Ordinary reports do not create `images/`. The
-archive retains exactly the canonical three files and can be supplied to a
-later `superreport`, including beside ordinary report archives:
+viewing or attachment. Every generated report artifact other than
+`manifest.json` is covered by the manifest; the manifest and all inventoried
+artifacts are included in `aggregate-report.tar.gz`. That archive can be
+supplied to a later `superreport`, including beside ordinary report archives:
 
 ```sh
 voxel perftest superreport \
@@ -406,24 +539,23 @@ voxel perftest superreport \
   --archive
 ```
 
-Each underlying raw-result SHA-256 digest contributes at most once. First
-occurrence follows command-line order and then archive order; every accepted
-archive origin is retained so overlap remains visible. Recursive aggregation
-therefore does not inflate sample counts when inputs overlap.
+Each underlying source SHA-256 digest contributes at most once. Cookout orders
+unique evidence deterministically by digest and retains every accepted archive
+origin so overlap remains visible. Recursive aggregation therefore does not
+inflate sample counts when inputs overlap.
 
-An invalid, unsupported, unsafe, or internally inconsistent archive is excluded
-without suppressing valid siblings. Rejections and reasons appear in the
-command summary, HTML, normalized JSON, and manifest. Generation succeeds when
-at least one valid unique normalized input remains and fails without publishing
-output when none remains. Output directories and sibling archives are never
-overwritten.
+Voxel's compatibility command rejects the complete aggregation if any archive
+is invalid, unsupported, unsafe, or internally inconsistent, and publishes no
+output. The Cookout library also exposes an explicit partial-acceptance policy
+for consumers that want rejected siblings recorded while valid evidence is
+aggregated. Output directories and sibling archives are never overwritten.
 
-Superreports replay the normalized evidence embedded in current
-`voxel-perftest-report-v1` archives. Those archives do not contain the original
-raw matrix JSON, so a superreport cannot recover fields discarded during the
-original normalization or renormalize old evidence under a future contract.
-Generate new ordinary reports from raw results when normalization policy
-changes.
+Superreports replay the `cookout.evidence.v1` evidence inventoried in Cookout
+archives. Those archives retain sanitized, replayable Voxel source rather than
+byte-for-byte raw matrix JSON. Future compatible adapters can renormalize the
+retained fields, but cannot recover fields sanitized or discarded by the
+adapter. Generate new ordinary reports from raw results when discarded fields
+become relevant.
 
 Fresh evidence for changing defaults must come from schema-v5,
 baseline-adjusted experiments with the API workload enabled. Each experiment
@@ -440,19 +572,12 @@ workflow additions. Add them only with concrete proof boundaries and a new
 capability-contract version; the current storage-default experiment neither
 claims nor requires those broader fidelity results.
 
-Pre-evidence and legacy inputs are descriptive compatibility data only. In
-particular, the two raw schema-v2 files under
-`docs/perftest-20260718-011546-crucial/` and
-`docs/perftest-20260718-162302-crucial/` are retained solely as legacy parser and
-report compatibility fixtures; they are not active performance evidence or
-evidence for defaults.
-
-Reports normalize schema-v5 stages independently. Launch charts use every
-launch with valid metrics and clean boundaries; workload charts use only
-successful workload measurements. Every chart and table displays its own sample
-count so unequal populations are explicit. Running, aborted, partial, and
-failed evidence is descriptive only. A recommendation additionally requires a
-completed run, the requested number of repeats, clean boundaries, successful
+Reports normalize schema-v5 stages independently. Launch metrics use every
+launch with valid measurements and clean boundaries; workload metrics use only
+successful workload measurements. Every metric row and SVG carries its own
+sample count so unequal populations are explicit. Running, aborted, partial,
+and failed evidence is descriptive only. A recommendation additionally requires
+a completed run, the requested number of repeats, clean boundaries, successful
 required workloads, complete provenance and effective configuration, passing
 capabilities, and a comparable cohort. Missing workload evidence is never
 converted to a zero or inferred from launch evidence.
@@ -469,9 +594,29 @@ experiments.
 - Inspect one interval with `perftest sample` before and after the operation,
   followed by `perftest sample-report`. Unlike matrix, this diagnostic path can
   fall back to host-wide totals, so verify `falcon_controllers` in its samples.
-- With a finalist running and the `oxide` CLI authenticated, measure API latency
-  and jitter with `pfexec voxel perftest smooth --count 50 --json-out
-  smooth.json`.
+- With a finalist running, measure API latency and jitter with `pfexec voxel
+  perftest smooth --count 50 --json-out smooth.json`. Smooth provisions the
+  same isolated temporary recovery-silo profile as matrix; use
+  `--oxide-auth-helper` when the configured recovery credentials require it.
+
+Cookout's standalone CLI accepts replayable `cookout.evidence.v1` envelopes
+only, rather than raw Voxel checkpoints. These portable commands expose
+Cookout's native validation, publication, aggregation, and comparison interfaces
+on an ordinary host; their output and comparison semantics are not identical to
+Voxel's compatibility commands:
+
+```sh
+cookout validate evidence.json
+cookout report evidence.json --out report --archive
+cookout aggregate report.tar.gz --out aggregate --archive
+cookout compare baseline-evidence.json candidate-evidence.json
+```
+
+Use `voxel perftest report` for raw Voxel matrix JSON; it validates and adapts
+that input into Cookout evidence before publication. Use `voxel perftest
+superreport` for Cookout report archives produced through the Voxel workflow;
+it validates and replays their embedded Cookout evidence without rerunning the
+Voxel adapter.
 
 ---
 
