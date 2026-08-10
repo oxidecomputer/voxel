@@ -336,6 +336,12 @@ The report directory contains:
   options; and
 - `manifest.json`, including input and artifact SHA-256 digests.
 
+The HTML starts with cohort-local verdicts, coverage, candidate differences,
+and non-empty charts. Detailed statistics, tabulated chart results, capability
+evidence, samples, complete conditions, and provenance remain available in
+disclosures and appendices. Empty cohorts are reduced to their coverage and
+failure evidence rather than displaying empty charts and placeholder tables.
+
 Add `--archive` anywhere after the report label to request the native sibling
 archive, `report.tar.gz`, alongside `report/` in the comparison directory:
 
@@ -353,6 +359,71 @@ Helios machines are commonly headless. Generate an archive there, copy it to a
 workstation (for example, `scp helios:/path/to/report.tar.gz .`), extract it,
 and open `report.html` locally in a graphical browser. Keep all three files
 together so operators can inspect normalized evidence and verify the manifest.
+
+### Aggregate report archives
+
+Use `superreport` when several retained `report.tar.gz` files contain comparable
+runs that should contribute to one larger sample. The command validates each
+archive, recovers its normalized run-level evidence, and recomputes cohorts,
+statistics, eligibility, and best-supported recommendations. It never combines
+the reports' precomputed means or recommendations.
+
+```sh
+voxel perftest superreport \
+  copied-results/batch-a/report.tar.gz \
+  copied-results/batch-b/report.tar.gz \
+  copied-results/batch-c/report.tar.gz \
+  --out aggregate-report \
+  --archive
+```
+
+This publishes `aggregate-report/` with the same `report.html`, `report.json`,
+and `manifest.json` contract as an ordinary report, plus an `images/` directory
+containing one standalone SVG for every non-empty chart in the recomputed
+superreport:
+
+```text
+aggregate-report/
+├── images/
+│   └── section-NNN-…-chart-NNN.svg
+├── manifest.json
+├── report.html
+└── report.json
+```
+
+The SVG files are inert, dependency-free derived exports intended for direct
+viewing or attachment. They are not referenced by `report.html`, are not
+canonical evidence or manifest artifacts, and are not included in
+`aggregate-report.tar.gz`. Ordinary reports do not create `images/`. The
+archive retains exactly the canonical three files and can be supplied to a
+later `superreport`, including beside ordinary report archives:
+
+```sh
+voxel perftest superreport \
+  aggregate-report.tar.gz \
+  copied-results/batch-d/report.tar.gz \
+  --out expanded-report \
+  --archive
+```
+
+Each underlying raw-result SHA-256 digest contributes at most once. First
+occurrence follows command-line order and then archive order; every accepted
+archive origin is retained so overlap remains visible. Recursive aggregation
+therefore does not inflate sample counts when inputs overlap.
+
+An invalid, unsupported, unsafe, or internally inconsistent archive is excluded
+without suppressing valid siblings. Rejections and reasons appear in the
+command summary, HTML, normalized JSON, and manifest. Generation succeeds when
+at least one valid unique normalized input remains and fails without publishing
+output when none remains. Output directories and sibling archives are never
+overwritten.
+
+Superreports replay the normalized evidence embedded in current
+`voxel-perftest-report-v1` archives. Those archives do not contain the original
+raw matrix JSON, so a superreport cannot recover fields discarded during the
+original normalization or renormalize old evidence under a future contract.
+Generate new ordinary reports from raw results when normalization policy
+changes.
 
 Fresh evidence for changing defaults must come from schema-v5,
 baseline-adjusted experiments with the API workload enabled. Each experiment
