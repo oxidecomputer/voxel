@@ -10,8 +10,9 @@
 
 use crate::sys::{capture, note, replace_in_file, run, run_quiet, warn};
 use anyhow::{Result, bail};
+use camino::Utf8Path;
+use indoc::indoc;
 use std::fs;
-use std::path::Path;
 
 const READY_MARKER: &str = "/var/voxel-image-ready";
 const CARGO_BAY: &str = "/opt/cargo-bay";
@@ -39,7 +40,7 @@ fn builder_net() -> Option<BuilderNet> {
 /// Fatal: an image without the agent boots into nothing at launch.
 fn bake_agent() -> Result<()> {
     let src = format!("{CARGO_BAY}/voxel-init");
-    if !Path::new(&src).exists() {
+    if !Utf8Path::new(&src).exists() {
         bail!("voxel-init not staged at {src}");
     }
     note("baking voxel-init agent");
@@ -243,8 +244,8 @@ pub fn build_control_plane_image() -> Result<()> {
     // into the cargo-bay by `image create` because the builder VM may not reach
     // buildomat.eng - only the host does.
     let sc_dir = format!("{CARGO_BAY}/sidecar");
-    if Path::new(&format!("{sc_dir}/scadm")).exists()
-        && Path::new(&format!("{sc_dir}/libsidecar_lite.so")).exists()
+    if Utf8Path::new(&format!("{sc_dir}/scadm")).exists()
+        && Utf8Path::new(&format!("{sc_dir}/libsidecar_lite.so")).exists()
     {
         note("baking sidecar_lite from cargo-bay");
         fs::create_dir_all("/opt/oxide/sidecar").ok();
@@ -365,7 +366,10 @@ pub fn build_frr_image() -> Result<()> {
     // Persistent forwarding; per-interface knobs are set at launch.
     fs::write(
         "/etc/sysctl.d/99-voxel-frr.conf",
-        "net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\n",
+        indoc! {"
+            net.ipv4.ip_forward=1
+            net.ipv6.conf.all.forwarding=1
+        "},
     )
     .map_err(|e| anyhow::anyhow!("write sysctl conf: {e}"))?;
     run("sysctl", &["-p", "/etc/sysctl.d/99-voxel-frr.conf"]);

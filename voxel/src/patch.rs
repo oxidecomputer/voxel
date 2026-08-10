@@ -26,9 +26,9 @@
 //! into a new pinned `@base` so it persists across relaunches.
 
 use anyhow::{Context, anyhow};
+use camino::{Utf8Path, Utf8PathBuf};
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 use voxel_config::VoxelConfig;
 
@@ -237,22 +237,22 @@ pub(crate) fn list() {
 
 /// Where downloaded artifacts are cached on the box: `<build_root>/patch-cache`
 /// (build_root from `[falcon].build_root`/`$BUILD_ROOT`, else `$HOME/voxel-builds`).
-fn cache_dir() -> PathBuf {
+fn cache_dir() -> Utf8PathBuf {
     let root = std::env::var("BUILD_ROOT")
         .ok()
-        .map(PathBuf::from)
+        .map(Utf8PathBuf::from)
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
-                .map(|h| PathBuf::from(h).join("voxel-builds"))
+                .map(|h| Utf8PathBuf::from(h).join("voxel-builds"))
         })
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(|| Utf8PathBuf::from("."));
     root.join("patch-cache")
 }
 
 /// sha256 of a file via illumos `digest -a sha256` (matches the buildomat
 /// `.sha256.txt` the manifest pins).
-fn sha256(file: &Path) -> anyhow::Result<String> {
+fn sha256(file: &Utf8Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("digest")
         .args(["-a", "sha256"])
         .arg(file)
@@ -261,7 +261,7 @@ fn sha256(file: &Path) -> anyhow::Result<String> {
     if !out.status.success() {
         return Err(anyhow!(
             "digest {}: {}",
-            file.display(),
+            file,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -291,9 +291,9 @@ fn fetch_sha(url: &str) -> anyhow::Result<String> {
 /// Download `comp`'s artifact at `reference` to the box cache and sha-verify it
 /// against the buildomat-published `.sha256.txt`. Reuses a cached, already-correct
 /// download. Returns the local tarball path.
-fn acquire(comp: &Component, reference: &str) -> anyhow::Result<PathBuf> {
+fn acquire(comp: &Component, reference: &str) -> anyhow::Result<Utf8PathBuf> {
     let dir = cache_dir().join(comp.repo).join(reference);
-    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir))?;
     let ext = comp.archive.ext();
     let tarball = dir.join(format!("{}.{ext}", comp.pkg));
 
@@ -309,8 +309,7 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<PathBuf> {
     if tarball.exists() && sha256(&tarball).map(|s| s == want).unwrap_or(false) {
         eprintln!(
             "[voxel] {} {reference}: using cached {} (sha ok)",
-            comp.pkg,
-            tarball.display()
+            comp.pkg, tarball
         );
         return Ok(tarball);
     }
@@ -533,9 +532,7 @@ pub(crate) async fn cmd_rack_patch(
     // Fetch + sha-verify once on the box, then distribute the same artifact.
     let tarball = acquire(&comp, reference)?;
     let remote = format!("/var/tmp/{}.{}", comp.pkg, comp.archive.ext());
-    let local = tarball
-        .to_str()
-        .ok_or_else(|| anyhow!("non-utf8 tarball path"))?;
+    let local = tarball.as_str();
 
     for (node, n) in nodes {
         let ip = match node_ip(cfg, d, &node, n).await {
@@ -568,7 +565,7 @@ pub(crate) async fn cmd_rack_patch(
 // --- image patch (persist into a new @base) --------------------------------
 
 /// Locate `voxel-image/patch-image.sh` (mirrors `image::build_cp_script`).
-fn patch_image_script() -> anyhow::Result<PathBuf> {
+fn patch_image_script() -> anyhow::Result<Utf8PathBuf> {
     locate_script("VOXEL_PATCH_IMAGE", "patch-image.sh")
 }
 
@@ -628,9 +625,7 @@ pub(crate) fn cmd_image_patch(
     }
     // FALCON_DATASET is already exported by resolve_falcon_env; patch-image.sh +
     // build-image.sh read it.
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow!("run {}: {e}", script.display()))?;
+    let status = cmd.status().map_err(|e| anyhow!("run {}: {e}", script))?;
     if !status.success() {
         return Err(anyhow!("patch-image.sh failed"));
     }

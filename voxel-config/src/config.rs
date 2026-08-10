@@ -1284,6 +1284,7 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::{formatdoc, indoc};
 
     #[test]
     fn get_reads_dotted_keys() {
@@ -1302,7 +1303,12 @@ mod tests {
 
     #[test]
     fn set_preserves_type_and_validates() {
-        let text = "# my rack\n[network]\nbgp_asn = 65000\n".to_string();
+        let text = indoc! {"
+            # my rack
+            [network]
+            bgp_asn = 65000
+        "}
+        .to_string();
         let out = set(&text, "network.bgp_asn", "65010").unwrap();
         assert!(out.contains("# my rack"), "comment preserved");
         assert!(out.contains("bgp_asn = 65010"));
@@ -1315,7 +1321,11 @@ mod tests {
         // A defaulted numeric field isn't written in a minimal toml, so there's
         // no existing type to coerce to - it must still be written as an integer,
         // not a quoted string (which would fail the u64 schema).
-        let text = "[topology]\nsleds = 6\n".to_string();
+        let text = indoc! {"
+            [topology]
+            sleds = 6
+        "}
+        .to_string();
         let out = set(&text, "topology.sled_memory_gb", "7").unwrap();
         assert!(
             out.contains("sled_memory_gb = 7"),
@@ -1369,16 +1379,23 @@ mod tests {
         // An auto config leaves `scrimlets` empty and `rss_sleds` 0; the derived
         // values are what the RSS bootstrap set and switch placement come from,
         // so an empty set here would mean "no peers".
-        let cfg = VoxelConfig::from_toml("[topology]\nsleds = 4\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+        "})
+        .unwrap();
         assert_eq!(
             cfg.topology.scrimlet_names(),
             vec!["g0".to_string(), "g3".to_string()]
         );
         assert_eq!(cfg.topology.rss_count(), 4);
         // Spelling the derived values out explicitly describes the same rack.
-        let explicit = VoxelConfig::from_toml(
-            "[topology]\nsleds = 4\nscrimlets = [\"g0\", \"g3\"]\nrss_sleds = 4\n",
-        )
+        let explicit = VoxelConfig::from_toml(indoc! {r#"
+            [topology]
+            sleds = 4
+            scrimlets = ["g0", "g3"]
+            rss_sleds = 4
+        "#})
         .unwrap();
         assert_eq!(explicit.sleds(), cfg.sleds());
     }
@@ -1390,7 +1407,12 @@ mod tests {
         assert_eq!(t.router_memory_gb, 4);
         assert_eq!(t.guest_memory_gb(), 44); // 4*8 + 3*4
         // Shrinking per-sled RAM to fit a bigger rack.
-        let cfg = VoxelConfig::from_toml("[topology]\nsleds = 6\nsled_memory_gb = 6\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 6
+            sled_memory_gb = 6
+        "})
+        .unwrap();
         assert_eq!(cfg.topology.guest_memory_gb(), 48); // 6*6 + 3*4
         assert_eq!(cfg.topology.router_memory_gb, 4); // unset -> default
     }
@@ -1407,7 +1429,11 @@ mod tests {
     fn scrimlets_and_rss_auto_derive_from_sled_count() {
         // Unset -> scrimlets are first + last, all sleds in RSS - at any size.
         for n in [3usize, 4, 6, 10] {
-            let cfg = VoxelConfig::from_toml(&format!("[topology]\nsleds = {n}\n")).unwrap();
+            let cfg = VoxelConfig::from_toml(&formatdoc! {"
+                [topology]
+                sleds = {n}
+            "})
+            .unwrap();
             let s = cfg.sleds();
             assert!(s[0].scrimlet, "{n}: g0 scrimlet");
             assert!(s[n - 1].scrimlet, "{n}: g{} scrimlet", n - 1);
@@ -1423,9 +1449,12 @@ mod tests {
             );
         }
         // Explicit scrimlets/rss_sleds still override the auto choice.
-        let cfg = VoxelConfig::from_toml(
-            "[topology]\nsleds = 4\nscrimlets = [\"g1\", \"g2\"]\nrss_sleds = 3\n",
-        )
+        let cfg = VoxelConfig::from_toml(indoc! {r#"
+            [topology]
+            sleds = 4
+            scrimlets = ["g1", "g2"]
+            rss_sleds = 3
+        "#})
         .unwrap();
         let s = cfg.sleds();
         assert!(s[1].scrimlet && s[2].scrimlet && !s[0].scrimlet && !s[3].scrimlet);
@@ -1441,9 +1470,13 @@ mod tests {
             d.sp.emu_bin.is_none() && d.sp.sidecar_image.is_none() && d.sp.gimlet_image.is_none()
         );
         // Populated [sp] parses, and image_for routes by selector.
-        let cfg = VoxelConfig::from_toml(
-            "[sp]\nemu = [\"sidecar\", \"g0\"]\nemu_bin = \"/x/sp-emu\"\nsidecar_image = \"/x/sc.zip\"\ngimlet_image = \"/x/g.zip\"\n",
-        )
+        let cfg = VoxelConfig::from_toml(indoc! {r#"
+            [sp]
+            emu = ["sidecar", "g0"]
+            emu_bin = "/x/sp-emu"
+            sidecar_image = "/x/sc.zip"
+            gimlet_image = "/x/g.zip"
+        "#})
         .unwrap();
         assert_eq!(cfg.sp.emu, vec!["sidecar".to_string(), "g0".to_string()]);
         assert_eq!(cfg.sp.image_for("sidecar"), Some("/x/sc.zip"));
@@ -1453,9 +1486,11 @@ mod tests {
 
     #[test]
     fn falcon_section_parses_and_defaults_to_none() {
-        let cfg = VoxelConfig::from_toml(
-            "[falcon]\ndataset = \"testbed/falcon\"\nbuild_root = \"/x/builds\"\n",
-        )
+        let cfg = VoxelConfig::from_toml(indoc! {r#"
+            [falcon]
+            dataset = "testbed/falcon"
+            build_root = "/x/builds"
+        "#})
         .unwrap();
         assert_eq!(cfg.falcon.dataset.as_deref(), Some("testbed/falcon"));
         assert_eq!(cfg.falcon.build_root.as_deref(), Some("/x/builds"));
@@ -1471,8 +1506,12 @@ mod tests {
         assert!(!d.external.isolated());
         assert!(!d.to_toml().contains("[external]"));
         // Populated section parses; unset fields keep the guide defaults.
-        let cfg =
-            VoxelConfig::from_toml("[external]\nmode = \"isolated\"\nuplink = \"igb0\"\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {r#"
+            [external]
+            mode = "isolated"
+            uplink = "igb0"
+        "#})
+        .unwrap();
         assert!(cfg.external.isolated());
         assert_eq!(cfg.external.host_ip, "172.30.199.199");
         assert_eq!(cfg.external.ip_start, "172.30.199.10");
@@ -1504,7 +1543,11 @@ mod tests {
     #[test]
     fn partial_toml_fills_defaults() {
         // Only override the sled count; everything else defaults.
-        let cfg = VoxelConfig::from_toml("[topology]\nsleds = 3\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 3
+        "})
+        .unwrap();
         assert_eq!(cfg.topology.sleds, 3);
         assert_eq!(cfg.network.bgp_asn, 65000);
     }
@@ -1682,7 +1725,11 @@ mod tests {
     #[test]
     fn frr_transit_peers_every_scrimlet_across_racks() {
         // Single rack: cr1 peers ce + the rack's 2 scrimlets (g0,g3), edge first.
-        let cfg = VoxelConfig::from_toml("[topology]\nsleds = 4\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+        "})
+        .unwrap();
         let frr = cfg.to_frr();
         let cr1 = &frr.iter().find(|(n, _)| n == "cr1").unwrap().1;
         assert_eq!(cr1.asn, 65101);
@@ -1691,7 +1738,12 @@ mod tests {
         assert!(cr1.originate4.is_empty(), "transit originates nothing");
 
         // a3x2x2: cr1 peers ce + all 4 scrimlets (rack0 g0,g2; rack1 g3,g5).
-        let cfg = VoxelConfig::from_toml("[topology]\nracks = 2\nsleds = 3\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            racks = 2
+            sleds = 3
+        "})
+        .unwrap();
         let frr = cfg.to_frr();
         let cr1 = &frr.iter().find(|(n, _)| n == "cr1").unwrap().1;
         let ifaces: Vec<&str> = cr1.neighbors.iter().map(|n| n.interface.as_str()).collect();
@@ -1736,7 +1788,12 @@ mod tests {
 
     #[test]
     fn three_node_drops_rss_membership() {
-        let cfg = VoxelConfig::from_toml("[topology]\nsleds = 4\nrss_sleds = 3\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+            rss_sleds = 3
+        "})
+        .unwrap();
         let rss: Vec<_> = cfg.sleds().into_iter().filter(|s| s.rss).collect();
         // Only the first 3 sleds join RSS; the 4th is dropped from the bootstrap set.
         assert_eq!(rss.len(), 3);
@@ -1849,7 +1906,12 @@ mod tests {
         // 2 racks * 3 sleds -> 4 scrimlets total and 2 fabric routers.
         // ce external = enp0s{8 + 2} = enp0s10.
         // cr1/cr2 external = enp0s{8 + 1 + 4} = enp0s13.
-        let cfg = VoxelConfig::from_toml("[topology]\nracks = 2\nsleds = 3\n").unwrap();
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            racks = 2
+            sleds = 3
+        "})
+        .unwrap();
         assert_eq!(cfg.router_ext_iface("ce"), "enp0s10");
         assert_eq!(cfg.router_ext_iface("cr1"), "enp0s13");
         assert_eq!(cfg.router_ext_iface("cr2"), "enp0s13");

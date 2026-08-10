@@ -410,7 +410,7 @@ pub(crate) async fn cmd_launch(
                 // wicketd-triggered bring-up exactly as for the file path.
                 if wicket_setup {
                     let net = cfg.network.for_rack(rack);
-                    let config_rss = std::path::Path::new("wicket-setup")
+                    let config_rss = camino::Utf8Path::new("wicket-setup")
                         .join(format!("rack{rack}"))
                         .join("config-rss.toml");
                     // wicketd's bootstrap_sleds must be THIS rack's cubby slots =

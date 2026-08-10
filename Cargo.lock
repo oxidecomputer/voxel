@@ -2127,6 +2127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "indoc"
+version = "2.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5740,6 +5749,7 @@ dependencies = [
  "camino",
  "clap",
  "futures",
+ "indoc",
  "libc",
  "libfalcon",
  "oxnet",
@@ -5757,6 +5767,7 @@ name = "voxel-config"
 version = "0.1.0"
 dependencies = [
  "expectorate",
+ "indoc",
  "oxnet",
  "serde",
  "toml 0.9.12+spec-1.1.0",
@@ -5768,7 +5779,9 @@ name = "voxel-init"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "camino",
  "clap",
+ "indoc",
  "libc",
  "toml_edit 0.25.12+spec-1.1.0",
 ]

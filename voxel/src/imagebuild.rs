@@ -5,8 +5,8 @@
 
 use crate::isolated_external;
 use anyhow::{Context, Result, bail};
+use camino::{Utf8Path, Utf8PathBuf};
 use libfalcon::{Runner, unit::gb};
-use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ pub(crate) struct BakeOpts<'a> {
     /// a captured image comes up with its payload intact.
     pub exec: Option<&'a str>,
     /// Host dir mounted at `/opt/cargo-bay` in the guest.
-    pub cargo_bay: &'a str,
+    pub cargo_bay: &'a Utf8Path,
     /// Registered image name; captured to `<dataset>/img/<name>@base`.
     pub image_name: &'a str,
     pub dataset: &'a str,
@@ -80,7 +80,7 @@ pub(crate) fn builder_network(external: Option<&voxel_config::External>) -> Resu
 
 /// Bring up the builder, install, quiesce, capture, tear down.
 pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
-    if !Path::new(o.cargo_bay).exists() {
+    if !o.cargo_bay.exists() {
         bail!("cargo-bay {} not found", o.cargo_bay);
     }
 
@@ -92,7 +92,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     // an image from voxel's workdir would wipe a live rack's pid files, orphan
     // its propolis processes, and leave its VNICs busy.
     let workspace = repo_root()?.join("voxel-image");
-    std::env::set_current_dir(&workspace).with_context(|| format!("cd {}", workspace.display()))?;
+    std::env::set_current_dir(&workspace).with_context(|| format!("cd {workspace}"))?;
 
     let mut d = Runner::new(o.deploy);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
@@ -111,9 +111,9 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         .iter()
         .any(|p| o.base_image.starts_with(p));
     let mounted = if is_linux {
-        d.mount_linux(o.cargo_bay, "/opt/cargo-bay", node)
+        d.mount_linux(o.cargo_bay.as_str(), "/opt/cargo-bay", node)
     } else {
-        d.mount(o.cargo_bay, "/opt/cargo-bay", node)
+        d.mount(o.cargo_bay.as_str(), "/opt/cargo-bay", node)
     };
     mounted.map_err(|e| anyhow::anyhow!("mount cargo-bay ({}): {e}", o.cargo_bay))?;
 
@@ -214,12 +214,10 @@ pub(crate) async fn create_frr(
         bail!("cross-compiling voxel-init for {FRR_TARGET} failed");
     }
 
-    std::fs::create_dir_all(&cargo_bay)
-        .with_context(|| format!("mkdir {}", cargo_bay.display()))?;
+    std::fs::create_dir_all(&cargo_bay).with_context(|| format!("mkdir {cargo_bay}"))?;
     let agent_src = root.join(format!("target/{FRR_TARGET}/release/voxel-init"));
     let agent_dst = cargo_bay.join("voxel-init");
-    std::fs::copy(&agent_src, &agent_dst)
-        .with_context(|| format!("stage agent {}", agent_src.display()))?;
+    std::fs::copy(&agent_src, &agent_dst).with_context(|| format!("stage agent {agent_src}"))?;
     // The 9p mount drops the exec bit in-guest anyway, but keep it host-side.
     let _ = Command::new("chmod").args(["+x"]).arg(&agent_dst).status();
 
@@ -227,7 +225,7 @@ pub(crate) async fn create_frr(
         base_image: "debian-13.2",
         role: Some("frr"),
         exec: None,
-        cargo_bay: &cargo_bay.display().to_string(),
+        cargo_bay: &cargo_bay,
         image_name: &image_name,
         dataset,
         deploy: "voxel_build",
@@ -245,38 +243,37 @@ pub(crate) async fn create_frr(
 /// falcon need it), which drops `~/.cargo/bin` from PATH - the shell scripts
 /// papered over this by prepending it. Prefer an explicit override, then the
 /// rustup install, then PATH.
-pub(crate) fn toolchain_bin(name: &str) -> std::path::PathBuf {
+pub(crate) fn toolchain_bin(name: &str) -> Utf8PathBuf {
     if let Ok(p) = std::env::var(name.to_uppercase()) {
-        return std::path::PathBuf::from(p);
+        return Utf8PathBuf::from(p);
     }
     for home in [std::env::var("HOME").ok(), Some("/root".into())]
         .into_iter()
         .flatten()
     {
-        let candidate = std::path::PathBuf::from(home).join(".cargo/bin").join(name);
+        let candidate = Utf8PathBuf::from(home).join(".cargo/bin").join(name);
         if candidate.exists() {
             return candidate;
         }
     }
-    std::path::PathBuf::from(name)
+    Utf8PathBuf::from(name)
 }
 
 /// voxel's own source tree, derived the same way `locate_script` finds
 /// `voxel-image/`: next to the binary, else the cwd.
-pub(crate) fn repo_root() -> Result<std::path::PathBuf> {
+pub(crate) fn repo_root() -> Result<Utf8PathBuf> {
     if let Ok(root) = std::env::var("VOXEL_REPO_ROOT") {
-        return Ok(std::path::PathBuf::from(root));
+        return Ok(Utf8PathBuf::from(root));
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
+        && let Ok(candidate) = Utf8PathBuf::try_from(dir.join("../.."))
+        && candidate.join("voxel-image").exists()
     {
-        let candidate = dir.join("../..");
-        if candidate.join("voxel-image").exists() {
-            return Ok(candidate);
-        }
+        return Ok(candidate);
     }
-    if Path::new("voxel-image").exists() {
-        return Ok(std::path::PathBuf::from("."));
+    if Utf8Path::new("voxel-image").exists() {
+        return Ok(Utf8PathBuf::from("."));
     }
     bail!("can't find voxel's source tree - set VOXEL_REPO_ROOT")
 }
@@ -290,14 +287,14 @@ pub(crate) fn repo_root() -> Result<std::path::PathBuf> {
 /// builds, and a leftover `builder-net` makes a later LAN build apply the
 /// isolated static address to its DHCP-serving VNIC, losing package and DNS
 /// access.
-fn stage_builder_net(cargo_bay: &str, explicit: Option<&str>) -> Result<()> {
-    let path = Path::new(cargo_bay).join("builder-net");
+fn stage_builder_net(cargo_bay: &Utf8Path, explicit: Option<&str>) -> Result<()> {
+    let path = cargo_bay.join("builder-net");
     let from_env = std::env::var("VOXEL_BUILDER_NET").ok();
     match explicit.map(str::to_string).or(from_env) {
         Some(net) if !net.trim().is_empty() => {
             eprintln!("[voxel] staging builder-net ({net}) into {cargo_bay}");
             std::fs::write(&path, format!("{}\n", net.trim()))
-                .with_context(|| format!("write {}", path.display()))?;
+                .with_context(|| format!("write {path}"))?;
         }
         _ => {
             let _ = std::fs::remove_file(&path);
@@ -359,8 +356,8 @@ fn wait_for_propolis_exit(name: &str, timeout: Duration) {
 
 /// The falcon workdir for the current deployment. `bake` has already `cd`-ed
 /// here, so this is always the builder's own workspace and never a rack's.
-fn falcon_dir() -> &'static Path {
-    Path::new(".falcon")
+fn falcon_dir() -> &'static Utf8Path {
+    Utf8Path::new(".falcon")
 }
 
 /// Read a node's propolis pid, rejecting anything that is not a plain number so
@@ -411,7 +408,7 @@ fn hyperstop(name: &str) {
 fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
     let node = Dataset::new(format!("{dataset}/topo/{deploy}/{NODE}"))?;
     let zvol = format!("/dev/zvol/rdsk/{}", node.as_str());
-    if !Path::new(&zvol).exists() {
+    if !Utf8Path::new(&zvol).exists() {
         bail!("node zvol not found at {zvol}");
     }
     let image = Dataset::new(format!("{dataset}/img/{image_name}"))?;
