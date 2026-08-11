@@ -123,6 +123,17 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let root = repo_root()?;
     let voxel_image = root.join("voxel-image");
     let cargo_bay = voxel_image.join("cargo-bay/vbuild");
+    // Everything under vbuild is regenerated per run. Leftovers owned by
+    // another user (an earlier pfexec run) fail every later write; fail once
+    // here instead.
+    if cargo_bay.exists() {
+        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
+            format!(
+                "clear {cargo_bay} (owned by another user? \
+                 remove it with pfexec rm -rf)"
+            )
+        })?;
+    }
     let src = &b.omicron_src;
     let image_name = format!("voxel-cp-{}", b.label);
 
@@ -131,7 +142,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         if !src.exists() {
             bail!("--src {src} not found");
         }
-        eprintln!("[voxel] building {src} as-is (--src; no clone/checkout)");
+        eprintln!("[voxel] building --src checkout {src}");
     } else {
         let commit = b.commit.context("a commit is required without --src")?;
         if !src.join(".git").exists() {
@@ -229,12 +240,14 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     // --- 7. stage the curated omicron dir into the builder cargo-bay ---------
     let stage = cargo_bay.join("omicron");
     eprintln!("[voxel] staging omicron build -> {stage}");
-    let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("mkdir {stage}"))?;
     let mut rsync = omicron_cmd(src, "rsync");
+    // No owner/group: staging is content-only and chgrp fails for non-root.
     rsync.args([
         "-a",
+        "--no-owner",
+        "--no-group",
         "tools",
         "out",
         "smf",
