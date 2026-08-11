@@ -242,37 +242,142 @@ fn generate_rss_config(
 /// commits to requirements table, voxel reads what the commit itself declares.
 /// It is the only place voxel consults an omicron checkout, and it is
 /// advisory. A rack whose source is absent still launches.
-fn detect_sled_schema(
-    cfg: &VoxelConfig,
-    src_root: Option<&Utf8Path>,
-) -> (SledDataLinksSchema, SledDisksSchema) {
-    let read = |rel: &str| {
-        src_root
-            .map(|p| p.join(rel))
-            .and_then(|p| fs::read_to_string(p).ok())
+pub(crate) const PROP_DATA_LINKS: &str = "voxel:data-links-schema";
+pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
+
+/// Sled-agent config schema read from an omicron checkout; None if the
+/// checkout's sled-agent config source is not readable.
+pub(crate) fn schema_from_checkout(
+    src_root: &Utf8Path,
+) -> Option<(SledDataLinksSchema, SledDisksSchema)> {
+    let read = |rel: &str| fs::read_to_string(src_root.join(rel)).ok();
+    let src = read("sled-agent/src/config.rs")?;
+    // Affirmative-only: each era must match its own marker; an unrecognized
+    // config shape is no answer, never an assumed era. The variants of
+    // `ExternalDisks` are declared in sled-hardware, so read the enum itself
+    // rather than the field that references it; `Virtual { vdevs }` and
+    // `HardcodedPhysical { disks }` merged into `Hardcoded { vdevs, disks }`.
+    let disks = if src.contains("pub external_disks") {
+        if read("sled-hardware/src/lib.rs")
             .unwrap_or_default()
-    };
-    let src = read("sled-agent/src/config.rs");
-    // The variants of `ExternalDisks` are declared in sled-hardware, so read the
-    // enum itself rather than the field that references it. `Virtual { vdevs }`
-    // and `HardcodedPhysical { disks }` merged into `Hardcoded { vdevs, disks }`.
-    let disks = if !src.contains("pub external_disks") {
+            .contains("Hardcoded {")
+        {
+            SledDisksSchema::Hardcoded
+        } else {
+            SledDisksSchema::ExternalDisks
+        }
+    } else if src.contains("pub vdevs") {
         SledDisksSchema::Vdevs
-    } else if read("sled-hardware/src/lib.rs").contains("Hardcoded {") {
-        SledDisksSchema::Hardcoded
     } else {
-        SledDisksSchema::ExternalDisks
+        return None;
     };
     // `data_links: DataLinks` (tagged enum) vs the older flat list.
     let data_links = if src.contains("data_links: DataLinks") {
         SledDataLinksSchema::Tagged
-    } else {
+    } else if src.contains("data_links") {
         SledDataLinksSchema::List
+    } else {
+        return None;
     };
-    (
-        cfg.image.data_links_schema.unwrap_or(data_links),
-        cfg.image.disks_schema.unwrap_or(disks),
-    )
+    Some((data_links, disks))
+}
+
+/// The schema stamp `image create` wrote on the image dataset; None on a
+/// pre-stamp image.
+fn schema_from_image_props(
+    image: &str,
+) -> Option<(SledDataLinksSchema, SledDisksSchema)> {
+    let ds = format!("{}/img/{image}", crate::image::falcon_dataset());
+    let out = std::process::Command::new("zfs")
+        .args(["get", "-H", "-o", "property,value"])
+        .arg(format!("{PROP_DATA_LINKS},{PROP_DISKS}"))
+        .arg(&ds)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut data_links = None;
+    let mut disks = None;
+    for line in text.lines() {
+        match *line.split('\t').collect::<Vec<_>>().as_slice() {
+            [PROP_DATA_LINKS, v] => data_links = SledDataLinksSchema::parse(v),
+            [PROP_DISKS, v] => disks = SledDisksSchema::parse(v),
+            _ => {}
+        }
+    }
+    Some((data_links?, disks?))
+}
+
+/// Copy the schema stamp from one image to another. Ok on a pre-stamp source
+/// (nothing to copy); the destination then errors at launch like any
+/// unstamped image.
+pub(crate) fn copy_image_schema_props(
+    src_image: &str,
+    out_image: &str,
+) -> anyhow::Result<()> {
+    let Some((data_links, disks)) = schema_from_image_props(src_image) else {
+        return Ok(());
+    };
+    let ds = format!("{}/img/{out_image}", crate::image::falcon_dataset());
+    let status = std::process::Command::new("zfs")
+        .arg("set")
+        .arg(format!("{PROP_DATA_LINKS}={}", data_links.as_str()))
+        .arg(format!("{PROP_DISKS}={}", disks.as_str()))
+        .arg(&ds)
+        .status()
+        .with_context(|| format!("zfs set schema props on {ds}"))?;
+    if !status.success() {
+        anyhow::bail!("zfs set schema props on {ds} failed");
+    }
+    Ok(())
+}
+
+/// Pick the schema from the available sources: explicit config override wins
+/// per field, then the image's zfs stamp, then the omicron checkout. No
+/// source at all is an error; a guessed schema writes configs sled-agent
+/// rejects at boot.
+fn choose_schema(
+    cfg: &VoxelConfig,
+    image: &str,
+    props: Option<(SledDataLinksSchema, SledDisksSchema)>,
+    checkout: Option<(SledDataLinksSchema, SledDisksSchema)>,
+) -> anyhow::Result<(SledDataLinksSchema, SledDisksSchema, &'static str)> {
+    let (detected, source) = match (props, checkout) {
+        (Some(v), _) => (Some(v), "image properties"),
+        (None, Some(v)) => (Some(v), "omicron checkout"),
+        (None, None) => (None, "config override"),
+    };
+    let data_links = cfg.image.data_links_schema.or(detected.map(|d| d.0));
+    let disks = cfg.image.disks_schema.or(detected.map(|d| d.1));
+    match (data_links, disks) {
+        (Some(data_links), Some(disks)) => Ok((data_links, disks, source)),
+        _ => anyhow::bail!(
+            "no sled-agent config schema for image {image}: it carries no \
+             voxel:*-schema zfs properties (re-create it with this voxel) \
+             and no omicron checkout was found (set VOXEL_OMICRON_SRC or \
+             [image] data_links_schema/disks_schema)"
+        ),
+    }
+}
+
+/// Resolve the sled-agent config schema for `image` from the live sources.
+fn resolve_sled_schema(
+    cfg: &VoxelConfig,
+    image: &str,
+) -> anyhow::Result<(SledDataLinksSchema, SledDisksSchema)> {
+    let (data_links, disks, source) = choose_schema(
+        cfg,
+        image,
+        schema_from_image_props(image),
+        omicron_src().as_deref().and_then(schema_from_checkout),
+    )?;
+    eprintln!(
+        "[voxel] sled-agent config schema ({source}): \
+         data_links={data_links:?} disks={disks:?}"
+    );
+    Ok((data_links, disks))
 }
 
 /// Path of the omicron checkout the image was built from, if it's on disk.
@@ -299,12 +404,7 @@ pub(crate) fn stage_config(
     let num_sleds_per_rack = cfg.topology.sleds;
     let num_fabric_routers =
         cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
-    // Auto-detect the sled-agent config shapes from the image's omicron (no
-    // per-era operator knobs); an [image] override wins if set.
-    let (data_links, disks) = detect_sled_schema(cfg, omicron_src().as_deref());
-    eprintln!(
-        "[voxel] sled-agent config schema: data_links={data_links:?} disks={disks:?}"
-    );
+    let (data_links, disks) = resolve_sled_schema(cfg, &cfg.image.cp_image())?;
     for s in &sleds {
         let dir = cargo_bay(&s.name);
         fs::create_dir_all(&dir)?;
@@ -661,19 +761,22 @@ mod tests {
     /// main's shape and refuse to boot.
     #[test]
     fn detects_the_disks_shape_per_era() {
-        let cfg = VoxelConfig::default();
-        let disks = |src: &Utf8PathBuf| detect_sled_schema(&cfg, Some(src)).1;
+        let disks = |src: &Utf8PathBuf| schema_from_checkout(src).unwrap().1;
 
         // Oldest: a flat `vdevs` list, no `external_disks` field at all.
         assert_eq!(
-            disks(&fake_sled_src("old", "pub vdevs: Vec<String>,", "")),
+            disks(&fake_sled_src(
+                "old",
+                "pub vdevs: Vec<String>, data_links: [String; 2],",
+                ""
+            )),
             SledDisksSchema::Vdevs
         );
         // Middle: separate `Virtual` and `HardcodedPhysical` variants.
         assert_eq!(
             disks(&fake_sled_src(
                 "mid",
-                "pub external_disks: ExternalDisks,",
+                "pub external_disks: ExternalDisks, data_links: [String; 2],",
                 "Virtual { vdevs: Vec<String> }, HardcodedPhysical { disks: Vec<D> }, DetectPhysical,",
             )),
             SledDisksSchema::ExternalDisks
@@ -682,12 +785,113 @@ mod tests {
         assert_eq!(
             disks(&fake_sled_src(
                 "new",
-                "pub external_disks: ExternalDisks,",
+                "pub external_disks: ExternalDisks, data_links: [String; 2],",
                 "Hardcoded { vdevs: Vec<String>, disks: Vec<D> }, DetectPhysical,",
             )),
             SledDisksSchema::Hardcoded
         );
-        // No checkout on disk: assume the oldest shape.
-        assert_eq!(detect_sled_schema(&cfg, None).1, SledDisksSchema::Vdevs);
+        // No checkout on disk: no answer, not a silent oldest-shape guess.
+        assert_eq!(
+            schema_from_checkout(Utf8Path::new("/nonexistent-checkout")),
+            None
+        );
+        // Unrecognized shape (a future restructure): also no answer.
+        assert_eq!(
+            schema_from_checkout(&fake_sled_src(
+                "odd",
+                "pub storage: StoragePlan,",
+                ""
+            )),
+            None
+        );
+    }
+
+    const NEW: (SledDataLinksSchema, SledDisksSchema) =
+        (SledDataLinksSchema::Tagged, SledDisksSchema::Hardcoded);
+    const OLD: (SledDataLinksSchema, SledDisksSchema) =
+        (SledDataLinksSchema::List, SledDisksSchema::Vdevs);
+
+    /// The image stamp must beat the checkout, config overrides must beat
+    /// both per field, and no source at all must be an error.
+    #[test]
+    fn schema_choice_precedence() {
+        let cfg = VoxelConfig::default();
+        let pick = |p, c| choose_schema(&cfg, "img", p, c);
+
+        let (dl, d, src) = pick(Some(NEW), Some(OLD)).unwrap();
+        assert_eq!((dl, d, src), (NEW.0, NEW.1, "image properties"));
+        let (dl, d, src) = pick(None, Some(NEW)).unwrap();
+        assert_eq!((dl, d, src), (NEW.0, NEW.1, "omicron checkout"));
+        assert!(pick(None, None).is_err());
+
+        let mut over = VoxelConfig::default();
+        over.image.disks_schema = Some(SledDisksSchema::ExternalDisks);
+        let (dl, d, _) = choose_schema(&over, "img", Some(NEW), None).unwrap();
+        assert_eq!((dl, d), (NEW.0, SledDisksSchema::ExternalDisks));
+        assert!(choose_schema(&over, "img", None, None).is_err());
+    }
+
+    /// A short image label must resolve through the build root to the
+    /// full-sha checkout and its schema (a --commit image with a short label).
+    #[test]
+    fn short_label_resolves_through_build_root_to_schema() {
+        let root = crate::util::temp_dir().join("voxel-schema-chain");
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("omicron-21dae8a64f00baa5deadbeef");
+        fs::create_dir_all(src.join("sled-agent/src")).unwrap();
+        fs::create_dir_all(src.join("sled-hardware/src")).unwrap();
+        fs::write(
+            src.join("sled-agent/src/config.rs"),
+            "pub external_disks: ExternalDisks, data_links: DataLinks,",
+        )
+        .unwrap();
+        fs::write(
+            src.join("sled-hardware/src/lib.rs"),
+            "pub enum ExternalDisks { Hardcoded { vdevs: V }, DetectPhysical }",
+        )
+        .unwrap();
+        let found = crate::find_omicron_checkout(root.as_str(), "21dae8a64");
+        assert_eq!(schema_from_checkout(Utf8Path::new(&found)), Some(NEW));
+    }
+
+    /// Live zfs stamp round-trip (write, read, copy). Needs a real dataset;
+    /// run on the box: VOXEL_SCHEMA_ZFS_TEST=<dataset> cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn zfs_stamp_round_trip() {
+        let Ok(dataset) = std::env::var("VOXEL_SCHEMA_ZFS_TEST") else {
+            panic!("set VOXEL_SCHEMA_ZFS_TEST=<dataset> to run");
+        };
+        let zfs = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("zfs")
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "zfs {args:?}"
+            );
+        };
+        for img in ["schema-test-a", "schema-test-b"] {
+            let _ = std::process::Command::new("zfs")
+                .args(["destroy", &format!("{dataset}/img/{img}")])
+                .status();
+            zfs(&["create", "-p", &format!("{dataset}/img/{img}")]);
+        }
+        // SAFETY: test-only process-global override of the dataset root.
+        unsafe { std::env::set_var("FALCON_DATASET", &dataset) };
+        zfs(&[
+            "set",
+            &format!("{PROP_DATA_LINKS}=tagged"),
+            &format!("{PROP_DISKS}=hardcoded"),
+            &format!("{dataset}/img/schema-test-a"),
+        ]);
+        assert_eq!(schema_from_image_props("schema-test-a"), Some(NEW));
+        assert_eq!(schema_from_image_props("schema-test-b"), None);
+        copy_image_schema_props("schema-test-a", "schema-test-b").unwrap();
+        assert_eq!(schema_from_image_props("schema-test-b"), Some(NEW));
+        for img in ["schema-test-a", "schema-test-b"] {
+            zfs(&["destroy", &format!("{dataset}/img/{img}")]);
+        }
     }
 }

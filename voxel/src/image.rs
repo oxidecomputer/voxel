@@ -67,6 +67,11 @@ pub(crate) fn render_smf(
 ) -> anyhow::Result<()> {
     let scrimlets = [0usize, gimlets.saturating_sub(1)];
     let fleet = voxel_config::sp::SpFleet::sim(gimlets);
+    // The baked config must speak the same schema as the omicron being built.
+    let (data_links, disks) = crate::topo::schema_from_checkout(omicron_root)
+        .with_context(|| {
+        format!("read sled-agent config schema from {omicron_root}")
+    })?;
     let writes = [
         (
             "smf/mgs-sim/config.toml",
@@ -75,7 +80,10 @@ pub(crate) fn render_smf(
         ("smf/sp-sim/config.toml", fleet.sp_sim_config()),
         (
             "smf/sled-agent/non-gimlet/config.toml",
-            voxel_config::sled::SledAgentConfig::new(0, true).render(),
+            voxel_config::sled::SledAgentConfig::new(
+                0, true, data_links, disks,
+            )
+            .render(),
         ),
     ];
     for (rel, text) in writes {

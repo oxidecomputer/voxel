@@ -549,10 +549,13 @@ impl SledDesc {
         data_links: SledDataLinksSchema,
         disks: SledDisksSchema,
     ) -> crate::sled::SledAgentConfig {
-        crate::sled::SledAgentConfig::new(self.index, self.scrimlet)
-            .with_topology(num_sleds, num_fabric_routers)
-            .with_data_links_schema(data_links)
-            .with_disks_schema(disks)
+        crate::sled::SledAgentConfig::new(
+            self.index,
+            self.scrimlet,
+            data_links,
+            disks,
+        )
+        .with_topology(num_sleds, num_fabric_routers)
     }
 }
 
@@ -590,13 +593,10 @@ impl Default for Image {
 /// omicron versions. `voxel-init` (baked into each image) is shape-preserving:
 /// it substitutes the detected NIC names into whichever shape this selects, so
 /// one agent works on any image. Pick the variant matching the image's omicron.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SledDataLinksSchema {
     /// Pre-main omicron (e.g. v20 / a3fee0ec): `data_links = ["vioif0", "vioif1"]`.
-    #[default]
     List,
     /// omicron main (the `DataLinks` enum):
     /// `data_links = { kind = "virtual", devices = ["vioif0", "vioif1"] }`.
@@ -606,14 +606,11 @@ pub enum SledDataLinksSchema {
 /// The shape of sled-agent's disk config, which changed across omicron versions:
 /// the flat `vdevs = [...]` list became a tagged `external_disks` enum. Selected
 /// independently of [`SledDataLinksSchema`] (they drifted at different commits).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SledDisksSchema {
     /// Pre-rename omicron (e.g. a3fee0ec / 43bb5af / 99a0aec):
     /// `vdevs = ["m2_g0_0.vdev", ...]`.
-    #[default]
     Vdevs,
     /// The `ExternalDisks` enum, `#[serde(tag = "kind")]`, while it still had a
     /// `Virtual` variant (e.g. cc07512e0):
@@ -623,6 +620,40 @@ pub enum SledDisksSchema {
     /// merged into one variant:
     /// `external_disks = { kind = "hardcoded", vdevs = [...], disks = [] }`.
     Hardcoded,
+}
+
+impl SledDataLinksSchema {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Tagged => "tagged",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "list" => Some(Self::List),
+            "tagged" => Some(Self::Tagged),
+            _ => None,
+        }
+    }
+}
+
+impl SledDisksSchema {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vdevs => "vdevs",
+            Self::ExternalDisks => "external_disks",
+            Self::Hardcoded => "hardcoded",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "vdevs" => Some(Self::Vdevs),
+            "external_disks" => Some(Self::ExternalDisks),
+            "hardcoded" => Some(Self::Hardcoded),
+            _ => None,
+        }
+    }
 }
 
 impl Image {
