@@ -38,13 +38,17 @@ pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(src)
+        // Under pfexec the checkout is usually owned by the invoking user,
+        // which git rejects as dubious ownership; the path is operator-given.
+        .arg("-c")
+        .arg(format!("safe.directory={src}"))
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .with_context(|| format!("run git in {}", src))?;
     if !out.status.success() {
         bail!(
-            "git rev-parse HEAD failed in {} (is it an omicron checkout?)",
-            src
+            "git rev-parse HEAD failed in {src}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())

@@ -123,9 +123,11 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     })?;
 
     eprintln!(
-        "[voxel] booting builder {}, role {}",
+        "[voxel] booting builder {}, role {}; image -> {}/img/{}",
         o.base_image,
-        o.role.unwrap_or("none")
+        o.role.unwrap_or("none"),
+        o.dataset,
+        o.image_name
     );
     d.launch().await.map_err(|e| anyhow::anyhow!("launch builder: {e}"))?;
 
