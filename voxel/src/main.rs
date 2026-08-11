@@ -710,7 +710,13 @@ async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
     // Anchor to the project root before anything touches cargo-bay/.falcon.
     let config_path = discover_config(cli.config.as_deref());
-    let cfg = load_config(&config_path).ok();
+    // A missing config means defaults; an existing one that fails to load or
+    // parse must not (it silently dropped settings like falcon.dataset).
+    let cfg = match load_config(&config_path) {
+        Ok(c) => Some(c),
+        Err(e) if config_path.is_file() => return Err(e),
+        Err(_) => None,
+    };
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
