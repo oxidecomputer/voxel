@@ -1,0 +1,98 @@
+[
+  {
+    "protocol": "ip",
+    "pref": 100,
+    "kind": "flower",
+    "chain": 0
+  },
+  {
+    "protocol": "ip",
+    "pref": 100,
+    "kind": "flower",
+    "chain": 0,
+    "options": {
+      "handle": 1,
+      "keys": {
+        "eth_type": "ipv4",
+        "dst_ip": "239.1.1.1"
+      },
+      "not_in_hw": true,
+      "actions": [
+        {
+          "order": 1,
+          "kind": "mirred",
+          "mirred_action": "mirror",
+          "direction": "egress",
+          "to_dev": "enp0s9",
+          "control_action": {
+            "type": "pipe"
+          },
+          "index": 1,
+          "ref": 1,
+          "bind": 1
+        },
+        {
+          "order": 2,
+          "kind": "mirred",
+          "mirred_action": "mirror",
+          "direction": "egress",
+          "to_dev": "enp0s10",
+          "control_action": {
+            "type": "pipe"
+          },
+          "index": 2,
+          "ref": 1,
+          "bind": 1
+        }
+      ]
+    }
+  },
+  {
+    "protocol": "ip",
+    "pref": 101,
+    "kind": "flower",
+    "chain": 0
+  },
+  {
+    "protocol": "ip",
+    "pref": 101,
+    "kind": "flower",
+    "chain": 0,
+    "options": {
+      "handle": 1,
+      "keys": {
+        "eth_type": "ipv4",
+        "dst_ip": "239.2.2.2"
+      },
+      "not_in_hw": true,
+      "actions": [
+        {
+          "order": 1,
+          "kind": "mirred",
+          "mirred_action": "mirror",
+          "direction": "egress",
+          "to_dev": "enp0s9",
+          "control_action": {
+            "type": "pipe"
+          },
+          "index": 3,
+          "ref": 1,
+          "bind": 1
+        },
+        {
+          "order": 2,
+          "kind": "mirred",
+          "mirred_action": "mirror",
+          "direction": "egress",
+          "to_dev": "enp0s10",
+          "control_action": {
+            "type": "pipe"
+          },
+          "index": 4,
+          "ref": 1,
+          "bind": 1
+        }
+      ]
+    }
+  }
+]

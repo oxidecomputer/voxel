@@ -16,8 +16,10 @@ use crate::imagebuild::{
     BakeOpts, bake, builder_network, repo_root, toolchain_bin,
 };
 
-/// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
-const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
+/// sidecar-lite pinned rev, the zl/multicast tip.
+///
+/// TODO: repin to main once zl/multicast merges.
+const SIDECAR_LITE_REV: &str = "461cbe1926b93b20c2f43ad5cd9007b193db61a6";
 const SIDECAR_URL: &str = "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
 
 /// Build flags matching the validated recipe for building omicron on Helios.
@@ -44,7 +46,8 @@ pub(crate) struct CpBuild<'a> {
 
 /// The omicron sha voxel's own rack-init-config dependency is pinned to. Empty while
 /// the dependency is a path dep. Set by build.rs from Cargo.lock.
-const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
+pub(crate) const PINNED_OMICRON_REV: &str =
+    env!("RACK_INIT_CONFIG_OMICRON_REV");
 
 /// `voxel image create`: resolve where the omicron source is and what the image
 /// is called, then build. `--src <path>` builds that checkout as-is with
@@ -157,31 +160,22 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
             let repo = std::env::var("OMICRON_REPO").unwrap_or_else(|_| {
                 "https://github.com/oxidecomputer/omicron".into()
             });
-            run(
-                Command::new("git").arg("clone").arg(&repo).arg(src),
-                "git clone omicron",
-            )?;
+            run(git().arg("clone").arg(&repo).arg(src), "git clone omicron")?;
         }
         eprintln!("[voxel] checking out {commit}");
         // A fetch failure is tolerable: the commit may already be local.
-        let _ = Command::new("git")
+        let _ = git()
             .arg("-C")
             .arg(src)
             .args(["fetch", "--all", "--tags", "-q"])
             .status();
         run(
-            Command::new("git")
-                .arg("-C")
-                .arg(src)
-                .args(["checkout", "-q", commit]),
+            git().arg("-C").arg(src).args(["checkout", "-q", commit]),
             "git checkout",
         )?;
         // Drop leftover local edits so the pinned commit builds pristine.
         run(
-            Command::new("git")
-                .arg("-C")
-                .arg(src)
-                .args(["checkout", "-q", "--", "."]),
+            git().arg("-C").arg(src).args(["checkout", "-q", "--", "."]),
             "git restore tracked files",
         )?;
     }
@@ -361,6 +355,22 @@ fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
     }
     eprintln!("[voxel] staged scadm + libsidecar_lite.so -> {dest}");
     Ok(())
+}
+
+/// A `git` command that ignores the invoking user's git config. `voxel image
+/// create` runs under pfexec, which keeps the caller's HOME, so root's git
+/// would otherwise read the user's `~/.gitconfig`. An `insteadOf` rewrite
+/// there turns the anonymous HTTPS clone into SSH that root has no host keys
+/// for, and root reading a user-owned `OMICRON_REPO` checkout trips git's
+/// `safe.directory` ownership check. Scrubbing both config files and passing
+/// `safe.directory` back in command scope (taken into effect since git 2.37's
+/// protected configuration) covers both.
+pub(crate) fn git() -> Command {
+    let mut c = Command::new("git");
+    c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["-c", "safe.directory=*"]);
+    c
 }
 
 /// A command run inside the omicron checkout, with the PATH and RUSTFLAGS the

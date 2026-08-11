@@ -7,6 +7,7 @@
 //! every step is visible and best-effort steps log a warning instead of
 //! aborting. Mirror that—`run`/`run_quiet` never panic and return success.
 
+use std::fs;
 use std::process::{Command, Stdio};
 
 /// Parsed `/opt/cargo-bay/external-net` (voxel-managed isolated segment). All
@@ -68,6 +69,58 @@ pub fn note(msg: impl AsRef<str>) {
 /// A non-fatal warning (mirrors the scripts' `echo WARN: ...`).
 pub fn warn(msg: impl AsRef<str>) {
     println!("[voxel-init] WARN: {}", msg.as_ref());
+}
+
+/// Append the staged operator key(s) at `staged` (the cargo-bay's
+/// `root_authorized_keys`, if present) to root's `authorized_keys`, skipping
+/// lines already there. Both role agents run this on every boot and the node
+/// disk survives destroy/relaunch, so a plain append would accumulate
+/// duplicates.
+/// Permissions are pinned to 0700/0600 because sshd's default `StrictModes`
+/// rejects looser ones.
+///
+/// This is best-effort, like the rest of bring-up.
+pub fn append_authorized_keys(staged: &str) {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !std::path::Path::new(staged).exists() {
+        return;
+    }
+    let keys = match fs::read_to_string(staged) {
+        Ok(k) => k,
+        Err(e) => {
+            warn(format!("authorized_keys: read {staged}: {e}"));
+            return;
+        }
+    };
+    let dir = "/root/.ssh";
+    let path = "/root/.ssh/authorized_keys";
+    if let Err(e) =
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    {
+        warn(format!("authorized_keys: {dir}: {e}"));
+        return;
+    }
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut out = existing.clone();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for line in keys.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || existing.lines().any(|l| l == line) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out != existing
+        && let Err(e) = fs::write(path, &out)
+    {
+        warn(format!("authorized_keys: write: {e}"));
+        return;
+    }
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
 }
 
 /// Apply literal `(from, to)` substitutions to `path` in one rewrite. Both role

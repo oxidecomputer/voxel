@@ -19,6 +19,7 @@ futures.workspace = true
 clap.workspace = true
 camino.workspace = true
 indoc.workspace = true
+itertools.workspace = true
 oxnet.workspace = true
 voxel-config = { path = "../voxel-config" }
 # Omicron's own RackInitializeRequest types and config-rss serialization,
@@ -29,6 +30,7 @@ wicketd-commission-client.workspace = true
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
+serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 libc = "0.2"

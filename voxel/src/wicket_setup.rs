@@ -16,7 +16,7 @@ pub(crate) fn dryrun(
     num_sleds: usize,
 ) -> Result<()> {
     let config_rss = std::fs::read_to_string(config_rss_path)
-        .with_context(|| format!("read {}", config_rss_path))?;
+        .with_context(|| format!("read {config_rss_path}"))?;
     // Offline check assumes a single rack (slots 0..n); the live multi-rack slot
     // set comes from the topology in `drive`.
     let slots: Vec<u16> = (0..num_sleds as u16).collect();

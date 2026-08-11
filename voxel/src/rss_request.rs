@@ -13,8 +13,8 @@ use rack_init_config::{
     BgpPeerConfig, BootstrapAddressDiscovery, IdOrdMap, IpRange, Ipv4Range,
     Ipv6Range, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
     MaxPathConfig, PortConfig, RackInitializeRequest, RackNetworkConfig,
-    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, RouterPeerType,
-    ServiceIpPoolConfig, SwitchSlot, UplinkAddress, UplinkAddressConfig,
+    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, ServiceIpPoolConfig,
+    SwitchSlot, UnnumberedRouter, UplinkAddress, UplinkAddressConfig,
     UplinkPorts,
 };
 use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
@@ -86,12 +86,13 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
             vec![BgpPeerConfig {
                 asn: p.peer_asn,
                 port: p.port.clone(),
-                addr: RouterPeerType::Unnumbered {
+                addr: UnnumberedRouter {
                     router_lifetime: RouterLifetimeConfig::new(
                         p.router_lifetime,
                     )
                     .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
-                },
+                }
+                .into(),
                 hold_time: None,
                 idle_hold_time: None,
                 delay_open: None,
@@ -136,6 +137,7 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
         autoneg: false,
         lldp: Some(lldp(&p.switch, &p.lldp)),
         tx_eq: None,
+        allow_ddm_traffic: false,
     })
 }
 
@@ -156,6 +158,9 @@ fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
         autoneg: false,
         lldp: Some(lldp(switch, &format!("interconnect-{port}"))),
         tx_eq: None,
+        // Interconnect ports carry cross-rack mg-ddm peering, the case the
+        // multirack DDM gate exists for. The flag is unenforced today.
+        allow_ddm_traffic: true,
     })
 }
 
@@ -319,6 +324,8 @@ pub fn config_rss_toml(cfg: &VoxelConfig, rack: usize) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use rack_init_config::RouterPeerType;
+
     use super::*;
 
     fn config(racks: usize, network: &str) -> VoxelConfig {

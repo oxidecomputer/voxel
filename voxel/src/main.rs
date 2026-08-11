@@ -31,6 +31,7 @@ mod cpbuild;
 mod image;
 mod imagebuild;
 mod isolated_external;
+mod multicast;
 mod net;
 mod network;
 mod patch;
@@ -125,7 +126,8 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Destroy the rack.
+    /// Destroy the rack. Run `voxel network multicast down` first when
+    /// host-side multicast plumbing is in use.
     Destroy,
     /// Open a serial console to a node (^q to exit).
     Serial { node: String },
@@ -198,6 +200,12 @@ enum Cmd {
         /// Run an already-built commtest binary.
         #[arg(long)]
         no_build: bool,
+
+        /// Plumb any missing host multicast route or router mirror instead of
+        /// refusing to start. This is equivalent to
+        /// `voxel network multicast up` for the groups this run uses.
+        #[arg(long)]
+        setup_mcast: bool,
 
         /// Permit running with effective uid 0. Build artifacts and reports
         /// under the build root become root-owned, which later unprivileged
@@ -372,6 +380,15 @@ enum NetworkCmd {
         #[command(subcommand)]
         cmd: ExternalCmd,
     },
+    /// Plumb host-sourced multicast into a running rack: a host route per
+    /// group, the transit router's `tc` mirror, and the link-layer membership
+    /// that lets its NIC accept the group.
+    ///
+    /// This works in either `[external]` mode.
+    Multicast {
+        #[command(subcommand)]
+        cmd: MulticastCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -391,6 +408,48 @@ enum ExternalCmd {
     },
     /// Assert the whole path is live (uplink, links, NAT); PASS/FAIL per item.
     Check,
+}
+
+#[derive(Subcommand)]
+enum MulticastCmd {
+    /// Point each group's host route at `ce`, install the mirror, and pin the
+    /// router NIC's link-layer membership.
+    Up {
+        /// Group to plumb (pass the flag once per group).
+        ///
+        /// This accepts commtest's `GROUP[@SRC,...]` form, of which only the
+        /// address matters here.
+        ///
+        /// Defaults to the group `voxel commtest --traffic multicast` sends.
+        #[arg(long = "group", value_name = "GROUP", default_value = commtest::DEFAULT_MCAST_GROUP)]
+        groups: Vec<String>,
+        /// Print the host and router commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the mirror, the memberships, and the per-group host routes.
+    Down {
+        /// Group to tear down (pass the flag once per group).
+        ///
+        /// Same form as `up`. Defaults to everything this Falcon environment
+        /// has recorded or still owns on its router. Routes belonging to
+        /// another environment are left alone.
+        #[arg(long = "group", value_name = "GROUP")]
+        groups: Vec<String>,
+        /// Print the host and router commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Assert the routes, mirror, and memberships are in place, listing
+    /// anything that's missing.
+    Check {
+        /// Group to assert (pass the flag once per group).
+        ///
+        /// Same form as `up`. Defaults to everything voxel has plumbed,
+        /// the same set a groupless `down` tears down.
+        #[arg(long = "group", value_name = "GROUP")]
+        groups: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -584,8 +643,7 @@ enum TpCmd {
 
 fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
     if path.exists() {
-        Ok(fs::read_to_string(path)
-            .with_context(|| format!("read {}", path))?)
+        Ok(fs::read_to_string(path).with_context(|| format!("read {path}"))?)
     } else {
         Ok(VoxelConfig::default().to_toml())
     }
@@ -593,9 +651,17 @@ fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
 
 fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    let cfg = VoxelConfig::from_toml(&text)
-        .with_context(|| format!("parse {}", path))?;
+    let mut cfg = VoxelConfig::from_toml(&text)
+        .with_context(|| format!("parse {path}"))?;
     cfg.topology.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    // An unset image.cp follows the workspace's omicron pin, the image a
+    // commitless `voxel image create` bakes, so a repin and rebuild-relaunch
+    // cycle gets by without a config edit. An explicit cp still selects any
+    // image.
+    if cfg.image.cp.is_none() && !cpbuild::PINNED_OMICRON_REV.is_empty() {
+        cfg.image.cp =
+            Some(format!("voxel-cp-{}", cpbuild::PINNED_OMICRON_REV));
+    }
     Ok(cfg)
 }
 
@@ -737,7 +803,7 @@ fn anchor_workdir(
         && root.is_dir()
     {
         std::env::set_current_dir(&root)
-            .with_context(|| format!("chdir to workdir {}", root))?;
+            .with_context(|| format!("chdir to workdir {root}"))?;
     }
     Ok(())
 }
@@ -803,25 +869,31 @@ async fn main() -> Result<(), Error> {
             api,
             traffic,
             no_build,
+            setup_mcast,
             allow_root,
             args,
-        } => commtest::run(
-            &load_config(&config_path)?,
-            commtest::Options {
-                // clap rejects <COMMIT> together with --source (conflicts_with).
-                source: match (source.as_deref(), reference.as_deref()) {
-                    (Some(path), _) => commtest::Source::Local(path),
-                    (None, Some(r)) => commtest::Source::Reference(r),
-                    (None, None) => commtest::Source::Image,
+        } => {
+            commtest::run(
+                &load_config(&config_path)?,
+                &cli.name,
+                commtest::Options {
+                    // clap rejects <COMMIT> together with --source (conflicts_with).
+                    source: match (source.as_deref(), reference.as_deref()) {
+                        (Some(path), _) => commtest::Source::Local(path),
+                        (None, Some(r)) => commtest::Source::Reference(r),
+                        (None, None) => commtest::Source::Image,
+                    },
+                    rack: *rack,
+                    api_override: api.as_deref(),
+                    traffic: *traffic,
+                    no_build: *no_build,
+                    setup_mcast: *setup_mcast,
+                    allow_root: *allow_root,
+                    passthrough: args,
                 },
-                rack: *rack,
-                api_override: api.as_deref(),
-                traffic: *traffic,
-                no_build: *no_build,
-                allow_root: *allow_root,
-                passthrough: args,
-            },
-        ),
+            )
+            .await
+        }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
             ImageCmd::Patch { component, reference, image, out } => {
@@ -930,6 +1002,20 @@ async fn main() -> Result<(), Error> {
                     ),
                     ExternalCmd::Check => {
                         isolated_external::check(&cfg.external)
+                    }
+                }
+            }
+            NetworkCmd::Multicast { cmd } => {
+                let cfg = load_config(&config_path)?;
+                match cmd {
+                    MulticastCmd::Up { groups, dry_run } => {
+                        multicast::up(&cfg, &cli.name, groups, *dry_run).await
+                    }
+                    MulticastCmd::Down { groups, dry_run } => {
+                        multicast::down(&cfg, &cli.name, groups, *dry_run).await
+                    }
+                    MulticastCmd::Check { groups } => {
+                        multicast::check(&cfg, &cli.name, groups).await
                     }
                 }
             }

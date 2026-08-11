@@ -21,7 +21,7 @@ use voxel_config::{SledDesc, VoxelConfig};
 use crate::net::{resolve_external_ip, ssh_capture, ssh_output, zlogin};
 use crate::topo::build_topo;
 
-const SWADM: &str = "/opt/oxide/dendrite/bin/swadm";
+pub(crate) const SWADM: &str = "/opt/oxide/dendrite/bin/swadm";
 const MGADM: &str = "/opt/oxide/mgd/bin/mgadm";
 
 /// The global switch index (`switchN`) for each scrimlet, in order.

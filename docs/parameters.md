@@ -33,7 +33,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. |
-| `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
+| `cp` | string | unset | Full cp image name. Overrides `version`. Unset follows the workspace's omicron pin (`voxel-cp-<pin>`, the image a commitless `voxel image create` bakes). Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
 | `disks_schema` | enum | unset | `vdevs`, `external_disks`, or `hardcoded` (omicron#10948). Unset auto-detects from the image. |
@@ -102,6 +102,7 @@ Runtime paths. Each unset value resolves via env then built-in default.
 | `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/` and `.falcon/` live under. Absolute. |
 | `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkouts). |
 | `propolis_binary` | string | unset | `propolis-server` the host runs each node under. Unset leaves falcon's own binary, which it downloads on demand. Set it to run a locally built propolis, e.g. for a device-model fix that has not reached a release. Rack nodes only, as the image-build VM keeps falcon's binary. |
+| `ssh_pubkey` | string | first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` | SSH public key staged into every node's cargo-bay as `root_authorized_keys`; voxel-init appends it to root's `authorized_keys`, so `ssh root@<node>` authenticates by key instead of the empty password. Content-validated before staging (a private key is refused). When unset and no default key exists, staging is skipped. |
 
 ## [sp]
 

@@ -309,7 +309,7 @@ async fn sp_reflash(
     image: &Utf8Path,
 ) -> anyhow::Result<()> {
     if !image.exists() {
-        return Err(anyhow!("image not found: {}", image));
+        return Err(anyhow!("image not found: {image}"));
     }
     let local = image.as_str();
     let topo = build_topo(cfg, name)?;
@@ -334,8 +334,7 @@ async fn sp_reflash(
         // instance (build-cp.sh copies `[sp].rot_image` -> rot.flash). Replace it
         // and restart them all; the SPs reconnect to the bridge.
         eprintln!(
-            "[voxel] reflashing shared RoT (rot.flash) on {sw} from {}",
-            image
+            "[voxel] reflashing shared RoT (rot.flash) on {sw} from {image}"
         );
         if !scp_to(
             &ip,
@@ -371,8 +370,7 @@ async fn sp_reflash(
     let port = resolve_port(&fleet, target)?;
     let zip = image.file_name().ok_or_else(|| anyhow!("bad image filename"))?;
     eprintln!(
-        "[voxel] reflashing SP {target} (port {port}) on {sw} from {}",
-        image
+        "[voxel] reflashing SP {target} (port {port}) on {sw} from {image}"
     );
     let remote_zip_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/{zip}");
     if !scp_to(&ip, local, &remote_zip_gz) {
@@ -464,7 +462,7 @@ async fn sp_debug(
     let local =
         crate::util::temp_dir().join(format!("voxel-sp-env-{port}.scfg"));
     std::fs::write(&local, &content)
-        .map_err(|e| anyhow!("write {}: {e}", local))?;
+        .map_err(|e| anyhow!("write {local}: {e}"))?;
     let remote_gz =
         format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-env-{port}.scfg");
     let remote = format!("/var/tmp/voxel-sp-env-{port}.scfg");
@@ -603,7 +601,7 @@ exit 1
     );
     let local = crate::util::temp_dir().join(format!("voxel-ipcc-{port}.sh"));
     std::fs::write(&local, &script)
-        .map_err(|e| anyhow!("write {}: {e}", local))?;
+        .map_err(|e| anyhow!("write {local}: {e}"))?;
     if !scp_to(
         &ip,
         local.as_str(),
@@ -746,7 +744,7 @@ async fn sp_dump(
         let local = crate::util::temp_dir()
             .join(format!("voxel-sp-dumpenv-{port}.scfg"));
         std::fs::write(&local, &content)
-            .map_err(|e| anyhow!("write {}: {e}", local))?;
+            .map_err(|e| anyhow!("write {local}: {e}"))?;
         let remote_gz =
             format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-dumpenv-{port}.scfg");
         let remote = format!("/var/tmp/voxel-sp-dumpenv-{port}.scfg");
@@ -787,7 +785,7 @@ async fn sp_dump(
     // Pull the zip to the host and decode it there (humility + archive live here).
     let host_dir = crate::util::temp_dir().join(format!("voxel-spdump-{port}"));
     std::fs::create_dir_all(&host_dir)
-        .map_err(|e| anyhow!("mkdir {}: {e}", host_dir))?;
+        .map_err(|e| anyhow!("mkdir {host_dir}: {e}"))?;
     let zip_local = host_dir.join("dump.zip");
     let zip_remote = format!("{SWITCH_ZONE_ROOT}{dump_dir}/dump.zip");
     if !scp_from(&ip, &zip_remote, zip_local.as_str()) {
@@ -828,8 +826,7 @@ async fn sp_dump(
     print!("{}", String::from_utf8_lossy(&dec.stdout));
     eprint!("{}", String::from_utf8_lossy(&dec.stderr));
     eprintln!(
-        "[voxel] dump saved: {} - inspect further with `{humility} -d {} <ringbuf|readvar|...>`",
-        hydrated, hydrated
+        "[voxel] dump saved: {hydrated} - inspect further with `{humility} -d {hydrated} <ringbuf|readvar|...>`"
     );
     Ok(())
 }
@@ -992,9 +989,9 @@ fn flash(
         anyhow!("[sp].emu_bin is not set (path to the sp-emu binary)")
     })?;
     if !image.exists() {
-        return Err(anyhow!("image not found: {}", image));
+        return Err(anyhow!("image not found: {image}"));
     }
-    eprintln!("[voxel] flashing {} -> {}", image, out);
+    eprintln!("[voxel] flashing {image} -> {out}");
     let status = std::process::Command::new(emu_bin)
         .env("SP_EMU_FLASH", out)
         .args(["flash", "a"])
@@ -1004,21 +1001,20 @@ fn flash(
     if !status.success() {
         return Err(anyhow!("sp-emu flash failed"));
     }
-    println!("flashed {}", out);
+    println!("flashed {out}");
     Ok(())
 }
 
 fn build(commit: &str) -> anyhow::Result<()> {
     let script = build_sp_script()?;
     eprintln!(
-        "[voxel] building sp-emu hubris images for {commit} via {}",
-        script
+        "[voxel] building sp-emu hubris images for {commit} via {script}"
     );
     let status = std::process::Command::new("bash")
         .arg(&script)
         .arg(commit)
         .status()
-        .map_err(|e| anyhow!("run {}: {e}", script))?;
+        .map_err(|e| anyhow!("run {script}: {e}"))?;
     if !status.success() {
         return Err(anyhow!("build-sp.sh failed for {commit}"));
     }

@@ -13,8 +13,8 @@ use voxel_config::VoxelConfig;
 
 use crate::isolated_external::{DryRun, link_mtu, up as external_up};
 use crate::net::{
-    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture,
-    ssh_output, wait_external_reachable, zlogin,
+    ce_static_ip, resolve_external_ip, serial_bounded, set_external_route,
+    ssh_capture, ssh_output, wait_external_reachable, zlogin,
 };
 use crate::rss::watch_rss;
 use crate::topo::{
@@ -646,6 +646,82 @@ fn rss_watch_cap(emu_sp: bool, racks: usize) -> std::time::Duration {
     })
 }
 
+/// Per-sled rpool usage and pool health, parsed from one ssh round trip.
+struct SledDisk {
+    used: u64,
+    avail: u64,
+    degraded: bool,
+}
+
+/// Separates the `zfs list` usage line from the `zpool status -x` health
+/// summary in the combined remote command output.
+const DISK_REPORT_SEP: &str = "--voxel-disk--";
+
+fn parse_sled_disk(out: &str) -> Option<SledDisk> {
+    let (usage, health) = out.split_once(DISK_REPORT_SEP)?;
+    let mut fields = usage.split_whitespace();
+    let used = fields.next()?.parse().ok()?;
+    let avail = fields.next()?.parse().ok()?;
+    let health = health.trim();
+    let degraded =
+        !health.is_empty() && !health.contains("all pools are healthy");
+    Some(SledDisk { used, avail, degraded })
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// Report each sled's rpool usage and pool health. The sparse U.2/M.2 vdev
+/// backing files in the guest's /var/tmp overcommit the rpool and only ever
+/// grow (illumos file vdevs never return freed blocks), so a long-held rack
+/// drifts toward the ENOSPC cliff, which takes out svc.configd and, with it,
+/// dendrite in the switch zone. Surfacing the pressure here lets an operator
+/// relaunch before the cliff.
+async fn print_sled_disk_pressure(cfg: &VoxelConfig, topo: &Topo) {
+    println!("sled disks:");
+    for (s, n) in &topo.sleds {
+        let resolved = serial_bounded(
+            &format!("reading {}'s address", s.name),
+            resolve_external_ip(cfg, &topo.runner, &s.name, *n, false),
+        )
+        .await;
+        let Ok(ip) = resolved else {
+            println!("    {}: unreachable (is the rack up?)", s.name);
+            continue;
+        };
+        let out = ssh_capture(
+            &ip,
+            &format!(
+                "zfs list -Hpo used,avail rpool; \
+                 echo {DISK_REPORT_SEP}; zpool status -x"
+            ),
+        );
+        let Some(disk) = out.as_deref().and_then(parse_sled_disk) else {
+            println!("    {}: rpool unreadable", s.name);
+            continue;
+        };
+        let total = disk.used + disk.avail;
+        let pct = if total == 0 {
+            0
+        } else {
+            (disk.used as f64 / total as f64 * 100.0).round() as u64
+        };
+        let low = if pct >= 85 { "  WARNING: low space" } else { "" };
+        let degraded = if disk.degraded {
+            "  DEGRADED pools (zpool status -x on the sled)"
+        } else {
+            ""
+        };
+        println!(
+            "    {}: rpool {} / {} ({pct}%){low}{degraded}",
+            s.name,
+            gib(disk.used),
+            gib(total)
+        );
+    }
+}
+
 pub(crate) async fn cmd_status(
     cfg: &VoxelConfig,
     name: &str,
@@ -657,6 +733,7 @@ pub(crate) async fn cmd_status(
         bail!("no RSS sled in topology");
     }
     let d = &topo.runner;
+    print_sled_disk_pressure(cfg, &topo).await;
     // Multi-rack racks converge under each other's load - watch longer (matches
     // cmd_launch). Duration is Copy, so each watcher closure gets its own.
     let watch_cap = rss_watch_cap(false, racks);

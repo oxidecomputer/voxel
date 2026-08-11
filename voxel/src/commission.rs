@@ -101,6 +101,9 @@ fn uplink_port(
                 enforce_first_as: false,
                 allowed_import: Default::default(),
                 allowed_export: Default::default(),
+                // Source addresses apply to numbered sessions only (ours is
+                // unnumbered).
+                src_addr: None,
                 vlan_id: None,
             }],
         ),
@@ -343,7 +346,7 @@ pub(crate) async fn drive(
         .await
         .map_err(|e| anyhow!("upload cert: {e}"))?;
     client
-        .post_rss_config_key(&types::PrivateKeyPem(key))
+        .post_rss_config_key(&types::PrivateKeyPem(key.into()))
         .await
         .map_err(|e| anyhow!("upload key: {e}"))?;
     client

@@ -257,6 +257,41 @@ pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// How a remote command could fail: the ssh transport never reached the node,
+/// or the node ran the command and it exited non-zero.
+///
+/// This split lets callers take an "unreachable node" path (a destroyed rack)
+/// without also swallowing real command failures on a live one.
+#[derive(Debug)]
+pub(crate) enum SshFailure {
+    /// ssh could not connect or authenticate (exit 255), so the node itself
+    /// is unreachable.
+    Unreachable,
+    /// The command ran remotely and failed, or ssh could not be run locally;
+    /// holds the failure text.
+    Failed(String),
+}
+
+/// Like [`ssh_capture`], but keeps the failure mode instead of folding every
+/// failure into `None`.
+pub(crate) fn ssh_try_capture(
+    ip: &str,
+    remote: &str,
+) -> Result<String, SshFailure> {
+    let Some(out) = ssh_exec(ip, remote) else {
+        return Err(SshFailure::Failed("ssh could not be run locally".into()));
+    };
+    if out.status.code() == Some(255) {
+        return Err(SshFailure::Unreachable);
+    }
+    if !out.status.success() {
+        return Err(SshFailure::Failed(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Like [`ssh_capture`], but returns the remote command's combined output even
 /// when it exits non-zero - for callers (e.g. `sp exec`) that want the remote
 /// tool's OWN error text (faux-mgs prints `Error: ...`, which the caller folds
@@ -411,16 +446,18 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
     }
 }
 
-/// (Re)point the host route for the rack's external network (`prefix`) at ce's
-/// current external IP. ce's host-facing NIC gets a fresh random MAC - and thus
-/// a fresh DHCP IP - every launch, so any static route goes stale; discovering
-/// it here keeps the external services reachable without a manual hunt. The
-/// route is keyed by `prefix`, so racks with distinct external prefixes don't
-/// collide. With `apply == false` it just prints the command.
-/// The gateways currently routing `dest` (an IPv4 network address like
-/// `198.51.100.0`), read from `netstat -rn -f inet`. Used to purge every stale
-/// route for a prefix - dead-ce gateways from prior launches pile up otherwise.
-pub(crate) fn route_gateways(dest: &str) -> Vec<String> {
+/// A routing-table entry as `netstat -rn -f inet` prints it, reduced to the
+/// destination, gateway, and flags columns.
+pub(crate) struct RouteEntry {
+    pub dest: String,
+    pub gateway: String,
+    pub flags: String,
+}
+
+/// The IPv4 routing table, one entry per line with at least a destination and
+/// gateway column. Headers and separators come through as unparseable
+/// destinations, so consumers matching on an address never see them.
+pub(crate) fn route_entries() -> Vec<RouteEntry> {
     let out = match std::process::Command::new("netstat")
         .args(["-rn", "-f", "inet"])
         .output()
@@ -431,13 +468,32 @@ pub(crate) fn route_gateways(dest: &str) -> Vec<String> {
     out.lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
-            let d = it.next()?;
-            let gw = it.next()?;
-            (d == dest).then(|| gw.to_string())
+            Some(RouteEntry {
+                dest: it.next()?.to_string(),
+                gateway: it.next()?.to_string(),
+                flags: it.next().unwrap_or_default().to_string(),
+            })
         })
         .collect()
 }
 
+/// The gateways currently routing `dest` (an IPv4 network address like
+/// `198.51.100.0`). Used to purge every stale route for a prefix - dead-ce
+/// gateways from prior launches pile up otherwise.
+pub(crate) fn route_gateways(dest: &str) -> Vec<String> {
+    route_entries()
+        .into_iter()
+        .filter_map(|e| (e.dest == dest).then_some(e.gateway))
+        .collect()
+}
+
+/// (Re)point the host route for the rack's external network (`prefix`) at ce's
+/// current external IP. ce's host-facing NIC gets a fresh random MAC, and thus
+/// a fresh DHCP IP, every launch, so any static route goes stale.
+///
+/// Discovering it here keeps the external services reachable without manual hunting.
+/// The route is keyed by `prefix`, so racks with distinct external prefixes don't
+/// collide. With `apply == false` it just prints the command.
 pub(crate) async fn set_external_route(
     d: &Runner,
     ce: NodeRef,
