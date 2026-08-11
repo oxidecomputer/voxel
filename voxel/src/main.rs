@@ -630,6 +630,28 @@ fn discover_config(explicit: Option<&Utf8Path>) -> Utf8PathBuf {
 /// the sled-schema detection, the `image` commands, and any subprocess all see
 /// one consistent value. An unset var falls back to its built-in default
 /// (falcon's `rpool/falcon`).
+/// Locate `<build_root>/omicron-<commit>`, matching a short image label
+/// against full-sha checkout dirs (and vice versa) when the exact directory
+/// is absent. Ambiguous matches fall back to the exact path.
+fn find_omicron_checkout(build_root: &str, commit: &str) -> String {
+    let exact = format!("{build_root}/omicron-{commit}");
+    if Utf8PathBuf::from(&exact).is_dir() {
+        return exact;
+    }
+    let mut candidates: Vec<String> = std::fs::read_dir(build_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|n| {
+            let sha = n.strip_prefix("omicron-")?;
+            (sha.starts_with(commit) || commit.starts_with(sha))
+                .then(|| format!("{build_root}/{n}"))
+        })
+        .collect();
+    if candidates.len() == 1 { candidates.pop().unwrap() } else { exact }
+}
+
 fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     let dataset = cli
         .dataset
@@ -670,7 +692,7 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     // drift from `image.cp`; $VOXEL_OMICRON_SRC overrides.
     let omicron_src = std::env::var("VOXEL_OMICRON_SRC").ok().or_else(|| {
         cfg.and_then(|c| c.image.cp_commit())
-            .map(|commit| format!("{build_root_eff}/omicron-{commit}"))
+            .map(|commit| find_omicron_checkout(&build_root_eff, &commit))
     });
     if let Some(s) = omicron_src {
         // SAFETY: same single-threaded argument as FALCON_DATASET above.
@@ -965,5 +987,28 @@ async fn main() -> Result<(), Error> {
                 .await
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_omicron_checkout;
+
+    #[test]
+    fn checkout_lookup_matches_short_and_full_shas() {
+        let root = crate::util::temp_dir().join("voxel-checkout-lookup");
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["omicron-21dae8a64f00baa5", "omicron-43bb5af", "rss-gen-x"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let find = |c: &str| find_omicron_checkout(root.as_str(), c);
+        // Exact directory wins untouched.
+        assert!(find("43bb5af").ends_with("omicron-43bb5af"));
+        // Short image label resolves to the full-sha checkout dir.
+        assert!(find("21dae8a64").ends_with("omicron-21dae8a64f00baa5"));
+        // Full sha resolves to a short-named checkout dir.
+        assert!(find("43bb5af99ec").ends_with("omicron-43bb5af"));
+        // No match falls back to the exact (nonexistent) path.
+        assert!(find("deadbeef").ends_with("omicron-deadbeef"));
     }
 }

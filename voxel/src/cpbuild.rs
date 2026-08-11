@@ -308,6 +308,23 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     })
     .await?;
 
+    // Stamp the sled-agent config schema on the image so launch reads it from
+    // the image itself instead of re-deriving it from a checkout.
+    let (data_links, disks) = crate::topo::schema_from_checkout(src)
+        .with_context(|| format!("read sled-agent config schema from {src}"))?;
+    run(
+        Command::new("zfs")
+            .arg("set")
+            .arg(format!(
+                "{}={}",
+                crate::topo::PROP_DATA_LINKS,
+                data_links.as_str()
+            ))
+            .arg(format!("{}={}", crate::topo::PROP_DISKS, disks.as_str()))
+            .arg(format!("{}/img/{image_name}", b.dataset)),
+        "zfs set sled schema on the image",
+    )?;
+
     println!("built image {image_name}");
     Ok(())
 }
