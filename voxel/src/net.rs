@@ -443,10 +443,22 @@ fn route_readback_confirms_nexthop(output: &str, nexthop: &str) -> bool {
     })
 }
 
+fn external_route_targets(prefix: &str, dns_ips: &[String]) -> Vec<String> {
+    let mut targets = vec![prefix.to_string()];
+    for ip in dns_ips {
+        let host = format!("{ip}/32");
+        if !targets.contains(&host) {
+            targets.push(host);
+        }
+    }
+    targets
+}
+
 pub(crate) async fn set_external_route(
     d: &Runner,
     ce: NodeRef,
     prefix: &str,
+    dns_ips: &[String],
     apply: bool,
     static_ip: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -458,59 +470,58 @@ pub(crate) async fn set_external_route(
         None => node_external_ip(d, ce, true).await.context("ce")?,
     };
 
-    if !apply {
-        info!(d.log, "external route (dry-run): route add {} {}", prefix, ip);
-        return Ok(());
-    }
-    // Drop ALL stale routes for this prefix, then point it at the live ce.
-    // Dead-ce gateways from prior launches accumulate, and a bare
-    // `route delete <prefix>` doesn't reliably clear multiple same-prefix routes -
-    // so first enumerate the live gateways for this prefix from the routing table
-    // and delete each explicitly, then a few unqualified deletes to catch any
-    // remainder. illumos `route`'s exit code is unreliable (non-zero even on a
-    // successful add), so we key off printed output and re-read the table to
-    // confirm the final state.
-    let dest = prefix.split('/').next().unwrap_or(prefix);
-    for gw in route_gateways(dest) {
-        let _ = std::process::Command::new("route")
-            .args(["delete", prefix, &gw])
-            .output();
-    }
-    for _ in 0..8 {
-        let out = std::process::Command::new("route")
-            .args(["delete", prefix])
-            .output();
-        let gone = match out {
-            Ok(o) => {
-                String::from_utf8_lossy(&o.stdout).contains("not in table")
-            }
-            Err(_) => true,
-        };
-        if gone {
-            break;
+    for target in external_route_targets(prefix, dns_ips) {
+        if !apply {
+            info!(
+                d.log,
+                "external route (dry-run): route add {} {}", target, ip
+            );
+            continue;
         }
+
+        // DNS host routes override dynamic /32s that illumos may have learned
+        // through the host's default gateway.
+        let dest = target.split('/').next().unwrap_or(&target);
+        for gw in route_gateways(dest) {
+            let _ = std::process::Command::new("route")
+                .args(["delete", &target, &gw])
+                .output();
+        }
+        for _ in 0..8 {
+            let out = std::process::Command::new("route")
+                .args(["delete", &target])
+                .output();
+            let gone = match out {
+                Ok(o) => {
+                    String::from_utf8_lossy(&o.stdout).contains("not in table")
+                }
+                Err(_) => true,
+            };
+            if gone {
+                break;
+            }
+        }
+        let add = std::process::Command::new("route")
+            .args(["add", &target, &ip])
+            .output()
+            .with_context(|| format!("route add {target}"))?;
+        let readback = std::process::Command::new("route")
+            .args(["-n", "get", dest])
+            .output()
+            .with_context(|| format!("route -n get {dest}"))?;
+        let readback_stdout = String::from_utf8_lossy(&readback.stdout);
+        if !route_readback_confirms_nexthop(&readback_stdout, &ip) {
+            bail!(
+                "route {target} -> {ip} was not confirmed by `route -n get {dest}`; route add output: {}{}; route readback: {}{}; run: route add {target} {ip}",
+                String::from_utf8_lossy(&add.stdout).trim(),
+                String::from_utf8_lossy(&add.stderr).trim(),
+                readback_stdout.trim(),
+                String::from_utf8_lossy(&readback.stderr).trim(),
+            );
+        }
+        info!(d.log, "external route set: {} -> {} (ce)", target, ip);
     }
-    let add = std::process::Command::new("route")
-        .args(["add", prefix, &ip])
-        .output()
-        .context("route add")?;
-    let readback = std::process::Command::new("route")
-        .args(["-n", "get", dest])
-        .output()
-        .with_context(|| format!("route -n get {dest}"))?;
-    let readback_stdout = String::from_utf8_lossy(&readback.stdout);
-    if route_readback_confirms_nexthop(&readback_stdout, &ip) {
-        info!(d.log, "external route set: {} -> {} (ce)", prefix, ip);
-        Ok(())
-    } else {
-        bail!(
-            "route {prefix} -> {ip} was not confirmed by `route -n get {dest}`; route add output: {}{}; route readback: {}{}; run: route add {prefix} {ip}",
-            String::from_utf8_lossy(&add.stdout).trim(),
-            String::from_utf8_lossy(&add.stderr).trim(),
-            readback_stdout.trim(),
-            String::from_utf8_lossy(&readback.stderr).trim(),
-        )
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -558,6 +569,28 @@ mod tests {
                 .chain()
                 .any(|cause| cause.to_string() == "serial transport failed"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn external_routes_include_dns_hosts() {
+        let dns =
+            vec!["198.51.100.20".to_string(), "198.51.100.21".to_string()];
+
+        assert_eq!(
+            external_route_targets("198.51.100.0/24", &dns),
+            ["198.51.100.0/24", "198.51.100.20/32", "198.51.100.21/32"]
+        );
+    }
+
+    #[test]
+    fn external_routes_deduplicate_dns_hosts() {
+        let dns =
+            vec!["198.51.100.20".to_string(), "198.51.100.20".to_string()];
+
+        assert_eq!(
+            external_route_targets("198.51.100.0/24", &dns),
+            ["198.51.100.0/24", "198.51.100.20/32"]
         );
     }
 }

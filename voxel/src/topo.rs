@@ -7,10 +7,15 @@ use attest_mock::MockData;
 use camino::{Utf8Path, Utf8PathBuf};
 use indoc::formatdoc;
 use libfalcon::{NodeRef, Runner, SmbiosType1Input, unit::gb};
+use slog::warn;
 use std::fs;
+use std::time::Duration;
 use voxel_config::{
     SledDataLinksSchema, SledDesc, SledDisksSchema, VoxelConfig,
 };
+
+const DEFAULT_EXT_LINK_ATTEMPTS: usize = 3;
+const DEFAULT_EXT_LINK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) struct Topo {
     pub(crate) runner: Runner,
@@ -40,6 +45,22 @@ impl Topo {
     }
 }
 
+fn retry_default_ext_link<E>(
+    mut operation: impl FnMut() -> Result<(), E>,
+    mut retrying: impl FnMut(usize, &E),
+) -> Result<(), E> {
+    for attempt in 1..=DEFAULT_EXT_LINK_ATTEMPTS {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < DEFAULT_EXT_LINK_ATTEMPTS => {
+                retrying(attempt, &error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("default external link attempts are nonzero")
+}
+
 /// Wire a node's external NIC. Precedence: `$EXT_INTERFACE` env, then the
 /// config-driven link (the voxel-managed stub in isolated mode), then falcon's
 /// default (the host's default-route interface).
@@ -53,7 +74,21 @@ fn ext_interface(
     } else if let Some(ifx) = cfg_link {
         d.ext_link(ifx, n);
     } else {
-        d.default_ext_link(n).map_err(|e| {
+        let log = d.log.clone();
+        retry_default_ext_link(
+            || d.default_ext_link(n).map_err(anyhow::Error::from),
+            |attempt, error| {
+                warn!(
+                    log,
+                    "default external interface discovery failed; retrying";
+                    "attempt" => attempt,
+                    "max_attempts" => DEFAULT_EXT_LINK_ATTEMPTS,
+                    "error" => %error,
+                );
+                std::thread::sleep(DEFAULT_EXT_LINK_RETRY_DELAY);
+            },
+        )
+        .map_err(|e| {
             anyhow!("failed to find default external interface: {e}")
         })?;
     }
@@ -737,6 +772,48 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_external_link_recovers_from_a_transient_route_error() {
+        let mut attempts = 0;
+        let mut retries = Vec::new();
+
+        let result = retry_default_ext_link(
+            || {
+                attempts += 1;
+                if attempts == 1 { Err("missing mask") } else { Ok(()) }
+            },
+            |attempt, error| retries.push((attempt, *error)),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts, 2);
+        assert_eq!(retries, [(1, "missing mask")]);
+    }
+
+    #[test]
+    fn default_external_link_returns_the_last_route_error() {
+        let mut attempts = 0;
+        let mut retries = Vec::new();
+
+        let result = retry_default_ext_link(
+            || {
+                attempts += 1;
+                Err(format!("route error {attempts}"))
+            },
+            |attempt, error| retries.push((attempt, error.clone())),
+        );
+
+        assert_eq!(result, Err("route error 3".to_string()));
+        assert_eq!(attempts, DEFAULT_EXT_LINK_ATTEMPTS);
+        assert_eq!(
+            retries,
+            [
+                (1, "route error 1".to_string()),
+                (2, "route error 2".to_string()),
+            ]
+        );
+    }
 
     /// A stand-in checkout carrying the two files the sled-schema detection
     /// reads: the sled-agent config field and the sled-hardware enum variants.

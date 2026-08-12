@@ -611,6 +611,7 @@ pub(crate) async fn cmd_route(
             &topo.runner,
             ce,
             &prefix,
+            &cfg.network.for_rack(rack).external_dns_ips,
             !dry_run,
             ce_static_ip(cfg).as_deref(),
         )
@@ -1276,6 +1277,7 @@ pub(crate) async fn cmd_launch(
                 d,
                 ce,
                 &net.infra_prefix,
+                &net.external_dns_ips,
                 true,
                 ce_static_ip(cfg).as_deref(),
             )
