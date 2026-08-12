@@ -406,18 +406,34 @@ fn staged_switch_slot() -> Option<u8> {
     None
 }
 
-/// The detached enforcer (runs as `voxel-init switch-enforcer <slot>`). Forces
+/// Whether the switch zone is fully installed and running. Before that, the
+/// zone install can still rewrite the baked configs under us.
+fn switch_zone_running() -> bool {
+    std::process::Command::new("zoneadm")
+        .args(["-z", "oxz_switch", "list", "-p"])
+        .output()
+        .is_ok_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split(':')
+                .nth(2)
+                .is_some_and(|state| state == "running")
+        })
+}
+
+/// The detached enforcer (runs as voxel-init switch-enforcer <slot>). Forces
 /// this scrimlet's launch-count MGS (switch{slot}) + sp-sim configs into the
-/// switch zone the moment it extracts, restarting each service, until the live
-/// files match what we staged. Uses content-equality so it's a **no-op when the
-/// baked configs already match the launch count**—only a true count/slot
-/// mismatch triggers a swap + restart. Output -> /tmp/switch-enforcer.log.
+/// switch zone, restarting each service, until the live files match what we
+/// staged. Judges nothing until the zone RUNS: the install's package
+/// extraction rewrites the baked configs, so an early file match is
+/// meaningless and an early restart fails. Output -> /tmp/switch-enforcer.log.
 pub fn switch_enforcer(slot: u8) {
     let mgs_staged = format!("{CARGO_BAY}/mgs-config-switch{slot}.toml");
     let sp_staged = format!("{CARGO_BAY}/sp-sim-config.toml");
+    let mut mgs_restarted = true;
+    let mut sp_restarted = true;
     for _ in 0..1500 {
         // up to ~25 min safety net
-        if !Utf8Path::new(SWITCH_ZONE_MGS).exists() {
+        if !switch_zone_running() || !Utf8Path::new(SWITCH_ZONE_MGS).exists() {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
@@ -428,24 +444,24 @@ pub fn switch_enforcer(slot: u8) {
         let sp_ok = !Utf8Path::new(&sp_staged).exists()
             || !sp_present
             || files_equal(SWITCH_ZONE_SP, &sp_staged);
-        if mgs_ok && sp_ok {
+        if mgs_ok && sp_ok && mgs_restarted && sp_restarted {
             note(format!("switch{slot} + sp-sim configs in place"));
             break;
         }
-        if !mgs_ok {
-            if let Err(e) = fs::copy(&mgs_staged, SWITCH_ZONE_MGS) {
+        if !mgs_ok || !mgs_restarted {
+            if !mgs_ok && let Err(e) = fs::copy(&mgs_staged, SWITCH_ZONE_MGS) {
                 warn(format!("copy switch{slot} MGS config: {e}"));
             }
-            run(
+            mgs_restarted = run(
                 "zlogin",
                 &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgs:default"],
             );
         }
-        if sp_present && !sp_ok {
-            if let Err(e) = fs::copy(&sp_staged, SWITCH_ZONE_SP) {
+        if sp_present && (!sp_ok || !sp_restarted) {
+            if !sp_ok && let Err(e) = fs::copy(&sp_staged, SWITCH_ZONE_SP) {
                 warn(format!("copy sp-sim config: {e}"));
             }
-            run(
+            sp_restarted = run(
                 "zlogin",
                 &[
                     "oxz_switch",
