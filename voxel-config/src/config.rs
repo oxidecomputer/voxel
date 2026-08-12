@@ -1,65 +1,33 @@
-//! The Voxel configuration model - the single source of truth `voxel` renders
-//! every per-node config from, persisted as `voxel.toml`.
-//!
-//! This replaces both a4x2's static per-sled config files and the hardcoded
-//! constants that used to live in `voxel`'s `main.rs` (the `SLEDS` table,
-//! `generate_rss`, the router wiring). `voxel config show` renders a
-//! [`VoxelConfig`]; `config get`/`set` edit `voxel.toml` in place (format
-//! preserving, via `toml_edit`); `config load` imports a prepared TOML file.
-//!
-//! The `network` section is shaped to map cleanly onto omicron's
-//! `wicket_common::rack_setup::PutRssUserConfigInsensitive`, so the typed,
-//! release-pinned RSS renderer can consume it directly once it lands.
+//! The configuration model behind voxel.toml; every per-node config renders from it.
 
 use serde::{Deserialize, Serialize};
 
 use crate::frr::{FrrNeighbor, FrrRouter, StaticUplink};
 
 /// Bootstrap-network IPv6 prefix (first three hextets); see
-/// [`SledDesc::bootstrap_addr`]. Each sled appends `:{2*index+1}::1`.
+/// SledDesc::bootstrap_addr. Each sled appends :{2*index+1}::1.
 const BOOTSTRAP_NET_PREFIX: &str = "fdb0:a840:2500";
 
-/// Default rack BGP ASN (the switch's local ASN + the uplink `peer_asn` it
-/// references). `for_rack` offsets it by rack index for multi-rack transit.
+/// Default rack BGP ASN (the switch's local ASN + the uplink peer_asn it
+/// references). for_rack offsets it by rack index for multi-rack transit.
 const DEFAULT_RACK_ASN: u32 = 65000;
 
-/// FRR transit ASN base: `ce` is [`TRANSIT_ASN_BASE`]; customer router `cr{i}` is
-/// [`TRANSIT_ASN_BASE`]` + i` (i starts at 1). See [`VoxelConfig::to_frr`].
+/// FRR transit ASN base: ce is TRANSIT_ASN_BASE; customer router cr{i} is
+/// TRANSIT_ASN_BASE + i (i starts at 1). See VoxelConfig::to_frr.
 const TRANSIT_ASN_BASE: u32 = 65100;
 
-/// First `enp0sN` index the fabric routers wire from (mirrors `build_topo`'s
-/// link-creation order). See [`VoxelConfig::to_frr`].
-///
-/// NOTE: every `enp0sN` derivation here assumes propolis assigns virtio PCI
-/// slots in falcon link-creation order, which systemd then names by PCI
-/// geography (`enp0s<slot>`).
-///
-/// Slot 8 is not a falcon constant. Falcon starts its slot counter at 5 and
-/// spends one slot per p9fs mount, then two on the softnpu p9 and pci-port
-/// pair, before the first NIC, so 8 holds only while a router carries exactly
-/// one cargo-bay mount. That softnpu pair is spent on every node in a
-/// deployment that has any softnpu link at all, not just the switch nodes, so
-/// the routers pay for it too. Falcon also appends a node's external link after
-/// all of its point-to-point links, which is what puts the external NIC last
-/// regardless of `build_topo`'s call order.
-///
-/// See `Deployment::nodes_preflight` and `Node::preflight` in falcon's
-/// `lib/src/lib.rs`. This is a contract voxel relies on but does not control,
-/// so `voxel-init` checks the staged name against the node's actual links.
+/// First enp0sN index the fabric routers wire from, mirroring falcon's slot
+/// assignment; voxel-init verifies staged names against the node's real links.
 const FRR_IFACE_BASE: usize = 8;
 
-// This is a proper V2 serial-number prefix
-//
-// All serial numbers must be 8 characters and start with the number '2' in
-// ascii. We use a 7 character prefix to allow appending a numeral. If we ever
-// require more than 9 sleds in a deployment we can change our generation to
-// take into account the last two 0s here.
+// Serial numbers are 8 ascii chars starting with '2'; the 7 char prefix
+// leaves one numeral for the sled index.
 pub const SLED_SERIAL_PREFIX: &str = "2FAKE00";
 
-/// A hardcoded part number for all fake sleds
+/// Part number shared by all fake sleds.
 pub const SLED_PART_NUMBER: &str = "913-0000019";
 
-/// Top-level Voxel configuration (`voxel.toml`).
+/// Top-level Voxel configuration (voxel.toml).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VoxelConfig {
@@ -79,68 +47,35 @@ pub struct VoxelConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExternalMode {
-    /// Wire external VNICs onto an existing LAN (the host's default-route
-    /// interface, or `$EXT_INTERFACE`) that provides DHCP.
-    ///
-    /// The default.
+    /// Wire external VNICs onto an existing LAN with DHCP (default).
     #[default]
     Lan,
-    /// Voxel-managed isolated segment.
-    ///
-    /// A host etherstub with a static host address, NAT out `uplink`,
-    /// and static per-node addresses staged into each node's cargo-bay
-    /// (no DHCP server).
+    /// Voxel-managed etherstub: NAT out uplink, static per-node addresses.
     Isolated,
 }
 
-/// The rack's external segment, i.e., the host-LAN side every node's external
-/// NIC lands on. `lan` (default) uses an existing network, while `isolated`
-/// has voxel stand the segment up itself at launch, replicating option 2
-/// ("external" network that only exists on the test machine) of omicron's
-/// [how-to-run external networking] guide: the host owns `host_ip` on an
-/// etherstub, NATs `subnet` out `uplink`, and every node gets a deterministic
-/// static address from `ip_start` staged into its cargo-bay for voxel-init
-/// to apply.
-///
-/// The nodes' addresses stay in use after bring-up (RSS progress is polled
-/// over SSH to them and each router NATs rack egress out its own external
-/// address), which is why the segment must exist before launch.
-///
-/// This is host-only plumbing and never reaches the rack's RSS config.
-///
-/// [how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
+/// The rack's external segment. Host-only plumbing; never reaches the rack's
+/// RSS config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct External {
-    /// `lan` (default; existing behavior) or `isolated`.
+    /// lan (default; existing behavior) or isolated.
     pub mode: ExternalMode,
-    /// Physical link the isolated subnet NATs out of (e.g. `igb0`). Required
+    /// Physical link the isolated subnet NATs out of (e.g. igb0). Required
     /// in isolated mode, and validated before use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uplink: Option<String>,
     /// The isolated segment's subnet.
     pub subnet: String,
     /// Host address on the etherstub and the nodes' default gateway.
-    ///
-    /// Traffic arriving here is forwarded to `uplink`, where ipnat rewrites it.
     pub host_ip: String,
-    /// First static node address.
-    ///
-    /// Nodes are numbered contiguously from here in `sleds()` order, then in
-    /// `topology.routers` order.
+    /// First static node address; nodes number contiguously from here in
+    /// sleds() then routers order.
     pub ip_start: String,
     /// Nameservers handed to the nodes.
     pub dns: Vec<String>,
-    /// Etherstub MTU.
-    ///
-    /// Launch refuses 9000 or above: voxel-init classifies a sled NIC as
-    /// underlay iff it accepts mtu=9000, so the external link has to reject
-    /// jumbo for classification to work. The 1500 default mirrors a physical
-    /// external network.
-    ///
-    /// Raising it (e.g. to 8900) exercises jumbo external ingress, which only
-    /// matters for external-to-external forwarding through the switch, whereas
-    /// guest delivery is capped by the VPC MTU regardless.
+    /// Etherstub MTU. Launch refuses 9000+: voxel-init classifies underlay
+    /// NICs by jumbo acceptance, so the external link must reject jumbo.
     pub mtu: u32,
 }
 
@@ -159,33 +94,28 @@ impl Default for External {
 }
 
 impl External {
-    /// This is `true` when the section is untouched, i.e., when a section is
-    /// omitted from serialized output.
+    /// True when untouched, so serialization omits the section.
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
 
-    /// Whether or not voxel manages an isolated external segment.
+    /// Whether voxel manages an isolated external segment.
     pub fn isolated(&self) -> bool {
         self.mode == ExternalMode::Isolated
     }
 
-    /// Prefix length parsed from `subnet` (`a.b.c.d/N`).
-    ///
-    /// Returns `None` if `subnet` is not parseable CIDR.
+    /// Prefix length parsed from subnet; None if it is not CIDR.
     pub fn prefix_length(&self) -> Option<u32> {
         Some(u32::from(self.subnet_net()?.width()))
     }
 
-    /// `subnet` parsed as an `Ipv4Net`, or `None` if it is not CIDR.
+    /// subnet parsed as an Ipv4Net, or None if it is not CIDR.
     fn subnet_net(&self) -> Option<oxnet::Ipv4Net> {
         self.subnet.parse().ok()
     }
 
-    /// Whether `ip` is a usable host address inside `subnet` (strictly between
-    /// its network and broadcast addresses). oxnet treats /31 and /32 as
-    /// all-host subnets (RFC 3021), but the segment needs distinct host,
-    /// builder, and node addresses, so those widths have no usable range here.
+    /// Whether ip sits strictly between subnet's network and broadcast. /31
+    /// and /32 have no usable range here; the segment needs distinct addresses.
     fn ip_is_usable(&self, ip: std::net::Ipv4Addr) -> bool {
         self.subnet_net().is_some_and(|net| {
             match (net.network(), net.broadcast()) {
@@ -197,16 +127,13 @@ impl External {
         })
     }
 
-    /// Whether `host_ip` parses and is a usable address inside `subnet`.
+    /// Whether host_ip parses and is a usable address inside subnet.
     pub fn host_ip_is_usable(&self) -> bool {
         self.host_ip.parse().is_ok_and(|ip| self.ip_is_usable(ip))
     }
 
-    /// Static address for the `nth` node (0-based): `ip_start + nth`.
-    ///
-    /// Returns `None` if the address would step past the subnet's broadcast,
-    /// land on the network or broadcast address, collide with `host_ip`, or
-    /// if `subnet`, `host_ip`, or `ip_start` are invalid.
+    /// Static address for the nth node: ip_start + nth. None on a boundary,
+    /// outside the subnet, colliding with host_ip, or unparseable inputs.
     pub fn node_ip(&self, nth: usize) -> Option<String> {
         let start: std::net::Ipv4Addr = self.ip_start.parse().ok()?;
         let host: std::net::Ipv4Addr = self.host_ip.parse().ok()?;
@@ -215,8 +142,7 @@ impl External {
         }
         let base = u32::from(start).checked_add(nth as u32)?;
         let ip = std::net::Ipv4Addr::from(base);
-        // Refuse the network + broadcast boundaries and anything outside the
-        // subnet (an operator-set ip_start plus a large rack can overrun it).
+        // A large rack can overrun an operator-set ip_start.
         if !self.ip_is_usable(ip) {
             return None;
         }
@@ -226,12 +152,8 @@ impl External {
         Some(ip.to_string())
     }
 
-    /// A builder for the VM address: `host_ip - 1`. This is used by the image
-    /// build path to give the builder a fixed static address on the isolated
-    /// segment. Same prefix length as `subnet`.
-    ///
-    /// Returns `None` if `host_ip` is not usable within `subnet`, or if the
-    /// derived builder address would underflow or land on a reserved boundary.
+    /// Builder VM address: host_ip - 1 with subnet's prefix length. None if
+    /// either address is unusable.
     pub fn builder_net(&self) -> Option<String> {
         let host: std::net::Ipv4Addr = self.host_ip.parse().ok()?;
         if !self.ip_is_usable(host) {
@@ -247,58 +169,48 @@ impl External {
     }
 }
 
-/// falcon/runtime settings (zfs dataset, project workdir, image build root).
-/// Each optional, resolved as flag > voxel.toml > env > built-in default.
-/// The omicron checkout path is derived from image.cp's commit in
-/// resolve_falcon_env; $VOXEL_OMICRON_SRC overrides.
+/// falcon/runtime settings, each optional and resolved as flag > voxel.toml
+/// > env > built-in default.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Falcon {
-    /// zfs dataset (falcon's `FALCON_DATASET`). `None` -> env, else `rpool/falcon`.
+    /// zfs dataset (falcon's FALCON_DATASET). None -> env, else rpool/falcon.
     pub dataset: Option<String>,
-    /// Project root that `cargo-bay/` and `.falcon/` live under. Absolute; lets
-    /// `voxel` run from anywhere (e.g. installed in `/usr/bin`). `None` -> the
-    /// directory containing this `voxel.toml`.
+    /// Absolute project root that cargo-bay/ and .falcon/ live under. None ->
+    /// the directory containing this voxel.toml.
     pub workdir: Option<String>,
-    /// Build root for `voxel image create` (the omicron checkouts live here).
-    /// Exported as `BUILD_ROOT`. `None` -> env, else the `$HOME/voxel-builds`
-    /// default. Lets a non-root user build images outside `/root`.
+    /// Build root for image create (omicron checkouts live here). None -> env,
+    /// else $HOME/voxel-builds.
     pub build_root: Option<String>,
 }
 
-/// SP provider selection: which SPs (if any) run on the real-firmware emulator
-/// (`sp-emu`) instead of `sp-sim`. Empty (the default) = every SP on `sp-sim`,
-/// i.e. today's behavior. See [`crate::sp::SpFleet::sim_with_emu`].
+/// SP provider selection: which SPs run on the real-firmware emulator sp-emu
+/// instead of sp-sim. Empty (default) = all sp-sim.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpCfg {
-    /// SPs to back with `sp-emu`. Selectors: `"sidecar"`, `"g{index}"` (global
-    /// gimlet index), e.g. `["sidecar", "g0"]`.
+    /// SPs to back with sp-emu. Selectors: "sidecar", "g{index}" (global
+    /// gimlet index), e.g. ["sidecar", "g0"].
     pub emu: Vec<String>,
-    /// Path to the `sp-emu` binary (illumos) staged into the switch zone.
-    /// Required when `emu` is non-empty.
+    /// Path to the sp-emu binary (illumos) staged into the switch zone.
+    /// Required when emu is non-empty.
     pub emu_bin: Option<String>,
-    /// Hubris image (`.zip`) flashed for the **sidecar** SP (the `sidecar-c-emu`
-    /// build). Required when `"sidecar"` is in `emu`.
+    /// Hubris image flashed for the sidecar SP (the sidecar-c-emu build).
+    /// Required when "sidecar" is in emu.
     pub sidecar_image: Option<String>,
-    /// Hubris image (`.zip`) flashed for **gimlet** SPs (the `gimlet-c` build).
-    /// Required when any `"g{index}"` is in `emu`.
+    /// Hubris image flashed for gimlet SPs (the gimlet-c build). Required when
+    /// any "g{index}" is in emu.
     pub gimlet_image: Option<String>,
-    /// Path to the `faux-mgs` binary (the MGS-side client). Staged into the switch
-    /// zone at `--emu` launch so `voxel sp ls/state/exec` can talk to the live SPs
-    /// (the same client pilot uses). Optional; operator `sp` commands need it.
+    /// Path to the faux-mgs binary, staged into the switch zone at --emu
+    /// launch. Optional; operator sp commands need it.
     pub faux_mgs: Option<String>,
-    /// RoT firmware image (`oxide-rot-1`, raw `.bin` or build archive) run as a
-    /// second emulated core alongside the **sidecar** SP — the sprot bridge — so
-    /// MGS/Nexus see a real Root of Trust (attestation, CMPA/CFPA, real boot
-    /// measurements) instead of the SP's canned fallback. Optional; when set,
-    /// `launch --emu` stages it and points the sidecar's `SP_EMU_ROT_FLASH` at it.
+    /// RoT firmware image (oxide-rot-1) run as a second emulated core beside
+    /// the sidecar SP so MGS/Nexus see a real Root of Trust. Optional.
     pub rot_image: Option<String>,
 }
 
 impl SpCfg {
-    /// The hubris image to flash for an SP selector (`"sidecar"` -> sidecar image,
-    /// else the gimlet image).
+    /// The hubris image for an SP selector.
     pub fn image_for(&self, selector: &str) -> Option<&str> {
         match selector {
             "sidecar" => self.sidecar_image.as_deref(),
@@ -308,27 +220,23 @@ impl SpCfg {
 }
 
 impl VoxelConfig {
-    /// Parse a `voxel.toml`. Missing fields fall back to defaults.
+    /// Parse a voxel.toml. Missing fields fall back to defaults.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
     }
 
-    /// Render this config as `voxel.toml` (what `config show` prints / seeds).
+    /// Render this config as voxel.toml (what config show prints / seeds).
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).expect("VoxelConfig serializes")
     }
 
-    /// The computed sled set (replaces the old `SLEDS` const).
+    /// The computed sled set.
     pub fn sleds(&self) -> Vec<SledDesc> {
         self.topology.sleds()
     }
 
-    /// Gather every node's static external address (isolated mode's single
-    /// source of assignment).
-    ///
-    /// Sleds first (in `sleds()` order), then routers (in `topology.routers`
-    /// order). The list truncates at the first address `node_ip` refuses
-    /// (overflow past `.254` or a `host_ip` collision).
+    /// Every node's static external address, sleds then routers; truncates at
+    /// the first address node_ip refuses.
     pub fn static_external_ips(&self) -> Vec<(String, String)> {
         self.sleds()
             .into_iter()
@@ -346,40 +254,25 @@ impl VoxelConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Topology {
-    /// Independent racks in this deployment (default 1). `>1` brings up N
-    /// separate 3+-sled RSS racks in one falcon deployment, linked via a shared
-    /// FRR transit (the "one launch, two racks" multi-rack form). Sleds are
-    /// numbered continuously (`rack r` owns `g{r*sleds}`..`g{r*sleds+sleds-1}`);
-    /// each rack auto-derives its own scrimlets + RSS and gets its addressing
-    /// offset by rack index (see [`Network::for_rack`]).
+    /// Independent racks (default 1); >1 brings up N racks linked by the
+    /// shared FRR transit, sleds numbered continuously across racks.
     pub racks: usize,
-    /// Gimlets (sleds) PER RACK - each rack is named `g{r*sleds + i}`. (With the
-    /// default `racks = 1` this is just the rack's sled count, as before.)
+    /// Sleds per rack, named g{r*sleds + i}.
     pub sleds: usize,
-    /// Which sleds run a switch zone (scrimlets), by name. **Empty -> auto-derived
-    /// as the first + last sled (`g0` + `g{n-1}`)** - which is exactly what the
-    /// `voxel-cp` image bakes (`render-smf` uses first+last), so a topology that
-    /// leaves this unset always stays consistent with its image. Set it explicitly
-    /// only to override (then the image must be built with the matching pair).
+    /// Switch-zone sleds by name; empty auto-derives the first + last RSS
+    /// sled.
     pub scrimlets: Vec<String>,
-    /// How many sleds participate in RSS / trust quorum (the first `rss_sleds`).
-    /// **`0` -> auto: all sleds.**
+    /// Sleds in RSS / trust quorum (the first N); 0 means all.
     pub rss_sleds: usize,
-    /// Customer routers (boot the `voxel-frr` image).
+    /// Customer routers (boot the voxel-frr image).
     pub routers: Vec<String>,
-    /// Per-sled guest RAM, GiB (default 8). Lower it to fit more sleds on a box -
-    /// guest VMs (`VMM Memory`) are the dominant consumer, so this is the knob
-    /// that gates how many sleds fit in physical RAM.
+    /// Per-sled guest RAM in GiB (default 8), the knob that gates how many
+    /// sleds fit in physical RAM.
     pub sled_memory_gb: u64,
     /// Per-router guest RAM, GiB (default 4).
     pub router_memory_gb: u64,
-    /// Static host-LAN address for the shared customer edge (`ce`), e.g.
-    /// `"192.168.68.170"`. Unset (`None`) -> `ce` DHCPs as before and voxel reads
-    /// the (volatile) lease over the serial console for the host route. Set it to
-    /// a fixed, free LAN address and voxel-init adds it as a SECONDARY address on
-    /// `ce`'s uplink (DHCP still provides egress/default) so the host route to each
-    /// rack's customer prefix has a STABLE nexthop that never churns across
-    /// launches - no serial lookup, no stale-route accumulation.
+    /// Static host-LAN address added as a secondary on ce's uplink, giving the
+    /// host route a stable nexthop. Unset -> read ce's DHCP lease over serial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ce_external_ip: Option<String>,
 }
@@ -389,7 +282,7 @@ impl Default for Topology {
         Self {
             racks: 1,
             sleds: 4,
-            scrimlets: Vec::new(), // auto: g0 + g{n-1}
+            scrimlets: Vec::new(), // auto: first + last RSS sled
             rss_sleds: 0,          // auto: all sleds
             routers: vec!["ce".into(), "cr1".into(), "cr2".into()],
             sled_memory_gb: 8,
@@ -400,58 +293,68 @@ impl Default for Topology {
 }
 
 impl Topology {
-    /// Total guest RAM (GiB) this topology asks for - sleds + routers. The
-    /// dominant term in the box's `VMM Memory`; the launch preflight checks it
-    /// against physical RAM.
+    /// Total guest RAM in GiB; the launch preflight checks it against
+    /// physical RAM.
     pub fn guest_memory_gb(&self) -> u64 {
         self.total_sleds() as u64 * self.sled_memory_gb
             + self.routers.len() as u64 * self.router_memory_gb
     }
 
-    /// Racks in this deployment (`racks`, floored at 1).
+    /// Racks in this deployment (racks, floored at 1).
     pub fn racks(&self) -> usize {
         self.racks.max(1)
     }
 
-    /// Total sleds across all racks (`racks * sleds`).
+    /// Total sleds across all racks (racks * sleds).
     pub fn total_sleds(&self) -> usize {
         self.racks() * self.sleds
     }
 }
 
 impl Topology {
-    /// Scrimlet sled names for `rack` (0-based): explicit `scrimlets` (honored
-    /// only for a single-rack deployment) else auto - the first and last sled of
-    /// that rack's contiguous range (`g{base}` + `g{base+sleds-1}`). Auto matches
-    /// what `render-smf` bakes, so an unset topology stays image-consistent.
+    /// Scrimlet names for rack: explicit list (single-rack only), else first +
+    /// last RSS sled. Switch zones must live on RSS sleds; see validate.
     pub fn scrimlet_names_for_rack(&self, rack: usize) -> Vec<String> {
         if self.racks() == 1 && !self.scrimlets.is_empty() {
             return self.scrimlets.clone();
         }
         let base = rack * self.sleds;
-        if self.sleds >= 2 {
-            vec![format!("g{base}"), format!("g{}", base + self.sleds - 1)]
+        let last = self.rss_count() - 1;
+        if last >= 1 {
+            vec![format!("g{base}"), format!("g{}", base + last)]
         } else {
             vec![format!("g{base}")]
         }
     }
 
-    /// Scrimlets across all racks (every rack's first+last). Single-rack:
-    /// equivalent to the old first+last / explicit list.
+    /// Scrimlets across all racks.
     pub fn scrimlet_names(&self) -> Vec<String> {
         (0..self.racks())
             .flat_map(|r| self.scrimlet_names_for_rack(r))
             .collect()
     }
 
-    /// Sleds that join RSS: explicit `rss_sleds` if non-zero, else all sleds.
+    /// Sleds that join RSS: explicit rss_sleds if non-zero, else all sleds.
     pub fn rss_count(&self) -> usize {
         if self.rss_sleds > 0 { self.rss_sleds } else { self.sleds }
     }
 
-    /// Expand into per-sled descriptors across all racks. Rack `r` owns
-    /// `g{r*sleds}`..`g{r*sleds+sleds-1}`; scrimlets + RSS membership are derived
-    /// per rack (each rack is an independent RSS domain).
+    /// Reject a topology whose switch zones land outside the RSS set;
+    /// reachable only via explicit scrimlets.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(s) = self.sleds().iter().find(|s| s.scrimlet && !s.rss) {
+            return Err(format!(
+                "scrimlet {} is not in the RSS set (rss_sleds = {}): switch \
+                 zones must live on RSS sleds or nexus handoff cannot find \
+                 their switch ports",
+                s.name, self.rss_sleds
+            ));
+        }
+        Ok(())
+    }
+
+    /// Per-sled descriptors across all racks; scrimlets and RSS membership
+    /// derive per rack.
     pub fn sleds(&self) -> Vec<SledDesc> {
         let rss = self.rss_count(); // per-rack count
         let mut out = Vec::new();
@@ -476,12 +379,8 @@ impl Topology {
         out
     }
 
-    /// Cross-rack sidecar interconnect pairs, as GLOBAL scrimlet index pairs
-    /// (`ai < bi`): every scrimlet links to every scrimlet in a DIFFERENT rack
-    /// (full cross-rack mesh), directly meshing a multi-rack deployment's sidecars
-    /// for the shared-/48 underlay. Empty for a single rack. Each pair is a
-    /// `softnpu_links` sidecar<->sidecar (see `topo::build_topo`) and adds one
-    /// front port to both endpoints.
+    /// Cross-rack sidecar link pairs as global scrimlet indices (full mesh
+    /// between racks, empty single-rack); each adds a front port to both ends.
     pub fn interconnect_pairs(&self) -> Vec<(usize, usize)> {
         let sleds = self.sleds();
         let scrimlets: Vec<&SledDesc> =
@@ -497,7 +396,7 @@ impl Topology {
         out
     }
 
-    /// How many interconnects scrimlet `index` participates in (its front-port bump).
+    /// How many interconnects scrimlet index participates in (its front-port bump).
     pub fn interconnect_count_for(&self, index: usize) -> usize {
         self.interconnect_pairs()
             .iter()
@@ -506,11 +405,11 @@ impl Topology {
     }
 }
 
-/// A single sled, expanded from [`Topology`].
+/// A single sled, expanded from Topology.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SledDesc {
     pub name: String,
-    /// Global sled index (`g{index}`) - drives vdev/sprockets/bootstrap identity.
+    /// Global sled index; drives vdev/sprockets/bootstrap identity.
     pub index: usize,
     /// Which rack (0-based) this sled belongs to.
     pub rack: usize,
@@ -518,30 +417,21 @@ pub struct SledDesc {
     pub scrimlet: bool,
     /// Participates in its rack's RSS bootstrap discovery.
     pub rss: bool,
-    /// Part number of a given `BaseboardId`
+    /// BaseboardId part number.
     pub part_number: String,
-    /// Serial number of a given `BaseboardId`
+    /// BaseboardId serial number.
     pub serial_number: String,
 }
 
 impl SledDesc {
-    /// Bootstrap-network address: `fdb0:a840:2500:{2*index+1}::1`
-    /// (g0=1, g1=3, g2=5, g3=7, g4=9, g5=11).
-    ///
-    /// The 4th group mirrors the sled's underlay viona MAC byte, which the
-    /// topology formats as a DECIMAL string into hex MAC notation
-    /// (`a8:40:25:00:00:{2*index+1:02}`, topo.rs `new_mac`). sled-agent derives
-    /// the bootstrap address from that MAC, so it must be formatted DECIMAL here
-    /// too - e.g. index 5 -> `...:11::1`, not hex `...:b::1`. Identical for indices
-    /// 0-4 (`2*index+1 < 10`); the old `{:x}` silently diverged at index 5,
-    /// breaking bootstrap discovery for >4-sled racks.
+    /// Bootstrap address fdb0:a840:2500:{2*index+1}::1. The group must format
+    /// DECIMAL to match the underlay viona MAC byte sled-agent derives it from.
     pub fn bootstrap_addr(&self) -> String {
         format!("{BOOTSTRAP_NET_PREFIX}:{}::1", 2 * self.index + 1)
     }
 
-    /// This sled's generated sled-agent config (`sled-config.toml`). The rack's
-    /// sled + fabric-router counts size the scrimlet SoftNPU's ports (needed for
-    /// >4-sled racks).
+    /// This sled's generated sled-agent config; the counts size the scrimlet
+    /// SoftNPU's ports.
     pub fn sled_config(
         &self,
         num_sleds: usize,
@@ -559,21 +449,17 @@ impl SledDesc {
     }
 }
 
-/// Which image version to boot. Bundles are named `voxel-cp-<version>` /
-/// `voxel-frr-<version>`; `cp`/`frr` override the full name when set.
+/// Which image version to boot. Bundles are named voxel-cp-<version> /
+/// voxel-frr-<version>; cp/frr override the full name when set.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Image {
     pub version: String,
     pub cp: Option<String>,
     pub frr: Option<String>,
-    /// Override the sled-agent `data_links` config shape. Normally leave this
-    /// unset (`None`): voxel auto-detects it from the image's omicron source at
-    /// launch. Set it only to force a shape. See [`SledDataLinksSchema`].
+    /// Override the detected sled-agent data_links shape; normally unset.
     pub data_links_schema: Option<SledDataLinksSchema>,
-    /// Override the sled-agent disks config shape (`vdevs` vs `external_disks`).
-    /// Normally leave unset (`None`) - auto-detected per image. See
-    /// [`SledDisksSchema`].
+    /// Override the detected sled-agent disks shape; normally unset.
     pub disks_schema: Option<SledDisksSchema>,
 }
 
@@ -589,36 +475,30 @@ impl Default for Image {
     }
 }
 
-/// The shape of sled-agent's `data_links` config field, which changed across
-/// omicron versions. `voxel-init` (baked into each image) is shape-preserving:
-/// it substitutes the detected NIC names into whichever shape this selects, so
-/// one agent works on any image. Pick the variant matching the image's omicron.
+/// Shape of sled-agent's data_links field across omicron versions; voxel-init
+/// substitutes detected NIC names into whichever shape is selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SledDataLinksSchema {
-    /// Pre-main omicron (e.g. v20 / a3fee0ec): `data_links = ["vioif0", "vioif1"]`.
+    /// Pre-main omicron (e.g. v20 / a3fee0ec): data_links = ["vioif0", "vioif1"].
     List,
-    /// omicron main (the `DataLinks` enum):
-    /// `data_links = { kind = "virtual", devices = ["vioif0", "vioif1"] }`.
+    /// omicron main (the DataLinks enum):
+    /// data_links = { kind = "virtual", devices = ["vioif0", "vioif1"] }.
     Tagged,
 }
 
-/// The shape of sled-agent's disk config, which changed across omicron versions:
-/// the flat `vdevs = [...]` list became a tagged `external_disks` enum. Selected
-/// independently of [`SledDataLinksSchema`] (they drifted at different commits).
+/// Shape of sled-agent's disk config across omicron versions, selected
+/// independently of SledDataLinksSchema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SledDisksSchema {
     /// Pre-rename omicron (e.g. a3fee0ec / 43bb5af / 99a0aec):
-    /// `vdevs = ["m2_g0_0.vdev", ...]`.
+    /// vdevs = ["m2_g0_0.vdev", ...].
     Vdevs,
-    /// The `ExternalDisks` enum, `#[serde(tag = "kind")]`, while it still had a
-    /// `Virtual` variant (e.g. cc07512e0):
-    /// `external_disks = { kind = "virtual", vdevs = ["m2_g0_0.vdev", ...] }`.
+    /// external_disks = { kind = "virtual", vdevs = [...] } (e.g. cc07512e0).
     ExternalDisks,
-    /// omicron main, after `Virtual { vdevs }` and `HardcodedPhysical { disks }`
-    /// merged into one variant:
-    /// `external_disks = { kind = "hardcoded", vdevs = [...], disks = [] }`.
+    /// external_disks = { kind = "hardcoded", vdevs = [...], disks = [] }
+    /// (omicron main).
     Hardcoded,
 }
 
@@ -661,10 +541,8 @@ impl Image {
         self.cp.clone().unwrap_or_else(|| format!("voxel-cp-{}", self.version))
     }
 
-    /// The omicron commit encoded in the cp image name (`voxel-cp-<commit>` with
-    /// an optional `-<variant>` suffix like `-rd`). Used to locate the matching
-    /// checkout under `<build_root>/omicron-<commit>`. `None` if the name
-    /// doesn't follow the `voxel-cp-` convention.
+    /// The omicron commit in the cp image name, locating the checkout under
+    /// build_root; None if the name is not voxel-cp-<commit>[-variant].
     pub fn cp_commit(&self) -> Option<String> {
         let name = self.cp_image();
         name.strip_prefix("voxel-cp-")
@@ -692,7 +570,7 @@ pub enum RouterMode {
     Static,
 }
 
-/// Customer-network / RSS parameters. Maps onto `PutRssUserConfigInsensitive`.
+/// Customer-network / RSS parameters. Maps onto PutRssUserConfigInsensitive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Network {
@@ -700,9 +578,9 @@ pub struct Network {
     pub external_dns_ips: Vec<String>,
     pub ntp_servers: Vec<String>,
     pub dns_servers: Vec<String>,
-    /// IPv6 `/56`. Empty -> not emitted.
+    /// IPv6 /56. Empty -> not emitted.
     pub rack_subnet: String,
-    /// `internal_services_ip_pool_ranges` (single range).
+    /// internal_services_ip_pool_ranges (single range).
     pub service_pool_first: String,
     pub service_pool_last: String,
     pub bgp_asn: u32,
@@ -710,11 +588,9 @@ pub struct Network {
     pub infra_prefix: String,
     /// Upstream routing mode.
     pub router_mode: RouterMode,
-    /// IPv4 /24 carved into per-uplink /30s for `Static` mode (.1 router, .2 sidecar).
+    /// IPv4 /24 carved into per-uplink /30s for Static mode (.1 router, .2 sidecar).
     pub transit_prefix: String,
-    /// `Static` mode: BFD-track the transit routes (FRR `ip route ... bfd` +
-    /// peers + rss BFD). Requires a dataplane where softnpu BFD establishes;
-    /// a4x2 ships this off and uses plain static routes, so it defaults off.
+    /// Static mode: BFD-track the transit routes. Defaults off, matching a4x2.
     pub transit_bfd: bool,
     /// Scrimlet uplink ports (one per switch toward the customer routers).
     pub uplinks: Vec<UplinkCfg>,
@@ -746,8 +622,8 @@ impl Default for Network {
     }
 }
 
-/// Split an `addr/prefix` (or bare `addr`) into the address and its `/prefix`
-/// suffix, apply `f` to the address, and rejoin. If `f` returns `None` (the
+/// Split an addr/prefix (or bare addr) into the address and its /prefix
+/// suffix, apply f to the address, and rejoin. If f returns None (the
 /// address didn't parse), the original input is returned unchanged.
 fn map_addr(s: &str, f: impl FnOnce(&str) -> Option<String>) -> String {
     let (addr, suffix) = match s.split_once('/') {
@@ -760,7 +636,7 @@ fn map_addr(s: &str, f: impl FnOnce(&str) -> Option<String>) -> String {
     }
 }
 
-/// Bump an IPv4 address's 3rd octet by `rack` (preserving any `/prefix`), so each
+/// Bump an IPv4 address's 3rd octet by rack (preserving any /prefix), so each
 /// rack gets a distinct customer/service network. Returns the input unchanged if
 /// it doesn't parse or the offset would leave the octet range (checked, not
 /// wrapping, so an out-of-range rack can't silently alias another rack's net).
@@ -773,10 +649,10 @@ fn offset_v4(s: &str, rack: usize) -> String {
     })
 }
 
-/// Offset an IPv6 rack subnet by `rack` /56s WITHIN its /48 (bits 48-55, the high
+/// Offset an IPv6 rack subnet by rack /56s WITHIN its /48 (bits 48-55, the high
 /// byte of hextet 3), so every rack shares one /48 AZ (omicron's AZ=/48, rack=/56
 /// scheme) and cross-rack underlay is a single aggregate prefix. rack 0 is
-/// unchanged. Preserves any `/prefix`. Returns the input unchanged if it doesn't
+/// unchanged. Preserves any /prefix. Returns the input unchanged if it doesn't
 /// parse or the offset overflows hextet 3 (checked, not wrapping).
 fn offset_v6_rack56(s: &str, rack: usize) -> String {
     map_addr(s, |addr| {
@@ -789,24 +665,10 @@ fn offset_v6_rack56(s: &str, rack: usize) -> String {
 }
 
 impl Network {
-    /// This network projected for `rack` (0-based) of a `racks`-rack deployment,
-    /// so independent racks don't collide: the customer prefix / service pool /
-    /// external DNS IPs shift by rack in the IPv4 3rd octet, the rack subnet in
-    /// its IPv6 3rd hextet, and the BGP ASN by rack (so the shared transit can
-    /// peer with and route between each rack). The IP/ASN offsets are by rack
-    /// index, so **rack 0 keeps the base addressing** (`198.51.100/24`).
-    ///
-    /// Each rack gets its own external DNS **zone** (`rack{N}.<dns_zone>`,
-    /// **1-based** - so racks read as rack1, rack2, ...), making each rack's silo
-    /// addressable by a distinct name (`recovery.sys.rack1.oxide.test`). This
-    /// holds even for a **single-rack** deployment (rack 0 -> `rack1.oxide.test`):
-    /// the addressing is identical to rack 1 of a multi-rack deployment, so a
-    /// single rack can later grow a second rack with no renaming / DNS churn, and
-    /// one split-DNS / silo-URL convention covers every deployment size. Upstream
-    /// NTP/DNS + uplink ports are left as-is.
+    /// The network for rack N: v4 nets shift by rack in octet 3, the subnet by
+    /// /56, the ASN by rack; the DNS zone becomes rack{N+1}.<zone> (1-based).
     pub fn for_rack(&self, rack: usize) -> Network {
-        // Rack index as an ASN offset; saturating so an absurd rack count can't
-        // wrap an ASN back onto a lower rack's. (racks() is tiny in practice.)
+        // Saturating so an absurd rack count cannot wrap onto a lower rack's ASN.
         let rack_asn = u32::try_from(rack).unwrap_or(u32::MAX);
         let dns_zone = format!("rack{}.{}", rack + 1, self.dns_zone);
         Network {
@@ -826,11 +688,8 @@ impl Network {
             router_mode: self.router_mode,
             transit_prefix: offset_v4(&self.transit_prefix, rack),
             transit_bfd: self.transit_bfd,
-            // The uplink's `peer_asn` is the switch's *local* BGP ASN for that
-            // session (it references a `[[bgp]]` entry, whose `asn` is offset
-            // above); the actual customer-router ASN is auto-discovered via
-            // unnumbered `remote-as external`. So it must track the rack's ASN -
-            // otherwise rack 1's peer config names an ASN with no `[[bgp]]` block.
+            // peer_asn references the switch's local [[bgp]] entry, whose asn
+            // is offset above, so it must track the rack's ASN.
             uplinks: self
                 .uplinks
                 .iter()
@@ -842,14 +701,13 @@ impl Network {
         }
     }
 
-    /// Base address of `transit_prefix` (its `.0`). None if it doesn't parse.
+    /// Base address of transit_prefix (its .0). None if it doesn't parse.
     fn transit_base(&self) -> Option<std::net::Ipv4Addr> {
         self.transit_prefix.split('/').next()?.parse().ok()
     }
 
-    /// The `/30` for transit `block` (0-based), carved from `transit_prefix`:
-    /// `(router gateway, sidecar)` as bare IPv4 (`.1` router, `.2` sidecar, the
-    /// a4x2 scheme). None if `transit_prefix` doesn't parse.
+    /// The /30 for transit block: (router gateway .1, sidecar .2). None if
+    /// transit_prefix does not parse.
     pub fn transit_slash30(&self, block: usize) -> Option<(String, String)> {
         let block = u32::try_from(block).ok()?;
         let b = u32::from(self.transit_base()?)
@@ -859,10 +717,8 @@ impl Network {
         Some((gateway.to_string(), sidecar.to_string()))
     }
 
-    /// The transit `/30` for the uplink from fabric router `router_index` (0-based)
-    /// to the switch in slot `switch_slot`, with `n_switches` per rack. Block =
-    /// `router*n_switches + slot`. The single source both the sidecar side
-    /// (`uplink_ports`) and router side (`to_frr`) use, so their /30s always agree.
+    /// The transit /30 for router_index to switch_slot; block = router *
+    /// n_switches + slot. Single source for both the sidecar and router side.
     pub fn transit_slash30_for(
         &self,
         router_index: usize,
@@ -872,11 +728,8 @@ impl Network {
         self.transit_slash30(router_index * n_switches + switch_slot)
     }
 
-    /// `Static`-mode infra address lot `(first, last)`, spanning the `nblocks`
-    /// per-uplink `/30`s from `transit_prefix`. Every numbered switch-port address
-    /// must fall inside it or Nexus rejects the handoff ("address not in lot").
-    /// Range `.1` to `.{nblocks*4 - 1}` (a4x2 uses `.1`/`.15` for 2x2). None if
-    /// `transit_prefix` doesn't parse or `nblocks` is 0.
+    /// Static-mode infra address lot (first, last) spanning nblocks /30s; every
+    /// numbered switch-port address must fall inside it or Nexus rejects handoff.
     pub fn infra_ip_range(
         &self,
         nblocks: usize,
@@ -893,25 +746,22 @@ impl Network {
     }
 }
 
-/// One generated scrimlet uplink port toward a specific fabric router (the
-/// 2-way fanout: every switch gets one port per fabric router). Derived, not a
-/// config knob; consumed by voxel's RSS request builder (sidecar side) and
-/// mirrored by `to_frr` (router side).
+/// One generated scrimlet uplink port toward a fabric router. Derived, not a
+/// config knob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UplinkPort {
     pub switch: String,
     pub switch_slot: usize,
     pub router_index: usize,
-    /// `qsfp{router_index}` (fabric uplinks take the first front ports, in
-    /// router link-creation order; see `build_topo`).
+    /// qsfp{router_index}; fabric uplinks take the first front ports.
     pub port: String,
     pub peer_asn: u32,
     pub router_lifetime: u16,
     pub port_speed: String,
     pub lldp: String,
-    /// `Static`-mode sidecar side, `addr/30`.
+    /// Static-mode sidecar side, addr/30.
     pub sidecar_addr: String,
-    /// `Static`-mode router side (nexthop + BFD peer), bare addr.
+    /// Static-mode router side (nexthop + BFD peer), bare addr.
     pub gateway: String,
 }
 
@@ -960,18 +810,15 @@ impl Default for RecoverySiloCfg {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Generation. The FRR router configs are generated here; the RSS
-// `config-rss.toml` in voxel's rss_request module.
-// ---------------------------------------------------------------------------
+// Generation: FRR router configs. The RSS config renders in rss_request.
 
 impl VoxelConfig {
-    /// Number of fabric (transit) routers, i.e. routers other than `ce`.
+    /// Routers other than ce.
     fn fabric_router_count(&self) -> usize {
         self.topology.routers.iter().filter(|r| r.as_str() != "ce").count()
     }
 
-    /// Number of scrimlets (switches) in `rack`.
+    /// Number of scrimlets (switches) in rack.
     fn scrimlets_in_rack(&self, rack: usize) -> usize {
         self.sleds()
             .into_iter()
@@ -979,12 +826,8 @@ impl VoxelConfig {
             .count()
     }
 
-    /// Generated uplink ports for `rack` (0-based): every switch fans out to
-    /// every fabric router (`qsfp{router}`), so a switch reaches upstream via
-    /// either router. `Static`-mode /30 addressing follows the datacenter
-    /// scheme: block = `router * n_switches + switch`, `.1` router / `.2`
-    /// sidecar. One `[[network.uplinks]]` entry per switch supplies the shared
-    /// per-port settings (asn, speed, ...).
+    /// Generated uplink ports for rack: every switch fans out to every fabric
+    /// router (qsfp{router}); static block = router * n_switches + switch.
     pub fn uplink_ports(&self, rack: usize) -> Vec<UplinkPort> {
         let net = self.network.for_rack(rack);
         let n_cr = self.fabric_router_count();
@@ -1011,12 +854,8 @@ impl VoxelConfig {
         out
     }
 
-    /// Cross-rack interconnect ports on `rack`'s switches, as `(switch, port)`.
-    /// Each cross-rack sidecar link (see `Topology::interconnect_pairs`) lands on
-    /// a front port after the fabric uplinks - `qsfp{n_cr + k}`, in
-    /// `interconnect_pairs` order, matching `build_topo`'s per-switch front-port
-    /// assignment. Emitted as link-local (`AddrConf`) cluster ports so
-    /// DDM can run the cross-rack underlay over the mesh. Empty for a single rack.
+    /// Cross-rack interconnect ports on rack's switches as (switch, port),
+    /// landing after the fabric uplinks at qsfp{n_cr + k}. Empty single-rack.
     pub fn interconnect_ports(&self, rack: usize) -> Vec<(String, String)> {
         let n_cr = self.fabric_router_count();
         let pairs = self.topology.interconnect_pairs();
@@ -1040,32 +879,8 @@ impl VoxelConfig {
         out
     }
 
-    /// The `enp0sN` name of a router's external (host-LAN) NIC.
-    ///
-    /// This is derived rather than discovered, for two reasons: the consumer
-    /// needs the name before the node exists because `stage_config` writes it
-    /// into the router's cargo-bay `external-net` file at launch, so voxel-init
-    /// has an interface to place the static address on.
-    ///
-    /// Isolated mode leaves the router with nothing to discover from, i.e., it
-    /// runs no DHCP server, so the default-route poll `lan` mode relies on
-    /// never resolves, and the sleds' jumbo probe (the underlay is MTU 9000,
-    /// the external NICs are not) has no router-side equivalent.
-    ///
-    /// The derivation mirrors the wiring in `build_topo`: `ce`'s falcon links
-    /// go fabric-router first (cr1=enp0s8, cr2=enp0s9, ...) then its external
-    /// NIC, so `ce`'s external NIC is
-    /// `enp0s{FRR_IFACE_BASE + fabric_router_count}`. A fabric router's falcon
-    /// links go `ce` (enp0s8) then every scrimlet across every rack in
-    /// `sleds()` order (enp0s9, enp0s10, ...) then its external NIC, so a
-    /// fabric router's external NIC is
-    /// `enp0s{FRR_IFACE_BASE + 1 + total_scrimlet_count}`. Encoded here so it
-    /// cannot drift from `to_frr`'s link ordering. The residual risk is the
-    /// base itself: falcon assigns NIC slots sequentially after its fixed
-    /// pre-NIC devices, so a falcon change that adds a device ahead of the
-    /// NICs shifts every derived name (see the note on [`FRR_IFACE_BASE`]).
-    /// Nothing here can catch that, so `voxel-init` checks the staged name
-    /// against the router's actual links at bring-up and reports the mismatch.
+    /// The enp0sN name of a router's external NIC, derived from build_topo's
+    /// link order; voxel-init verifies it against the node's actual links.
     pub fn router_ext_iface(&self, router: &str) -> String {
         let fabric_router_count =
             self.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
@@ -1079,29 +894,17 @@ impl VoxelConfig {
         format!("enp0s{n}")
     }
 
-    /// Build each customer router's `frr.conf` as `(name, FrrRouter)` pairs.
-    /// `cr*` are the **shared transit**: each peers `ce` plus *every* scrimlet
-    /// across *all* racks, and originates nothing. eBGP (`no bgp
-    /// ebgp-requires-policy`) re-advertises each rack's customer prefix to the
-    /// other rack's switches, so a 2-rack deployment routes between
-    /// `198.51.100/24` and `198.51.101/24` with no extra config. `ce` originates
-    /// the default route toward the fabric. ASNs are `65100` (ce) and `65101 + i`
-    /// (cr`i`).
-    ///
-    /// The `enp0sN` interface names mirror `build_topo`'s link-creation order:
-    /// `ce` links each fabric router (cr1=enp0s8, cr2=enp0s9, ...); each fabric
-    /// router links `ce` first (enp0s8) then every scrimlet in `sleds()` order
-    /// (enp0s9, enp0s10, ...).
+    /// Each customer router's frr.conf. cr* peer ce plus every scrimlet across
+    /// all racks and originate nothing; ce originates the default route.
     pub fn to_frr(&self) -> Vec<(String, FrrRouter)> {
-        // Fabric (transit) routers - everything except the customer edge `ce`.
+        // Everything except the customer edge.
         let fabric: Vec<&String> = self
             .topology
             .routers
             .iter()
             .filter(|r| r.as_str() != "ce")
             .collect();
-        // Scrimlets across all racks, in falcon softnpu-link order (= `sleds()`
-        // order), each labelled with its rack + in-rack switch slot.
+        // Scrimlets in falcon softnpu-link order, labelled rack + switch slot.
         let mut scrimlets: Vec<(String, usize, usize)> = Vec::new();
         let mut per_rack: std::collections::BTreeMap<usize, usize> =
             std::collections::BTreeMap::new();
@@ -1159,10 +962,8 @@ impl VoxelConfig {
                             track_bfd: false,
                         }
                     }
-                    // 2-way fanout: this cr has a numbered /30 to EVERY scrimlet
-                    // (matching the physical mesh), so both routers reach every
-                    // switch. Block = router*n_switches + slot (the datacenter
-                    // scheme). Keeps eBGP to ce, redistributing the static routes.
+                    // Numbered /30 to every scrimlet, block = router *
+                    // n_switches + slot; keeps eBGP to ce for redistribution.
                     RouterMode::Static => {
                         let c = (cr_index - 1) as usize;
                         let mut static_uplinks = Vec::new();
@@ -1203,13 +1004,11 @@ impl VoxelConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `config get` / `config set` - format-preserving edits over `voxel.toml`
-// text (comments + layout survive), validated against the typed model.
-// ---------------------------------------------------------------------------
+// config get / config set: format-preserving edits over voxel.toml text,
+// validated against the typed model.
 
-/// Read a dotted key (`network.bgp_asn`) out of a `voxel.toml`. Returns the
-/// value's TOML rendering, or `None` if the path doesn't exist.
+/// Read a dotted key out of a voxel.toml as its TOML rendering; None if the
+/// path does not exist.
 pub fn get(doc_text: &str, key: &str) -> Result<Option<String>, String> {
     use toml_edit::{DocumentMut, Item};
     let doc: DocumentMut =
@@ -1228,13 +1027,8 @@ pub fn get(doc_text: &str, key: &str) -> Result<Option<String>, String> {
     Ok(Some(rendered))
 }
 
-/// Set a dotted key (`network.bgp_asn = 65001`) in a `voxel.toml`, preserving
-/// formatting and comments. Scalars are coerced to the existing value's type
-/// (int/bool/float, else string). A value that begins with `[` or `{` is parsed
-/// as a TOML array or inline table, so collection keys are settable too - e.g.
-/// `config set topology.scrimlets '["g0", "g3"]'`. The result is validated
-/// against [`VoxelConfig`] so typos, bad types, and malformed collections are
-/// rejected. Returns the updated document text.
+/// Set a dotted key in a voxel.toml, preserving formatting. Scalars coerce to
+/// the existing type; [ or { parses as TOML; the result must validate.
 pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
     use toml_edit::{DocumentMut, Item, Value};
 
@@ -1253,14 +1047,12 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
         item.and_then(|i| i.as_value()).cloned()
     };
     let trimmed = value.trim_start();
-    // Candidate value(s) for the leaf, best-typed first. We try each against the
-    // schema below and keep the first that validates - this lets us infer the
-    // type of a key that's ABSENT from the file (a default, e.g. `sled_memory_gb`,
-    // which has no existing value to coerce to) without quoting numbers/bools.
+    // Candidates best-typed first; the first that validates wins, which infers
+    // the type of a key absent from the file.
     let candidates: Vec<Value> = if trimmed.starts_with('[')
         || trimmed.starts_with('{')
     {
-        // Array or inline table - parse the literal as TOML.
+        // Parse the literal as TOML.
         vec![value.parse::<Value>().map_err(|e| {
             format!(
                 "{key}: '{value}' is not a valid TOML array/table ({e}); e.g. '[\"g0\", \"g3\"]'"
@@ -1289,8 +1081,7 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
                 ));
             }
             Some(Value::String(_)) => vec![Value::from(value)],
-            // Absent (or an exotic type): infer. A bare TOML scalar (int/bool/
-            // float) first, then a string fallback - validation picks the winner.
+            // Absent: try a bare TOML scalar first, then a string.
             _ => {
                 let mut c = Vec::new();
                 if let Ok(v) = value.parse::<Value>()
@@ -1304,8 +1095,7 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
         }
     };
 
-    // Insert each candidate into a fresh copy of the doc; keep the first that
-    // still models a valid VoxelConfig.
+    // Keep the first candidate that still models a valid VoxelConfig.
     let mut last_err = String::new();
     for cand in candidates {
         let mut doc = doc.clone();
@@ -1363,9 +1153,8 @@ mod tests {
 
     #[test]
     fn set_infers_type_for_absent_default_field() {
-        // A defaulted numeric field isn't written in a minimal toml, so there's
-        // no existing type to coerce to - it must still be written as an integer,
-        // not a quoted string (which would fail the u64 schema).
+        // An absent defaulted field has no type to coerce to; it must still be
+        // written as an integer.
         let text = indoc! {"
             [topology]
             sleds = 6
@@ -1401,7 +1190,7 @@ mod tests {
 
     #[test]
     fn set_array_key() {
-        // A `[...]` value is parsed as a TOML array, and the result must still
+        // A [...] value is parsed as a TOML array, and the result must still
         // model a VoxelConfig (so the override actually takes effect).
         let text = VoxelConfig::default().to_toml();
         let out = set(&text, "topology.scrimlets", "[\"g1\", \"g7\"]").unwrap();
@@ -1418,9 +1207,7 @@ mod tests {
 
     #[test]
     fn auto_topology_derives_scrimlets_and_rss_peers() {
-        // An auto config leaves `scrimlets` empty and `rss_sleds` 0; the derived
-        // values are what the RSS bootstrap set and switch placement come from,
-        // so an empty set here would mean "no peers".
+        // Derived values feed the RSS bootstrap set and switch placement.
         let cfg = VoxelConfig::from_toml(indoc! {"
             [topology]
             sleds = 4
@@ -1547,7 +1334,7 @@ mod tests {
 
     #[test]
     fn external_section_parses_defaults_and_set_round_trips() {
-        // Default: `lan` mode. The untouched section is omitted from output.
+        // Default: lan mode. The untouched section is omitted from output.
         let d = VoxelConfig::default();
         assert!(!d.external.isolated());
         assert!(!d.to_toml().contains("[external]"));
@@ -1561,7 +1348,7 @@ mod tests {
         assert!(cfg.external.isolated());
         assert_eq!(cfg.external.host_ip, "172.30.199.199");
         assert_eq!(cfg.external.ip_start, "172.30.199.10");
-        // `voxel config set` auto-creates the table and round-trips.
+        // voxel config set auto-creates the table and round-trips.
         let out = set(&d.to_toml(), "external.mode", "isolated").unwrap();
         let out = set(&out, "external.uplink", "igb0").unwrap();
         let cfg = VoxelConfig::from_toml(&out).unwrap();
@@ -1580,7 +1367,7 @@ mod tests {
         assert_eq!(img.cp_commit().as_deref(), Some("43bb5af"));
         img.cp = Some("voxel-cp-99a0aec".into());
         assert_eq!(img.cp_commit().as_deref(), Some("99a0aec"));
-        // Falls back to `voxel-cp-<version>` when `cp` is unset.
+        // Falls back to voxel-cp-<version> when cp is unset.
         img.cp = None;
         img.version = "abc1234".into();
         assert_eq!(img.cp_commit().as_deref(), Some("abc1234"));
@@ -1643,10 +1430,8 @@ mod tests {
         // The uplink peer_asn tracks the rack's local ASN (rack 0 unchanged).
         assert_eq!(net.for_rack(0).uplinks[0].peer_asn, 65000);
         assert_eq!(net.for_rack(1).uplinks[0].peer_asn, 65001);
-        // Every rack gets its own 1-based external DNS zone, so silos are
-        // addressable per rack (recovery.sys.rack{N}.oxide.test) - including a
-        // single-rack deploy, whose rack 0 is rack1 (matches rack 1 of a
-        // multi-rack deploy, so it can grow a 2nd rack with no DNS churn).
+        // Per-rack 1-based DNS zones; single-rack rack 0 is rack1 so a second
+        // rack can be added with no DNS churn.
         assert_eq!(net.for_rack(0).dns_zone, "rack1.oxide.test");
         assert_eq!(net.for_rack(1).dns_zone, "rack2.oxide.test");
     }
@@ -1810,11 +1595,44 @@ mod tests {
 
     #[test]
     fn bootstrap_addr_is_decimal_past_four_sleds() {
-        // index 5 -> 2*5+1 = 11, which must render as decimal "11" (matching the
-        // viona MAC byte sled-agent derives the address from), NOT hex "b".
+        // index 5 -> 11 must render decimal, not hex b.
         let sleds = Topology { sleds: 6, ..Topology::default() }.sleds();
         assert_eq!(sleds[5].bootstrap_addr(), "fdb0:a840:2500:11::1");
         assert_eq!(sleds[4].bootstrap_addr(), "fdb0:a840:2500:9::1");
+    }
+
+    #[test]
+    fn scrimlets_come_from_the_rss_set() {
+        // 5 sleds, 4 in RSS, g4 added post-init: switch zones must land on
+        // RSS sleds.
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 5
+            rss_sleds = 4
+        "})
+        .unwrap();
+        let sleds = cfg.sleds();
+        let scrimlets: Vec<&str> = sleds
+            .iter()
+            .filter(|s| s.scrimlet)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(scrimlets, ["g0", "g3"]);
+        assert!(sleds.iter().filter(|s| s.scrimlet).all(|s| s.rss));
+        assert_eq!(sleds.len(), 5);
+        assert!(!sleds[4].rss && !sleds[4].scrimlet);
+        assert!(cfg.topology.validate().is_ok());
+
+        // Explicit scrimlets can still name a non-RSS sled; validate rejects.
+        let cfg = VoxelConfig::from_toml(indoc! {r#"
+            [topology]
+            sleds = 5
+            scrimlets = ["g0", "g4"]
+            rss_sleds = 4
+        "#})
+        .unwrap();
+        let err = cfg.topology.validate().unwrap_err();
+        assert!(err.contains("g4"), "{err}");
     }
 
     #[test]
