@@ -356,11 +356,8 @@ pub struct Topology {
     /// Gimlets (sleds) PER RACK - each rack is named `g{r*sleds + i}`. (With the
     /// default `racks = 1` this is just the rack's sled count, as before.)
     pub sleds: usize,
-    /// Which sleds run a switch zone (scrimlets), by name. **Empty -> auto-derived
-    /// as the first + last sled (`g0` + `g{n-1}`)** - which is exactly what the
-    /// `voxel-cp` image bakes (`render-smf` uses first+last), so a topology that
-    /// leaves this unset always stays consistent with its image. Set it explicitly
-    /// only to override (then the image must be built with the matching pair).
+    /// Switch-zone sleds by name; empty auto-derives the first + last RSS
+    /// sled.
     pub scrimlets: Vec<String>,
     /// How many sleds participate in RSS / trust quorum (the first `rss_sleds`).
     /// **`0` -> auto: all sleds.**
@@ -389,7 +386,7 @@ impl Default for Topology {
         Self {
             racks: 1,
             sleds: 4,
-            scrimlets: Vec::new(), // auto: g0 + g{n-1}
+            scrimlets: Vec::new(), // auto: first + last RSS sled
             rss_sleds: 0,          // auto: all sleds
             routers: vec!["ce".into(), "cr1".into(), "cr2".into()],
             sled_memory_gb: 8,
@@ -420,33 +417,45 @@ impl Topology {
 }
 
 impl Topology {
-    /// Scrimlet sled names for `rack` (0-based): explicit `scrimlets` (honored
-    /// only for a single-rack deployment) else auto - the first and last sled of
-    /// that rack's contiguous range (`g{base}` + `g{base+sleds-1}`). Auto matches
-    /// what `render-smf` bakes, so an unset topology stays image-consistent.
+    /// Scrimlet names for rack: explicit list (single-rack only), else first +
+    /// last RSS sled. Switch zones must live on RSS sleds; see validate.
     pub fn scrimlet_names_for_rack(&self, rack: usize) -> Vec<String> {
         if self.racks() == 1 && !self.scrimlets.is_empty() {
             return self.scrimlets.clone();
         }
         let base = rack * self.sleds;
-        if self.sleds >= 2 {
-            vec![format!("g{base}"), format!("g{}", base + self.sleds - 1)]
+        let last = self.rss_count() - 1;
+        if last >= 1 {
+            vec![format!("g{base}"), format!("g{}", base + last)]
         } else {
             vec![format!("g{base}")]
         }
     }
 
-    /// Scrimlets across all racks (every rack's first+last). Single-rack:
-    /// equivalent to the old first+last / explicit list.
+    /// Scrimlets across all racks.
     pub fn scrimlet_names(&self) -> Vec<String> {
         (0..self.racks())
             .flat_map(|r| self.scrimlet_names_for_rack(r))
             .collect()
     }
 
-    /// Sleds that join RSS: explicit `rss_sleds` if non-zero, else all sleds.
+    /// Sleds that join RSS: explicit rss_sleds if non-zero, else all sleds.
     pub fn rss_count(&self) -> usize {
         if self.rss_sleds > 0 { self.rss_sleds } else { self.sleds }
+    }
+
+    /// Reject a topology whose switch zones land outside the RSS set;
+    /// reachable only via explicit scrimlets.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(s) = self.sleds().iter().find(|s| s.scrimlet && !s.rss) {
+            return Err(format!(
+                "scrimlet {} is not in the RSS set (rss_sleds = {}): switch \
+                 zones must live on RSS sleds or nexus handoff cannot find \
+                 their switch ports",
+                s.name, self.rss_sleds
+            ));
+        }
+        Ok(())
     }
 
     /// Expand into per-sled descriptors across all racks. Rack `r` owns
@@ -1815,6 +1824,40 @@ mod tests {
         let sleds = Topology { sleds: 6, ..Topology::default() }.sleds();
         assert_eq!(sleds[5].bootstrap_addr(), "fdb0:a840:2500:11::1");
         assert_eq!(sleds[4].bootstrap_addr(), "fdb0:a840:2500:9::1");
+    }
+
+    #[test]
+    fn scrimlets_come_from_the_rss_set() {
+        // 5 sleds, 4 in RSS, g4 added post-init: switch zones must land on
+        // RSS sleds.
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 5
+            rss_sleds = 4
+        "})
+        .unwrap();
+        let sleds = cfg.sleds();
+        let scrimlets: Vec<&str> = sleds
+            .iter()
+            .filter(|s| s.scrimlet)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(scrimlets, ["g0", "g3"]);
+        assert!(sleds.iter().filter(|s| s.scrimlet).all(|s| s.rss));
+        assert_eq!(sleds.len(), 5);
+        assert!(!sleds[4].rss && !sleds[4].scrimlet);
+        assert!(cfg.topology.validate().is_ok());
+
+        // Explicit scrimlets can still name a non-RSS sled; validate rejects.
+        let cfg = VoxelConfig::from_toml(indoc! {r#"
+            [topology]
+            sleds = 5
+            scrimlets = ["g0", "g4"]
+            rss_sleds = 4
+        "#})
+        .unwrap();
+        let err = cfg.topology.validate().unwrap_err();
+        assert!(err.contains("g4"), "{err}");
     }
 
     #[test]

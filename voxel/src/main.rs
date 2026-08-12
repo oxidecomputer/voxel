@@ -581,7 +581,10 @@ fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
 
 fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    VoxelConfig::from_toml(&text).with_context(|| format!("parse {}", path))
+    let cfg = VoxelConfig::from_toml(&text)
+        .with_context(|| format!("parse {}", path))?;
+    cfg.topology.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    Ok(cfg)
 }
 
 /// Make a path absolute against the current directory.
