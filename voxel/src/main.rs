@@ -20,6 +20,7 @@ use std::fs;
 use voxel_config::VoxelConfig;
 
 mod access;
+mod commission;
 mod commtest;
 mod config_cmd;
 mod cpbuild;
@@ -106,6 +107,13 @@ enum Cmd {
         /// Per-rack sled count (the bootstrap slot set).
         #[arg(default_value_t = 4)]
         sleds: usize,
+    },
+    /// (debug) Print the typed commission rack-setup config body as JSON.
+    #[command(hide = true)]
+    CommissionDryrun {
+        /// Rack index (0-based).
+        #[arg(default_value_t = 0)]
+        rack: usize,
     },
     /// (Re)point the host route for the rack's external net at ce's current IP.
     Route {
@@ -765,6 +773,9 @@ async fn main() -> Result<(), Error> {
         }
         Cmd::WicketDryrun { config_rss, sleds } => {
             wicket_setup::dryrun(config_rss, *sleds)
+        }
+        Cmd::CommissionDryrun { rack } => {
+            commission::dryrun(&load_config(&config_path)?, *rack)
         }
         Cmd::Route { dry_run } => {
             rack::cmd_route(&load_config(&config_path)?, &cli.name, *dry_run)
