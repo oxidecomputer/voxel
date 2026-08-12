@@ -241,6 +241,59 @@ mod tests {
     }
 
     #[test]
+    fn isolated_node_addresses_are_available_without_serial_discovery() {
+        let config = VoxelConfig::from_toml(
+            "[topology]\nracks = 1\nsleds = 3\nrouters = [\"ce\"]\n\
+             [external]\nmode = \"isolated\"\n",
+        )
+        .unwrap();
+
+        let cache =
+            IpCache::from_config_and_addresses(&config, BTreeMap::new());
+
+        assert_eq!(
+            cache.resolved.get("g0").map(String::as_str),
+            Some("172.30.199.10")
+        );
+        assert_eq!(
+            cache.resolved.get("ce").map(String::as_str),
+            Some("172.30.199.13")
+        );
+        assert!(cache.in_flight.is_empty());
+
+        assert!(
+            IpCache::from_config_and_addresses(
+                &VoxelConfig::default(),
+                BTreeMap::new(),
+            )
+            .resolved
+            .is_empty()
+        );
+        let resumed = IpCache::from_config_and_addresses(
+            &VoxelConfig::default(),
+            [("g0".to_string(), "192.168.1.184".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            resumed.resolved.get("g0").map(String::as_str),
+            Some("192.168.1.184")
+        );
+        assert!(resumed.address_for_probe("g0", true).is_ok());
+        assert!(
+            IpCache::default()
+                .address_for_probe("g0", true)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable after resuming")
+        );
+        assert_eq!(
+            IpCache::default().address_for_probe("g0", false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn scheduler_configuration_rejects_zero_values() {
         assert!(
             SchedulerConfig::new(
@@ -874,21 +927,57 @@ struct IpCache {
         BTreeMap<String, watch::Receiver<Option<Result<String, String>>>>,
 }
 
+impl IpCache {
+    fn from_config_and_addresses(
+        config: &VoxelConfig,
+        mut resolved: BTreeMap<String, String>,
+    ) -> Self {
+        if config.external.isolated() {
+            resolved.extend(config.static_external_ips());
+        }
+        Self { resolved, in_flight: BTreeMap::new() }
+    }
+
+    fn address_for_probe(
+        &self,
+        host: &str,
+        resumed: bool,
+    ) -> anyhow::Result<Option<String>> {
+        match self.resolved.get(host) {
+            Some(ip) => Ok(Some(ip.clone())),
+            None if resumed => Err(anyhow!(
+                "telemetry for {host} is unavailable after resuming without a saved address"
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
 pub(crate) struct FalconExecutor {
     topo: Arc<crate::topo::Topo>,
     ips: Arc<Mutex<IpCache>>,
     router_commands: Arc<Mutex<BTreeSet<String>>>,
     serial_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    resumed: bool,
     timeout: Duration,
 }
 
 impl FalconExecutor {
-    pub(crate) fn new(topo: crate::topo::Topo, timeout: Duration) -> Self {
+    pub(crate) fn new(
+        topo: crate::topo::Topo,
+        config: &VoxelConfig,
+        addresses: BTreeMap<String, String>,
+        resumed: bool,
+        timeout: Duration,
+    ) -> Self {
         Self {
             topo: Arc::new(topo),
-            ips: Default::default(),
+            ips: Arc::new(Mutex::new(IpCache::from_config_and_addresses(
+                config, addresses,
+            ))),
             router_commands: Default::default(),
             serial_tasks: Default::default(),
+            resumed,
             timeout,
         }
     }
@@ -919,14 +1008,14 @@ impl FalconExecutor {
         }
     }
 
-    pub(crate) fn topology(&self) -> Arc<crate::topo::Topo> {
-        self.topo.clone()
+    pub(crate) async fn resolved_addresses(&self) -> BTreeMap<String, String> {
+        self.ips.lock().await.resolved.clone()
     }
 
     async fn sled_ip(&self, host: &str) -> anyhow::Result<String> {
         let mut cache = self.ips.lock().await;
-        if let Some(ip) = cache.resolved.get(host) {
-            return Ok(ip.clone());
+        if let Some(ip) = cache.address_for_probe(host, self.resumed)? {
+            return Ok(ip);
         }
         let node = self
             .topo
@@ -978,6 +1067,11 @@ impl FalconExecutor {
         name: &str,
         command: &str,
     ) -> anyhow::Result<String> {
+        if self.resumed {
+            return Err(anyhow!(
+                "router telemetry is unavailable after resuming a TUI session"
+            ));
+        }
         let node = self
             .topo
             .node_ref(name)

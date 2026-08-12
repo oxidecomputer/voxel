@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -30,6 +31,8 @@ pub(crate) struct DetachedSession {
     name: String,
     dataset: String,
     build_root: PathBuf,
+    #[serde(default)]
+    addresses: BTreeMap<String, String>,
 }
 
 impl DetachedSession {
@@ -46,7 +49,19 @@ impl DetachedSession {
             name: context.name.clone(),
             dataset: context.dataset.clone(),
             build_root: context.build_root.clone().into_std_path_buf(),
+            addresses: BTreeMap::new(),
         })
+    }
+
+    pub(crate) fn addresses(&self) -> &BTreeMap<String, String> {
+        &self.addresses
+    }
+
+    pub(crate) fn set_addresses(
+        &mut self,
+        addresses: BTreeMap<String, String>,
+    ) {
+        self.addresses = addresses;
     }
 
     fn arguments(&self) -> Vec<OsString> {
@@ -246,9 +261,14 @@ pub(crate) fn detach(session: &DetachedSession) -> anyhow::Result<PathBuf> {
 pub(crate) struct SessionClaim {
     path: PathBuf,
     _file: fs::File,
+    session: DetachedSession,
 }
 
 impl SessionClaim {
+    pub(crate) fn addresses(&self) -> &BTreeMap<String, String> {
+        self.session.addresses()
+    }
+
     pub(crate) fn finish(self) -> anyhow::Result<()> {
         fs::remove_file(&self.path).with_context(|| {
             format!("remove resumed session {}", self.path.display())
@@ -263,7 +283,7 @@ pub(crate) fn claim_from_environment() -> anyhow::Result<Option<SessionClaim>> {
     if path.parent() != Some(Path::new(SYSTEM_DIRECTORY)) {
         return Err(anyhow!("invalid detached TUI session claim path"));
     }
-    read_private(&path)?;
+    let session = read_private(&path)?;
     let file =
         OpenOptions::new().read(true).write(true).open(&path).with_context(
             || format!("open session claim {}", path.display()),
@@ -275,7 +295,7 @@ pub(crate) fn claim_from_environment() -> anyhow::Result<Option<SessionClaim>> {
         return Err(io::Error::last_os_error())
             .context("detached TUI session is already being resumed");
     }
-    Ok(Some(SessionClaim { path, _file: file }))
+    Ok(Some(SessionClaim { path, _file: file, session }))
 }
 
 pub(crate) fn resume(choose: bool) -> anyhow::Result<()> {
@@ -372,6 +392,7 @@ mod tests {
             name: name.into(),
             dataset: "pool/falcon".into(),
             build_root: "/build".into(),
+            addresses: BTreeMap::new(),
         }
     }
     fn directory() -> PathBuf {
@@ -390,11 +411,21 @@ mod tests {
         let directory = directory();
         let store = Store::at(directory.clone());
         store.write(&record(1, "old")).unwrap();
-        let expected = record(2, "new");
+        let mut expected = record(2, "new");
+        expected.set_addresses(
+            [("g0".to_string(), "192.168.1.10".to_string())]
+                .into_iter()
+                .collect(),
+        );
         store.write(&expected).unwrap();
         let (records, warnings) = store.load().unwrap();
         assert!(warnings.is_empty());
-        assert_eq!(select(&records, false).unwrap().unwrap().session, expected);
+        let selected = select(&records, false).unwrap().unwrap();
+        assert_eq!(selected.session, expected);
+        assert_eq!(
+            selected.session.addresses().get("g0").map(String::as_str),
+            Some("192.168.1.10")
+        );
         assert!(!expected.arguments().iter().any(|arg| arg == "--rss-gen"));
         assert!(
             expected

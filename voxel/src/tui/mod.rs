@@ -54,12 +54,21 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
         context.workdir.join("voxel-tui.log").as_std_path(),
     )
     .context("open durable TUI log")?;
-    let (detached, reattach) = session::prepare_direct(&context)?;
+    let (mut detached, reattach) = session::prepare_direct(&context)?;
     let topology = telemetry::resource_descriptors(&context.config);
     prepare_probe_mounts(&context.workdir, &context.config)?;
-    let topo = crate::topo::build_topo(&context.config, &context.name)?;
-    let executor =
-        Arc::new(collector::FalconExecutor::new(topo, Duration::from_secs(10)));
+    let mut topo = crate::topo::build_topo(&context.config, &context.name)?;
+    topo.runner.log = durable.falcon_logger();
+    let executor = Arc::new(collector::FalconExecutor::new(
+        topo,
+        &context.config,
+        resumed_claim
+            .as_ref()
+            .map(|claim| claim.addresses().clone())
+            .unwrap_or_default(),
+        resumed_claim.is_some(),
+        Duration::from_secs(10),
+    ));
     let collector = Arc::new(collector::Collector::new(
         executor.clone(),
         &context.config,
@@ -271,6 +280,8 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
     match app.session.exit {
         Some(app::SessionExit::Detach) => {
             if resumed_claim.is_none() {
+                detached
+                    .set_addresses(executor_drain.resolved_addresses().await);
                 session::detach(&detached)?;
             }
             Ok(())

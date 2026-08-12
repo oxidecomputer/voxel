@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::collector::FalconExecutor;
+use super::collector::{FalconExecutor, NodeExecutor, NodeTarget};
 use super::context::TuiContext;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -380,11 +380,17 @@ pub(crate) async fn collect(
     shutdown: &CancellationToken,
 ) -> anyhow::Result<ReconciliationEvidence> {
     let sleds = context.config.sleds();
-    let node_ids: Vec<_> = sleds
+    let nodes_and_targets: Vec<_> = sleds
         .iter()
-        .map(|sled| sled.name.clone())
-        .chain(context.config.topology.routers.iter().cloned())
+        .map(|sled| {
+            (sled.name.clone(), NodeTarget::Sled { name: sled.name.clone() })
+        })
+        .chain(context.config.topology.routers.iter().map(|name| {
+            (name.clone(), NodeTarget::Router { name: name.clone() })
+        }))
         .collect();
+    let node_ids =
+        nodes_and_targets.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
     let rack_ids: Vec<_> = (0..context.config.topology.racks()).collect();
     let mut pid_states = Vec::with_capacity(node_ids.len());
     let mut any_live = false;
@@ -411,23 +417,19 @@ pub(crate) async fn collect(
         pid_states.push(state);
     }
 
-    let topology = any_live.then(|| executor.topology());
     let mut nodes = Vec::with_capacity(node_ids.len());
-    for (id, mut state) in node_ids.iter().cloned().zip(pid_states) {
+    for ((id, target), mut state) in nodes_and_targets
+        .iter()
+        .zip(pid_states)
+        .map(|(node, state)| ((node.0.clone(), &node.1), state))
+    {
         if state == NodeEvidence::Running {
-            let node =
-                topology.as_ref().and_then(|topology| topology.node_ref(&id));
-            state = match (topology.as_ref(), node) {
-                (Some(topology), Some(node)) => {
-                    match topology.runner.exec(node, "true").await {
-                        Ok(_) => NodeEvidence::Running,
-                        Err(_) if intent == LifecycleIntent::Launch => {
-                            NodeEvidence::Booting
-                        }
-                        Err(_) => NodeEvidence::Unknown,
-                    }
+            state = match executor.execute(target, "true").await {
+                Ok(_) => NodeEvidence::Running,
+                Err(_) if intent == LifecycleIntent::Launch => {
+                    NodeEvidence::Booting
                 }
-                _ => NodeEvidence::Unknown,
+                Err(_) => NodeEvidence::Unknown,
             };
             if shutdown.is_cancelled() {
                 anyhow::bail!("node observation cancelled");
@@ -446,16 +448,21 @@ pub(crate) async fn collect(
         .iter()
         .map(|rack| (*rack, RssObservation::Unavailable))
         .collect();
-    let mut observed_rss_rack_ids = Vec::new();
-    if let Some(topology) = &topology {
-        for (sled, node) in topology.rss_sleds() {
-            observed_rss_rack_ids.push(sled.rack);
+    let mut seen_racks = HashSet::new();
+    let rss_sleds = sleds
+        .iter()
+        .filter(|sled| sled.rss && seen_racks.insert(sled.rack))
+        .collect::<Vec<_>>();
+    let mut observed_rss_rack_ids =
+        rss_sleds.iter().map(|sled| sled.rack).collect::<Vec<_>>();
+    if any_live {
+        for sled in rss_sleds {
             let command = format!(
                 "curl -s --max-time 5 http://[{}]:8080/rack-initialize 2>/dev/null",
                 sled.bootstrap_addr()
             );
-            let observation = match topology.runner.exec(*node, &command).await
-            {
+            let target = NodeTarget::Sled { name: sled.name.clone() };
+            let observation = match executor.execute(&target, &command).await {
                 Ok(body) => parse_rss_observation(&body),
                 Err(_) => RssObservation::Unavailable,
             };
@@ -464,14 +471,6 @@ pub(crate) async fn collect(
             }
             rack_observations.insert(sled.rack, observation);
         }
-    } else {
-        observed_rss_rack_ids.extend(
-            sleds
-                .iter()
-                .filter(|sled| sled.rss)
-                .map(|sled| sled.rack)
-                .collect::<HashSet<_>>(),
-        );
     }
     observed_rss_rack_ids.sort_unstable();
     let required_rss_rack_ids =
