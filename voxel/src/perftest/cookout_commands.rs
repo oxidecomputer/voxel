@@ -7,6 +7,9 @@ use super::{
 use anyhow::{Context, Result, bail};
 use cookout::analysis::{Analysis, Cohort, NoiseStatus};
 use cookout::model::{Aggregation, OptimizationDirection, Unit};
+use cookout::policy::{
+    Objective, RecommendationMode, RecommendationPolicy, SelectionMode,
+};
 use cookout::{
     AggregateRequest, AnalysisPolicy, Comparison, EvidenceEnvelope,
     ExperimentDocument, Limits, MetricKey, PartialAcceptance, PublishRequest,
@@ -20,9 +23,50 @@ use std::path::{Path, PathBuf};
 const STORAGE_COHORT_SELECTOR: &str =
     "target.dimension.oxide.voxel.storage_cohort";
 
-fn voxel_analysis_policy() -> AnalysisPolicy {
+pub(super) fn voxel_analysis_policy() -> AnalysisPolicy {
+    let objective = |phase: &str, metric: &str, unit, aggregation| Objective {
+        metric: MetricKey {
+            phase: phase.into(),
+            metric: metric.into(),
+            unit,
+            direction: OptimizationDirection::LowerIsBetter,
+            aggregation,
+        },
+    };
     AnalysisPolicy {
         compatibility_dimensions: vec![STORAGE_COHORT_SELECTOR.into()],
+        recommendation: Some(RecommendationPolicy {
+            mode: RecommendationMode::UsabilityDefault,
+            selection: SelectionMode::Pareto,
+            objectives: vec![
+                objective(
+                    "launch",
+                    "launch.bytes_written",
+                    Unit::Bytes,
+                    Aggregation::Sum,
+                ),
+                objective(
+                    "workload",
+                    "workload.bytes_written",
+                    Unit::Bytes,
+                    Aggregation::Sum,
+                ),
+                objective(
+                    "launch",
+                    "launch.duration",
+                    Unit::Seconds,
+                    Aggregation::Last,
+                ),
+                objective(
+                    "launch",
+                    "launch.peak_ram_delta",
+                    Unit::Bytes,
+                    Aggregation::Maximum,
+                ),
+            ],
+            constraints: Vec::new(),
+            resource_order: None,
+        }),
         ..AnalysisPolicy::default()
     }
 }

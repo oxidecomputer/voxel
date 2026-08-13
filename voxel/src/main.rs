@@ -755,18 +755,21 @@ async fn main() -> Result<(), Error> {
             emu_sp,
             emu_rot,
             wicket_setup,
-        } => {
-            rack::cmd_launch(
-                &load_config(&config_path)?,
-                &cli.name,
-                *no_progress,
-                *no_route,
-                *emu_sp || *emu_rot,
-                *emu_rot,
-                *wicket_setup,
-            )
-            .await
-        }
+        } => rack::cmd_launch(
+            &load_config(&config_path)?,
+            &cli.name,
+            *no_progress,
+            if *no_route {
+                rack::ExternalRoutePolicy::Disabled
+            } else {
+                rack::ExternalRoutePolicy::Required
+            },
+            *emu_sp || *emu_rot,
+            *emu_rot,
+            *wicket_setup,
+        )
+        .await
+        .map(|_| ()),
         Cmd::WicketDryrun { config_rss, sleds } => {
             wicket_setup::dryrun(config_rss, *sleds)
         }

@@ -50,12 +50,15 @@ default-branch commit. The development and reporting commands do not push
 either repository, create remotes, alter repository history, or otherwise
 perform network operations at runtime.
 
-`matrix` runs the normal fail-closed launch path. A successful repeat therefore
-requires the router and gimlet completion milestones, RSS completion, external
-route reachability, the requested host and guest lever states, strict Falcon
-drive scope, and clean pre/post-repeat teardown boundaries. Matrix evidence is
-durable by stage: a successful launch remains descriptive evidence when its
-workload fails, but the partial repeat is not recommendation-eligible. A launch
+`matrix` keeps the normal fail-closed launch gates for router and gimlet
+completion, RSS completion, external route installation, requested host and
+guest lever states, strict Falcon drive scope, and clean pre/post-repeat
+teardown boundaries. It probes every configured external DNS server; when none
+answers after the bounded convergence window, matrix retains the valid launch
+measurements, records the workload as blocked, and keeps the repeat as
+launch-only evidence. The ordinary `voxel launch` command still treats that
+condition as a launch failure.
+Launch-only evidence is descriptive, not recommendation-eligible. A launch
 failure is retried once only after teardown and host-property reset prove
 another clean boundary. A workload failure after a successful launch is not
 retried by launching another rack. A failed clean-boundary proof aborts
@@ -227,6 +230,13 @@ The workdir must be the project root under which Voxel manages `cargo-bay/`
 and `.falcon/`; it is not the results directory. The explicit dataset overrides
 `[falcon].dataset` for that invocation. Complete the launch/destroy preparation
 above in the same workdir before starting its first matrix.
+
+Use a deterministic external segment for repeated matrices. Prefer
+`[external] mode = "isolated"` with an explicit `uplink`; LAN mode depends on
+ambient DHCP, and a customer-edge lease outside the host's directly connected
+subnet cannot be installed as a route gateway. If LAN mode is required, pin
+`EXT_INTERFACE` and configure `[topology].ce_external_ip` to an unused address
+on that interface's subnet rather than relying on changing DHCP leases.
 
 Labels may contain only ASCII letters, digits, dots, underscores, and hyphens.
 By default `run` supplies `--workload api-disk-lifecycle`, `--repeat 3`, and
@@ -576,11 +586,19 @@ Reports normalize schema-v5 stages independently. Launch metrics use every
 launch with valid measurements and clean boundaries; workload metrics use only
 successful workload measurements. Every metric row and SVG carries its own
 sample count so unequal populations are explicit. Running, aborted, partial,
-and failed evidence is descriptive only. A recommendation additionally requires
-a completed run, the requested number of repeats, clean boundaries, successful
-required workloads, complete provenance and effective configuration, passing
-capabilities, and a comparable cohort. Missing workload evidence is never
-converted to a zero or inferred from launch evidence.
+and failed evidence is descriptive only. A candidate from a completed matrix is
+recommendation-eligible when at least 80% of its planned repeats succeed and
+every attempted repeat proves a clean boundary. Bounded launch, preparation, or
+workload failures remain visible as warnings and are not converted to zero;
+boundary failures remain blocking. Recommendations additionally require
+complete provenance and effective configuration, passing matrix-wide scope and
+boundary capabilities, and a comparable cohort.
+
+Superreports retain exact cohorts for formal statistics and recommendations,
+and also publish a descriptive cross-cohort view for storage experiments. That
+view places compatible metric observations from the retained runs on shared
+charts while preserving source attribution. It does not pool eligibility or
+override cohort-local recommendations.
 
 Hyperfine is not part of this harness. Command timing alone cannot preserve or
 validate the rack lifecycle, clean state boundaries, stable session/cohort

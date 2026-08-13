@@ -2780,7 +2780,7 @@ async fn cmd_matrix_checkpointed(
                     },
                     || std::future::ready(clean_repeat_boundary(&cfg, name)),
                     || async {
-                        let (sample, after_launch) =
+                        let (sample, after_launch, external_reachable) =
                             run_launch_phase(&cfg, name, &scope).await?;
                         let metrics = LaunchMetrics {
                             bringup_bytes: sample.bringup_bytes,
@@ -2789,7 +2789,10 @@ async fn cmd_matrix_checkpointed(
                                 .peak_ram_bytes
                                 .expect("launch phase requires RAM"),
                         };
-                        Ok((metrics, (sample, after_launch)))
+                        Ok((
+                            metrics,
+                            (sample, after_launch, external_reachable),
+                        ))
                     },
                     |launch_data| async {
                         prepare_simulated_zpool_capacity(&cfg, name)
@@ -2797,24 +2800,36 @@ async fn cmd_matrix_checkpointed(
                             .map_err(classified_anyhow)?;
                         Ok(launch_data)
                     },
-                    |(mut sample, after_launch)| async {
-                        let (metrics, metadata) = run_workload_phase(
-                            &cfg,
-                            name,
-                            oxide_auth_helper,
-                            &scope,
-                            &after_launch,
-                        )
-                        .await?;
-                        sample.workload_bytes = Some(metrics.workload_bytes);
-                        sample.workload_secs = Some(metrics.workload_secs);
-                        sample.workload_peak_delta_bytes =
-                            Some(metrics.workload_peak_delta_bytes);
-                        Ok((metrics, (sample, after_launch), metadata))
+                    |(mut sample, after_launch, external_reachable)| {
+                        let cfg = &cfg;
+                        let scope = &scope;
+                        async move {
+                            require_workload_external_dns(external_reachable)?;
+                            let (metrics, metadata) = run_workload_phase(
+                                cfg,
+                                name,
+                                oxide_auth_helper,
+                                scope,
+                                &after_launch,
+                            )
+                            .await?;
+                            sample.workload_bytes =
+                                Some(metrics.workload_bytes);
+                            sample.workload_secs = Some(metrics.workload_secs);
+                            sample.workload_peak_delta_bytes =
+                                Some(metrics.workload_peak_delta_bytes);
+                            Ok((
+                                metrics,
+                                (sample, after_launch, external_reachable),
+                                metadata,
+                            ))
+                        }
                     },
                 )
                 .await?;
-                let Some((sample, _after_launch)) = outcome.launch_data else {
+                let Some((sample, _after_launch, _external_reachable)) =
+                    outcome.launch_data
+                else {
                     let LaunchOutcome::Failure { attempt_failures } =
                         &slot.launch
                     else {
@@ -3284,9 +3299,18 @@ async fn cmd_preflight(
     clean_repeat_boundary(cfg, name)
         .context("preflight initial clean boundary")?;
     let operation = async {
-        crate::rack::cmd_launch(cfg, name, false, false, false, false, false)
-            .await
-            .context("preflight launch")?;
+        crate::rack::cmd_launch(
+            cfg,
+            name,
+            false,
+            crate::rack::ExternalRoutePolicy::Required,
+            false,
+            false,
+            false,
+        )
+        .await
+        .map(|_| ())
+        .context("preflight launch")?;
         prepare_simulated_zpool_capacity(cfg, name)
             .await
             .map_err(classified_anyhow)
@@ -3435,14 +3459,22 @@ async fn run_launch_phase(
     cfg: &VoxelConfig,
     name: &str,
     scope: &Value,
-) -> Result<(RepeatSample, Value)> {
+) -> Result<(RepeatSample, Value, bool)> {
     let before = collect_matrix_sample("before", Some(scope))?;
     let ram = PeakRamSampler::start();
-    let launched =
-        crate::rack::cmd_launch(cfg, name, false, false, false, false, false)
-            .await;
+    let launched = crate::rack::cmd_launch(
+        cfg,
+        name,
+        false,
+        crate::rack::ExternalRoutePolicy::BestEffort,
+        false,
+        false,
+        false,
+    )
+    .await;
     let peak_ram = ram.finish();
-    launched.map_err(|error| anyhow!("launch: {error:#}"))?;
+    let external_reachable =
+        launched.map_err(|error| anyhow!("launch: {error:#}"))?;
     let peak_ram =
         require_ram_delta(peak_ram, "launch").map_err(|error| match error {
             RepeatRunError::Execution(error)
@@ -3461,7 +3493,17 @@ async fn run_launch_phase(
         workload_secs: None,
         workload_peak_delta_bytes: None,
     };
-    Ok((sample, after))
+    Ok((sample, after, external_reachable))
+}
+
+fn require_workload_external_dns(external_reachable: bool) -> Result<()> {
+    if external_reachable {
+        Ok(())
+    } else {
+        bail!(
+            "workload blocked because no configured external DNS server answered; retaining launch-only evidence"
+        )
+    }
 }
 
 async fn run_workload_phase(
@@ -3523,11 +3565,18 @@ async fn run_combo_body(
     // Sample the host RAM increase above the pre-launch baseline. A missing
     // in-window Helios sample invalidates this repeat.
     let ram = PeakRamSampler::start();
-    let launched =
-        crate::rack::cmd_launch(cfg, name, false, false, false, false, false)
-            .await;
+    let launched = crate::rack::cmd_launch(
+        cfg,
+        name,
+        false,
+        crate::rack::ExternalRoutePolicy::BestEffort,
+        false,
+        false,
+        false,
+    )
+    .await;
     let peak_ram_delta = ram.finish();
-    launched
+    let external_reachable = launched
         .map_err(|e| RepeatRunError::Execution(anyhow!("launch: {e:#}")))?;
     let peak_ram_bytes = Some(require_ram_delta(peak_ram_delta, "launch")?);
     verify_guest_levers(cfg, name).await.map_err(RepeatRunError::Execution)?;
@@ -3540,6 +3589,8 @@ async fn run_combo_body(
 
     let (workload_bytes, workload_secs, workload_peak_delta_bytes, metadata) =
         if workload.is_some() {
+            require_workload_external_dns(external_reachable)
+                .map_err(RepeatRunError::Execution)?;
             prepare_simulated_zpool_capacity(cfg, name)
                 .await
                 .map_err(classify_lifecycle)?;
@@ -6596,6 +6647,106 @@ mod tests {
         assert_eq!(evidence.source.value["source_schema"], "matrix_run");
     }
 
+    fn checkpoint_with_successes(successful: usize) -> MatrixCheckpoint {
+        let mut checkpoint = schema_v5_fixture("matrix-complete-v5.json");
+        let completed = checkpoint.combos[0].repeats[0].clone();
+        checkpoint.status = RunStatus::Completed;
+        checkpoint.abort_error = None;
+        checkpoint.ended = Some(checkpoint.updated);
+        checkpoint.repeat = 5;
+        checkpoint.combos[0].repeats = (0..5)
+            .map(|index| {
+                let mut repeat = completed.clone();
+                repeat.index = index;
+                if index >= successful {
+                    repeat.workload = WorkloadOutcome::Failure {
+                        error: "bounded workload failure".into(),
+                    };
+                }
+                repeat
+            })
+            .collect();
+        checkpoint
+    }
+
+    #[test]
+    fn cookout_adapter_tolerates_one_bounded_failure_in_five() {
+        let evidence = cookout_adapter::matrix_checkpoint_to_evidence(
+            &checkpoint_with_successes(4),
+            Path::new("four-of-five.json"),
+        )
+        .unwrap();
+        let failure = evidence
+            .issues
+            .iter()
+            .find(|issue| issue.code == "oxide.voxel.perftest.stage_failure")
+            .unwrap();
+        assert_eq!(failure.impact, cookout::IssueImpact::Diagnostic);
+    }
+
+    #[test]
+    fn cookout_adapter_blocks_below_success_tolerance() {
+        let evidence = cookout_adapter::matrix_checkpoint_to_evidence(
+            &checkpoint_with_successes(3),
+            Path::new("three-of-five.json"),
+        )
+        .unwrap();
+        assert!(evidence.issues.iter().any(|issue| {
+            issue.code == "oxide.voxel.perftest.stage_failure"
+                && issue.impact == cookout::IssueImpact::Blocking
+        }));
+    }
+
+    #[test]
+    fn cookout_adapter_blocks_boundary_failure_at_success_tolerance() {
+        let mut checkpoint = checkpoint_with_successes(4);
+        checkpoint.status = RunStatus::Aborted;
+        checkpoint.abort_error = Some("clean boundary failed".into());
+        checkpoint.combos[0].repeats[4].post_boundary =
+            BoundaryOutcome::Failure { error: "dirty boundary".into() };
+        let evidence = cookout_adapter::matrix_checkpoint_to_evidence(
+            &checkpoint,
+            Path::new("dirty-four-of-five.json"),
+        )
+        .unwrap();
+        assert!(evidence.issues.iter().any(|issue| {
+            issue.code == "oxide.voxel.perftest.stage_failure"
+                && issue.impact == cookout::IssueImpact::Blocking
+        }));
+    }
+
+    #[test]
+    fn voxel_recommendation_policy_uses_storage_pareto_objectives() {
+        let policy = cookout_commands::voxel_analysis_policy();
+        assert_eq!(policy.noise_multiplier, 2.0);
+        let recommendation = policy.recommendation.unwrap();
+        assert_eq!(
+            recommendation.mode,
+            cookout::policy::RecommendationMode::UsabilityDefault
+        );
+        assert_eq!(
+            recommendation.selection,
+            cookout::policy::SelectionMode::Pareto
+        );
+        assert_eq!(
+            recommendation
+                .objectives
+                .iter()
+                .map(|objective| objective.metric.metric.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "launch.bytes_written",
+                "workload.bytes_written",
+                "launch.duration",
+                "launch.peak_ram_delta",
+            ]
+        );
+        assert!(recommendation.objectives.iter().all(|objective| {
+            objective.metric.direction
+                == cookout::model::OptimizationDirection::LowerIsBetter
+        }));
+    }
+
     fn storage_cohort(checkpoint: &MatrixCheckpoint, source: &Path) -> String {
         let document = cookout_adapter::matrix_checkpoint_to_experiment(
             checkpoint, source,
@@ -7736,6 +7887,47 @@ mod tests {
             prior_attempt_failures[0].clean_boundary,
             BoundaryOutcome::Clean {}
         );
+        assert_eq!(repeat.post_boundary, BoundaryOutcome::Clean {});
+    }
+
+    #[tokio::test]
+    async fn unavailable_external_dns_retains_launch_only_evidence() {
+        let mut repeat =
+            planned_schema_v5_checkpoint().combos.remove(0).repeats.remove(0);
+        let outcome =
+            checkpointed_repeat_with::<bool, (), _, _, _, _, _, _, _, _, _>(
+                &mut repeat,
+                true,
+                |_| Ok(()),
+                || async { Ok(()) },
+                || async {
+                    Ok((
+                        LaunchMetrics {
+                            bringup_bytes: 1,
+                            launch_secs: 2,
+                            peak_ram_bytes: 3,
+                        },
+                        false,
+                    ))
+                },
+                |external_reachable| async move { Ok(external_reachable) },
+                |external_reachable| async move {
+                    require_workload_external_dns(external_reachable)?;
+                    unreachable!(
+                        "DNS-unreachable repeat must not run the workload"
+                    )
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.launch_data, Some(false));
+        assert!(matches!(repeat.launch, LaunchOutcome::Success { .. }));
+        assert_eq!(repeat.preparation, PreparationOutcome::Success {});
+        let WorkloadOutcome::Failure { error } = repeat.workload else {
+            panic!("DNS-unreachable repeat must record a workload failure")
+        };
+        assert!(error.contains("retaining launch-only evidence"), "{error}");
         assert_eq!(repeat.post_boundary, BoundaryOutcome::Clean {});
     }
 

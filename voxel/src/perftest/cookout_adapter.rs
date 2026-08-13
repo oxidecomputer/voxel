@@ -258,6 +258,43 @@ fn adapter_issues(
 ) -> Vec<AdapterIssue<VoxelIssueClassification>> {
     let experiment_id = snapshot.identity.experiment_id.clone();
     let mut issues = Vec::new();
+    let tolerated_candidates = snapshot
+        .variants
+        .iter()
+        .map(|variant| {
+            let runs = snapshot
+                .runs
+                .iter()
+                .filter(|run| run.variant_id == variant.id)
+                .collect::<Vec<_>>();
+            let planned = variant
+                .report_context
+                .as_ref()
+                .map_or(0, |context| context.expected_repeats);
+            let successful = runs
+                .iter()
+                .filter(|run| run.outcome == RunOutcome::Completed)
+                .count() as u64;
+            let clean_boundaries = runs.iter().all(|run| {
+                run.report_context
+                    .as_ref()
+                    .is_some_and(|context| context.boundary_failure.is_none())
+                    && ["pre-boundary", "cleanup"].into_iter().all(|name| {
+                        run.phases.iter().any(|phase| {
+                            phase.name == name
+                                && phase.status == PhaseStatus::Completed
+                        })
+                    })
+            });
+            (
+                variant.id.as_str(),
+                planned != 0
+                    && successful.saturating_mul(100)
+                        >= planned.saturating_mul(80)
+                    && clean_boundaries,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for run in &snapshot.runs {
         let failed_stages = run
             .phases
@@ -277,7 +314,18 @@ fn adapter_issues(
                     variant_id: run.variant_id.clone(),
                     run_id: run.id.clone(),
                 },
-                impact: IssueImpact::Blocking,
+                impact: if tolerated_candidates
+                    .get(run.variant_id.as_str())
+                    .copied()
+                    .unwrap_or(false)
+                    && matches!(
+                        phase.name.as_str(),
+                        "launch" | "preparation" | "workload"
+                    ) {
+                    IssueImpact::Diagnostic
+                } else {
+                    IssueImpact::Blocking
+                },
                 classification: Some(VoxelIssueClassification::StageFailure {
                     stage: phase.name.clone(),
                     repeat: run.attempt,
@@ -584,7 +632,7 @@ fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
         workload_memory_semantics,
     } = args;
     let digest = hex_digest(&source);
-    let constraints = capability_names()
+    let constraints = target_constraint_capability_names()
         .into_iter()
         .map(|capability| Constraint::Capability {
             capability: capability.into(),
@@ -1721,13 +1769,8 @@ fn checkpoint_run_context(
     }
 }
 
-fn capability_names() -> [&'static str; 4] {
-    [
-        "matrix_host_storage_scope",
-        "clean_launch_teardown_boundaries",
-        "api_disk_lifecycle",
-        "simulated_zpool_preparation",
-    ]
+fn target_constraint_capability_names() -> [&'static str; 2] {
+    ["matrix_host_storage_scope", "clean_launch_teardown_boundaries"]
 }
 
 fn capability_states(ledger: &MatrixCapabilityLedger) -> Value {

@@ -340,49 +340,61 @@ pub(crate) fn scp_from(ip: &str, remote: &str, local: &str) -> bool {
 
 /// Confirm a rack's external network is actually reachable end-to-end after the
 /// host route is set - a route in the table isn't the same as a converged
-/// transit. Probes the rack's external DNS (a `dig` SOA query, UDP/53) from the
-/// host and waits, bounded, until it answers. With the shared transit, the second
-/// rack joining can briefly flap the first rack's path while BGP reconverges; this
-/// waits that out *here* instead of letting it surface to the operator as a dead
-/// DNS. Missing host prerequisites and a bounded probe timeout both fail the
-/// launch rather than allowing an unusable rack to look ready.
+/// transit. Probes every configured external DNS server (a `dig` SOA query,
+/// UDP/53) from the host and waits, bounded, until one answers. With the shared
+/// transit, the second rack joining can briefly flap the first rack's path while
+/// BGP reconverges; this waits that out *here*. Missing host prerequisites remain
+/// fatal. The caller decides whether exhausting the bounded probe is fatal.
 pub(crate) fn wait_external_reachable(
     log: &slog::Logger,
-    dns_ip: &str,
+    dns_ips: &[String],
     dns_zone: &str,
     label: &str,
-) -> anyhow::Result<()> {
-    const ATTEMPTS: u32 = 30; // ~90s at 3s spacing
+) -> anyhow::Result<bool> {
+    const TIMEOUT: Duration = Duration::from_secs(90);
     const SPACING: Duration = Duration::from_secs(3);
-    for attempt in 1..=ATTEMPTS {
-        match dig_soa(dns_ip, dns_zone) {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut first_attempt = true;
+    loop {
+        if let Some(dns_ip) =
+            probe_external_dns(dns_ips, |dns_ip| dig_soa(dns_ip, dns_zone))?
+        {
+            info!(log, "{label}: external network reachable (dns {dns_ip})");
+            return Ok(true);
+        }
+        if first_attempt {
+            info!(
+                log,
+                "{label}: waiting for external network to converge (dns {}) ...",
+                dns_ips.join(", ")
+            );
+            first_attempt = false;
+        }
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(SPACING.min(remaining));
+    }
+}
+
+fn probe_external_dns(
+    dns_ips: &[String],
+    mut probe: impl FnMut(&str) -> Option<bool>,
+) -> anyhow::Result<Option<&str>> {
+    for dns_ip in dns_ips {
+        match probe(dns_ip) {
+            Some(true) => return Ok(Some(dns_ip)),
+            Some(false) => {}
             None => {
                 bail!(
-                    "{label}: required host command `dig` could not be executed; install `dig` to validate external DNS reachability"
-                );
-            }
-            Some(true) => {
-                info!(
-                    log,
-                    "{label}: external network reachable (dns {dns_ip})"
-                );
-                return Ok(());
-            }
-            Some(false) => {
-                if attempt == 1 {
-                    info!(
-                        log,
-                        "{label}: waiting for external network to converge (dns {dns_ip}) ..."
-                    );
-                }
-                std::thread::sleep(SPACING);
+                    "required host command `dig` could not be executed; install `dig` to validate external DNS reachability"
+                )
             }
         }
     }
-    bail!(
-        "{label}: external network not reachable after ~{}s (dns {dns_ip}); retry `voxel route` or `dig {dns_zone} SOA @{dns_ip}`",
-        ATTEMPTS * SPACING.as_secs() as u32
-    )
+    Ok(None)
 }
 
 /// `dig <zone> SOA @<dns_ip>`: `Some(true)` if the server answered, `Some(false)`
@@ -592,5 +604,29 @@ mod tests {
             external_route_targets("198.51.100.0/24", &dns),
             ["198.51.100.0/24", "198.51.100.20/32"]
         );
+    }
+
+    #[test]
+    fn external_dns_probe_accepts_the_second_server() {
+        let dns =
+            vec!["198.51.100.20".to_string(), "198.51.100.21".to_string()];
+        let mut probed = Vec::new();
+
+        let reachable = probe_external_dns(&dns, |ip| {
+            probed.push(ip.to_string());
+            Some(ip == "198.51.100.21")
+        })
+        .unwrap();
+
+        assert_eq!(reachable, Some("198.51.100.21"));
+        assert_eq!(probed, dns);
+    }
+
+    #[test]
+    fn external_dns_probe_reports_all_servers_unavailable() {
+        let dns =
+            vec!["198.51.100.20".to_string(), "198.51.100.21".to_string()];
+
+        assert_eq!(probe_external_dns(&dns, |_| Some(false)).unwrap(), None);
     }
 }

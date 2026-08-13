@@ -95,16 +95,6 @@
       "constraint_kind": "capability",
       "capability": "clean_launch_teardown_boundaries",
       "required": true
-    },
-    {
-      "constraint_kind": "capability",
-      "capability": "api_disk_lifecycle",
-      "required": true
-    },
-    {
-      "constraint_kind": "capability",
-      "capability": "simulated_zpool_preparation",
-      "required": true
     }
   ],
   "extensions": {

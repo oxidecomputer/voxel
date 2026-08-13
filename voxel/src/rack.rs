@@ -35,6 +35,13 @@ const FALCON_BOOT_ATTEMPTS: u32 = 3;
 const FALCON_BOOT_ATTEMPT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExternalRoutePolicy {
+    Disabled,
+    Required,
+    BestEffort,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum FalconLaunchAttemptError {
     Failed(String),
@@ -163,15 +170,30 @@ fn aggregate_voxel_init_results(
 
 fn validate_launch_gate_bypasses(
     no_progress: bool,
-    no_route: bool,
+    external_route: ExternalRoutePolicy,
 ) -> anyhow::Result<()> {
-    if no_progress && !no_route {
+    if no_progress && external_route != ExternalRoutePolicy::Disabled {
         Err(anyhow!(
             "--no-progress skips the RSS completion barrier, so external reachability cannot be validated; also pass --no-route to make both bypasses explicit"
         ))
     } else {
         Ok(())
     }
+}
+
+fn enforce_external_reachability(
+    policy: ExternalRoutePolicy,
+    reachable: bool,
+    label: &str,
+    dns_ips: &[String],
+) -> anyhow::Result<()> {
+    if reachable || policy == ExternalRoutePolicy::BestEffort {
+        return Ok(());
+    }
+    bail!(
+        "{label}: external network not reachable after ~90s (dns {}); retry `voxel route` or query either server with `dig`",
+        dns_ips.join(", ")
+    )
 }
 
 fn classify_interconnect_retry(
@@ -295,13 +317,49 @@ mod review_tests {
 
     #[test]
     fn skipping_rss_progress_requires_skipping_external_route_validation() {
-        assert!(validate_launch_gate_bypasses(false, false).is_ok());
-        assert!(validate_launch_gate_bypasses(false, true).is_ok());
-        assert!(validate_launch_gate_bypasses(true, true).is_ok());
+        assert!(
+            validate_launch_gate_bypasses(false, ExternalRoutePolicy::Required)
+                .is_ok()
+        );
+        assert!(
+            validate_launch_gate_bypasses(
+                false,
+                ExternalRoutePolicy::BestEffort
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_launch_gate_bypasses(true, ExternalRoutePolicy::Disabled)
+                .is_ok()
+        );
         let error =
-            validate_launch_gate_bypasses(true, false).unwrap_err().to_string();
+            validate_launch_gate_bypasses(true, ExternalRoutePolicy::Required)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("--no-progress"));
         assert!(error.contains("--no-route"));
+    }
+
+    #[test]
+    fn perftest_allows_unavailable_external_dns() {
+        assert!(
+            enforce_external_reachability(
+                ExternalRoutePolicy::BestEffort,
+                false,
+                "rack",
+                &["198.51.100.20".to_string(), "198.51.100.21".to_string()],
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_external_reachability(
+                ExternalRoutePolicy::Required,
+                false,
+                "rack",
+                &["198.51.100.20".to_string(), "198.51.100.21".to_string()],
+            )
+            .is_err()
+        );
     }
 
     fn assert_transient_interconnect_failure_retries(error: &str) {
@@ -1025,12 +1083,12 @@ pub(crate) async fn cmd_launch(
     cfg: &VoxelConfig,
     name: &str,
     no_progress: bool,
-    no_route: bool,
+    external_route: ExternalRoutePolicy,
     emu_sp: bool,
     emu_rot: bool,
     wicket_setup: bool,
-) -> anyhow::Result<()> {
-    validate_launch_gate_bypasses(no_progress, no_route)?;
+) -> anyhow::Result<bool> {
+    validate_launch_gate_bypasses(no_progress, external_route)?;
     cfg.topology.validate_rss_membership().map_err(anyhow::Error::msg)?;
     // Floor (per rack - each is an independent RSS domain): omicron's control
     // plane can't form below 3 sleds (Crucible 3-way replication,
@@ -1070,7 +1128,7 @@ pub(crate) async fn cmd_launch(
             );
         }
     }
-    if !no_route {
+    if external_route != ExternalRoutePolicy::Disabled {
         if !cfg.topology.routers.iter().any(|router| router == "ce") {
             return Err(anyhow!(
                 "external routing is enabled but topology.routers does not contain `ce` (use --no-route to bypass external routing)"
@@ -1264,7 +1322,9 @@ pub(crate) async fn cmd_launch(
     // then confirm the rack is actually reachable before declaring it usable - a
     // route isn't reachability (the shared transit can briefly flap the first
     // rack's path as the second rack joins).
-    if no_route {
+    let mut external_reachable =
+        external_route == ExternalRoutePolicy::Disabled;
+    if external_route == ExternalRoutePolicy::Disabled {
         info!(d.log, "external route and reachability skipped (--no-route)");
     } else {
         let ce = topo.node_ref("ce").ok_or_else(|| {
@@ -1283,10 +1343,25 @@ pub(crate) async fn cmd_launch(
             )
             .await
             .map_err(|e| anyhow!("{label} external route: {e}"))?;
-            let dns_ip = net.external_dns_ips.first().ok_or_else(|| {
-                anyhow!("{label}: external routing is enabled but no external DNS probe target is configured")
-            })?;
-            wait_external_reachable(&d.log, dns_ip, &net.dns_zone, &label)?;
+            let reachable = wait_external_reachable(
+                &d.log,
+                &net.external_dns_ips,
+                &net.dns_zone,
+                &label,
+            )?;
+            external_reachable = reachable;
+            enforce_external_reachability(
+                external_route,
+                reachable,
+                &label,
+                &net.external_dns_ips,
+            )?;
+            if !reachable {
+                warn!(
+                    d.log,
+                    "{label}: neither external DNS server is reachable; retaining launch-only perftest evidence"
+                );
+            }
         }
     }
 
@@ -1304,7 +1379,7 @@ pub(crate) async fn cmd_launch(
     // `voxel-rot-emu` service per switch zone and points every SP at it via
     // SP_EMU_ROT_SERVICE from boot, so each SP stays single-core and the RoT
     // bridge is live through RSS -- MGS/Nexus pin the real RoT at rack-init.
-    Ok(())
+    Ok(external_reachable)
 }
 
 /// Kill propolis processes that belong to this deployment but that falcon won't
