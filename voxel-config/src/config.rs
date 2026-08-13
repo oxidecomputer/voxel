@@ -471,7 +471,8 @@ impl Topology {
             .collect()
     }
 
-    /// Sleds that join RSS: explicit `rss_sleds` if non-zero, else all sleds.
+    /// Number of sleds that join RSS: explicit `rss_sleds` if non-zero, else all
+    /// sleds. Membership always includes both scrimlets; see [`Self::sleds`].
     pub fn rss_count(&self) -> usize {
         if self.rss_sleds > 0 { self.rss_sleds } else { self.sleds }
     }
@@ -496,6 +497,16 @@ impl Topology {
         let mut out = Vec::new();
         for rack in 0..self.racks() {
             let scrimlets = self.scrimlet_names_for_rack(rack);
+            let mut rss_names = scrimlets.clone();
+            for local in 0..self.sleds {
+                if rss_names.len() >= rss {
+                    break;
+                }
+                let name = format!("g{}", rack * self.sleds + local);
+                if !rss_names.contains(&name) {
+                    rss_names.push(name);
+                }
+            }
             for local in 0..self.sleds {
                 let index = rack * self.sleds + local;
                 let name = format!("g{index}");
@@ -504,7 +515,7 @@ impl Topology {
                 out.push(SledDesc {
                     rack,
                     scrimlet: scrimlets.iter().any(|s| s == &name),
-                    rss: local < rss,
+                    rss: rss_names.iter().any(|s| s == &name),
                     name,
                     index,
                     part_number,
@@ -1857,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn three_node_drops_rss_membership() {
+    fn reduced_rss_membership_keeps_both_scrimlets() {
         let cfg = VoxelConfig::from_toml(indoc! {"
             [topology]
             sleds = 4
@@ -1865,9 +1876,11 @@ mod tests {
         "})
         .unwrap();
         let rss: Vec<_> = cfg.sleds().into_iter().filter(|s| s.rss).collect();
-        // Only the first 3 sleds join RSS; the 4th is dropped from the bootstrap set.
-        assert_eq!(rss.len(), 3);
-        assert!(rss.iter().all(|s| s.index < 3));
+        assert_eq!(
+            rss.iter().map(|sled| sled.index).collect::<Vec<_>>(),
+            [0, 1, 3]
+        );
+        assert_eq!(rss.iter().filter(|sled| sled.scrimlet).count(), 2);
     }
 
     #[test]
