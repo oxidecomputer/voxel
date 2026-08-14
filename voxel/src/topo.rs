@@ -94,6 +94,11 @@ pub(crate) fn build_topo(
 
     let mut d = Runner::new(name);
     d.persistent = true;
+    // Falcon skips its on-demand propolis download once a path is set, so an
+    // unset knob keeps the released binary.
+    if let Some(bin) = &cfg.falcon.propolis_binary {
+        d.set_propolis_binary(Some(bin.clone()));
+    }
 
     // Sleds (voxel-cp) and routers (voxel-frr). Guest RAM is configurable so a
     // bigger rack can shrink per-sled memory to fit physical RAM (VMM Memory is

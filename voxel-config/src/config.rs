@@ -182,6 +182,17 @@ pub struct Falcon {
     /// Build root for image create (omicron checkouts live here). None -> env,
     /// else $HOME/voxel-builds.
     pub build_root: Option<String>,
+    /// `propolis-server` binary the host runs each node under. `None` -> falcon's
+    /// own `<falcon_dir>/bin/propolis-server`, which it downloads on demand.
+    ///
+    /// Set this to run under a locally built propolis, e.g. when a device-model
+    /// fix has not reached a release yet. Falcon skips its download when the path
+    /// is set (`Runner::set_propolis_binary`), the equivalent of a4x2's
+    /// `FALCON_PROPOLIS_BINARY`.
+    ///
+    /// Applies to rack nodes only. The image-build VM keeps falcon's own
+    /// binary.
+    pub propolis_binary: Option<String>,
 }
 
 /// SP provider selection: which SPs run on the real-firmware emulator sp-emu
@@ -580,7 +591,8 @@ pub struct Network {
     pub dns_servers: Vec<String>,
     /// IPv6 /56. Empty -> not emitted.
     pub rack_subnet: String,
-    /// internal_services_ip_pool_ranges (single range).
+    /// Service IP pool (single range). Rendered as the rack's sole
+    /// service_ip_pools entry.
     pub service_pool_first: String,
     pub service_pool_last: String,
     pub bgp_asn: u32,

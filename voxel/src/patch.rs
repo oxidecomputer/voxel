@@ -33,8 +33,8 @@ use std::time::Duration;
 use voxel_config::VoxelConfig;
 
 use crate::net::{
-    SERIAL_RESOLVE_TIMEOUT, SWITCH_ZONE_ROOT, resolve_external_ip, scp_to,
-    ssh_capture, zlogin,
+    SWITCH_ZONE_ROOT, resolve_external_ip, scp_to, serial_bounded, ssh_capture,
+    zlogin,
 };
 use crate::topo::{Topo, build_topo};
 use crate::util::{locate_script, shell_quote as q};
@@ -334,21 +334,19 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<Utf8PathBuf> {
 
 // --- rack patch (live nodes) -----------------------------------------------
 
-/// Resolve a node's host-LAN IP, bounded so a wedged serial console fails fast.
+/// Resolve a node's host-LAN IP under [`serial_bounded`]'s two-stage deadline.
 async fn node_ip(
     cfg: &VoxelConfig,
     d: &Runner,
     node: &str,
     n: NodeRef,
 ) -> anyhow::Result<String> {
-    tokio::time::timeout(
-        SERIAL_RESOLVE_TIMEOUT,
+    serial_bounded(
+        &format!("resolving {node}'s IP"),
         resolve_external_ip(cfg, d, node, n, false),
     )
     .await
-    .context(
-        "timed out resolving node IP over the serial console (is the rack up?)",
-    )?
+    .context("is the rack up?")
 }
 
 /// The target `(name, NodeRef)` set for a component.

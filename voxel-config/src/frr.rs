@@ -1,4 +1,4 @@
-//! FRR `frr.conf` generation for Voxel routers.
+//! FRR `frr.conf` generation for voxel routers.
 //!
 //! Two forms per router. Unnumbered eBGP (default): `neighbor <iface> interface
 //! remote-as external`, `no bgp ebgp-requires-policy`, both address-families with
