@@ -477,10 +477,40 @@ pub fn switch_enforcer(slot: u8) {
     // Stand up any staged emulated SPs as an SMF service in the switch zone (the
     // zone is up by now). Idempotent + reboot-safe (startd owns them).
     setup_sp_emu();
+    open_switch_zone_ssh();
 }
 
 fn files_equal(a: &str, b: &str) -> bool {
     matches!((fs::read(a), fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Path to the switch zone's sshd_config from the global zone.
+const SWITCH_ZONE_SSHD: &str = "/zone/oxz_switch/root/etc/ssh/sshd_config";
+
+/// Open the switch zone's sshd to the lab posture (root, empty password,
+/// forwarding scoped to the commission API), mirroring the global-zone
+/// `setup_ssh`. The commission API binds only in-zone loopback, so the host
+/// reaches it by forwarding through this sshd. Idempotent.
+fn open_switch_zone_ssh() {
+    if !Utf8Path::new(SWITCH_ZONE_SSHD).exists() {
+        return;
+    }
+    run("zlogin", &["oxz_switch", "passwd", "-d", "root"]);
+    replace_in_file(
+        SWITCH_ZONE_SSHD,
+        &[
+            ("PasswordAuthentication no", "PasswordAuthentication yes"),
+            ("PermitEmptyPasswords no", "PermitEmptyPasswords yes"),
+            ("PermitRootLogin no", "PermitRootLogin yes"),
+            ("AllowTcpForwarding no", "AllowTcpForwarding yes"),
+            ("PermitOpen none", "PermitOpen [::1]:12234"),
+            ("AllowUsers wicket support\n", "AllowUsers wicket support root\n"),
+        ],
+    );
+    run(
+        "zlogin",
+        &["oxz_switch", "svcadm", "restart", "svc:/network/ssh:default"],
+    );
 }
 
 /// Stand up the staged emulated SPs (`sp-emu`) as `svc:/oxide/voxel-sp-emu` in the

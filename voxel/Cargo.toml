@@ -24,10 +24,13 @@ voxel-config = { path = "../voxel-config" }
 # Omicron's own RackInitializeRequest types and config-rss serialization,
 # pinned to the omicron commit voxel targets.
 rack-init-config.workspace = true
+wicketd-commission-types-versions.workspace = true
+wicketd-commission-client.workspace = true
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
 serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 libc = "0.2"
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's

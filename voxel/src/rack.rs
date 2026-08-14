@@ -413,44 +413,19 @@ pub(crate) async fn cmd_launch(
                 topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
             {
                 let tag = rack_label(racks, rack, "rack-init");
-                // --wicket-setup: nothing auto-inited (no staged config-rss), so
-                // drive RSS through wicketd (upload config + cert + recovery
-                // password, then POST to start). watch_rss then reports the
-                // wicketd-triggered bring-up exactly as for the file path.
-                if wicket_setup {
-                    let net = cfg.network.for_rack(rack);
-                    let config_rss = camino::Utf8Path::new("wicket-setup")
-                        .join(format!("rack{rack}"))
-                        .join("config-rss.toml");
-                    // wicketd's bootstrap_sleds must be THIS rack's cubby slots =
-                    // its sleds' GLOBAL indices (rack 1 -> 3,4,5), matching what the
-                    // MGS sim reports (`location = ["sled", global_index]`); a flat
-                    // 0..n only correlates for rack 0.
-                    let slots: Vec<u16> = topo
-                        .sleds
-                        .iter()
-                        .filter(|(s, _)| s.rack == rack)
-                        .map(|(s, _)| s.index as u16)
-                        .collect();
-                    if let Err(e) = crate::wicket_setup::drive(
-                        cfg,
-                        d,
-                        crate::wicket_setup::RackSetup {
-                            scrimlet: *n,
-                            scrimlet_name: &s.name,
-                            bootstrap_slots: &slots,
-                            config_rss_path: &config_rss,
-                            zone: &net.dns_zone,
-                            tag: &tag,
-                        },
+                // --wicket-setup: nothing auto-inited (no staged config-rss),
+                // so drive rack setup through the commission API; watch_rss
+                // then reports the wicketd-triggered bring-up as usual.
+                if wicket_setup
+                    && let Err(e) = crate::commission::drive(
+                        cfg, d, *n, &s.name, rack, &tag,
                     )
                     .await
-                    {
-                        warn!(
-                            d.log,
-                            "{tag}: wicket-setup failed: {e}; rack will not initialize"
-                        );
-                    }
+                {
+                    warn!(
+                        d.log,
+                        "{tag}: commission setup failed: {e:#}; rack will not initialize"
+                    );
                 }
                 let watch_cap = rss_watch_cap(emu_sp, racks);
                 let known_ip = if cfg.external.isolated() {
