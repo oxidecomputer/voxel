@@ -725,16 +725,16 @@ impl Default for Network {
         Self {
             dns_zone: "oxide.test".into(),
             external_dns_ips: vec![
-                "198.51.100.20".into(),
-                "198.51.100.21".into(),
+                "192.168.0.120".into(),
+                "192.168.0.121".into(),
             ],
             ntp_servers: vec!["time.cloudflare.com".into()],
             dns_servers: vec!["1.1.1.1".into(), "9.9.9.9".into()],
             rack_subnet: "fd00:17:01:d00::/56".into(),
-            service_pool_first: "198.51.100.20".into(),
-            service_pool_last: "198.51.100.29".into(),
+            service_pool_first: "192.168.0.120".into(),
+            service_pool_last: "192.168.0.129".into(),
             bgp_asn: DEFAULT_RACK_ASN,
-            infra_prefix: "198.51.100.0/24".into(),
+            infra_prefix: "192.168.0.10/24".into(),
             router_mode: RouterMode::Bgp,
             transit_prefix: "198.51.101.0/24".into(),
             transit_bfd: false,
@@ -1632,7 +1632,7 @@ mod tests {
         assert!(s.iter().all(|d| d.rss), "all 3 sleds per rack join RSS");
         // Per-rack addressing offset: rack 1 shifts the customer/service nets.
         let net = Network::default();
-        assert_eq!(net.for_rack(0).infra_prefix, "198.51.100.0/24");
+        assert_eq!(net.for_rack(0).infra_prefix, "192.168.0.10/24");
         assert_eq!(net.for_rack(1).infra_prefix, "198.51.101.0/24");
         assert_eq!(net.for_rack(1).service_pool_first, "198.51.101.20");
         assert_eq!(net.for_rack(1).external_dns_ips[0], "198.51.101.20");
@@ -1739,8 +1739,8 @@ mod tests {
         let cr1 = cr("cr1");
         assert!(cr1.contains("ip address 198.51.101.1/30"));
         assert!(cr1.contains("ip address 198.51.101.5/30"));
-        assert!(cr1.contains("ip route 198.51.100.0/24 198.51.101.2\n"));
-        assert!(cr1.contains("ip route 198.51.100.0/24 198.51.101.6\n"));
+        assert!(cr1.contains("ip route 192.168.0.10/24 198.51.101.2\n"));
+        assert!(cr1.contains("ip route 192.168.0.10/24 198.51.101.6\n"));
         assert!(!cr1.contains(" bfd"));
         assert!(cr1.contains("redistribute static"));
         let cr2 = cr("cr2");
@@ -1754,7 +1754,7 @@ mod tests {
         cfg.network.transit_bfd = true;
         let cr1b =
             cfg.to_frr().iter().find(|(n, _)| n == "cr1").unwrap().1.render();
-        assert!(cr1b.contains("ip route 198.51.100.0/24 198.51.101.2 bfd"));
+        assert!(cr1b.contains("ip route 192.168.0.10/24 198.51.101.2 bfd"));
         assert!(cr1b.contains("peer 198.51.101.2"));
     }
 
@@ -1913,7 +1913,7 @@ mod tests {
         assert_eq!(first_usable_gateway.builder_net(), None);
 
         let outside_gateway =
-            External { host_ip: "198.51.100.1".into(), ..first_usable_gateway };
+            External { host_ip: "192.168.0.11".into(), ..first_usable_gateway };
         assert_eq!(outside_gateway.builder_net(), None);
     }
 
