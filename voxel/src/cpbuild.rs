@@ -123,6 +123,17 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let root = repo_root()?;
     let voxel_image = root.join("voxel-image");
     let cargo_bay = voxel_image.join("cargo-bay/vbuild");
+    // Everything under vbuild is regenerated per run. Leftovers owned by
+    // another user (an earlier pfexec run) fail every later write; fail once
+    // here instead.
+    if cargo_bay.exists() {
+        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
+            format!(
+                "clear {cargo_bay} (owned by another user? \
+                 remove it with pfexec rm -rf)"
+            )
+        })?;
+    }
     let src = &b.omicron_src;
     let image_name = format!("voxel-cp-{}", b.label);
 
@@ -131,7 +142,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         if !src.exists() {
             bail!("--src {src} not found");
         }
-        eprintln!("[voxel] building {src} as-is (--src; no clone/checkout)");
+        eprintln!("[voxel] building --src checkout {src}");
     } else {
         let commit = b.commit.context("a commit is required without --src")?;
         if !src.join(".git").exists() {
@@ -229,12 +240,14 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     // --- 7. stage the curated omicron dir into the builder cargo-bay ---------
     let stage = cargo_bay.join("omicron");
     eprintln!("[voxel] staging omicron build -> {stage}");
-    let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("mkdir {stage}"))?;
     let mut rsync = omicron_cmd(src, "rsync");
+    // No owner/group: staging is content-only and chgrp fails for non-root.
     rsync.args([
         "-a",
+        "--no-owner",
+        "--no-group",
         "tools",
         "out",
         "smf",
@@ -294,6 +307,23 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         network: &network,
     })
     .await?;
+
+    // Stamp the sled-agent config schema on the image so launch reads it from
+    // the image itself instead of re-deriving it from a checkout.
+    let (data_links, disks) = crate::topo::schema_from_checkout(src)
+        .with_context(|| format!("read sled-agent config schema from {src}"))?;
+    run(
+        Command::new("zfs")
+            .arg("set")
+            .arg(format!(
+                "{}={}",
+                crate::topo::PROP_DATA_LINKS,
+                data_links.as_str()
+            ))
+            .arg(format!("{}={}", crate::topo::PROP_DISKS, disks.as_str()))
+            .arg(format!("{}/img/{image_name}", b.dataset)),
+        "zfs set sled schema on the image",
+    )?;
 
     println!("built image {image_name}");
     Ok(())

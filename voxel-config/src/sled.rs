@@ -47,19 +47,24 @@ pub struct SledAgentConfig {
 }
 
 impl SledAgentConfig {
-    pub fn new(index: usize, scrimlet: bool) -> Self {
+    pub fn new(
+        index: usize,
+        scrimlet: bool,
+        data_links: crate::config::SledDataLinksSchema,
+        disks: crate::config::SledDisksSchema,
+    ) -> Self {
         Self {
             index,
             scrimlet,
             sprockets_dir: "/opt/cargo-bay/sprockets".into(),
-            // Defaults mirror the original fixed 4-sled / 2-fabric-router layout
+            // Counts mirror the original fixed 4-sled / 2-fabric-router layout
             // (used by the build-time baked config + tests); per-launch staging
             // calls `with_topology` for the live counts.
             num_sleds: 4,
             num_fabric_routers: 2,
             num_interconnects: 0,
-            data_links: crate::config::SledDataLinksSchema::default(),
-            disks: crate::config::SledDisksSchema::default(),
+            data_links,
+            disks,
         }
     }
 
@@ -89,16 +94,6 @@ impl SledAgentConfig {
         schema: crate::config::SledDataLinksSchema,
     ) -> Self {
         self.data_links = schema;
-        self
-    }
-
-    /// Select the sled-agent disks config shape (see
-    /// [`crate::config::SledDisksSchema`]).
-    pub fn with_disks_schema(
-        mut self,
-        schema: crate::config::SledDisksSchema,
-    ) -> Self {
-        self.disks = schema;
         self
     }
 
@@ -254,15 +249,26 @@ impl SledAgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SledDataLinksSchema, SledDisksSchema};
 
     /// The rendered config is valid TOML with the expected per-sled fields.
     fn parse(s: &str) -> toml::Value {
         toml::from_str(s).expect("renders valid TOML")
     }
 
+    /// Oldest-era construction, the shape most render tests assert.
+    fn old(index: usize, scrimlet: bool) -> SledAgentConfig {
+        SledAgentConfig::new(
+            index,
+            scrimlet,
+            SledDataLinksSchema::List,
+            SledDisksSchema::Vdevs,
+        )
+    }
+
     #[test]
     fn scrimlet_fields() {
-        let v = parse(&SledAgentConfig::new(0, true).render());
+        let v = parse(&old(0, true).render());
         assert_eq!(v["sled_mode"].as_str(), Some("scrimlet"));
         assert_eq!(
             v["sidecar_revision"]["soft_propolis"]["front_port_count"]
@@ -288,8 +294,7 @@ mod tests {
         // A 6-sled rack: the scrimlet SoftNPU needs a rear port per sled (so all
         // 6 sleds land in the underlay range, not the front/uplink range) and a
         // front port per fabric router. Regression for the >4-sled fabric bug.
-        let v =
-            parse(&SledAgentConfig::new(0, true).with_topology(6, 2).render());
+        let v = parse(&old(0, true).with_topology(6, 2).render());
         let sp = &v["sidecar_revision"]["soft_propolis"];
         assert_eq!(sp["rear_port_count"].as_integer(), Some(6));
         assert_eq!(sp["front_port_count"].as_integer(), Some(2));
@@ -303,20 +308,14 @@ mod tests {
         // A scrimlet on 1 interconnect: front = num_fabric_routers + 1 (the
         // extra QSFP for the sidecar<->sidecar link). Rear unchanged.
         let v = parse(
-            &SledAgentConfig::new(0, true)
-                .with_topology(4, 2)
-                .with_interconnects(1)
-                .render(),
+            &old(0, true).with_topology(4, 2).with_interconnects(1).render(),
         );
         let sp = &v["sidecar_revision"]["soft_propolis"];
         assert_eq!(sp["front_port_count"].as_integer(), Some(3));
         assert_eq!(sp["rear_port_count"].as_integer(), Some(4));
         // Gimlets have no switch zone, so interconnects don't apply.
         let g = parse(
-            &SledAgentConfig::new(1, false)
-                .with_topology(4, 2)
-                .with_interconnects(1)
-                .render(),
+            &old(1, false).with_topology(4, 2).with_interconnects(1).render(),
         );
         assert_eq!(
             g["sidecar_revision"]["soft_propolis"]["front_port_count"]
@@ -327,7 +326,7 @@ mod tests {
 
     #[test]
     fn gimlet_fields() {
-        let v = parse(&SledAgentConfig::new(1, false).render());
+        let v = parse(&old(1, false).render());
         assert_eq!(v["sled_mode"].as_str(), Some("gimlet"));
         assert_eq!(
             v["sidecar_revision"]["soft_propolis"]["front_port_count"]
@@ -349,15 +348,18 @@ mod tests {
 
     #[test]
     fn data_links_schema_shapes() {
-        use crate::config::SledDataLinksSchema;
         // Default (List) renders the legacy array shape.
-        let list = parse(&SledAgentConfig::new(0, false).render());
+        let list = parse(&old(0, false).render());
         assert!(list["data_links"].as_array().is_some(), "List => array");
         // Tagged renders omicron main's DataLinks enum: { kind, devices }.
         let tagged = parse(
-            &SledAgentConfig::new(0, false)
-                .with_data_links_schema(SledDataLinksSchema::Tagged)
-                .render(),
+            &SledAgentConfig::new(
+                0,
+                false,
+                SledDataLinksSchema::Tagged,
+                SledDisksSchema::Vdevs,
+            )
+            .render(),
         );
         assert_eq!(tagged["data_links"]["kind"].as_str(), Some("virtual"));
         assert_eq!(
@@ -368,16 +370,19 @@ mod tests {
 
     #[test]
     fn disks_schema_shapes() {
-        use crate::config::SledDisksSchema;
         // Default (Vdevs) renders the legacy flat `vdevs` array.
-        let flat = parse(&SledAgentConfig::new(0, false).render());
+        let flat = parse(&old(0, false).render());
         assert_eq!(flat["vdevs"].as_array().unwrap().len(), 7);
         assert!(flat.get("external_disks").is_none());
         // ExternalDisks renders omicron main's tagged enum: { kind, vdevs }.
         let ext = parse(
-            &SledAgentConfig::new(0, false)
-                .with_disks_schema(SledDisksSchema::ExternalDisks)
-                .render(),
+            &SledAgentConfig::new(
+                0,
+                false,
+                SledDataLinksSchema::List,
+                SledDisksSchema::ExternalDisks,
+            )
+            .render(),
         );
         assert!(ext.get("vdevs").is_none(), "flat vdevs must be gone");
         assert_eq!(ext["external_disks"]["kind"].as_str(), Some("virtual"));
@@ -391,11 +396,14 @@ mod tests {
     /// empty `disks` list matter.
     #[test]
     fn hardcoded_disks_schema_matches_omicron_main() {
-        use crate::config::SledDisksSchema;
         let cfg = parse(
-            &SledAgentConfig::new(0, false)
-                .with_disks_schema(SledDisksSchema::Hardcoded)
-                .render(),
+            &SledAgentConfig::new(
+                0,
+                false,
+                SledDataLinksSchema::List,
+                SledDisksSchema::Hardcoded,
+            )
+            .render(),
         );
         assert!(cfg.get("vdevs").is_none(), "flat vdevs must be gone");
         let disks = &cfg["external_disks"];

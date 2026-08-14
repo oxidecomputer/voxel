@@ -123,9 +123,11 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     })?;
 
     eprintln!(
-        "[voxel] booting builder {}, role {}",
+        "[voxel] booting builder {}, role {}; image -> {}/img/{}",
         o.base_image,
-        o.role.unwrap_or("none")
+        o.role.unwrap_or("none"),
+        o.dataset,
+        o.image_name
     );
     d.launch().await.map_err(|e| anyhow::anyhow!("launch builder: {e}"))?;
 
@@ -155,6 +157,19 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
             .await
             .unwrap_or_default();
         if !marker.contains("version=") {
+            // Surface the guest's own log before teardown destroys it.
+            let tail = d
+                .exec(node, "tail -40 /tmp/install.log 2>/dev/null")
+                .await
+                .unwrap_or_default();
+            if tail.trim().is_empty() {
+                eprintln!("[voxel] no guest install log captured");
+            } else {
+                eprintln!(
+                    "[voxel] guest install log tail:\n{}",
+                    tail.trim_end()
+                );
+            }
             bail!("ready marker missing/empty; {label} did not complete");
         }
         eprintln!("[voxel] ready: {}", marker.trim());

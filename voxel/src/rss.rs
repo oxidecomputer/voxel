@@ -269,16 +269,15 @@ async fn watch_rss_loop(
                 }
             }
             "initialized" => {
-                // `RackInitUuid` identifies the RSS run, not the rack; the rack
-                // uuid is Nexus-only. A null id is a stale "initialized" ledger,
-                // not a real bring-up.
+                // A null RSS run id means the ledger predates this process:
+                // stale storage or a sled-agent restart during RSS.
                 let init_id = json_str_field(&out, "id");
                 if init_id.is_empty() {
                     warn!(
                         d.log,
-                        "{tag}: status=initialized but init id is null - stale \
-                         sled state, NOT a real init. Destroy and relaunch from clean \
-                         storage (the emulated vdevs must be wiped)."
+                        "{tag}: initialized with a null RSS run id: stale sled \
+                         storage or a sled-agent restart during RSS; destroy \
+                         and relaunch"
                     );
                 } else {
                     info!(

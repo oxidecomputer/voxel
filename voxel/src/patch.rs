@@ -643,6 +643,7 @@ pub(crate) fn cmd_image_patch(
     if !status.success() {
         return Err(anyhow!("patch-image.sh failed"));
     }
+    crate::topo::copy_image_schema_props(src_image, out)?;
     println!(
         "patched image {out} (component {} @ {reference}); set it with: voxel config set image.cp {out}",
         comp.name

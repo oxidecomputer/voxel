@@ -38,13 +38,17 @@ pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(src)
+        // Under pfexec the checkout is usually owned by the invoking user,
+        // which git rejects as dubious ownership; the path is operator-given.
+        .arg("-c")
+        .arg(format!("safe.directory={src}"))
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .with_context(|| format!("run git in {}", src))?;
     if !out.status.success() {
         bail!(
-            "git rev-parse HEAD failed in {} (is it an omicron checkout?)",
-            src
+            "git rev-parse HEAD failed in {src}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -63,6 +67,11 @@ pub(crate) fn render_smf(
 ) -> anyhow::Result<()> {
     let scrimlets = [0usize, gimlets.saturating_sub(1)];
     let fleet = voxel_config::sp::SpFleet::sim(gimlets);
+    // The baked config must speak the same schema as the omicron being built.
+    let (data_links, disks) = crate::topo::schema_from_checkout(omicron_root)
+        .with_context(|| {
+        format!("read sled-agent config schema from {omicron_root}")
+    })?;
     let writes = [
         (
             "smf/mgs-sim/config.toml",
@@ -71,7 +80,10 @@ pub(crate) fn render_smf(
         ("smf/sp-sim/config.toml", fleet.sp_sim_config()),
         (
             "smf/sled-agent/non-gimlet/config.toml",
-            voxel_config::sled::SledAgentConfig::new(0, true).render(),
+            voxel_config::sled::SledAgentConfig::new(
+                0, true, data_links, disks,
+            )
+            .render(),
         ),
     ];
     for (rel, text) in writes {
