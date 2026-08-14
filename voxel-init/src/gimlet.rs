@@ -484,8 +484,10 @@ fn files_equal(a: &str, b: &str) -> bool {
     matches!((fs::read(a), fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
-/// Path to the switch zone's sshd_config from the global zone.
+/// Paths to the switch zone's sshd_config and login defaults from the global
+/// zone.
 const SWITCH_ZONE_SSHD: &str = "/zone/oxz_switch/root/etc/ssh/sshd_config";
+const SWITCH_ZONE_LOGIN: &str = "/zone/oxz_switch/root/etc/default/login";
 
 /// Open the switch zone's sshd to the lab posture (root, empty password,
 /// forwarding scoped to the commission API), mirroring the global-zone
@@ -507,6 +509,9 @@ fn open_switch_zone_ssh() {
             ("AllowUsers wicket support\n", "AllowUsers wicket support root\n"),
         ],
     );
+    // login rejects the now-empty root password under PASSREQ=YES, which
+    // breaks bare `zlogin oxz_switch` (and `voxel tp login`); allow it.
+    replace_in_file(SWITCH_ZONE_LOGIN, &[("PASSREQ=YES", "PASSREQ=NO")]);
     run(
         "zlogin",
         &["oxz_switch", "svcadm", "restart", "svc:/network/ssh:default"],
