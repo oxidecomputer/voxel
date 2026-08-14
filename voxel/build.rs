@@ -11,15 +11,17 @@ fn main() {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let lock = manifest_dir.join("../Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock.display());
-    let revs = fs::read_to_string(&lock)
-        .map(|text| omicron_git_shas(&text))
-        .unwrap_or_default();
+    let text = fs::read_to_string(&lock)
+        .unwrap_or_else(|e| panic!("read {}: {e}", lock.display()));
+    let revs = omicron_git_shas(&text);
     if revs.len() > 1 {
         panic!(
             "omicron git dependencies resolve to different revs: {revs:?}; \
              pin every omicron dep in Cargo.toml to the same rev"
         );
     }
+    // Empty when omicron is a path dependency (no git sha); image-create reads
+    // an empty rev as "no pin known" and skips its mismatch warning.
     let rev = revs.into_iter().next().unwrap_or_default();
     println!("cargo:rustc-env=RACK_INIT_CONFIG_OMICRON_REV={rev}");
 }

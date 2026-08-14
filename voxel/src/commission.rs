@@ -21,8 +21,12 @@ use crate::net::{
 /// wicketd commission API port, bound on the switch zone's loopback only.
 const COMMISSION_PORT: u16 = 12234;
 
-/// The rack's cubby slots wicketd maps to discovered SPs: the global sled
-/// indices of this rack's RSS sleds.
+/// Bootstrap-network addresses begin with this hextet (voxel_config's
+/// BOOTSTRAP_NET_PREFIX); the switch zone's is the tunnel target.
+const BOOTSTRAP_ADDR_PREFIX: &str = "fdb0";
+
+/// This rack's RSS sleds, by cubby slot (each sled's global index). wicketd
+/// correlates these slots with the SPs it discovers.
 pub(crate) fn bootstrap_slots(cfg: &VoxelConfig, rack: usize) -> BTreeSet<u16> {
     cfg.sleds()
         .iter()
@@ -394,12 +398,14 @@ async fn ready_slots(client: &Client) -> Result<BTreeSet<u16>> {
 /// zone. The commission API binds only in-zone loopback, so the tunnel lands
 /// on this address inside the zone.
 fn zone_bootstrap_addr(gz_ip: &str) -> Result<String> {
-    let cmd =
-        zlogin("ipadm show-addr -po addr | grep -o 'fdb0[^/]*' | head -1");
+    let cmd = zlogin(&format!(
+        "ipadm show-addr -po addr | grep -o '{BOOTSTRAP_ADDR_PREFIX}[^/]*' \
+         | head -1"
+    ));
     ssh_capture(gz_ip, &cmd)
         .map(|o| o.trim().to_string())
         .filter(|a| !a.is_empty())
-        .ok_or_else(|| anyhow!("no fdb0 address on oxz_switch"))
+        .ok_or_else(|| anyhow!("no bootstrap address on oxz_switch"))
 }
 
 /// Discover the switch zone's bootstrap address, open a tunnel to its
