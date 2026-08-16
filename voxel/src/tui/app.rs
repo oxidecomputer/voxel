@@ -232,9 +232,16 @@ impl PendingOperation {
 pub struct OperationState {
     pub pending: Option<PendingOperation>,
     pub active: Option<ActiveOperation>,
+    pub retained: Option<ActiveOperation>,
     pub retained_warnings: Vec<OperationWarning>,
     pub outcome: Option<CommandOutcome>,
     pub start_failure: Option<String>,
+}
+
+impl OperationState {
+    pub(crate) fn displayed(&self) -> Option<&ActiveOperation> {
+        self.active.as_ref().or(self.retained.as_ref())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +329,7 @@ impl App {
             operation: OperationState {
                 pending: None,
                 active: None,
+                retained: None,
                 retained_warnings: vec![],
                 outcome: None,
                 start_failure: None,
@@ -1290,7 +1298,14 @@ impl App {
             }
             OperationEvent::PhaseStarted { phase } => {
                 if let Some(active) = self.matching_active_mut(request_id) {
-                    active.phase = Some(phase);
+                    let phases =
+                        crate::tui::ui::deployment::phase_order(active.kind);
+                    if let Some(index) =
+                        phases.iter().position(|candidate| *candidate == phase)
+                    {
+                        active.completed_phases = phases[..index].to_vec();
+                        active.phase = Some(phase);
+                    }
                 }
             }
             OperationEvent::Log { level, message } => self.logs.push_filtered(
@@ -1311,10 +1326,18 @@ impl App {
                     .as_ref()
                     .is_some_and(|active| active.request_id == request_id)
                 {
-                    let active = self.operation.active.take().unwrap();
+                    let mut active = self.operation.active.take().unwrap();
                     let active_kind = active.kind;
                     let cancel_choice = active.cancel_choice;
-                    self.operation.retained_warnings = active.warnings;
+                    self.operation.retained_warnings = active.warnings.clone();
+                    if command_succeeded(&outcome) {
+                        active.completed_phases =
+                            crate::tui::ui::deployment::phase_order(
+                                active.kind,
+                            );
+                        active.phase = None;
+                    }
+                    self.operation.retained = Some(active);
                     let should_start_destroy = active_kind
                         != OperationKind::Destroy
                         && (self.session.post_operation_exit
@@ -1368,6 +1391,7 @@ impl App {
             return vec![];
         };
         self.next_operation_request_id = request_id.next();
+        self.operation.retained = None;
         self.operation.pending = Some(PendingOperation::new(request_id, kind));
         self.operation.start_failure = None;
         vec![Effect::Start { request_id, kind }]
@@ -1434,6 +1458,8 @@ fn command_succeeded(outcome: &CommandOutcome) -> bool {
 #[cfg(test)]
 mod factual_outcome_tests {
     use super::*;
+    use crate::tui::operation::LaunchPhase;
+    use std::os::unix::process::ExitStatusExt;
 
     fn active_app() -> App {
         let mut app = App::new(vec![], 8, 8);
@@ -1449,6 +1475,100 @@ mod factual_outcome_tests {
         CommandOutcome::SpawnFailed {
             message: "cancelled child settled".into(),
         }
+    }
+
+    fn successful_outcome() -> CommandOutcome {
+        CommandOutcome::Exited {
+            status: std::process::ExitStatus::from_raw(0),
+            stderr_summary: vec![],
+        }
+    }
+
+    #[test]
+    fn later_phase_completes_skipped_predecessors() {
+        let mut app = active_app();
+
+        app.update(AppEvent::Operation {
+            request_id: OperationRequestId::FIRST,
+            event: OperationEvent::PhaseStarted {
+                phase: OperationPhase::Launch(LaunchPhase::Initialize),
+            },
+        });
+
+        let operation = app.operation.active.as_ref().unwrap();
+        assert_eq!(
+            operation.completed_phases,
+            vec![
+                OperationPhase::Launch(LaunchPhase::Preflight),
+                OperationPhase::Launch(LaunchPhase::Stage),
+                OperationPhase::Launch(LaunchPhase::Boot),
+            ]
+        );
+        assert_eq!(
+            operation.phase,
+            Some(OperationPhase::Launch(LaunchPhase::Initialize))
+        );
+    }
+
+    #[test]
+    fn successful_operation_retains_complete_phase_history() {
+        let mut app = active_app();
+        app.update(AppEvent::Operation {
+            request_id: OperationRequestId::FIRST,
+            event: OperationEvent::PhaseStarted {
+                phase: OperationPhase::Launch(LaunchPhase::Initialize),
+            },
+        });
+
+        app.update(AppEvent::Operation {
+            request_id: OperationRequestId::FIRST,
+            event: OperationEvent::Finished(successful_outcome()),
+        });
+
+        assert!(app.operation.active.is_none());
+        let operation = app.operation.displayed().unwrap();
+        assert_eq!(
+            operation.completed_phases,
+            crate::tui::ui::deployment::phase_order(OperationKind::Launch)
+        );
+        assert_eq!(operation.phase, None);
+    }
+
+    #[test]
+    fn failed_operation_retains_only_proven_phase_history() {
+        let mut app = active_app();
+        app.update(AppEvent::Operation {
+            request_id: OperationRequestId::FIRST,
+            event: OperationEvent::PhaseStarted {
+                phase: OperationPhase::Launch(LaunchPhase::Initialize),
+            },
+        });
+
+        app.update(AppEvent::Operation {
+            request_id: OperationRequestId::FIRST,
+            event: OperationEvent::Finished(failed_outcome()),
+        });
+
+        let operation = app.operation.displayed().unwrap();
+        assert_eq!(operation.completed_phases.len(), 3);
+        assert_eq!(
+            operation.phase,
+            Some(OperationPhase::Launch(LaunchPhase::Initialize))
+        );
+    }
+
+    #[test]
+    fn new_operation_clears_retained_phase_history() {
+        let mut app = active_app();
+        app.update(AppEvent::Operation {
+            request_id: OperationRequestId::FIRST,
+            event: OperationEvent::Finished(successful_outcome()),
+        });
+        assert!(app.operation.displayed().is_some());
+
+        app.start(OperationKind::Route);
+
+        assert!(app.operation.displayed().is_none());
     }
 
     #[test]

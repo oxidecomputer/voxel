@@ -58,12 +58,19 @@ impl PhaseClassifier {
 }
 
 fn launch_phase(line: &str) -> Option<LaunchPhase> {
-    if line.contains(" external route:") {
+    if line.contains("external route set:") || line.contains(" external route:")
+    {
         Some(LaunchPhase::Route)
     } else if line.contains(": watching rss progress on the rss node ...") {
         Some(LaunchPhase::RackSetup)
     } else if line.contains(": launch start") {
         Some(LaunchPhase::Initialize)
+    } else if line.contains("creating nodes") {
+        Some(LaunchPhase::Boot)
+    } else if line.contains("creating links") {
+        Some(LaunchPhase::Stage)
+    } else if line.contains("starting preflight for deployment") {
+        Some(LaunchPhase::Preflight)
     } else {
         None
     }
@@ -92,12 +99,21 @@ mod tests {
     fn known_current_main_launch_output_advances_monotonically() {
         let mut classifier = PhaseClassifier::default();
         let fixtures = [
-            ("gimlet-0: launch start", LaunchPhase::Initialize),
+            (
+                "starting preflight for deployment vtui_demo2",
+                LaunchPhase::Preflight,
+            ),
+            ("creating links", LaunchPhase::Stage),
+            ("creating nodes", LaunchPhase::Boot),
+            ("g0: launch start", LaunchPhase::Initialize),
             (
                 "rack-init: watching RSS progress on the RSS node ...",
                 LaunchPhase::RackSetup,
             ),
-            ("rack external route: timed out", LaunchPhase::Route),
+            (
+                "external route set: 198.51.100.0/24 -> 172.30.199.14 (ce)",
+                LaunchPhase::Route,
+            ),
         ];
         for (line, phase) in fixtures {
             assert_eq!(

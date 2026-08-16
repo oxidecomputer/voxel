@@ -146,11 +146,36 @@ fn draw_progress(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(block, area);
         return;
     }
-    let (completed, total, ratio, message) = app
-        .operation
-        .active
-        .as_ref()
-        .map_or((0, 0, 0.0, "Idle".to_owned()), |operation| {
+    let (completed, total, ratio, message) = progress_summary(app);
+    if area.height == 2 {
+        // The following section owns the separator below this compact region.
+        // Omitting this block's bottom border leaves one real summary row.
+        let compact_block =
+            block.borders(Borders::TOP | Borders::LEFT | Borders::RIGHT);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{completed}/{total} {message}"),
+                Style::default().fg(TUI_GREEN),
+            )))
+            .block(compact_block),
+            area,
+        );
+    } else {
+        frame.render_widget(
+            Gauge::default()
+                .block(block)
+                .gauge_style(Style::default().fg(TUI_GREEN))
+                .ratio(ratio.clamp(0.0, 1.0))
+                .label(format!("{completed}/{total} {message}")),
+            area,
+        );
+    }
+}
+
+fn progress_summary(app: &App) -> (usize, usize, f64, String) {
+    app.operation.displayed().map_or(
+        (0, 0, 0.0, "Idle".to_owned()),
+        |operation| {
             let phases = phase_order(operation.kind);
             let phase_completed =
                 operation.completed_phases.len().min(phases.len());
@@ -178,38 +203,17 @@ fn draw_progress(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     phase_completed,
                     phases.len(),
                     phase_ratio,
-                    phase_name(
-                        operation.phase.unwrap_or(
-                            phases[phase_completed
-                                .min(phases.len().saturating_sub(1))],
-                        ),
-                    )
-                    .to_owned(),
+                    if phase_completed == phases.len() {
+                        "Complete".to_owned()
+                    } else {
+                        phase_name(
+                            operation.phase.unwrap_or(phases[phase_completed]),
+                        )
+                        .to_owned()
+                    },
                 ))
-        });
-    if area.height == 2 {
-        // The following section owns the separator below this compact region.
-        // Omitting this block's bottom border leaves one real summary row.
-        let compact_block =
-            block.borders(Borders::TOP | Borders::LEFT | Borders::RIGHT);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("{completed}/{total} {message}"),
-                Style::default().fg(TUI_GREEN),
-            )))
-            .block(compact_block),
-            area,
-        );
-    } else {
-        frame.render_widget(
-            Gauge::default()
-                .block(block)
-                .gauge_style(Style::default().fg(TUI_GREEN))
-                .ratio(ratio.clamp(0.0, 1.0))
-                .label(format!("{completed}/{total} {message}")),
-            area,
-        );
-    }
+        },
+    )
 }
 
 fn draw_phases(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -221,7 +225,7 @@ fn draw_phases(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(block, area);
         return;
     }
-    let Some(operation) = app.operation.active.as_ref() else {
+    let Some(operation) = app.operation.displayed() else {
         frame.render_widget(
             List::new([ListItem::new("○ No active deployment operation")])
                 .block(block),
@@ -478,6 +482,55 @@ fn observed_name(app: &App) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::{
+        app::ActiveOperation,
+        event::OperationRequestId,
+        operation::{LaunchPhase, OperationKind, OperationPhase},
+    };
+
+    #[test]
+    fn retained_success_renders_complete_progress() {
+        let mut app = App::new(vec![], 8, 8);
+        let mut operation = ActiveOperation::new(
+            OperationRequestId::FIRST,
+            OperationKind::Launch,
+        );
+        operation.completed_phases = LaunchPhase::ORDER
+            .into_iter()
+            .map(OperationPhase::Launch)
+            .collect();
+        app.operation.retained = Some(operation);
+
+        assert_eq!(progress_summary(&app), (7, 7, 1.0, "Complete".into()));
+    }
+
+    #[test]
+    fn retained_failure_renders_last_proven_phase() {
+        let mut app = App::new(vec![], 8, 8);
+        let mut operation = ActiveOperation::new(
+            OperationRequestId::FIRST,
+            OperationKind::Launch,
+        );
+        operation.completed_phases = LaunchPhase::ORDER[..3]
+            .iter()
+            .copied()
+            .map(OperationPhase::Launch)
+            .collect();
+        operation.phase = Some(OperationPhase::Launch(LaunchPhase::Initialize));
+        app.operation.retained = Some(operation);
+
+        assert_eq!(
+            progress_summary(&app),
+            (3, 7, 3.0 / 7.0, "Initialize".into())
+        );
+    }
+
+    #[test]
+    fn absent_operation_renders_idle_progress() {
+        let app = App::new(vec![], 8, 8);
+
+        assert_eq!(progress_summary(&app), (0, 0, 0.0, "Idle".into()));
+    }
 
     #[test]
     fn status_lines_fit_terminal_columns() {

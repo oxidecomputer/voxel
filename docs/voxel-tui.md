@@ -55,7 +55,8 @@ section traversal wraps. `Tab` and `Shift-Tab` always move section focus, and
 The Deployment view tracks the launch and teardown of a Voxel deployment, and
 contains **Overall Progress**, **Phases**, **Status**, **Current Phase**, and
 **Logs** in separate sections. Live probes are used to track observed deployment
-and route state.
+and route state. The last operation's advisory phase result remains visible
+until another lifecycle operation begins.
 
 Logs are displayed oldest to newest, with new entries edging older ones out of
 the bounded view. Press `f` to filter them by level: All, Info, Warning, or

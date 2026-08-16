@@ -8,8 +8,9 @@ use super::{
     event::{AppEvent, Effect, OperationRequestId},
     logging::DurableLog,
     operation::{
-        CommandOutcome, LogLevel, OperationEvent, OperationKind,
-        OperationWarning, OutputStream,
+        CommandOutcome, DestroyPhase, LaunchPhase, LogLevel, OperationEvent,
+        OperationKind, OperationPhase, OperationWarning, OutputStream,
+        RoutePhase,
     },
     phase::{PhaseClassifier, PhaseHint},
     process::{
@@ -281,6 +282,11 @@ impl Effects {
                 message: format!("child wait failed: {}", error.message),
             },
         };
+        self.operation(
+            request_id,
+            OperationEvent::PhaseStarted { phase: reconciliation_phase(kind) },
+        )
+        .await;
         self.reconcile(kind).await;
         self.operation(request_id, OperationEvent::Finished(outcome)).await;
     }
@@ -359,6 +365,16 @@ fn child_outcome(result: ChildResult) -> CommandOutcome {
     }
 }
 
+fn reconciliation_phase(kind: OperationKind) -> OperationPhase {
+    match kind {
+        OperationKind::Launch => OperationPhase::Launch(LaunchPhase::Reconcile),
+        OperationKind::Destroy => {
+            OperationPhase::Destroy(DestroyPhase::Reconcile)
+        }
+        OperationKind::Route => OperationPhase::Route(RoutePhase::Reconcile),
+    }
+}
+
 fn force_outcome(result: ChildResult, kill: ForceStopResult) -> CommandOutcome {
     if matches!(
         kill,
@@ -372,5 +388,29 @@ fn force_outcome(result: ChildResult, kill: ForceStopResult) -> CommandOutcome {
             ForceStopResult::Failed(message) => Some(message),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::operation::{
+        DestroyPhase, LaunchPhase, OperationPhase, RoutePhase,
+    };
+
+    #[test]
+    fn every_operation_has_a_tui_owned_reconciliation_phase() {
+        assert_eq!(
+            reconciliation_phase(OperationKind::Launch),
+            OperationPhase::Launch(LaunchPhase::Reconcile)
+        );
+        assert_eq!(
+            reconciliation_phase(OperationKind::Destroy),
+            OperationPhase::Destroy(DestroyPhase::Reconcile)
+        );
+        assert_eq!(
+            reconciliation_phase(OperationKind::Route),
+            OperationPhase::Route(RoutePhase::Reconcile)
+        );
     }
 }
