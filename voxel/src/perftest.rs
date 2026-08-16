@@ -36,8 +36,8 @@
 //!   distribution* (p50/p90/p99, max, and a p99/p50 jitter ratio) of serial
 //!   disk create/settle/delete requests. Complements the wear/time metrics with
 //!   a jitter signal the matrix can't see.
-//! * `levers` — print the active four-lever matrix for the current config.
-//! * `matrix` — the A/B driver: for each lever combination, (re)launch the
+//! * `levers` — print the active storage and topology levers.
+//! * `matrix` — the storage A/B driver: for each lever combination, (re)launch the
 //!   rack, measure bring-up wear + launch time + baseline-adjusted launch RAM
 //!   growth (and optional workload wear + RAM growth), tear down, and emit a
 //!   comparison table (+ `--out`
@@ -45,6 +45,8 @@
 //!   summarizes the spread (mean/median/stddev/CV). Helios host only; each
 //!   combination is a full launch, run strictly serially (see the nextest note
 //!   in the roadmap).
+//! * `topology-matrix` — independently compare full and reduced RSS
+//!   participation using the same durable execution machinery.
 //! * `compare` — diff two `matrix --json-out` runs (baseline vs candidate):
 //!   per-combo, per-metric relative deltas, flagging which changes exceed the
 //!   measured run-to-run noise rather than any fixed threshold.
@@ -169,19 +171,17 @@ pub enum PerftestCmd {
         #[arg(long)]
         json_out: Option<PathBuf>,
     },
-    /// Show the state of all four disk-wear levers for the current `voxel.toml`
-    /// (levers 1-3 from `[disk_wear]`, lever 4 from `topology.rss_sleds`), so an
-    /// A/B run's configuration is captured alongside its samples.
+    /// Show the storage and topology performance levers for `voxel.toml`.
     Levers,
-    /// Run the full A/B lever matrix (Helios host only). For each lever
+    /// Run the storage A/B lever matrix (Helios host only). For each lever
     /// combination: tear down + reset host props, sample, launch the rack,
     /// sample bring-up wear, optionally run a workload + sample it, tear down;
     /// then print a comparison table (+ optional CSV). Each combination is a
     /// full multi-minute launch, run strictly serially.
     Matrix {
         /// Combinations to run, `;`-separated; each a `+`-list of lever numbers
-        /// (1-4), or `none`/`all`. E.g. `"none;1;1+2;1+2+3;all"`. Default: a
-        /// cumulative ladder (none, +1, +1+2, +1+2+3, +1+2+3+4) so each row
+        /// (1-3), or `none`/`all`. E.g. `"none;1;1+2;all"`. Default: a
+        /// cumulative ladder (none, +1, +1+2, +1+2+3) so each row
         /// shows one lever's marginal effect.
         #[arg(long)]
         combos: Option<String>,
@@ -192,10 +192,6 @@ pub enum PerftestCmd {
         /// Trusted provider for a non-default Oxide authentication setup.
         #[arg(long, requires = "workload")]
         oxide_auth_helper: Option<PathBuf>,
-        /// RSS sled count for combos that include lever 4 (reduce replication);
-        /// default 3, omicron's floor. See the caveat in `run_combo`.
-        #[arg(long, default_value_t = 3)]
-        rss_sleds: usize,
         /// Rated endurance per drive in TB, to project drive lifetime per combo.
         #[arg(long)]
         rated_tbw: Option<f64>,
@@ -215,6 +211,26 @@ pub enum PerftestCmd {
         /// Continue to the next combination if both execution attempts at a
         /// repeat fail (default: stop). A failed first execution is retried once
         /// only after cleanup proves a clean boundary; boundary failures abort.
+        #[arg(long)]
+        keep_going: bool,
+    },
+    /// Compare full and reduced RSS participation independently of storage
+    /// tuning. The reduced configuration defaults to Omicron's floor of three.
+    TopologyMatrix {
+        #[arg(long)]
+        workload: Option<WorkloadKind>,
+        #[arg(long, requires = "workload")]
+        oxide_auth_helper: Option<PathBuf>,
+        #[arg(long, default_value_t = 3)]
+        rss_sleds: usize,
+        #[arg(long)]
+        rated_tbw: Option<f64>,
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        json_out: Option<PathBuf>,
         #[arg(long)]
         keep_going: bool,
     },
@@ -270,7 +286,6 @@ pub async fn run(
             combos,
             workload,
             oxide_auth_helper,
-            rss_sleds,
             rated_tbw,
             repeat,
             out,
@@ -281,6 +296,33 @@ pub async fn run(
                 cfg,
                 name,
                 combos.as_deref(),
+                MatrixKind::Storage,
+                *workload,
+                oxide_auth_helper.as_deref(),
+                0,
+                *rated_tbw,
+                *repeat,
+                out.as_deref(),
+                json_out.as_deref(),
+                *keep_going,
+            )
+            .await
+        }
+        PerftestCmd::TopologyMatrix {
+            workload,
+            oxide_auth_helper,
+            rss_sleds,
+            rated_tbw,
+            repeat,
+            out,
+            json_out,
+            keep_going,
+        } => {
+            cmd_matrix(
+                cfg,
+                name,
+                None,
+                MatrixKind::Topology,
                 *workload,
                 oxide_auth_helper.as_deref(),
                 *rss_sleds,
@@ -298,10 +340,8 @@ pub async fn run(
     }
 }
 
-/// Print the state of all four disk-wear levers for the current `voxel.toml`, so
-/// an A/B run's configuration is unambiguous. Levers 1-3 come from the
-/// `[disk_wear]` section; lever 4 (reduce replication) is `topology.rss_sleds`
-/// (a rack with fewer RSS sleds than total drops a sled's write load entirely).
+/// Print storage tuning separately from RSS participation so an A/B run's
+/// configuration is unambiguous.
 fn cmd_levers(cfg: Option<&VoxelConfig>) -> Result<()> {
     let cfg = cfg.ok_or_else(|| {
         anyhow!("no voxel.toml found - run from a project dir or pass --config")
@@ -309,15 +349,11 @@ fn cmd_levers(cfg: Option<&VoxelConfig>) -> Result<()> {
     let w = &cfg.disk_wear;
     let on = |b: bool| if b { "ON " } else { "off" };
 
-    // Lever 4: RSS membership below the total sled count means fewer sleds do
-    // control-plane writes. `rss_sleds = 0` means "all sleds" (no reduction).
     let total = cfg.topology.sleds;
     let rss = cfg.topology.rss_count();
     let reduced = rss < total;
 
-    println!(
-        "disk-wear levers (see docs/voxel-roadmap.md; A/B via `voxel perftest sample`/`sample-report`):"
-    );
+    println!("storage levers (A/B via `voxel perftest matrix`):");
     println!(
         "  [{}] 1 host sync=disabled      (host falcon dataset)",
         on(w.host_sync_disabled)
@@ -331,7 +367,7 @@ fn cmd_levers(cfg: Option<&VoxelConfig>) -> Result<()> {
         on(w.guest_zfs_tuning)
     );
     println!(
-        "  [{}] 4 reduce replication      (topology.rss_sleds = {} of {} sleds)",
+        "\ntopology levers (A/B via `voxel perftest topology-matrix`):\n  [{}] reduced RSS participation (topology.rss_sleds = {} of {} sleds)",
         on(reduced),
         rss,
         total
@@ -353,6 +389,22 @@ const MATRIX_SCHEMA_VERSION: u32 = 4;
 /// One initial attempt plus one retry after a proven clean boundary. Only the
 /// successful attempt contributes a sample to the requested repeat count.
 const MATRIX_REPEAT_ATTEMPTS: usize = 2;
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+enum MatrixKind {
+    #[default]
+    Storage,
+    Topology,
+}
+
+impl MatrixKind {
+    fn is_storage(&self) -> bool {
+        *self == Self::Storage
+    }
+}
 
 /// One repeat's measured metrics for a single combo run. Bytes are gross NVMe
 /// writes (Data Units Written * 512000) summed across the falcon pool's drives
@@ -658,6 +710,8 @@ struct MatrixCheckpoint {
     checkpoint_sequence: u64,
     status: RunStatus,
     abort_error: Option<String>,
+    #[serde(default, skip_serializing_if = "MatrixKind::is_storage")]
+    kind: MatrixKind,
     name: String,
     started: u64,
     updated: u64,
@@ -1239,6 +1293,8 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct MatrixRun {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "MatrixKind::is_storage")]
+    kind: MatrixKind,
     name: String,
     /// Unix seconds at the start / end of the whole matrix run.
     started: u64,
@@ -1259,6 +1315,8 @@ pub(super) struct MatrixRun {
 #[serde(deny_unknown_fields)]
 struct MatrixRunWire {
     schema_version: u32,
+    #[serde(default)]
+    kind: MatrixKind,
     name: String,
     started: u64,
     ended: u64,
@@ -1313,6 +1371,7 @@ impl<'de> Deserialize<'de> for MatrixRun {
         }
         let run = Self {
             schema_version: MATRIX_SCHEMA_VERSION,
+            kind: wire.kind,
             name: wire.name,
             started: wire.started,
             ended: wire.ended,
@@ -1502,9 +1561,9 @@ fn validate_matrix_run(run: &MatrixRun) -> Result<()> {
     for (index, (planned, result)) in
         run.combos.iter().zip(&run.results).enumerate()
     {
-        if result.levers.iter().any(|lever| !(1..=4).contains(lever)) {
+        if !valid_matrix_levers(run.kind, &result.levers) {
             return Err(anyhow!(
-                "matrix combo {index} contains an unsupported storage lever"
+                "matrix combo {index} contains a lever unsupported by its experiment class"
             ));
         }
         let canonical = canonical_combo_label(&result.levers);
@@ -1584,7 +1643,8 @@ fn validate_report_failed_matrix(matrix: &MatrixRun) -> Result<()> {
         bail!("retained failed matrix has invalid repeat or result count");
     }
     for (result, label) in matrix.results.iter().zip(&matrix.combos) {
-        if result.label != *label
+        if !valid_matrix_levers(matrix.kind, &result.levers)
+            || result.label != *label
             || result.label != canonical_combo_label(&result.levers)
         {
             bail!("retained failed matrix combo identity mismatch");
@@ -1649,7 +1709,8 @@ fn validate_matrix_checkpoint(matrix: &MatrixCheckpoint) -> Result<()> {
     let completed = matrix.status == RunStatus::Completed;
     let mut labels = std::collections::BTreeSet::new();
     for combo in &matrix.combos {
-        if combo.label != canonical_combo_label(&combo.levers)
+        if !valid_matrix_levers(matrix.kind, &combo.levers)
+            || combo.label != canonical_combo_label(&combo.levers)
             || !labels.insert(&combo.label)
         {
             bail!("schema-v5 matrix combo identity is not exact and canonical");
@@ -2005,9 +2066,9 @@ fn validate_report_evidence(
     for (index, (combo, result)) in
         evidence.combos.iter().zip(&run.results).enumerate()
     {
-        if combo.levers.iter().any(|lever| !(1..=4).contains(lever)) {
+        if !valid_matrix_levers(run.kind, &combo.levers) {
             return Err(anyhow!(
-                "matrix report evidence combo {index} contains an unsupported storage lever"
+                "matrix report evidence combo {index} contains a lever unsupported by its experiment class"
             ));
         }
         if combo.label != run.combos[index]
@@ -2018,8 +2079,12 @@ fn validate_report_evidence(
                 "matrix report evidence combo {index} identity mismatch"
             ));
         }
-        let expected =
-            apply_combo(&evidence.base_config, &combo.levers, run.rss_sleds);
+        let expected = apply_matrix_combo(
+            &evidence.base_config,
+            &combo.levers,
+            run.kind,
+            run.rss_sleds,
+        );
         if combo.effective_config != expected {
             return Err(anyhow!(
                 "matrix report evidence combo '{}' effective config mismatch",
@@ -2095,6 +2160,17 @@ fn validate_report_evidence(
         ));
     }
     Ok(())
+}
+
+fn valid_matrix_levers(kind: MatrixKind, levers: &BTreeSet<u8>) -> bool {
+    match kind {
+        MatrixKind::Storage => {
+            levers.iter().all(|lever| (1..=3).contains(lever))
+        }
+        MatrixKind::Topology => {
+            levers.is_empty() || levers == &BTreeSet::from([1])
+        }
+    }
 }
 
 fn capability_pass(evidence: &str) -> CapabilityStatus {
@@ -2190,9 +2266,11 @@ fn observed_command(
         .unwrap_or_else(|| unavailable(unavailable_reason))
 }
 
-fn build_report_evidence(
+#[allow(clippy::too_many_arguments)]
+fn build_report_evidence_for_kind(
     base: &VoxelConfig,
     plan: &[(String, BTreeSet<u8>)],
+    kind: MatrixKind,
     rss_sleds: usize,
     workload: Option<WorkloadSpec>,
     oxide_session: Option<OxideSessionMetadata>,
@@ -2230,7 +2308,9 @@ fn build_report_evidence(
             .map(|(label, levers)| MatrixComboEvidence {
                 label: label.clone(),
                 levers: levers.clone(),
-                effective_config: apply_combo(&sanitized, levers, rss_sleds),
+                effective_config: apply_matrix_combo(
+                    &sanitized, levers, kind, rss_sleds,
+                ),
             })
             .collect(),
         base_config: sanitized,
@@ -2257,6 +2337,28 @@ fn build_report_evidence(
             repeat,
         ),
     }
+}
+
+#[cfg(test)]
+fn build_report_evidence(
+    base: &VoxelConfig,
+    plan: &[(String, BTreeSet<u8>)],
+    rss_sleds: usize,
+    workload: Option<WorkloadSpec>,
+    oxide_session: Option<OxideSessionMetadata>,
+    results: &[ComboAggregate],
+    repeat: usize,
+) -> MatrixReportEvidence {
+    build_report_evidence_for_kind(
+        base,
+        plan,
+        MatrixKind::Storage,
+        rss_sleds,
+        workload,
+        oxide_session,
+        results,
+        repeat,
+    )
 }
 
 #[cfg(test)]
@@ -2422,6 +2524,7 @@ async fn cmd_matrix(
     cfg: Option<&VoxelConfig>,
     name: &str,
     combos: Option<&str>,
+    kind: MatrixKind,
     workload: Option<WorkloadKind>,
     oxide_auth_helper: Option<&Path>,
     rss_sleds: usize,
@@ -2436,12 +2539,15 @@ async fn cmd_matrix(
     let base = cfg.ok_or_else(|| {
         anyhow!("no voxel.toml found - run from a project dir or pass --config")
     })?;
-    let plan = parse_combos(combos)?;
+    let plan = match kind {
+        MatrixKind::Storage => parse_combos(combos)?,
+        MatrixKind::Topology => topology_plan(base, rss_sleds)?,
+    };
     // Validate every requested topology before the first repeat tears down a
     // rack or resets host ZFS properties. In particular, an invalid lever-4
     // participant count must not fail only after the matrix mutates host state.
     for (label, levers) in &plan {
-        apply_combo(base, levers, rss_sleds)
+        apply_matrix_combo(base, levers, kind, rss_sleds)
             .topology
             .validate_rss_membership()
             .map_err(|error| {
@@ -2453,6 +2559,7 @@ async fn cmd_matrix(
             base,
             name,
             plan,
+            kind,
             workload,
             oxide_auth_helper,
             rss_sleds,
@@ -2491,14 +2598,14 @@ async fn cmd_matrix(
     let mut results = Vec::new();
     let mut matrix_session = OxideSessionAggregation::Unobserved;
     'combo: for (i, (label, levers)) in plan.iter().enumerate() {
-        let cfg2 = apply_combo(base, levers, rss_sleds);
+        let cfg2 = apply_matrix_combo(base, levers, kind, rss_sleds);
         let mut repeats = Vec::new();
         for rep in 0..repeat {
             println!(
                 "=== [{}/{}] combo '{label}'  (levers: {})  repeat {}/{} ===",
                 i + 1,
                 plan.len(),
-                describe_levers(levers),
+                describe_levers(levers, kind),
                 rep + 1,
                 repeat
             );
@@ -2604,9 +2711,10 @@ async fn cmd_matrix(
 
     let matrix_workload = workload.map(|_| WorkloadSpec::api_disk_lifecycle());
     let matrix_session = matrix_session.finish();
-    let report_evidence = build_report_evidence(
+    let report_evidence = build_report_evidence_for_kind(
         base,
         &plan,
+        kind,
         rss_sleds,
         matrix_workload.clone(),
         matrix_session.clone(),
@@ -2616,6 +2724,7 @@ async fn cmd_matrix(
 
     let run = MatrixRun {
         schema_version: MATRIX_SCHEMA_VERSION,
+        kind,
         name: name.to_string(),
         started,
         ended,
@@ -2630,9 +2739,9 @@ async fn cmd_matrix(
     };
     validate_publishable_matrix_run(&run)
         .context("matrix result completeness validation")?;
-    println!("\n{}", render_table(&run.results, rated_tbw)?);
+    println!("\n{}", render_table(&run.results, rated_tbw, kind)?);
 
-    let csv = out.map(|_| render_csv(&run.results));
+    let csv = out.map(|_| render_csv(&run.results, kind));
     let json = json_out
         .map(|_| {
             serde_json::to_string_pretty(&run).context("serialize matrix run")
@@ -2661,6 +2770,7 @@ async fn cmd_matrix_checkpointed(
     base: &VoxelConfig,
     name: &str,
     plan: Vec<(String, BTreeSet<u8>)>,
+    kind: MatrixKind,
     workload: Option<WorkloadKind>,
     oxide_auth_helper: Option<&Path>,
     rss_sleds: usize,
@@ -2672,9 +2782,10 @@ async fn cmd_matrix_checkpointed(
 ) -> Result<()> {
     let started = now_secs();
     let workload_spec = workload.map(|_| WorkloadSpec::api_disk_lifecycle());
-    let evidence = build_report_evidence(
+    let evidence = build_report_evidence_for_kind(
         base,
         &plan,
+        kind,
         rss_sleds,
         workload_spec.clone(),
         None,
@@ -2686,6 +2797,7 @@ async fn cmd_matrix_checkpointed(
         checkpoint_sequence: 0,
         status: RunStatus::Running,
         abort_error: None,
+        kind,
         name: name.into(),
         started,
         updated: started,
@@ -2872,7 +2984,7 @@ async fn cmd_matrix_checkpointed(
         checkpoint.status = RunStatus::Completed;
         checkpoint.ended = Some(ended);
         publish_checkpoint(&mut publisher, &mut checkpoint)?;
-        println!("\n{}", render_table(&results, rated_tbw)?);
+        println!("\n{}", render_table(&results, rated_tbw, kind)?);
         Ok((results, out.map(Path::to_path_buf)))
     }
     .await;
@@ -2892,7 +3004,7 @@ async fn cmd_matrix_checkpointed(
     if let Some(path) = csv_path {
         publish_final_csv_with(&checkpoint, || {
             publish_matrix_outputs(
-                Some((&path, render_csv(&results).as_bytes())),
+                Some((&path, render_csv(&results, kind).as_bytes())),
                 None,
                 owner,
             )
@@ -2907,8 +3019,9 @@ async fn cmd_matrix_checkpointed(
 /// `cmd_launch` applies levers 1/2 (host `zfs set`) and stages lever 3 as a
 /// cargo-bay flag, so passing `cfg` is all it takes to realize the combo.
 ///
-/// Lever 4 uses the topology's scrimlet-safe RSS selection, retaining both
-/// scrimlets before filling remaining participant slots with non-scrimlets.
+/// Reduced RSS participation uses the topology's scrimlet-safe selection,
+/// retaining both scrimlets before filling remaining participant slots with
+/// non-scrimlets.
 /// Combos that fail to launch are recorded as errors (see `--keep-going`).
 fn clean_repeat_boundary(cfg: &VoxelConfig, name: &str) -> Result<()> {
     combine_operation_and_cleanup(
@@ -3831,21 +3944,48 @@ fn validate_zfs_evidence(output: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// A combination's config: clone the base, then set each lever from the set.
-/// Levers absent from the set are forced OFF (so a combo is exactly its set,
-/// regardless of what the base `voxel.toml` had) - this is what makes the A/B
-/// clean. Lever 4 maps to `topology.rss_sleds` (`0` = all sleds = no reduction).
+/// A storage combination forces all three storage levers to the requested
+/// state and restores full RSS participation, regardless of the base config.
 fn apply_combo(
     base: &VoxelConfig,
     set: &BTreeSet<u8>,
-    rss_sleds: usize,
+    _rss_sleds: usize,
 ) -> VoxelConfig {
     let mut c = base.clone();
     c.disk_wear.host_sync_disabled = set.contains(&1);
     c.disk_wear.host_compression = set.contains(&2);
     c.disk_wear.guest_zfs_tuning = set.contains(&3);
-    c.topology.rss_sleds = if set.contains(&4) { rss_sleds } else { 0 };
+    c.topology.rss_sleds = 0;
     c
+}
+
+fn apply_matrix_combo(
+    base: &VoxelConfig,
+    set: &BTreeSet<u8>,
+    kind: MatrixKind,
+    rss_sleds: usize,
+) -> VoxelConfig {
+    match kind {
+        MatrixKind::Storage => apply_combo(base, set, rss_sleds),
+        MatrixKind::Topology => {
+            let mut config = base.clone();
+            config.topology.rss_sleds =
+                if set.contains(&1) { rss_sleds } else { 0 };
+            config
+        }
+    }
+}
+
+fn topology_plan(
+    base: &VoxelConfig,
+    rss_sleds: usize,
+) -> Result<Vec<(String, BTreeSet<u8>)>> {
+    let reduced = BTreeSet::from([1]);
+    apply_matrix_combo(base, &reduced, MatrixKind::Topology, rss_sleds)
+        .topology
+        .validate_rss_membership()
+        .map_err(|error| anyhow!("reduced RSS participation: {error}"))?;
+    Ok(vec![("none".into(), BTreeSet::new()), ("1".into(), reduced)])
 }
 
 /// Reset the host-dataset props levers 1/2 set, back to inherited defaults, and
@@ -3918,19 +4058,19 @@ fn parse_combos(spec: Option<&str>) -> Result<Vec<(String, BTreeSet<u8>)>> {
 fn parse_one_combo(s: &str) -> Result<(String, BTreeSet<u8>)> {
     let set: BTreeSet<u8> = match s.to_ascii_lowercase().as_str() {
         "none" | "baseline" => BTreeSet::new(),
-        "all" => (1u8..=4).collect(),
+        "all" => (1u8..=3).collect(),
         _ => {
             let mut set = BTreeSet::new();
             for tok in s.split('+') {
                 let n: u8 = tok.trim().parse().map_err(|_| {
                     anyhow!(
-                        "bad lever '{}' in combo '{s}' (want 1-4, none, or all)",
+                        "bad lever '{}' in combo '{s}' (want 1-3, none, or all)",
                         tok.trim()
                     )
                 })?;
-                if !(1..=4).contains(&n) {
+                if !(1..=3).contains(&n) {
                     return Err(anyhow!(
-                        "lever {n} out of range (1-4) in combo '{s}'"
+                        "lever {n} out of range (1-3) in combo '{s}'"
                     ));
                 }
                 set.insert(n);
@@ -3941,13 +4081,13 @@ fn parse_one_combo(s: &str) -> Result<(String, BTreeSet<u8>)> {
     Ok((combo_label(&set), set))
 }
 
-/// The cumulative ladder: none, +1, +1+2, +1+2+3, +1+2+3+4. Each row
+/// The cumulative storage ladder: none, +1, +1+2, +1+2+3. Each row
 /// adds one lever, so the table reads as each lever's marginal effect.
 fn default_ladder() -> Vec<(String, BTreeSet<u8>)> {
     let mut out = Vec::new();
     let mut cur = BTreeSet::new();
     out.push((combo_label(&cur), cur.clone()));
-    for n in 1u8..=4 {
+    for n in 1u8..=3 {
         cur.insert(n);
         out.push((combo_label(&cur), cur.clone()));
     }
@@ -3964,16 +4104,16 @@ fn combo_label(set: &BTreeSet<u8>) -> String {
 }
 
 /// Short human names for a lever set, for the table's LEVERS column.
-fn describe_levers(set: &BTreeSet<u8>) -> String {
+fn describe_levers(set: &BTreeSet<u8>, kind: MatrixKind) -> String {
     if set.is_empty() {
         return "none".to_string();
     }
     set.iter()
-        .map(|n| match n {
-            1 => "sync",
-            2 => "comp",
-            3 => "guest",
-            4 => "repl",
+        .map(|n| match (kind, n) {
+            (MatrixKind::Storage, 1) => "sync",
+            (MatrixKind::Storage, 2) => "comp",
+            (MatrixKind::Storage, 3) => "guest",
+            (MatrixKind::Topology, 1) => "reduced-rss",
             _ => "?",
         })
         .collect::<Vec<_>>()
@@ -3988,6 +4128,7 @@ fn describe_levers(set: &BTreeSet<u8>) -> String {
 fn render_table(
     results: &[ComboAggregate],
     rated_tbw: Option<f64>,
+    kind: MatrixKind,
 ) -> Result<String> {
     let policy = projection_policy(rated_tbw)?;
     let any_workload = results.iter().any(|r| r.has_workload());
@@ -4029,7 +4170,7 @@ fn render_table(
             s.push_str(&format!(
                 "{:<12}  {:<20}  FAILED: {e}\n",
                 r.label,
-                describe_levers(&r.levers)
+                describe_levers(&r.levers, kind)
             ));
             continue;
         }
@@ -4040,7 +4181,7 @@ fn render_table(
         let mut row = format!(
             "{:<12}  {:<20}  {:>13}  {:>12}  {:>8}",
             r.label,
-            describe_levers(&r.levers),
+            describe_levers(&r.levers, kind),
             human_bytes(bytes),
             format!("{}/s", human_bytes(rate as u64)),
             human_secs(secs)
@@ -4099,9 +4240,13 @@ fn render_table(
 /// Render the results as CSV (one row per combo; lever columns are 0/1) for
 /// import into a spreadsheet. Numeric columns carry the per-combo mean over
 /// repeats (identical to the single value at `--repeat 1`).
-fn render_csv(results: &[ComboAggregate]) -> String {
-    let mut s = String::from(
-        "combo,sync,compression,guest_zfs,reduce_replication,bringup_bytes,bringup_secs,peak_ram_bytes,workload_bytes,workload_secs,workload_peak_delta_bytes,error\n",
+fn render_csv(results: &[ComboAggregate], kind: MatrixKind) -> String {
+    let lever_header = match kind {
+        MatrixKind::Storage => "sync,compression,guest_zfs",
+        MatrixKind::Topology => "reduced_rss_participation",
+    };
+    let mut s = format!(
+        "combo,{lever_header},bringup_bytes,bringup_secs,peak_ram_bytes,workload_bytes,workload_secs,workload_peak_delta_bytes,error\n"
     );
     for r in results {
         let on = |n: u8| u8::from(r.levers.contains(&n));
@@ -4123,13 +4268,16 @@ fn render_csv(results: &[ComboAggregate]) -> String {
                 String::new()
             }
         };
+        let levers = match kind {
+            MatrixKind::Storage => {
+                format!("{},{},{}", on(1), on(2), on(3))
+            }
+            MatrixKind::Topology => on(1).to_string(),
+        };
         s.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{}\n",
             r.label,
-            on(1),
-            on(2),
-            on(3),
-            on(4),
+            levers,
             r.bringup_bytes().mean as u64,
             r.launch_secs().mean as u64,
             peak_ram,
@@ -4146,6 +4294,11 @@ pub(super) fn validate_comparison_compatibility(
     base: &MatrixRun,
     candidate: &MatrixRun,
 ) -> Result<()> {
+    if base.kind != candidate.kind {
+        return Err(anyhow!(
+            "experiment class mismatch: storage and topology matrices are not comparable"
+        ));
+    }
     if base.workload != candidate.workload {
         return Err(anyhow!(
             "workload mismatch: baseline and candidate matrix runs are not comparable"
@@ -6359,6 +6512,7 @@ mod tests {
             checkpoint_sequence: 0,
             status: RunStatus::Running,
             abort_error: None,
+            kind: MatrixKind::Storage,
             name: "strict-checkpoint".into(),
             started: 100,
             updated: 100,
@@ -7095,6 +7249,39 @@ mod tests {
         assert_eq!(
             document.report_context.as_ref().unwrap().source_display,
             Some("matrix.json".into())
+        );
+    }
+
+    #[test]
+    fn cookout_adapter_classifies_topology_matrix_separately() {
+        let mut run = run_with(
+            "topology",
+            &[("none", &[], &[10, 20]), ("1", &[1], &[8, 9])],
+        );
+        run.kind = MatrixKind::Topology;
+        run.rss_sleds = 3;
+        let value = serde_json::to_value(&run).unwrap();
+        assert_eq!(value["kind"], "topology");
+        let run: MatrixRun = serde_json::from_value(value).unwrap();
+        let document = cookout_adapter::matrix_run_to_experiment(
+            &run,
+            Path::new("topology.json"),
+        )
+        .unwrap();
+        assert!(document.variants.iter().all(|variant| matches!(
+            variant.configuration,
+            Some(cookout::model::VariantConfiguration::TopologyLevers { .. })
+        )));
+        assert!(
+            !document
+                .target
+                .dimensions
+                .namespaced
+                .contains_key("oxide.voxel.storage_cohort")
+        );
+        assert_eq!(
+            document.provenance.invocation,
+            "voxel perftest topology-matrix"
         );
     }
 
@@ -8217,6 +8404,21 @@ mod tests {
         assert!(
             PerftestCli::try_parse_from([
                 "test",
+                "topology-matrix",
+                "--rss-sleds",
+                "3",
+                "--workload",
+                "api-disk-lifecycle"
+            ])
+            .is_ok()
+        );
+        assert!(
+            PerftestCli::try_parse_from(["test", "matrix", "--rss-sleds", "3"])
+                .is_err()
+        );
+        assert!(
+            PerftestCli::try_parse_from([
+                "test",
                 "preflight",
                 "--workload",
                 "api-disk-lifecycle"
@@ -8357,6 +8559,12 @@ mod tests {
 
         current.oxide_session = Some(test_session_metadata());
         assert!(validate_comparison_compatibility(&baseline, &current).is_ok());
+
+        current.kind = MatrixKind::Topology;
+        assert!(
+            validate_comparison_compatibility(&baseline, &current).is_err()
+        );
+        current.kind = MatrixKind::Storage;
 
         current.workload.as_mut().unwrap().parallel = 5;
         assert!(
@@ -9083,37 +9291,32 @@ mod tests {
             default_ladder().into_iter().map(|(_, s)| s).collect();
         assert_eq!(
             ladder,
-            vec![
-                set(&[]),
-                set(&[1]),
-                set(&[1, 2]),
-                set(&[1, 2, 3]),
-                set(&[1, 2, 3, 4])
-            ]
+            vec![set(&[]), set(&[1]), set(&[1, 2]), set(&[1, 2, 3])]
         );
         // Labels read as "none", "1", "1+2", ...
         let labels: Vec<String> =
             default_ladder().into_iter().map(|(l, _)| l).collect();
-        assert_eq!(labels, vec!["none", "1", "1+2", "1+2+3", "1+2+3+4"]);
+        assert_eq!(labels, vec!["none", "1", "1+2", "1+2+3"]);
     }
 
     #[test]
     fn parse_combos_spec_and_aliases() {
         let got: Vec<(String, BTreeSet<u8>)> =
-            parse_combos(Some("none; 1 ;1+2; all ;;3+4")).unwrap();
+            parse_combos(Some("none; 1 ;1+2; all ;;3")).unwrap();
         assert_eq!(
             got,
             vec![
                 ("none".into(), set(&[])),
                 ("1".into(), set(&[1])),
                 ("1+2".into(), set(&[1, 2])),
-                ("1+2+3+4".into(), set(&[1, 2, 3, 4])), // "all"
-                ("3+4".into(), set(&[3, 4])),
+                ("1+2+3".into(), set(&[1, 2, 3])), // "all"
+                ("3".into(), set(&[3])),
             ]
         );
         // Absent -> the default ladder.
-        assert_eq!(parse_combos(None).unwrap().len(), 5);
+        assert_eq!(parse_combos(None).unwrap().len(), 4);
         // Out-of-range / non-numeric levers are rejected.
+        assert!(parse_combos(Some("4")).is_err());
         assert!(parse_combos(Some("5")).is_err());
         assert!(parse_combos(Some("1+x")).is_err());
     }
@@ -9134,13 +9337,8 @@ mod tests {
         assert!(!c.disk_wear.host_compression);
         assert_eq!(
             c.topology.rss_sleds, 0,
-            "lever 4 absent -> no reduction (all sleds)"
+            "storage combinations always use full RSS participation"
         );
-
-        // Lever 4 present -> rss_sleds set to the matrix value.
-        let c4 = apply_combo(&base, &set(&[4]), 3);
-        assert_eq!(c4.topology.rss_sleds, 3);
-        assert!(!c4.disk_wear.guest_zfs_tuning);
     }
 
     #[test]
@@ -9163,13 +9361,25 @@ mod tests {
                 levers.contains(&3),
                 "{label}"
             );
-            assert_eq!(
-                cfg.topology.rss_sleds,
-                if levers.contains(&4) { 3 } else { 0 },
-                "{label}"
-            );
+            assert_eq!(cfg.topology.rss_sleds, 0, "{label}");
         }
-        assert_eq!(describe_levers(&set(&[3, 4])), "guest,repl");
+        assert_eq!(describe_levers(&set(&[3]), MatrixKind::Storage), "guest");
+    }
+
+    #[test]
+    fn topology_plan_compares_full_and_reduced_rss_participation() {
+        let base = VoxelConfig::from_toml("[topology]\nsleds = 4\n").unwrap();
+        let plan = topology_plan(&base, 3).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, "none");
+        assert_eq!(plan[1].0, "1");
+        let full =
+            apply_matrix_combo(&base, &plan[0].1, MatrixKind::Topology, 3);
+        let reduced =
+            apply_matrix_combo(&base, &plan[1].1, MatrixKind::Topology, 3);
+        assert_eq!(full.topology.rss_sleds, 0);
+        assert_eq!(reduced.topology.rss_sleds, 3);
+        assert_eq!(full.disk_wear, reduced.disk_wear);
     }
 
     #[test]
@@ -12056,24 +12266,32 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
                 }],
                 error: None,
             },
-            ComboAggregate {
-                label: "4".into(),
-                levers: set(&[4]),
-                error: Some("launch: boom, timeout".into()),
-                ..Default::default()
-            },
         ];
-        let csv = render_csv(&results);
+        let csv = render_csv(&results, MatrixKind::Storage);
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(
             lines[0],
-            "combo,sync,compression,guest_zfs,reduce_replication,bringup_bytes,bringup_secs,peak_ram_bytes,workload_bytes,workload_secs,workload_peak_delta_bytes,error"
+            "combo,sync,compression,guest_zfs,bringup_bytes,bringup_secs,peak_ram_bytes,workload_bytes,workload_secs,workload_peak_delta_bytes,error"
         );
         // peak_ram_bytes column is empty when the sampler didn't measure it.
-        assert_eq!(lines[1], "none,0,0,0,0,1000,10,,,,,");
-        assert_eq!(lines[2], "1+3,1,0,1,0,500,10,,2000,5,3000000000,");
-        // Errors have their commas sanitized so the CSV stays well-formed.
-        assert_eq!(lines[3], "4,0,0,0,1,0,0,,,,,launch: boom; timeout");
+        assert_eq!(lines[1], "none,0,0,0,1000,10,,,,,");
+        assert_eq!(lines[2], "1+3,1,0,1,500,10,,2000,5,3000000000,");
+
+        let topology = render_csv(
+            &[ComboAggregate {
+                label: "1".into(),
+                levers: set(&[1]),
+                error: Some("launch: boom, timeout".into()),
+                ..Default::default()
+            }],
+            MatrixKind::Topology,
+        );
+        let lines: Vec<&str> = topology.lines().collect();
+        assert_eq!(
+            lines[0],
+            "combo,reduced_rss_participation,bringup_bytes,bringup_secs,peak_ram_bytes,workload_bytes,workload_secs,workload_peak_delta_bytes,error"
+        );
+        assert_eq!(lines[1], "1,1,0,0,,,,,launch: boom; timeout");
     }
 
     #[test]
@@ -12090,7 +12308,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         }];
         // No workload, no rating, no RAM sample -> those columns absent, but
         // BRING-UP, RATE/s, and LAUNCH always show.
-        let plain = render_table(&results, None).unwrap();
+        let plain = render_table(&results, None, MatrixKind::Storage).unwrap();
         assert!(plain.contains("BRING-UP") && plain.contains("RATE/s"));
         assert!(plain.contains("LAUNCH"), "got:\n{plain}");
         assert!(plain.contains("1m40s"), "launch 100s -> 1m40s:\n{plain}"); // launch_secs 100
@@ -12098,7 +12316,8 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         assert!(!plain.contains("WORKLOAD") && !plain.contains("YEARS"));
         assert!(plain.contains("2.00 GB"), "got:\n{plain}");
         // 2 GB over 100s is 20 MB/s; 1200 TBW lasts about 1.90 years.
-        let projected = render_table(&results, Some(1200.0)).unwrap();
+        let projected =
+            render_table(&results, Some(1200.0), MatrixKind::Storage).unwrap();
         assert!(projected.contains("~YEARS"));
         assert!(projected.contains("      1.90"), "got:\n{projected}");
 
@@ -12114,7 +12333,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             }],
             error: None,
         }];
-        let ram = render_table(&with_ram, None).unwrap();
+        let ram = render_table(&with_ram, None, MatrixKind::Storage).unwrap();
         assert!(ram.contains("LAUNCH ΔRAM"), "got:\n{ram}");
         assert!(ram.contains("8.00 GB"), "got:\n{ram}");
 
@@ -12131,7 +12350,8 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             }],
             error: None,
         }];
-        let workload = render_table(&with_workload, None).unwrap();
+        let workload =
+            render_table(&with_workload, None, MatrixKind::Storage).unwrap();
         assert!(workload.contains("WORKLOAD ΔRAM"), "got:\n{workload}");
         assert!(workload.contains("3.00 GB"), "got:\n{workload}");
     }
@@ -12355,6 +12575,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             .collect();
         MatrixRun {
             schema_version: MATRIX_SCHEMA_VERSION,
+            kind: MatrixKind::Storage,
             name: name.into(),
             started: 0,
             ended: 1,
@@ -12373,6 +12594,7 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
     fn matrix_run_json_round_trips() {
         let run = MatrixRun {
             schema_version: MATRIX_SCHEMA_VERSION,
+            kind: MatrixKind::Storage,
             name: "a4x2".into(),
             started: 1000,
             ended: 1600,
@@ -12437,11 +12659,11 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
         base.falcon.dataset = Some("tank/voxel-performance".into());
         let plan = vec![
             ("none".to_string(), set(&[])),
-            ("1+4".to_string(), set(&[1, 4])),
+            ("1+3".to_string(), set(&[1, 3])),
         ];
         let mut run = run_with(
             "evidence",
-            &[("none", &[], &[1, 2]), ("1+4", &[1, 4], &[3, 4])],
+            &[("none", &[], &[1, 2]), ("1+3", &[1, 3], &[3, 4])],
         );
         for combo in &mut run.results {
             for repeat in &mut combo.repeats {
@@ -12473,7 +12695,8 @@ nvme2: model: CT1000P310SSD8, serial: CCCC, FW rev: 1
             apply_combo(&combos[0].effective_config, &set(&[]), 3)
         );
         assert!(combos[1].effective_config.disk_wear.host_sync_disabled);
-        assert_eq!(combos[1].effective_config.topology.rss_sleds, 3);
+        assert!(combos[1].effective_config.disk_wear.guest_zfs_tuning);
+        assert_eq!(combos[1].effective_config.topology.rss_sleds, 0);
     }
 
     #[test]

@@ -496,7 +496,13 @@ pub(super) fn matrix_run_to_experiment(
                         .find(|evidence| evidence.label == combo.label)
                         .map(|evidence| &evidence.effective_config)
                 });
-            variant(&combo.label, &combo.levers, run.repeat, effective_config)
+            variant(
+                &combo.label,
+                &combo.levers,
+                run.kind,
+                run.repeat,
+                effective_config,
+            )
         })
         .collect();
     let mut runs = Vec::new();
@@ -521,6 +527,7 @@ pub(super) fn matrix_run_to_experiment(
     }
     let failed = run.results.iter().any(|combo| combo.error.is_some());
     build_document(BuildDocumentArgs {
+        kind: run.kind,
         source_name: &run.name,
         started: run.started,
         rss_sleds: run.rss_sleds,
@@ -557,6 +564,7 @@ pub(super) fn matrix_checkpoint_to_experiment(
             variant(
                 &combo.label,
                 &combo.levers,
+                checkpoint.kind,
                 checkpoint.repeat,
                 Some(&combo.effective_config),
             )
@@ -572,6 +580,7 @@ pub(super) fn matrix_checkpoint_to_experiment(
         })
         .collect::<Vec<_>>();
     build_document(BuildDocumentArgs {
+        kind: checkpoint.kind,
         source_name: &checkpoint.name,
         started: checkpoint.started,
         rss_sleds: checkpoint.rss_sleds,
@@ -596,6 +605,7 @@ pub(super) fn matrix_checkpoint_to_experiment(
 }
 
 struct BuildDocumentArgs<'a> {
+    kind: MatrixKind,
     source_name: &'a str,
     started: u64,
     rss_sleds: usize,
@@ -615,6 +625,7 @@ struct BuildDocumentArgs<'a> {
 
 fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
     let BuildDocumentArgs {
+        kind,
         source_name,
         started,
         rss_sleds,
@@ -656,20 +667,24 @@ fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
         "oxide.rss_sleds".into(),
         DimensionValue::Count(rss_sleds as u64),
     );
-    namespaced.insert(
-        STORAGE_COHORT_DIMENSION.into(),
-        DimensionValue::Text(storage_cohort_dimension(&StorageCohortArgs {
-            rss_sleds,
-            variants: &variants,
-            workload,
-            session,
-            evidence,
-            source_path,
-            run_id: source_name,
-            launch_memory_semantics,
-            workload_memory_semantics,
-        })?),
-    );
+    if kind == MatrixKind::Storage {
+        namespaced.insert(
+            STORAGE_COHORT_DIMENSION.into(),
+            DimensionValue::Text(storage_cohort_dimension(
+                &StorageCohortArgs {
+                    rss_sleds,
+                    variants: &variants,
+                    workload,
+                    session,
+                    evidence,
+                    source_path,
+                    run_id: source_name,
+                    launch_memory_semantics,
+                    workload_memory_semantics,
+                },
+            )?),
+        );
+    }
     let conditions = experiment_conditions(
         rss_sleds,
         &variants,
@@ -721,7 +736,11 @@ fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
         provenance: Provenance {
             producer: "oxide.voxel".into(),
             producer_version: env!("CARGO_PKG_VERSION").into(),
-            invocation: "voxel perftest matrix".into(),
+            invocation: match kind {
+                MatrixKind::Storage => "voxel perftest matrix",
+                MatrixKind::Topology => "voxel perftest topology-matrix",
+            }
+            .into(),
             source_digest: digest,
             source_revision: None,
             generated_at: None,
@@ -831,14 +850,20 @@ fn storage_cohort_dimension(args: &StorageCohortArgs<'_>) -> Result<String> {
 fn variant(
     label: &str,
     levers: &BTreeSet<u8>,
+    kind: MatrixKind,
     expected_repeats: usize,
     effective_config: Option<&VoxelConfig>,
 ) -> Variant {
     Variant {
         id: variant_id(label),
         name: label.into(),
-        configuration: Some(VariantConfiguration::StorageLevers {
-            levers: levers.clone(),
+        configuration: Some(match kind {
+            MatrixKind::Storage => {
+                VariantConfiguration::StorageLevers { levers: levers.clone() }
+            }
+            MatrixKind::Topology => {
+                VariantConfiguration::TopologyLevers { levers: levers.clone() }
+            }
         }),
         report_context: Some(VariantReportContext {
             expected_repeats: expected_repeats as u64,

@@ -394,8 +394,9 @@ fn load_evidence(path: &Path, limits: &Limits) -> Result<EvidenceEnvelope> {
 mod tests {
     use super::*;
     use crate::perftest::{
-        ComboAggregate, MATRIX_SCHEMA_VERSION, OxideAuthProviderMetadata,
-        OxideSessionMetadata, RepeatSample, WorkloadSpec,
+        ComboAggregate, MATRIX_SCHEMA_VERSION, MatrixKind,
+        OxideAuthProviderMetadata, OxideSessionMetadata, RepeatSample,
+        WorkloadSpec,
     };
     use std::collections::BTreeSet;
 
@@ -407,6 +408,7 @@ mod tests {
     ) -> MatrixRun {
         MatrixRun {
             schema_version: MATRIX_SCHEMA_VERSION,
+            kind: MatrixKind::Storage,
             name: name.into(),
             started: 1,
             ended: 2,

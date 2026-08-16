@@ -256,7 +256,7 @@ example:
 docs/run-perftest.sh run six-repeats \
   --workload api-disk-lifecycle \
   --repeat=6 \
-  --combos 'none;1;2;3;4;all'
+  --combos 'none;1;2;3;all'
 ```
 
 The script prints the results directory before running Voxel and creates it
@@ -373,24 +373,41 @@ after a nonzero matrix exit whenever a valid checkpoint exists. Automatic
 resume, workload-only retry, an append-only journal, and legacy artifact
 conversion are outside this contract.
 
-The default ladder tests `none`, `1`, `1+2`, `1+2+3`, and `all` (`1+2+3+4`):
+The default storage ladder tests `none`, `1`, `1+2`, and `all` (`1+2+3`):
 
 1. host `sync=disabled`;
 2. host compression and metadata tuning;
 3. guest ZFS tuning: the bounded tuner attempts `rpool` and every non-`rpool`
    pool it discovers, while matrix evidence verifies `rpool` and the
-   `oxi_*`/`oxp_*` pools; and
-4. reduced RSS participation.
+   `oxi_*`/`oxp_*` pools.
 
 Each combination is exact: named levers are enabled and omitted levers are
 disabled. `none` is therefore a true all-off baseline, including lever 3, and
-`all` enables all four. To test different combinations, add an explicit list
-such as `--combos "none;1;2;3;4;all"` to the same command.
+`all` enables all three. To test different combinations, add an explicit list
+such as `--combos "none;1;2;3;all"` to the same command.
+
+To measure RSS participation, run the independent topology experiment:
+
+```sh
+pfexec voxel perftest topology-matrix \
+  --rss-sleds 3 \
+  --workload api-disk-lifecycle \
+  --repeat 5 \
+  --json-out topology-levers.json \
+  --out topology-levers.csv \
+  --keep-going
+```
+
+`topology-matrix` compares the base storage configuration twice: once with all
+sleds participating in RSS and once with the requested reduced participant
+count. The command emits `TopologyLevers` evidence, so Cookout reports it
+separately from `StorageLevers`; it is never included in a storage
+recommendation.
 
 The matrix validates the Falcon drive scope and requested lever states itself;
 no separate sampling preflight is needed. Invoke `run` again with a suitable
 label rather than reusing a run directory. See `voxel perftest matrix --help`
-for controls such as RSS count and the current workload choices.
+and `voxel perftest topology-matrix --help` for the current controls.
 
 `voxel-init` is baked into the CP image. Rebuilding only the host `voxel` binary
 does not update guest-side lever behavior; after changing `voxel-init`, rebuild

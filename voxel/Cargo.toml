@@ -24,7 +24,7 @@ voxel-config = { path = "../voxel-config" }
 # Omicron's own RackInitializeRequest types and config-rss serialization,
 # pinned to the omicron commit voxel targets.
 rack-init-config.workspace = true
-cookout = { git = "https://github.com/oxidecomputer/cookout.git" }
+cookout = { path = "../../cookout-voxel" }
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"

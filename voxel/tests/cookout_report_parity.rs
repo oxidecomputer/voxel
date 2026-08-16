@@ -9,10 +9,10 @@ use std::process::Command;
 // currently locked dependency. Normalized-source digests below instead cover
 // the current Voxel typed/defaulted schema passed to the Cookout renderer.
 const RENDERER_ORACLE_GENERATION_COOKOUT_COMMIT: &str =
-    "d8f6d922dc8424c047b2858dcb18884d894da0c5";
+    "60ecf91bc13793d83a708dba3c6d96f648024efb";
 const RAW_FIXTURE_REVISION: &str = "3ed372e6168ae99c1e19a1d3fcc8f70cb41eccf2";
 const RENDERER_ORACLE_REVISION: &str =
-    "fcc9e8c2a1ac1e80278ef9e785da061cd5e0b144";
+    "60ecf91bc13793d83a708dba3c6d96f648024efb";
 
 struct Expected {
     name: &'static str,
@@ -27,50 +27,50 @@ struct Expected {
 const COMPLETE_SVGS: &[(&str, usize, &str)] = &[
     (
         "section-000-cohort-000-chart-000.svg",
-        1747,
-        "7a64a4d5dad0e8a2b4c67147a8dd8edee569d59ff4d7d4ed9685bc2cb5c69b0c",
+        2780,
+        "041fff9b8543bfee3fa0b66981e2b2dad662ccebe6ee29610ba2b8062c88d62e",
     ),
     (
         "section-000-cohort-000-chart-001.svg",
-        1679,
-        "7dab7d62a17f5bbd3e680a48009ef05558a1b88eaee0266eb515cf0a927ce855",
+        2615,
+        "dc90fe3dc33c4c9906cbbcb2b4d2ec8b35f1fffacb468446682d2a16129690be",
     ),
     (
         "section-000-cohort-000-chart-002.svg",
-        1725,
-        "b6132b11067914f4f22bd8f39e0f03090af7392303be0331c2fbe16beb9a6267",
+        2414,
+        "db9dbde24ad64956b4a45a002a310e223490df34cc981bfb23cf9ea3503faeda",
     ),
     (
         "section-000-cohort-000-chart-003.svg",
-        1737,
-        "cf070dbf8e50c2fcc5b67abf8d696b0d5ab305d7ba59a9da347b998b3ad48028",
+        2746,
+        "3845551009ea39d5be7b5ec7a4c35a06293885345d6c212356cc6095ec0b78cc",
     ),
     (
         "section-000-cohort-000-chart-004.svg",
-        1677,
-        "2a21296e8aae7b2c29fca9b13444edb034c28222ab4399241b4f0008735e2f81",
+        2353,
+        "d0ccb7ad3b50490bdfb55cae36de3edc436286d99978363519a25804128b890d",
     ),
     (
         "section-000-cohort-000-chart-005.svg",
-        1665,
-        "3e1c80190ff0513c56b0e4ca1ef3b1dbab3c4e85fbc5a272b3a701d67117cfe0",
+        2581,
+        "02552066f2530259b92ec1083b4448317d1bc16428c96bdb2740ef15d044b666",
     ),
 ];
 const PARTIAL_SVGS: &[(&str, usize, &str)] = &[
     (
         "section-000-cohort-000-chart-000.svg",
-        1747,
-        "7a64a4d5dad0e8a2b4c67147a8dd8edee569d59ff4d7d4ed9685bc2cb5c69b0c",
+        2780,
+        "041fff9b8543bfee3fa0b66981e2b2dad662ccebe6ee29610ba2b8062c88d62e",
     ),
     (
         "section-000-cohort-000-chart-001.svg",
-        1679,
-        "7dab7d62a17f5bbd3e680a48009ef05558a1b88eaee0266eb515cf0a927ce855",
+        2615,
+        "dc90fe3dc33c4c9906cbbcb2b4d2ec8b35f1fffacb468446682d2a16129690be",
     ),
     (
         "section-000-cohort-000-chart-002.svg",
-        1725,
-        "b6132b11067914f4f22bd8f39e0f03090af7392303be0331c2fbe16beb9a6267",
+        2414,
+        "db9dbde24ad64956b4a45a002a310e223490df34cc981bfb23cf9ea3503faeda",
     ),
 ];
 const CASES: &[Expected] = &[
@@ -211,7 +211,7 @@ fn verify_manifest(directory: &Path) {
 fn raw_voxel_fixtures_match_the_reviewed_cookout_report_oracle() {
     assert_eq!(
         RENDERER_ORACLE_GENERATION_COOKOUT_COMMIT,
-        "d8f6d922dc8424c047b2858dcb18884d894da0c5"
+        "60ecf91bc13793d83a708dba3c6d96f648024efb"
     );
     assert_eq!(
         RAW_FIXTURE_REVISION,
@@ -219,7 +219,7 @@ fn raw_voxel_fixtures_match_the_reviewed_cookout_report_oracle() {
     );
     assert_eq!(
         RENDERER_ORACLE_REVISION,
-        "fcc9e8c2a1ac1e80278ef9e785da061cd5e0b144"
+        "60ecf91bc13793d83a708dba3c6d96f648024efb"
     );
     let root = tempfile::tempdir().unwrap();
     let mut archives = Vec::new();
