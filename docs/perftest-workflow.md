@@ -577,7 +577,7 @@ output. The Cookout library also exposes an explicit partial-acceptance policy
 for consumers that want rejected siblings recorded while valid evidence is
 aggregated. Output directories and sibling archives are never overwritten.
 
-Superreports replay the `cookout.evidence.v1` evidence inventoried in Cookout
+Superreports replay the `cookout.evidence` evidence inventoried in Cookout
 archives. Those archives retain sanitized, replayable Voxel source rather than
 byte-for-byte raw matrix JSON. Future compatible adapters can renormalize the
 retained fields, but cannot recover fields sanitized or discarded by the
@@ -634,7 +634,7 @@ experiments.
   same isolated temporary recovery-silo profile as matrix; use
   `--oxide-auth-helper` when the configured recovery credentials require it.
 
-Cookout's standalone CLI accepts replayable `cookout.evidence.v1` envelopes
+Cookout's standalone CLI accepts replayable `cookout.evidence` envelopes
 only, rather than raw Voxel checkpoints. These portable commands expose
 Cookout's native validation, publication, aggregation, and comparison interfaces
 on an ordinary host; their output and comparison semantics are not identical to

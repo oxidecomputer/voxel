@@ -22,6 +22,12 @@ struct Expected {
     candidates: usize,
     successful_repeats: &'static [usize],
     svgs: &'static [(&'static str, usize, &'static str)],
+    execution_state: &'static str,
+    run_outcomes: [usize; 3],
+    phase_statuses: [usize; 4],
+    capabilities: usize,
+    issues: usize,
+    metrics: usize,
 }
 
 const COMPLETE_SVGS: &[(&str, usize, &str)] = &[
@@ -82,6 +88,12 @@ const CASES: &[Expected] = &[
         candidates: 1,
         successful_repeats: &[1],
         svgs: COMPLETE_SVGS,
+        execution_state: "completed",
+        run_outcomes: [1, 0, 0],
+        phase_statuses: [5, 0, 0, 0],
+        capabilities: 0,
+        issues: 1,
+        metrics: 6,
     },
     Expected {
         name: "partial",
@@ -91,6 +103,12 @@ const CASES: &[Expected] = &[
         candidates: 1,
         successful_repeats: &[0],
         svgs: PARTIAL_SVGS,
+        execution_state: "running",
+        run_outcomes: [0, 1, 1],
+        phase_statuses: [4, 5, 1, 0],
+        capabilities: 0,
+        issues: 3,
+        metrics: 3,
     },
     Expected {
         name: "failed",
@@ -100,6 +118,12 @@ const CASES: &[Expected] = &[
         candidates: 2,
         successful_repeats: &[0, 0],
         svgs: &[],
+        execution_state: "failed",
+        run_outcomes: [0, 0, 2],
+        phase_statuses: [6, 2, 2, 0],
+        capabilities: 0,
+        issues: 4,
+        metrics: 6,
     },
     Expected {
         name: "checkpoint",
@@ -109,6 +133,12 @@ const CASES: &[Expected] = &[
         candidates: 1,
         successful_repeats: &[0],
         svgs: &[],
+        execution_state: "running",
+        run_outcomes: [0, 0, 1],
+        phase_statuses: [1, 1, 1, 2],
+        capabilities: 0,
+        issues: 3,
+        metrics: 0,
     },
 ];
 
@@ -204,6 +234,268 @@ fn verify_manifest(directory: &Path) {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+}
+
+fn echarts_options(html: &str) -> Vec<Value> {
+    let mut options = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = html[offset..].find("setOption(") {
+        let call = offset + relative + "setOption(".len();
+        let start = call
+            + html[call..]
+                .find(|character: char| !character.is_whitespace())
+                .unwrap();
+        if !matches!(html.as_bytes()[start], b'{' | b'[')
+            || (html.as_bytes()[start] == b'{'
+                && html.as_bytes().get(start + 1) != Some(&b'"'))
+        {
+            offset = call;
+            continue;
+        }
+        let bytes = html.as_bytes();
+        let mut stack = Vec::new();
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (index, byte) in bytes.iter().enumerate().skip(start) {
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if *byte == b'\\' {
+                    escaped = true;
+                } else if *byte == b'"' {
+                    quoted = false;
+                }
+                continue;
+            }
+            match *byte {
+                b'"' => quoted = true,
+                b'{' => stack.push(b'}'),
+                b'[' => stack.push(b']'),
+                b'}' | b']' => {
+                    assert_eq!(stack.pop(), Some(*byte));
+                    if stack.is_empty() {
+                        end = Some(index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.expect("balanced literal setOption JSON");
+        options.push(serde_json::from_str(&html[start..end]).unwrap());
+        offset = end;
+    }
+    options
+}
+
+fn artifact_names(directory: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn assert_publications_equal(first: &Path, second: &Path) {
+    let names = artifact_names(first);
+    assert_eq!(names, artifact_names(second));
+    for name in names {
+        assert_eq!(
+            fs::read(first.join(&name)).unwrap(),
+            fs::read(second.join(&name)).unwrap(),
+            "deterministic artifact {name}"
+        );
+    }
+}
+
+#[test]
+fn neutral_cookout_report_preserves_experiment_evidence_and_publication() {
+    let root = tempfile::tempdir().unwrap();
+
+    for expected in CASES {
+        let input_path = fixture(expected.name);
+        let first = root.path().join(format!("{}-first", expected.name));
+        let second = root.path().join(format!("{}-second", expected.name));
+        for output in [&first, &second] {
+            voxel(&[
+                Path::new("report"),
+                &input_path,
+                Path::new("--out"),
+                output,
+                Path::new("--archive"),
+            ]);
+        }
+
+        let report: Value = serde_json::from_slice(
+            &fs::read(first.join("report.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["schema"], "cookout.report");
+        assert!(report.get("view").is_none());
+        assert_eq!(
+            report["inputs"][0]["identity"]["name"],
+            "Voxel performance report"
+        );
+        assert_eq!(
+            report["experiments"][0]["variants"].as_array().unwrap().len(),
+            expected.candidates
+        );
+        let input = &report["inputs"][0];
+        assert_eq!(
+            input["variants"].as_array().unwrap().len(),
+            expected.candidates
+        );
+        assert_eq!(input["provenance"]["producer"], "oxide.voxel");
+        assert_eq!(
+            input["extensions"]["oxide.voxel"]["execution_state"],
+            expected.execution_state
+        );
+        for variant in input["variants"].as_array().unwrap() {
+            assert!(variant["planned_runs"].as_u64().is_some());
+            assert!(
+                variant["dimensions"]["oxide.voxel.matrix_kind"]["value"]
+                    .is_string()
+            );
+            assert!(
+                variant["dimensions"]["oxide.voxel.levers"]["value"]
+                    .is_string()
+            );
+        }
+        for run in input["runs"].as_array().unwrap() {
+            assert!(
+                run["extensions"]["oxide.voxel"]["workload_disposition"]
+                    .is_string()
+            );
+            assert_eq!(run["phases"].as_array().unwrap().len(), 5);
+        }
+        assert_eq!(
+            input["capabilities"].as_array().unwrap().len(),
+            expected.capabilities
+        );
+        let constraints = input["target"]["constraints"].as_array().unwrap();
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(constraints[0]["capability"], "matrix_host_storage_scope");
+        assert_eq!(
+            constraints[1]["capability"],
+            "clean_launch_teardown_boundaries"
+        );
+
+        let outcomes = ["completed", "incomplete", "failed"].map(|status| {
+            input["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|run| run["outcome"] == status)
+                .count()
+        });
+        assert_eq!(
+            outcomes, expected.run_outcomes,
+            "{} outcomes",
+            expected.name
+        );
+        let phase_statuses =
+            ["completed", "incomplete", "failed", "not_executed"].map(
+                |status| {
+                    input["runs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|run| run["phases"].as_array().unwrap())
+                        .filter(|phase| phase["status"] == status)
+                        .count()
+                },
+            );
+        assert_eq!(
+            phase_statuses, expected.phase_statuses,
+            "{} phases",
+            expected.name
+        );
+        assert_eq!(report["issues"].as_array().unwrap().len(), expected.issues);
+        if matches!(expected.name, "failed" | "partial" | "checkpoint") {
+            assert!(
+                report["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue["impact"] == "blocking")
+            );
+        }
+        if matches!(expected.name, "partial" | "checkpoint") {
+            assert!(phase_statuses[1] > 0);
+            assert!(
+                report["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|issue| issue["code"]
+                        == "oxide.voxel.perftest.repeat_pending")
+            );
+        }
+
+        let metric_count: usize = report["cohorts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cohort| cohort["metrics"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(metric_count, expected.metrics);
+        let first_options = echarts_options(
+            &fs::read_to_string(first.join("report.html")).unwrap(),
+        );
+        let second_options = echarts_options(
+            &fs::read_to_string(second.join("report.html")).unwrap(),
+        );
+        assert_eq!(first_options.len(), expected.metrics);
+        assert_eq!(first_options, second_options);
+
+        let serialized =
+            String::from_utf8(fs::read(first.join("report.json")).unwrap())
+                .unwrap()
+                .to_lowercase();
+        for sensitive in [
+            "token",
+            "password",
+            "authorization",
+            "bearer ",
+            "api_key",
+            "private_key",
+            "ssh ",
+            "omdb ",
+            "helper command",
+        ] {
+            assert!(
+                !serialized.contains(sensitive),
+                "{} exposed {sensitive}",
+                expected.name
+            );
+        }
+        let svg_names = artifact_names(&first)
+            .into_iter()
+            .filter(|name| name.ends_with(".svg"))
+            .collect::<Vec<_>>();
+        assert_eq!(svg_names.len(), expected.metrics);
+        for (metric, name) in svg_names.iter().enumerate() {
+            assert_eq!(name, &format!("cohort-000-metric-{metric:03}.svg"));
+            let svg = fs::read_to_string(first.join(name)).unwrap();
+            assert!(svg.starts_with("<svg "));
+            assert!(svg.contains("role=\"img\""));
+            assert!(svg.contains("x-axis") && svg.contains("y-axis"));
+            assert!(!svg.to_lowercase().contains("<script"));
+            assert!(!svg.contains("NaN") && !svg.contains("Infinity"));
+        }
+        assert_publications_equal(&first, &second);
+        verify_manifest(&first);
+        verify_manifest(&second);
+        let evidence: Value = serde_json::from_slice(
+            &fs::read(first.join("evidence-0000.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence["schema"], "cookout.evidence");
     }
 }
 
