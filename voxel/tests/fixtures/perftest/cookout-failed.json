@@ -1,111 +1,411 @@
 {
-  "variants": [
-    "levers-none",
-    "levers-1"
-  ],
-  "runs": [
+  "capabilities": [],
+  "constraints": [
     {
-      "id": "levers-none-repeat-1",
-      "outcome": "failed",
-      "phases": [
-        {
-          "name": "pre-boundary",
-          "status": "completed",
-          "metrics": []
-        },
-        {
-          "name": "launch",
-          "status": "failed",
-          "metrics": []
-        },
-        {
-          "name": "preparation",
-          "status": "incomplete",
-          "metrics": []
-        },
-        {
-          "name": "workload",
-          "status": "incomplete",
-          "metrics": []
-        },
-        {
-          "name": "cleanup",
-          "status": "completed",
-          "metrics": []
-        }
-      ],
-      "guardrail": null
+      "capability": "matrix_host_storage_scope",
+      "constraint_kind": "capability",
+      "required": true
     },
     {
-      "id": "levers-1-repeat-1",
-      "outcome": "failed",
-      "phases": [
-        {
-          "name": "pre-boundary",
-          "status": "completed",
-          "metrics": []
-        },
-        {
-          "name": "launch",
-          "status": "completed",
-          "metrics": [
-            "launch.bytes_written",
-            "launch.duration",
-            "launch.peak_ram_delta"
-          ]
-        },
-        {
-          "name": "preparation",
-          "status": "completed",
-          "metrics": []
-        },
-        {
-          "name": "workload",
-          "status": "completed",
-          "metrics": [
-            "workload.bytes_written",
-            "workload.duration",
-            "workload.peak_ram_delta"
-          ]
-        },
-        {
-          "name": "cleanup",
-          "status": "failed",
-          "metrics": []
-        }
-      ],
-      "guardrail": null
+      "capability": "clean_launch_teardown_boundaries",
+      "constraint_kind": "capability",
+      "required": true
     }
   ],
-  "target_dimensions": {
-    "cpu": null,
-    "memory": null,
-    "storage": null,
-    "devices": null,
-    "network": null,
-    "namespaced": {
-      "oxide.rss_sleds": {
-        "kind": "count",
-        "value": 3
+  "document_extensions": {
+    "oxide.voxel": {
+      "abort_error": "synthetic matrix stopped after cleanup failure",
+      "adapter_version": 2,
+      "conditions": [
+        {
+          "code": false,
+          "label": "RSS sleds",
+          "value": "3"
+        },
+        {
+          "code": false,
+          "label": "Combinations",
+          "value": "none → 1"
+        },
+        {
+          "code": false,
+          "label": "Workload",
+          "value": "API disk lifecycle — 20 disks, parallelism 4, 1 GiB each, snapshots disabled"
+        },
+        {
+          "code": false,
+          "label": "Oxide session",
+          "value": "not supplied"
+        },
+        {
+          "code": false,
+          "label": "Capability contract version",
+          "value": "not supplied"
+        },
+        {
+          "code": false,
+          "label": "Launch memory semantics",
+          "value": "Launch baseline-adjusted delta"
+        },
+        {
+          "code": false,
+          "label": "Workload memory semantics",
+          "value": "Workload baseline-adjusted delta"
+        },
+        {
+          "code": false,
+          "label": "Provenance",
+          "value": "unavailable"
+        },
+        {
+          "code": true,
+          "label": "Source",
+          "value": "matrix-failed-v5.json"
+        },
+        {
+          "code": true,
+          "label": "Run ID",
+          "value": "synthetic-rack"
+        }
+      ],
+      "execution_state": "failed",
+      "matrix_kind": "storage",
+      "planned_repeats": 2,
+      "provenance_state": "unavailable",
+      "source_display": "matrix-failed-v5.json",
+      "workload": {
+        "count": 20,
+        "parallel": 4,
+        "size_bytes": 1073741824,
+        "snapshot": false
       }
     }
   },
-  "constraints": [
-    {
-      "constraint_kind": "capability",
-      "capability": "matrix_host_storage_scope",
-      "required": true
-    },
-    {
-      "constraint_kind": "capability",
-      "capability": "clean_launch_teardown_boundaries",
-      "required": true
-    }
-  ],
   "extensions": {
     "oxide.voxel": {
       "capabilities": null,
       "session": null
     }
-  }
+  },
+  "runs": [
+    {
+      "extensions": {
+        "oxide.voxel": {
+          "boundary_failure": null,
+          "display_id": "synthetic-rack",
+          "launch_failure": "synthetic launch attempt one failed; synthetic launch attempt two failed",
+          "launch_memory_semantics": null,
+          "preparation_failure": null,
+          "prior_launch_attempt_failures": [],
+          "workload_disposition": "blocked",
+          "workload_failure": null,
+          "workload_memory_semantics": null
+        }
+      },
+      "guardrail": null,
+      "id": "levers-none-repeat-1",
+      "outcome": "failed",
+      "phases": [
+        {
+          "metrics": [],
+          "name": "pre-boundary",
+          "status": "completed"
+        },
+        {
+          "metrics": [],
+          "name": "launch",
+          "status": "failed"
+        },
+        {
+          "metrics": [],
+          "name": "preparation",
+          "status": "incomplete"
+        },
+        {
+          "metrics": [],
+          "name": "workload",
+          "status": "incomplete"
+        },
+        {
+          "metrics": [],
+          "name": "cleanup",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "extensions": {
+        "oxide.voxel": {
+          "boundary_failure": "synthetic cleanup boundary failed",
+          "display_id": "synthetic-rack",
+          "launch_failure": null,
+          "launch_memory_semantics": "launch-baseline-delta",
+          "preparation_failure": null,
+          "prior_launch_attempt_failures": [],
+          "workload_disposition": "succeeded",
+          "workload_failure": null,
+          "workload_memory_semantics": "workload-baseline-delta"
+        }
+      },
+      "guardrail": null,
+      "id": "levers-1-repeat-1",
+      "outcome": "failed",
+      "phases": [
+        {
+          "metrics": [],
+          "name": "pre-boundary",
+          "status": "completed"
+        },
+        {
+          "metrics": [
+            "launch.bytes_written",
+            "launch.duration",
+            "launch.peak_ram_delta"
+          ],
+          "name": "launch",
+          "status": "completed"
+        },
+        {
+          "metrics": [],
+          "name": "preparation",
+          "status": "completed"
+        },
+        {
+          "metrics": [
+            "workload.bytes_written",
+            "workload.duration",
+            "workload.peak_ram_delta"
+          ],
+          "name": "workload",
+          "status": "completed"
+        },
+        {
+          "metrics": [],
+          "name": "cleanup",
+          "status": "failed"
+        }
+      ]
+    }
+  ],
+  "target_dimensions": {
+    "cpu": null,
+    "devices": null,
+    "memory": null,
+    "namespaced": {
+      "oxide.rss_sleds": {
+        "kind": "count",
+        "value": 3
+      }
+    },
+    "network": null,
+    "storage": null
+  },
+  "variants": [
+    {
+      "dimensions": {
+        "oxide.voxel.levers": {
+          "kind": "text",
+          "value": "none"
+        },
+        "oxide.voxel.matrix_kind": {
+          "kind": "text",
+          "value": "storage"
+        }
+      },
+      "extensions": {
+        "oxide.voxel": {
+          "effective_configuration": {
+            "disk_wear": {
+              "guest_zfs_tuning": false,
+              "host_compression": false,
+              "host_sync_disabled": false
+            },
+            "falcon": {
+              "build_root": null,
+              "dataset": null,
+              "workdir": null
+            },
+            "image": {
+              "cp": null,
+              "data_links_schema": null,
+              "disks_schema": null,
+              "frr": null,
+              "version": "proto"
+            },
+            "network": {
+              "bgp_asn": 65000,
+              "dns_servers": [
+                "1.1.1.1",
+                "9.9.9.9"
+              ],
+              "dns_zone": "oxide.test",
+              "external_dns_ips": [
+                "198.51.100.20",
+                "198.51.100.21"
+              ],
+              "infra_prefix": "198.51.100.0/24",
+              "ntp_servers": [
+                "time.cloudflare.com"
+              ],
+              "rack_subnet": "fd00:17:01:d00::/56",
+              "router_mode": "bgp",
+              "service_pool_first": "198.51.100.20",
+              "service_pool_last": "198.51.100.29",
+              "transit_bfd": false,
+              "transit_prefix": "198.51.101.0/24",
+              "uplinks": [
+                {
+                  "lldp_port_description": "uplink0",
+                  "peer_asn": 65000,
+                  "port": "qsfp0",
+                  "port_speed": "40G",
+                  "router_lifetime": 300,
+                  "switch": "switch0"
+                },
+                {
+                  "lldp_port_description": "uplink1",
+                  "peer_asn": 65000,
+                  "port": "qsfp0",
+                  "port_speed": "40G",
+                  "router_lifetime": 300,
+                  "switch": "switch1"
+                }
+              ]
+            },
+            "recovery_silo": {
+              "silo_name": "recovery",
+              "user_name": "recovery"
+            },
+            "sp": {
+              "emu": [],
+              "emu_bin": null,
+              "faux_mgs": null,
+              "gimlet_image": null,
+              "rot_image": null,
+              "sidecar_image": null
+            },
+            "topology": {
+              "racks": 1,
+              "router_memory_gb": 4,
+              "routers": [
+                "ce",
+                "cr1",
+                "cr2"
+              ],
+              "rss_sleds": 0,
+              "scrimlets": [],
+              "sled_memory_gb": 8,
+              "sleds": 4
+            }
+          }
+        }
+      },
+      "id": "levers-none",
+      "name": "none",
+      "planned_runs": 1
+    },
+    {
+      "dimensions": {
+        "oxide.voxel.levers": {
+          "kind": "text",
+          "value": "1"
+        },
+        "oxide.voxel.matrix_kind": {
+          "kind": "text",
+          "value": "storage"
+        }
+      },
+      "extensions": {
+        "oxide.voxel": {
+          "effective_configuration": {
+            "disk_wear": {
+              "guest_zfs_tuning": false,
+              "host_compression": false,
+              "host_sync_disabled": false
+            },
+            "falcon": {
+              "build_root": null,
+              "dataset": null,
+              "workdir": null
+            },
+            "image": {
+              "cp": null,
+              "data_links_schema": null,
+              "disks_schema": null,
+              "frr": null,
+              "version": "proto"
+            },
+            "network": {
+              "bgp_asn": 65000,
+              "dns_servers": [
+                "1.1.1.1",
+                "9.9.9.9"
+              ],
+              "dns_zone": "oxide.test",
+              "external_dns_ips": [
+                "198.51.100.20",
+                "198.51.100.21"
+              ],
+              "infra_prefix": "198.51.100.0/24",
+              "ntp_servers": [
+                "time.cloudflare.com"
+              ],
+              "rack_subnet": "fd00:17:01:d00::/56",
+              "router_mode": "bgp",
+              "service_pool_first": "198.51.100.20",
+              "service_pool_last": "198.51.100.29",
+              "transit_bfd": false,
+              "transit_prefix": "198.51.101.0/24",
+              "uplinks": [
+                {
+                  "lldp_port_description": "uplink0",
+                  "peer_asn": 65000,
+                  "port": "qsfp0",
+                  "port_speed": "40G",
+                  "router_lifetime": 300,
+                  "switch": "switch0"
+                },
+                {
+                  "lldp_port_description": "uplink1",
+                  "peer_asn": 65000,
+                  "port": "qsfp0",
+                  "port_speed": "40G",
+                  "router_lifetime": 300,
+                  "switch": "switch1"
+                }
+              ]
+            },
+            "recovery_silo": {
+              "silo_name": "recovery",
+              "user_name": "recovery"
+            },
+            "sp": {
+              "emu": [],
+              "emu_bin": null,
+              "faux_mgs": null,
+              "gimlet_image": null,
+              "rot_image": null,
+              "sidecar_image": null
+            },
+            "topology": {
+              "racks": 1,
+              "router_memory_gb": 4,
+              "routers": [
+                "ce",
+                "cr1",
+                "cr2"
+              ],
+              "rss_sleds": 0,
+              "scrimlets": [],
+              "sled_memory_gb": 8,
+              "sleds": 4
+            }
+          }
+        }
+      },
+      "id": "levers-1",
+      "name": "1",
+      "planned_runs": 1
+    }
+  ]
 }

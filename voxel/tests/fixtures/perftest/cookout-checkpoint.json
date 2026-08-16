@@ -1,70 +1,250 @@
 {
-  "variants": [
-    "levers-none"
-  ],
-  "runs": [
-    {
-      "id": "levers-none-repeat-1",
-      "outcome": "failed",
-      "phases": [
-        {
-          "name": "pre-boundary",
-          "status": "completed",
-          "metrics": []
-        },
-        {
-          "name": "launch",
-          "status": "failed",
-          "metrics": []
-        },
-        {
-          "name": "preparation",
-          "status": "not_executed",
-          "metrics": []
-        },
-        {
-          "name": "workload",
-          "status": "not_executed",
-          "metrics": []
-        },
-        {
-          "name": "cleanup",
-          "status": "incomplete",
-          "metrics": []
-        }
-      ],
-      "guardrail": null
-    }
-  ],
-  "target_dimensions": {
-    "cpu": null,
-    "memory": null,
-    "storage": null,
-    "devices": null,
-    "network": null,
-    "namespaced": {
-      "oxide.rss_sleds": {
-        "kind": "count",
-        "value": 3
-      }
-    }
-  },
+  "capabilities": [],
   "constraints": [
     {
-      "constraint_kind": "capability",
       "capability": "matrix_host_storage_scope",
+      "constraint_kind": "capability",
       "required": true
     },
     {
-      "constraint_kind": "capability",
       "capability": "clean_launch_teardown_boundaries",
+      "constraint_kind": "capability",
       "required": true
     }
   ],
+  "document_extensions": {
+    "oxide.voxel": {
+      "abort_error": null,
+      "adapter_version": 2,
+      "conditions": [
+        {
+          "code": false,
+          "label": "RSS sleds",
+          "value": "3"
+        },
+        {
+          "code": false,
+          "label": "Combinations",
+          "value": "none"
+        },
+        {
+          "code": false,
+          "label": "Workload",
+          "value": "Not requested"
+        },
+        {
+          "code": false,
+          "label": "Oxide session",
+          "value": "not supplied"
+        },
+        {
+          "code": false,
+          "label": "Capability contract version",
+          "value": "not supplied"
+        },
+        {
+          "code": false,
+          "label": "Launch memory semantics",
+          "value": "Launch baseline-adjusted delta"
+        },
+        {
+          "code": false,
+          "label": "Workload memory semantics",
+          "value": "Not applicable"
+        },
+        {
+          "code": false,
+          "label": "Provenance",
+          "value": "unavailable"
+        },
+        {
+          "code": true,
+          "label": "Source",
+          "value": "checkpoint-in-progress-v5.json"
+        },
+        {
+          "code": true,
+          "label": "Run ID",
+          "value": "synthetic-rack"
+        }
+      ],
+      "execution_state": "running",
+      "matrix_kind": "storage",
+      "planned_repeats": 1,
+      "provenance_state": "unavailable",
+      "source_display": "checkpoint-in-progress-v5.json",
+      "workload": null
+    }
+  },
   "extensions": {
     "oxide.voxel": {
       "capabilities": null,
       "session": null
     }
-  }
+  },
+  "runs": [
+    {
+      "extensions": {
+        "oxide.voxel": {
+          "boundary_failure": null,
+          "display_id": "synthetic-rack",
+          "launch_failure": "synthetic launch attempt is awaiting cleanup",
+          "launch_memory_semantics": null,
+          "preparation_failure": null,
+          "prior_launch_attempt_failures": [],
+          "workload_disposition": "not_requested",
+          "workload_failure": null,
+          "workload_memory_semantics": null
+        }
+      },
+      "guardrail": null,
+      "id": "levers-none-repeat-1",
+      "outcome": "failed",
+      "phases": [
+        {
+          "metrics": [],
+          "name": "pre-boundary",
+          "status": "completed"
+        },
+        {
+          "metrics": [],
+          "name": "launch",
+          "status": "failed"
+        },
+        {
+          "metrics": [],
+          "name": "preparation",
+          "status": "not_executed"
+        },
+        {
+          "metrics": [],
+          "name": "workload",
+          "status": "not_executed"
+        },
+        {
+          "metrics": [],
+          "name": "cleanup",
+          "status": "incomplete"
+        }
+      ]
+    }
+  ],
+  "target_dimensions": {
+    "cpu": null,
+    "devices": null,
+    "memory": null,
+    "namespaced": {
+      "oxide.rss_sleds": {
+        "kind": "count",
+        "value": 3
+      }
+    },
+    "network": null,
+    "storage": null
+  },
+  "variants": [
+    {
+      "dimensions": {
+        "oxide.voxel.levers": {
+          "kind": "text",
+          "value": "none"
+        },
+        "oxide.voxel.matrix_kind": {
+          "kind": "text",
+          "value": "storage"
+        }
+      },
+      "extensions": {
+        "oxide.voxel": {
+          "effective_configuration": {
+            "disk_wear": {
+              "guest_zfs_tuning": false,
+              "host_compression": false,
+              "host_sync_disabled": false
+            },
+            "falcon": {
+              "build_root": null,
+              "dataset": null,
+              "workdir": null
+            },
+            "image": {
+              "cp": null,
+              "data_links_schema": null,
+              "disks_schema": null,
+              "frr": null,
+              "version": "proto"
+            },
+            "network": {
+              "bgp_asn": 65000,
+              "dns_servers": [
+                "1.1.1.1",
+                "9.9.9.9"
+              ],
+              "dns_zone": "oxide.test",
+              "external_dns_ips": [
+                "198.51.100.20",
+                "198.51.100.21"
+              ],
+              "infra_prefix": "198.51.100.0/24",
+              "ntp_servers": [
+                "time.cloudflare.com"
+              ],
+              "rack_subnet": "fd00:17:01:d00::/56",
+              "router_mode": "bgp",
+              "service_pool_first": "198.51.100.20",
+              "service_pool_last": "198.51.100.29",
+              "transit_bfd": false,
+              "transit_prefix": "198.51.101.0/24",
+              "uplinks": [
+                {
+                  "lldp_port_description": "uplink0",
+                  "peer_asn": 65000,
+                  "port": "qsfp0",
+                  "port_speed": "40G",
+                  "router_lifetime": 300,
+                  "switch": "switch0"
+                },
+                {
+                  "lldp_port_description": "uplink1",
+                  "peer_asn": 65000,
+                  "port": "qsfp0",
+                  "port_speed": "40G",
+                  "router_lifetime": 300,
+                  "switch": "switch1"
+                }
+              ]
+            },
+            "recovery_silo": {
+              "silo_name": "recovery",
+              "user_name": "recovery"
+            },
+            "sp": {
+              "emu": [],
+              "emu_bin": null,
+              "faux_mgs": null,
+              "gimlet_image": null,
+              "rot_image": null,
+              "sidecar_image": null
+            },
+            "topology": {
+              "racks": 1,
+              "router_memory_gb": 4,
+              "routers": [
+                "ce",
+                "cr1",
+                "cr2"
+              ],
+              "rss_sleds": 0,
+              "scrimlets": [],
+              "sled_memory_gb": 8,
+              "sleds": 4
+            }
+          }
+        }
+      },
+      "id": "levers-none",
+      "name": "none",
+      "planned_runs": 1
+    }
+  ]
 }

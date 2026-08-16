@@ -6572,7 +6572,7 @@ mod tests {
             &std::fs::read(out.join("report.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(report["schema"], "cookout.report.v2");
+        assert_eq!(report["schema"], "cookout.report");
         assert!(
             report["issues"]
                 .as_array()
@@ -6596,7 +6596,7 @@ mod tests {
             &std::fs::read(out.join("evidence-0000.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(retained["schema"], "cookout.evidence.v1");
+        assert_eq!(retained["schema"], "cookout.evidence");
         assert_eq!(retained["adapter"]["id"], "oxide.voxel.perftest");
         assert_eq!(
             retained["source"]["value"]["source_schema"],
@@ -6704,12 +6704,12 @@ mod tests {
         assert_eq!(report["aggregation"]["unique_input_count"], 1);
         assert_eq!(report["aggregation"]["duplicate_count"], 1);
         assert_eq!(report["aggregation"]["normalization"], "adapter_replay");
-        assert_eq!(report["schema"], "cookout.report.v2");
+        assert_eq!(report["schema"], "cookout.report");
         let retained: Value = serde_json::from_slice(
             &std::fs::read(out.join("evidence-0000.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(retained["schema"], "cookout.evidence.v1");
+        assert_eq!(retained["schema"], "cookout.evidence");
         assert_eq!(retained["adapter"]["id"], "oxide.voxel.perftest");
         assert!(root.path().join("aggregate.tar.gz").is_file());
     }
@@ -6717,22 +6717,32 @@ mod tests {
     #[test]
     fn cookout_adapter_maps_complete_checkpoint_contract() {
         let source = Path::new("matrix-complete-v5.json");
+        let mut checkpoint = checkpoint_with_complete_cohort_evidence();
+        checkpoint.repeat = 2;
         let document = cookout_adapter::matrix_checkpoint_to_experiment(
-            &schema_v5_fixture("matrix-complete-v5.json"),
+            &checkpoint,
             source,
         )
         .unwrap();
         assert_eq!(document.variants.len(), 1);
         assert_eq!(document.runs.len(), 1);
+        assert_eq!(document.variants[0].planned_runs, Some(2));
         assert_eq!(
-            document.variants[0].configuration,
-            Some(cookout::model::VariantConfiguration::StorageLevers {
-                levers: BTreeSet::new(),
-            })
+            document.variants[0].dimensions["oxide.voxel.matrix_kind"],
+            cookout::model::DimensionValue::Text("storage".into())
         );
+        assert_eq!(
+            document.variants[0].dimensions["oxide.voxel.levers"],
+            cookout::model::DimensionValue::Text("none".into())
+        );
+        assert_eq!(document.capabilities.len(), 4);
         assert_eq!(
             document.runs[0].outcome,
             cookout::model::RunOutcome::Completed
+        );
+        assert_eq!(
+            document.extensions["oxide.voxel"]["execution_state"],
+            "completed"
         );
         assert!(document.runs[0]
             .phases
@@ -7065,12 +7075,14 @@ mod tests {
             Path::new("completed-with-failures-v5.json"),
         )
         .unwrap();
-        let context = document.report_context.as_ref().unwrap();
         assert_eq!(
-            context.execution_state,
-            cookout::model::ExecutionState::Completed
+            document.extensions["oxide.voxel"]["execution_state"],
+            "completed"
         );
-        assert_eq!(context.abort_error, None);
+        assert_eq!(
+            document.extensions["oxide.voxel"]["abort_error"],
+            Value::Null
+        );
         assert!(
             document
                 .runs
@@ -7092,7 +7104,7 @@ mod tests {
                     && value.len() == "v1:sha256:".len() + 64
         ));
         let actual = json!({
-            "variants": document.variants.iter().map(|variant| &variant.id).collect::<Vec<_>>(),
+            "variants": document.variants,
             "runs": document.runs.iter().map(|run| json!({
                 "id": run.id,
                 "outcome": run.outcome,
@@ -7102,12 +7114,15 @@ mod tests {
                     "metrics": phase.observations.iter().map(|observation| &observation.metric).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
                 "guardrail": run.guardrail,
+                "extensions": run.extensions,
             })).collect::<Vec<_>>(),
             // The opaque cohort is covered independently because its digest deliberately
             // changes whenever the cohort identity contract changes.
             "target_dimensions": target_dimensions,
             "constraints": document.target.constraints,
             "extensions": document.target.extensions,
+            "capabilities": document.capabilities,
+            "document_extensions": document.extensions,
         });
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/perftest")
@@ -7148,36 +7163,30 @@ mod tests {
     }
 
     #[test]
-    fn cookout_adapter_preserves_typed_report_context() {
+    fn cookout_adapter_preserves_voxel_extension_context() {
         let cases = [
-            (
-                "matrix-complete-v5.json",
-                cookout::model::ExecutionState::Completed,
-                1,
-                cookout::model::WorkloadDisposition::Succeeded,
-                None,
-            ),
+            ("matrix-complete-v5.json", "completed", 1, "succeeded", None),
             (
                 "matrix-partial-v5.json",
-                cookout::model::ExecutionState::Running,
+                "running",
                 2,
-                cookout::model::WorkloadDisposition::Failed,
+                "failed",
                 Some("synthetic workload request failed"),
             ),
             (
                 "matrix-failed-v5.json",
-                cookout::model::ExecutionState::Failed,
+                "failed",
                 2,
-                cookout::model::WorkloadDisposition::Blocked,
+                "blocked",
                 Some(
                     "synthetic launch attempt one failed; synthetic launch attempt two failed",
                 ),
             ),
             (
                 "checkpoint-in-progress-v5.json",
-                cookout::model::ExecutionState::Running,
+                "running",
                 1,
-                cookout::model::WorkloadDisposition::NotRequested,
+                "not_requested",
                 Some("synthetic launch attempt is awaiting cleanup"),
             ),
         ];
@@ -7187,24 +7196,18 @@ mod tests {
                 Path::new(source),
             )
             .unwrap();
-            let context = document.report_context.as_ref().unwrap();
-            assert_eq!(context.execution_state, state, "{source}");
-            assert_eq!(context.planned_repeats, planned, "{source}");
-            assert_eq!(
-                context.source_display.as_deref(),
-                Some(source),
-                "{source}"
-            );
+            let context = &document.extensions["oxide.voxel"];
+            assert_eq!(context["execution_state"], state, "{source}");
+            assert_eq!(context["planned_repeats"], planned, "{source}");
+            assert_eq!(context["source_display"], source, "{source}");
             assert!(document.variants.iter().all(|variant| {
-                variant
-                    .report_context
-                    .as_ref()
-                    .is_some_and(|context| !context.conditions.is_empty())
+                !variant.extensions["oxide.voxel"]["effective_configuration"]
+                    .is_null()
             }));
             let run = &document.runs[0];
-            let run_context = run.report_context.as_ref().unwrap();
+            let run_context = &run.extensions["oxide.voxel"];
             assert_eq!(
-                run_context.workload_disposition, disposition,
+                run_context["workload_disposition"], disposition,
                 "{source}"
             );
             assert_eq!(
@@ -7212,18 +7215,10 @@ mod tests {
                 failure
             );
             assert!(
-                document
-                    .variants
-                    .iter()
-                    .flat_map(|variant| &variant
-                        .report_context
-                        .as_ref()
-                        .unwrap()
-                        .conditions)
-                    .all(|condition| !condition
-                        .label
-                        .to_ascii_lowercase()
-                        .contains("password"))
+                !serde_json::to_string(&document.variants)
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("password")
             );
         }
     }
@@ -7245,10 +7240,10 @@ mod tests {
             .runs
             .iter()
             .all(|run| run.outcome == cookout::model::RunOutcome::Completed));
-        assert_eq!(document.identity.name, "Voxel");
+        assert_eq!(document.identity.name, "Voxel performance report");
         assert_eq!(
-            document.report_context.as_ref().unwrap().source_display,
-            Some("matrix.json".into())
+            document.extensions["oxide.voxel"]["source_display"],
+            "matrix.json"
         );
     }
 
@@ -7268,10 +7263,13 @@ mod tests {
             Path::new("topology.json"),
         )
         .unwrap();
-        assert!(document.variants.iter().all(|variant| matches!(
-            variant.configuration,
-            Some(cookout::model::VariantConfiguration::TopologyLevers { .. })
-        )));
+        assert!(
+            document
+                .variants
+                .iter()
+                .all(|variant| variant.dimensions["oxide.voxel.matrix_kind"]
+                    == cookout::model::DimensionValue::Text("topology".into()))
+        );
         assert!(
             !document
                 .target
@@ -7296,20 +7294,12 @@ mod tests {
             Path::new("matrix.json"),
         )
         .unwrap();
-        let context = document.report_context.as_ref().unwrap();
         assert_eq!(
-            context.execution_state,
-            cookout::model::ExecutionState::Failed
+            document.extensions["oxide.voxel"]["execution_state"],
+            "failed"
         );
-        assert_eq!(context.planned_repeats, 3);
-        assert_eq!(
-            document.variants[0]
-                .report_context
-                .as_ref()
-                .unwrap()
-                .expected_repeats,
-            3
-        );
+        assert_eq!(document.extensions["oxide.voxel"]["planned_repeats"], 3);
+        assert_eq!(document.variants[0].planned_runs, Some(3));
         assert_eq!(document.runs.len(), 3);
         assert_eq!(document.runs[2].attempt, 3);
         assert_eq!(
@@ -7317,8 +7307,8 @@ mod tests {
             cookout::model::RunOutcome::Failed
         );
         assert_eq!(
-            document.runs[2].report_context.as_ref().unwrap().launch_failure,
-            None
+            document.runs[2].extensions["oxide.voxel"]["launch_failure"],
+            Value::Null
         );
         assert_eq!(
             document.runs[2].failure.as_ref().unwrap().message,
@@ -7337,10 +7327,7 @@ mod tests {
             Path::new("matrix.json"),
         )
         .unwrap();
-        assert_eq!(
-            document.report_context.as_ref().unwrap().planned_repeats,
-            3
-        );
+        assert_eq!(document.extensions["oxide.voxel"]["planned_repeats"], 3);
         assert_eq!(document.runs.len(), 1);
         assert_eq!(document.runs[0].attempt, 1);
         assert_eq!(
@@ -7383,24 +7370,22 @@ mod tests {
             Path::new("matrix-complete-v5.json"),
         )
         .unwrap();
-        let context = document.report_context.as_ref().unwrap();
         assert_eq!(
-            context.provenance_state,
-            cookout::model::ProvenanceState::Unavailable
+            document.extensions["oxide.voxel"]["provenance_state"],
+            "unavailable"
+        );
+        let conditions = document.extensions["oxide.voxel"]["conditions"]
+            .as_array()
+            .unwrap();
+        assert!(
+            conditions
+                .iter()
+                .any(|condition| condition["label"] == "Voxel build"
+                    && condition["value"] != "unavailable")
         );
         assert!(
-            context
-                .conditions
-                .iter()
-                .any(|condition| condition.label == "Voxel build"
-                    && condition.value != "unavailable")
-        );
-        assert!(
-            context
-                .conditions
-                .iter()
-                .any(|condition| condition.label == "Host"
-                    && condition.value == "unavailable: host capture failed")
+            conditions.iter().any(|condition| condition["label"] == "Host"
+                && condition["value"] == "unavailable: host capture failed")
         );
         let serialized = serde_json::to_string(&document).unwrap();
         for forbidden in
@@ -7428,16 +7413,10 @@ mod tests {
             Path::new("matrix-partial-v5.json"),
         )
         .unwrap();
-        let context = document.runs[0].report_context.as_ref().unwrap();
-        assert_eq!(
-            context.preparation_failure.as_deref(),
-            Some("preparation failed")
-        );
-        assert_eq!(context.workload_failure, None);
-        assert_eq!(
-            context.workload_disposition,
-            cookout::model::WorkloadDisposition::Blocked
-        );
+        let context = &document.runs[0].extensions["oxide.voxel"];
+        assert_eq!(context["preparation_failure"], "preparation failed");
+        assert_eq!(context["workload_failure"], Value::Null);
+        assert_eq!(context["workload_disposition"], "blocked");
 
         let mut cleanup_failed = schema_v5_fixture("matrix-complete-v5.json");
         cleanup_failed.status = RunStatus::Aborted;
@@ -7449,15 +7428,12 @@ mod tests {
             Path::new("matrix-complete-v5.json"),
         )
         .unwrap();
-        let context = document.runs[0].report_context.as_ref().unwrap();
-        assert_eq!(context.boundary_failure.as_deref(), Some("cleanup failed"));
+        let context = &document.runs[0].extensions["oxide.voxel"];
+        assert_eq!(context["boundary_failure"], "cleanup failed");
+        assert_eq!(context["launch_memory_semantics"], "launch-baseline-delta");
         assert_eq!(
-            context.launch_memory_semantics.as_deref(),
-            Some("launch-baseline-delta")
-        );
-        assert_eq!(
-            context.workload_memory_semantics.as_deref(),
-            Some("workload-baseline-delta")
+            context["workload_memory_semantics"],
+            "workload-baseline-delta"
         );
     }
 
@@ -7477,12 +7453,9 @@ mod tests {
             Path::new("launch-only.json"),
         )
         .unwrap();
-        let context = document.runs[0].report_context.as_ref().unwrap();
-        assert_eq!(
-            context.workload_disposition,
-            cookout::model::WorkloadDisposition::NotRequested
-        );
-        assert_eq!(context.boundary_failure.as_deref(), Some("cleanup failed"));
+        let context = &document.runs[0].extensions["oxide.voxel"];
+        assert_eq!(context["workload_disposition"], "not_requested");
+        assert_eq!(context["boundary_failure"], "cleanup failed");
 
         let mut workload_failed = schema_v5_fixture("matrix-complete-v5.json");
         workload_failed.status = RunStatus::Aborted;
@@ -7498,16 +7471,10 @@ mod tests {
             Path::new("workload-failed.json"),
         )
         .unwrap();
-        let context = document.runs[0].report_context.as_ref().unwrap();
-        assert_eq!(
-            context.workload_disposition,
-            cookout::model::WorkloadDisposition::Failed
-        );
-        assert_eq!(
-            context.workload_failure.as_deref(),
-            Some("workload failed")
-        );
-        assert_eq!(context.boundary_failure.as_deref(), Some("cleanup failed"));
+        let context = &document.runs[0].extensions["oxide.voxel"];
+        assert_eq!(context["workload_disposition"], "failed");
+        assert_eq!(context["workload_failure"], "workload failed");
+        assert_eq!(context["boundary_failure"], "cleanup failed");
     }
 
     #[test]
@@ -7538,16 +7505,12 @@ mod tests {
             );
         }
         assert_eq!(
-            document.report_context.as_ref().unwrap().execution_state,
-            cookout::model::ExecutionState::Failed
+            document.extensions["oxide.voxel"]["execution_state"],
+            "failed"
         );
         assert!(
-            document.runs[0]
-                .report_context
-                .as_ref()
-                .unwrap()
-                .launch_failure
-                .as_deref()
+            document.runs[0].extensions["oxide.voxel"]["launch_failure"]
+                .as_str()
                 .is_some_and(|message| message.contains("redacted"))
         );
     }

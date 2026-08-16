@@ -10,17 +10,13 @@ use cookout::adapter::{
 };
 use cookout::model::{
     Aggregation, ApplicationIdentity,
-    CapabilityLedger as CookoutCapabilityLedger,
     CapabilityResult as CookoutCapabilityResult,
     CapabilityStatus as CookoutCapabilityStatus, Constraint, DimensionValue,
-    EvidenceEnvelope, ExecutionState, ExperimentDocument, ExperimentIdentity,
-    ExperimentKind, ExperimentReportContext, FailureRecord, HardwareDimensions,
-    IssueImpact, IssueScope, Observation, ObservationValue, ObservationWindow,
-    OptimizationDirection, PhaseKind, PhaseResult, PhaseStatus, Provenance,
-    ProvenanceState, ReportCondition, Run, RunOutcome, RunReportContext,
-    Scenario, Target, Unit, Variant, VariantConfiguration,
-    VariantReportContext, WorkloadDisposition as CookoutWorkloadDisposition,
-    WorkloadRequest,
+    EvidenceEnvelope, ExperimentDocument, ExperimentIdentity, ExperimentKind,
+    FailureRecord, HardwareDimensions, IssueImpact, IssueScope, Observation,
+    ObservationValue, ObservationWindow, OptimizationDirection, PhaseKind,
+    PhaseResult, PhaseStatus, Provenance, Run, RunOutcome, Scenario, Target,
+    Unit, Variant,
 };
 use serde::de::DeserializeOwned;
 use std::path::Path;
@@ -62,10 +58,32 @@ pub(super) struct VoxelCandidateParameters {
 
 pub(super) struct VoxelCookoutAdapter;
 
+const NORMALIZATION_VERSION: u32 = 2;
+
+#[derive(Serialize)]
+struct VoxelCondition {
+    label: String,
+    value: String,
+    code: bool,
+}
+
+#[derive(Serialize)]
+struct VoxelRunContext {
+    display_id: String,
+    workload_disposition: &'static str,
+    launch_failure: Option<String>,
+    preparation_failure: Option<String>,
+    workload_failure: Option<String>,
+    boundary_failure: Option<String>,
+    prior_launch_attempt_failures: Vec<String>,
+    launch_memory_semantics: Option<&'static str>,
+    workload_memory_semantics: Option<&'static str>,
+}
+
 impl Adapter for VoxelCookoutAdapter {
     const ID: &'static str = "oxide.voxel.perftest";
     const SOURCE_SCHEMA_VERSION: u32 = 1;
-    const NORMALIZATION_VERSION: u32 = 1;
+    const NORMALIZATION_VERSION: u32 = NORMALIZATION_VERSION;
     const ISSUE_CLASSIFICATION_SCHEMA: &'static str =
         "oxide.voxel.perftest.issue.v1";
 
@@ -267,18 +285,13 @@ fn adapter_issues(
                 .iter()
                 .filter(|run| run.variant_id == variant.id)
                 .collect::<Vec<_>>();
-            let planned = variant
-                .report_context
-                .as_ref()
-                .map_or(0, |context| context.expected_repeats);
+            let planned = variant.planned_runs.unwrap_or(0);
             let successful = runs
                 .iter()
                 .filter(|run| run.outcome == RunOutcome::Completed)
                 .count() as u64;
             let clean_boundaries = runs.iter().all(|run| {
-                run.report_context
-                    .as_ref()
-                    .is_some_and(|context| context.boundary_failure.is_none())
+                run.extensions["oxide.voxel"]["boundary_failure"].is_null()
                     && ["pre-boundary", "cleanup"].into_iter().all(|name| {
                         run.phases.iter().any(|phase| {
                             phase.name == name
@@ -405,17 +418,14 @@ fn adapter_issues(
             }
         }
     }
-    if let Some(context) = &snapshot.report_context {
+    if snapshot.extensions.contains_key("oxide.voxel") {
         for variant in &snapshot.variants {
             let observed = snapshot
                 .runs
                 .iter()
                 .filter(|run| run.variant_id == variant.id)
                 .count() as u64;
-            let planned = variant
-                .report_context
-                .as_ref()
-                .map_or(0, |context| context.expected_repeats);
+            let planned = variant.planned_runs.unwrap_or(0);
             if observed < planned {
                 issues.push(AdapterIssue {
                     code: "oxide.voxel.perftest.planned_repeat_shortfall".into(),
@@ -436,7 +446,8 @@ fn adapter_issues(
                 });
             }
         }
-        if context.provenance_state != ProvenanceState::Complete {
+        if snapshot.extensions["oxide.voxel"]["provenance_state"] != "complete"
+        {
             issues.push(AdapterIssue {
                 code: "oxide.voxel.perftest.reproducibility_incomplete".into(),
                 title: "Reproducibility evidence is incomplete".into(),
@@ -537,11 +548,7 @@ pub(super) fn matrix_run_to_experiment(
         runs,
         source: serde_json::to_vec(run)?,
         session: run.oxide_session.as_ref(),
-        execution_state: if failed {
-            ExecutionState::Failed
-        } else {
-            ExecutionState::Completed
-        },
+        execution_state: if failed { "failed" } else { "completed" },
         abort_error: failed.then(|| {
             "matrix execution stopped before all planned repeats completed"
                 .into()
@@ -615,7 +622,7 @@ struct BuildDocumentArgs<'a> {
     runs: Vec<Run>,
     source: Vec<u8>,
     session: Option<&'a OxideSessionMetadata>,
-    execution_state: ExecutionState,
+    execution_state: &'static str,
     abort_error: Option<String>,
     planned_repeats: usize,
     source_path: &'a Path,
@@ -697,7 +704,7 @@ fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
     let document = ExperimentDocument {
         identity: ExperimentIdentity {
             experiment_id: format!("voxel-matrix-{started}"),
-            name: "Voxel".into(),
+            name: "Voxel performance report".into(),
             created_at: started.to_string(),
             application: ApplicationIdentity {
                 id: "oxide.voxel".into(),
@@ -749,22 +756,22 @@ fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
                 "voxel matrix".into(),
             )]),
         },
-        report_context: Some(ExperimentReportContext {
-            execution_state,
-            abort_error: abort_error.as_deref().map(|error| {
-                safe_diagnostic(error, "matrix abort detail was redacted")
-            }),
-            planned_repeats: planned_repeats as u64,
-            workload: workload_request(workload),
-            capabilities: evidence
-                .map(|evidence| capability_ledger(&evidence.capabilities)),
-            provenance_state: provenance_state(evidence),
-            source_display: Some(stable_source_display(source_path)),
-            conditions,
-        }),
+        capabilities: evidence
+            .map(|evidence| capability_ledger(&evidence.capabilities))
+            .unwrap_or_default(),
         extensions: BTreeMap::from([(
             "oxide.voxel".into(),
-            json!({"adapter_version": 1}),
+            json!({
+                "adapter_version": VoxelCookoutAdapter::NORMALIZATION_VERSION,
+                "matrix_kind": match kind { MatrixKind::Storage => "storage", MatrixKind::Topology => "topology" },
+                "execution_state": execution_state,
+                "abort_error": abort_error.as_deref().map(|value| safe_diagnostic(value, "matrix abort detail was redacted")),
+                "planned_repeats": planned_repeats,
+                "workload": workload.map(workload_summary),
+                "provenance_state": provenance_state(evidence),
+                "source_display": stable_source_display(source_path),
+                "conditions": conditions,
+            }),
         )]),
     };
     Ok(document)
@@ -854,26 +861,38 @@ fn variant(
     expected_repeats: usize,
     effective_config: Option<&VoxelConfig>,
 ) -> Variant {
+    let kind_name = match kind {
+        MatrixKind::Storage => "storage",
+        MatrixKind::Topology => "topology",
+    };
+    let lever_label = if levers.is_empty() {
+        "none".to_owned()
+    } else {
+        levers.iter().map(u8::to_string).collect::<Vec<_>>().join("+")
+    };
     Variant {
         id: variant_id(label),
         name: label.into(),
-        configuration: Some(match kind {
-            MatrixKind::Storage => {
-                VariantConfiguration::StorageLevers { levers: levers.clone() }
-            }
-            MatrixKind::Topology => {
-                VariantConfiguration::TopologyLevers { levers: levers.clone() }
-            }
-        }),
-        report_context: Some(VariantReportContext {
-            expected_repeats: expected_repeats as u64,
-            conditions: effective_config
-                .map(|config| effective_configuration_conditions(label, config))
-                .unwrap_or_default(),
-        }),
-        dimensions: BTreeMap::new(),
-        extensions: BTreeMap::new(),
+        dimensions: BTreeMap::from([
+            (
+                "oxide.voxel.matrix_kind".into(),
+                DimensionValue::Text(kind_name.into()),
+            ),
+            ("oxide.voxel.levers".into(), DimensionValue::Text(lever_label)),
+        ]),
+        planned_runs: Some(expected_repeats as u64),
+        extensions: BTreeMap::from([(
+            "oxide.voxel".into(),
+            json!({"effective_configuration": effective_config.map(sanitized_config_value)}),
+        )]),
     }
+}
+
+fn sanitized_config_value(config: &VoxelConfig) -> Value {
+    let mut value =
+        serde_json::to_value(config).expect("Voxel configuration serializes");
+    sanitize_retained_json(&mut value);
+    value
 }
 
 fn variant_id(label: &str) -> String {
@@ -885,7 +904,7 @@ fn base_run(
     index: usize,
     phases: Vec<PhaseResult>,
     failure_message: Option<String>,
-    report_context: RunReportContext,
+    report_context: VoxelRunContext,
 ) -> Run {
     let outcome = if phases
         .iter()
@@ -909,8 +928,11 @@ fn base_run(
         }),
         guardrail: None,
         phases,
-        report_context: Some(report_context),
-        extensions: BTreeMap::new(),
+        extensions: BTreeMap::from([(
+            "oxide.voxel".into(),
+            serde_json::to_value(report_context)
+                .expect("run context serializes"),
+        )]),
     }
 }
 
@@ -1000,28 +1022,28 @@ fn aggregate_run(
             completed_phase("cleanup", PhaseKind::Cleanup, Some(0.0)),
         ],
         None,
-        RunReportContext {
-            display_id: Some(display_id.into()),
+        VoxelRunContext {
+            display_id: display_id.into(),
             workload_disposition: if workload_requested {
                 if sample.workload_bytes.is_some()
                     && sample.workload_secs.is_some()
                 {
-                    CookoutWorkloadDisposition::Succeeded
+                    "succeeded"
                 } else {
-                    CookoutWorkloadDisposition::Pending
+                    "pending"
                 }
             } else {
-                CookoutWorkloadDisposition::NotRequested
+                "not_requested"
             },
             launch_failure: None,
             preparation_failure: None,
             workload_failure: None,
             boundary_failure: None,
             prior_launch_attempt_failures: Vec::new(),
-            launch_memory_semantics: Some("launch-baseline-delta".into()),
+            launch_memory_semantics: Some("launch-baseline-delta"),
             workload_memory_semantics: sample
                 .workload_peak_delta_bytes
-                .map(|_| "workload-baseline-delta".into()),
+                .map(|_| "workload-baseline-delta"),
         },
     )
 }
@@ -1050,12 +1072,12 @@ fn failed_aggregate_run(
             not_executed_phase("cleanup", PhaseKind::Cleanup),
         ],
         Some(failure.clone()),
-        RunReportContext {
-            display_id: Some(display_id.into()),
+        VoxelRunContext {
+            display_id: display_id.into(),
             workload_disposition: if workload_requested {
-                CookoutWorkloadDisposition::Blocked
+                "blocked"
             } else {
-                CookoutWorkloadDisposition::NotRequested
+                "not_requested"
             },
             launch_failure: None,
             preparation_failure: None,
@@ -1287,17 +1309,20 @@ fn observation(
     }
 }
 
-fn execution_state(status: RunStatus) -> ExecutionState {
+fn execution_state(status: RunStatus) -> &'static str {
     match status {
-        RunStatus::Completed => ExecutionState::Completed,
-        RunStatus::Running => ExecutionState::Running,
-        RunStatus::Aborted => ExecutionState::Failed,
+        RunStatus::Completed => "completed",
+        RunStatus::Running => "running",
+        RunStatus::Aborted => "failed",
     }
 }
 
-fn workload_request(workload: Option<&WorkloadSpec>) -> WorkloadRequest {
-    workload.map_or(WorkloadRequest::NotRequested, |workload| {
-        WorkloadRequest::Requested { description: workload_label(workload) }
+fn workload_summary(workload: &WorkloadSpec) -> Value {
+    json!({
+        "count": workload.count,
+        "parallel": workload.parallel,
+        "size_bytes": workload.size_bytes,
+        "snapshot": workload.snapshot,
     })
 }
 
@@ -1328,8 +1353,8 @@ fn condition(
     label: impl Into<String>,
     value: impl Into<String>,
     code: bool,
-) -> ReportCondition {
-    ReportCondition { label: label.into(), value: value.into(), code }
+) -> VoxelCondition {
+    VoxelCondition { label: label.into(), value: value.into(), code }
 }
 
 fn human_key(key: &str) -> String {
@@ -1398,7 +1423,7 @@ fn safe_diagnostic(value: &str, redacted: &str) -> String {
     if diagnostic_is_sensitive(value) { redacted.into() } else { value.into() }
 }
 
-fn flatten_value(label: &str, value: &Value, rows: &mut Vec<ReportCondition>) {
+fn flatten_value(label: &str, value: &Value, rows: &mut Vec<VoxelCondition>) {
     match value {
         Value::Object(object) => {
             if object.is_empty() {
@@ -1428,20 +1453,6 @@ fn flatten_value(label: &str, value: &Value, rows: &mut Vec<ReportCondition>) {
     }
 }
 
-fn effective_configuration_conditions(
-    label: &str,
-    config: &VoxelConfig,
-) -> Vec<ReportCondition> {
-    let display = human_key(label);
-    let mut rows = Vec::new();
-    flatten_value(
-        &format!("Effective candidate configuration / {display}"),
-        &serde_json::to_value(config).expect("Voxel configuration serializes"),
-        &mut rows,
-    );
-    rows
-}
-
 fn experiment_conditions(
     rss_sleds: usize,
     variants: &[Variant],
@@ -1450,7 +1461,7 @@ fn experiment_conditions(
     evidence: Option<&MatrixReportEvidence>,
     source_path: &Path,
     run_id: &str,
-) -> Result<Vec<ReportCondition>> {
+) -> Result<Vec<VoxelCondition>> {
     let combinations = variants
         .iter()
         .map(|variant| variant.name.as_str())
@@ -1516,7 +1527,7 @@ fn provenance_conditions(
     evidence: Option<&MatrixReportEvidence>,
     source_path: &Path,
     run_id: &str,
-) -> Vec<ReportCondition> {
+) -> Vec<VoxelCondition> {
     let Some(evidence) = evidence else {
         return vec![
             condition("Provenance", "unavailable", false),
@@ -1594,19 +1605,17 @@ fn complete_provenance(
     ])
 }
 
-fn provenance_state(
-    evidence: Option<&MatrixReportEvidence>,
-) -> ProvenanceState {
+fn provenance_state(evidence: Option<&MatrixReportEvidence>) -> &'static str {
     if complete_provenance(evidence).is_some() {
-        ProvenanceState::Complete
+        "complete"
     } else {
-        ProvenanceState::Unavailable
+        "unavailable"
     }
 }
 
 fn capability_ledger(
     ledger: &MatrixCapabilityLedger,
-) -> CookoutCapabilityLedger {
+) -> Vec<CookoutCapabilityResult> {
     let result = |name: &str, status: &CapabilityStatus| {
         let (status, evidence, error) = match status {
             CapabilityStatus::Pass { evidence } => (
@@ -1642,30 +1651,24 @@ fn capability_ledger(
             elapsed_millis: None,
         }
     };
-    CookoutCapabilityLedger {
-        version: ledger.ledger_version.to_string(),
-        results: vec![
-            result(
-                "matrix_host_storage_scope",
-                &ledger.matrix_host_storage_scope,
-            ),
-            result(
-                "clean_launch_teardown_boundaries",
-                &ledger.clean_launch_teardown_boundaries,
-            ),
-            result("api_disk_lifecycle", &ledger.api_disk_lifecycle),
-            result(
-                "simulated_zpool_preparation",
-                &ledger.simulated_zpool_preparation,
-            ),
-        ],
-    }
+    vec![
+        result("matrix_host_storage_scope", &ledger.matrix_host_storage_scope),
+        result(
+            "clean_launch_teardown_boundaries",
+            &ledger.clean_launch_teardown_boundaries,
+        ),
+        result("api_disk_lifecycle", &ledger.api_disk_lifecycle),
+        result(
+            "simulated_zpool_preparation",
+            &ledger.simulated_zpool_preparation,
+        ),
+    ]
 }
 
 fn checkpoint_run_context(
     repeat: &MatrixCheckpointRepeat,
     display_id: &str,
-) -> RunReportContext {
+) -> VoxelRunContext {
     let launch_attempts = match &repeat.launch {
         LaunchOutcome::Success { prior_attempt_failures, .. } => {
             prior_attempt_failures.as_slice()
@@ -1754,27 +1757,23 @@ fn checkpoint_run_context(
         _ => None,
     };
     let workload_disposition = match &repeat.workload {
-        WorkloadOutcome::Success { .. } => {
-            CookoutWorkloadDisposition::Succeeded
-        }
+        WorkloadOutcome::Success { .. } => "succeeded",
         WorkloadOutcome::Failure { .. } if preparation_failure.is_some() => {
-            CookoutWorkloadDisposition::Blocked
+            "blocked"
         }
-        WorkloadOutcome::Failure { .. } => CookoutWorkloadDisposition::Failed,
+        WorkloadOutcome::Failure { .. } => "failed",
         WorkloadOutcome::Pending {}
             if launch_failure.is_some()
                 || boundary_failure.is_some()
                 || preparation_failure.is_some() =>
         {
-            CookoutWorkloadDisposition::Blocked
+            "blocked"
         }
-        WorkloadOutcome::Pending {} => CookoutWorkloadDisposition::Pending,
-        WorkloadOutcome::NotRequested {} => {
-            CookoutWorkloadDisposition::NotRequested
-        }
+        WorkloadOutcome::Pending {} => "pending",
+        WorkloadOutcome::NotRequested {} => "not_requested",
     };
-    RunReportContext {
-        display_id: Some(display_id.into()),
+    VoxelRunContext {
+        display_id: display_id.into(),
         workload_disposition,
         launch_failure,
         preparation_failure,
@@ -1785,12 +1784,12 @@ fn checkpoint_run_context(
             repeat.launch,
             LaunchOutcome::Success { .. }
         )
-        .then_some("launch-baseline-delta".into()),
+        .then_some("launch-baseline-delta"),
         workload_memory_semantics: matches!(
             repeat.workload,
             WorkloadOutcome::Success { .. }
         )
-        .then_some("workload-baseline-delta".into()),
+        .then_some("workload-baseline-delta"),
     }
 }
 
