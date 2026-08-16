@@ -38,17 +38,17 @@ Cookout while retaining Voxel's existing command syntax and compare output.
 Cookout does not launch a rack, inspect a host, invoke Falcon, ZFS, NVMe,
 `omdb`, or the Oxide CLI, or read credentials.
 
-Voxel follows the default branch of the reviewed Cookout repository:
+Voxel follows Cookout's remote `main` branch:
 
 ```toml
-cookout = { git = "https://github.com/oxidecomputer/cookout.git" }
+cookout = { git = "https://github.com/oxidecomputer/cookout.git", branch = "main" }
 ```
 
 `Cargo.lock` records the exact Cookout commit resolved for a given Voxel
 revision. Updating the dependency advances that lock entry to the latest
-default-branch commit. The development and reporting commands do not push
-either repository, create remotes, alter repository history, or otherwise
-perform network operations at runtime.
+`main` commit. The development and reporting commands do not push either
+repository, create remotes, alter repository history, or otherwise perform
+network operations at runtime.
 
 `matrix` keeps the normal fail-closed launch gates for router and gimlet
 completion, RSS completion, external route installation, requested host and
