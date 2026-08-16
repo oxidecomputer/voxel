@@ -470,7 +470,7 @@ $RESULTS_ROOT/comparison-YYYYMMDD-HHMMSS-LABEL-PID/
 ├── invocation.txt
 ├── report.log
 └── report/
-    ├── section-NNN-cohort-NNN-chart-NNN.svg
+    ├── cohort-NNN-metric-NNN.svg
     ├── cohorts.csv
     ├── evidence-NNNN.json
     ├── manifest.json
@@ -490,15 +490,16 @@ The report directory contains:
 - `report.html`, a self-contained static report;
 - `report.json`, the normalized analysis and recommendations;
 - `cohorts.csv`, a tabular export of cohort metrics;
-- `section-NNN-cohort-NNN-chart-NNN.svg` for every rendered chart (for example,
-  `section-000-cohort-000-chart-000.svg`);
+- `cohort-NNN-metric-NNN.svg` for every rendered metric (for example,
+  `cohort-000-metric-000.svg`);
 - `evidence-NNNN.json`, the normalized Cookout evidence used to build the
   report; and
 - `manifest.json`, including artifact media types, sizes, and SHA-256 digests.
 
 The HTML summarizes experiments, cohort metrics, exclusions, recommendations,
-and decision traces. The JSON retains the complete normalized analysis, and the
-evidence files retain the validated inputs. Empty cohorts remain visible with
+and decision traces. The JSON retains the complete normalized analysis but does
+not currently persist Cookout's mature presentation view or composite-chart
+catalog. The evidence files retain the validated inputs. Empty cohorts remain visible with
 their outcome counts and an explicit absence of scalar observations rather
 than placeholder metric rows or SVGs.
 
@@ -544,7 +545,7 @@ Cookout report:
 
 ```text
 aggregate-report/
-├── section-NNN-cohort-NNN-chart-NNN.svg # zero or more
+├── cohort-NNN-metric-NNN.svg # zero or more
 ├── cohorts.csv
 ├── evidence-NNNN.json    # one or more
 ├── manifest.json
@@ -650,8 +651,8 @@ cookout compare baseline-evidence.json candidate-evidence.json
 Use `voxel perftest report` for raw Voxel matrix JSON; it validates and adapts
 that input into Cookout evidence before publication. Use `voxel perftest
 superreport` for Cookout report archives produced through the Voxel workflow;
-it validates and replays their embedded Cookout evidence without rerunning the
-Voxel adapter.
+it validates retained evidence and invokes the Voxel adapter while aggregating
+and replaying that evidence.
 
 ---
 

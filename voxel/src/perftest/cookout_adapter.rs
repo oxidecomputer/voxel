@@ -525,6 +525,8 @@ pub(super) fn matrix_run_to_experiment(
                 sample,
                 run.workload.is_some(),
                 &run.name,
+                "launch-baseline-delta",
+                run.workload.as_ref().map(|_| "workload-baseline-delta"),
             ));
         }
         if combo.error.is_some() {
@@ -555,8 +557,11 @@ pub(super) fn matrix_run_to_experiment(
         }),
         planned_repeats: run.repeat.saturating_mul(run.results.len()),
         source_path,
-        launch_memory_semantics: "legacy-absolute-host-peak",
-        workload_memory_semantics: None,
+        launch_memory_semantics: "launch-baseline-delta",
+        workload_memory_semantics: run
+            .workload
+            .as_ref()
+            .map(|_| "workload-baseline-delta"),
     })
 }
 
@@ -650,6 +655,11 @@ fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
         workload_memory_semantics,
     } = args;
     let digest = hex_digest(&source);
+    let digest_prefix = digest
+        .strip_prefix("sha256:")
+        .expect("hex_digest uses the sha256 scheme")
+        .get(..12)
+        .expect("SHA-256 digest has a 12-character prefix");
     let constraints = target_constraint_capability_names()
         .into_iter()
         .map(|capability| Constraint::Capability {
@@ -674,37 +684,39 @@ fn build_document(args: BuildDocumentArgs<'_>) -> Result<ExperimentDocument> {
         "oxide.rss_sleds".into(),
         DimensionValue::Count(rss_sleds as u64),
     );
-    if kind == MatrixKind::Storage {
-        namespaced.insert(
-            STORAGE_COHORT_DIMENSION.into(),
-            DimensionValue::Text(storage_cohort_dimension(
-                &StorageCohortArgs {
-                    rss_sleds,
-                    variants: &variants,
-                    workload,
-                    session,
-                    evidence,
-                    source_path,
-                    run_id: source_name,
-                    launch_memory_semantics,
-                    workload_memory_semantics,
-                },
-            )?),
-        );
-    }
-    let conditions = experiment_conditions(
+    let cohort_args = StorageCohortArgs {
         rss_sleds,
-        &variants,
+        variants: &variants,
         workload,
         session,
         evidence,
         source_path,
-        source_name,
-    )?;
+        run_id: source_name,
+        launch_memory_semantics,
+        workload_memory_semantics,
+    };
+    if kind == MatrixKind::Storage {
+        namespaced.insert(
+            STORAGE_COHORT_DIMENSION.into(),
+            DimensionValue::Text(storage_cohort_dimension(&cohort_args)?),
+        );
+    }
+    let conditions = experiment_conditions(&cohort_args)?;
+    let variant_kind = match kind {
+        MatrixKind::Storage => "storage-tuning",
+        MatrixKind::Topology => "topology",
+    };
+    let workload_clause = workload
+        .map(|_| " and API disk lifecycle workloads")
+        .unwrap_or_default();
     let document = ExperimentDocument {
         identity: ExperimentIdentity {
-            experiment_id: format!("voxel-matrix-{started}"),
+            experiment_id: format!("voxel-matrix-{started}-{digest_prefix}"),
             name: "Voxel performance report".into(),
+            description: Some(format!(
+                "Compares host NVMe writes, launch duration, and peak memory across Voxel \
+                 {variant_kind} variants during simulated Oxide rack launch{workload_clause}."
+            )),
             created_at: started.to_string(),
             application: ApplicationIdentity {
                 id: "oxide.voxel".into(),
@@ -942,6 +954,8 @@ fn aggregate_run(
     sample: &RepeatSample,
     workload_requested: bool,
     display_id: &str,
+    launch_memory_semantics: &'static str,
+    workload_memory_semantics: Option<&'static str>,
 ) -> Run {
     let launch_duration = sample.launch_secs as f64;
     let mut launch =
@@ -1027,6 +1041,7 @@ fn aggregate_run(
             workload_disposition: if workload_requested {
                 if sample.workload_bytes.is_some()
                     && sample.workload_secs.is_some()
+                    && sample.workload_peak_delta_bytes.is_some()
                 {
                     "succeeded"
                 } else {
@@ -1040,10 +1055,12 @@ fn aggregate_run(
             workload_failure: None,
             boundary_failure: None,
             prior_launch_attempt_failures: Vec::new(),
-            launch_memory_semantics: Some("launch-baseline-delta"),
+            launch_memory_semantics: sample
+                .peak_ram_bytes
+                .map(|_| launch_memory_semantics),
             workload_memory_semantics: sample
                 .workload_peak_delta_bytes
-                .map(|_| "workload-baseline-delta"),
+                .and(workload_memory_semantics),
         },
     )
 }
@@ -1454,14 +1471,19 @@ fn flatten_value(label: &str, value: &Value, rows: &mut Vec<VoxelCondition>) {
 }
 
 fn experiment_conditions(
-    rss_sleds: usize,
-    variants: &[Variant],
-    workload: Option<&WorkloadSpec>,
-    session: Option<&OxideSessionMetadata>,
-    evidence: Option<&MatrixReportEvidence>,
-    source_path: &Path,
-    run_id: &str,
+    args: &StorageCohortArgs<'_>,
 ) -> Result<Vec<VoxelCondition>> {
+    let StorageCohortArgs {
+        rss_sleds,
+        variants,
+        workload,
+        session,
+        evidence,
+        source_path,
+        run_id,
+        launch_memory_semantics,
+        workload_memory_semantics,
+    } = args;
     let combinations = variants
         .iter()
         .map(|variant| variant.name.as_str())
@@ -1496,20 +1518,27 @@ fn experiment_conditions(
     ));
     rows.push(condition(
         "Launch memory semantics",
-        "Launch baseline-adjusted delta",
+        memory_semantics_label(launch_memory_semantics),
         false,
     ));
     rows.push(condition(
         "Workload memory semantics",
-        if workload.is_some() {
-            "Workload baseline-adjusted delta"
-        } else {
-            "Not applicable"
-        },
+        workload_memory_semantics
+            .map(memory_semantics_label)
+            .unwrap_or("Not applicable"),
         false,
     ));
-    rows.extend(provenance_conditions(evidence, source_path, run_id));
+    rows.extend(provenance_conditions(*evidence, source_path, run_id));
     Ok(rows)
+}
+
+fn memory_semantics_label(semantics: &str) -> &'static str {
+    match semantics {
+        "legacy-absolute-host-peak" => "Legacy absolute host peak",
+        "launch-baseline-delta" => "Launch baseline-adjusted delta",
+        "workload-baseline-delta" => "Workload baseline-adjusted delta",
+        _ => "Unknown memory semantics",
+    }
 }
 
 fn safe_session_value(session: &OxideSessionMetadata) -> Value {

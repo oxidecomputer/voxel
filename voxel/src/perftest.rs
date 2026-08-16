@@ -6578,9 +6578,14 @@ mod tests {
                 .as_array()
                 .is_some_and(|issues| !issues.is_empty())
         );
-        let report_text = serde_json::to_string(&report).unwrap();
-        assert!(report_text.contains("required repeat failed"));
-        assert!(report_text.contains("required measurement missing"));
+        let issue_codes = report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|issue| issue["code"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(issue_codes.contains(&"oxide.voxel.perftest.stage_failure"));
+        assert!(issue_codes.contains(&"oxide.voxel.perftest.repeat_pending"));
         for index in 0..inputs.len() {
             let archived =
                 std::fs::read(out.join(format!("evidence-{index:04}.json")))
@@ -6736,6 +6741,17 @@ mod tests {
             cookout::model::DimensionValue::Text("none".into())
         );
         assert_eq!(document.capabilities.len(), 4);
+        let capabilities =
+            serde_json::to_value(&document.capabilities).unwrap();
+        assert_eq!(
+            capabilities,
+            json!([
+                {"name":"matrix_host_storage_scope","status":"unavailable","evidence":null,"error":"no matrix combination was measured","elapsed_millis":null},
+                {"name":"clean_launch_teardown_boundaries","status":"unavailable","evidence":null,"error":"no matrix combination was measured","elapsed_millis":null},
+                {"name":"api_disk_lifecycle","status":"failed","evidence":null,"error":"one or more required repeats did not reach the proof boundary","elapsed_millis":null},
+                {"name":"simulated_zpool_preparation","status":"failed","evidence":null,"error":"one or more required repeats did not reach the proof boundary","elapsed_millis":null}
+            ])
+        );
         assert_eq!(
             document.runs[0].outcome,
             cookout::model::RunOutcome::Completed
@@ -6749,6 +6765,66 @@ mod tests {
             .iter()
             .flat_map(|phase| &phase.observations)
             .any(|observation| observation.metric == "launch.bytes_written"));
+    }
+
+    #[test]
+    fn cookout_adapter_ids_are_source_stable_and_disambiguate_same_start() {
+        let complete = schema_v5_fixture("matrix-complete-v5.json");
+        let partial = schema_v5_fixture("matrix-partial-v5.json");
+        let first = cookout_adapter::matrix_checkpoint_to_experiment(
+            &complete,
+            Path::new("first.json"),
+        )
+        .unwrap();
+        let duplicate = cookout_adapter::matrix_checkpoint_to_experiment(
+            &complete,
+            Path::new("duplicate.json"),
+        )
+        .unwrap();
+        let distinct = cookout_adapter::matrix_checkpoint_to_experiment(
+            &partial,
+            Path::new("partial.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            first.identity.experiment_id,
+            duplicate.identity.experiment_id
+        );
+        assert_ne!(
+            first.identity.experiment_id,
+            distinct.identity.experiment_id
+        );
+        assert!(
+            first
+                .identity
+                .experiment_id
+                .starts_with("voxel-matrix-1700000000-")
+        );
+    }
+
+    #[test]
+    fn failed_checkpoint_retains_completed_phase_observations() {
+        let document = cookout_adapter::matrix_checkpoint_to_experiment(
+            &schema_v5_fixture("matrix-failed-v5.json"),
+            Path::new("matrix-failed-v5.json"),
+        )
+        .unwrap();
+        let observations = document
+            .runs
+            .iter()
+            .flat_map(|run| &run.phases)
+            .flat_map(|phase| &phase.observations)
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 6);
+        assert!(observations.iter().all(|observation| matches!(
+            observation.metric.as_str(),
+            "launch.bytes_written"
+                | "launch.duration"
+                | "launch.peak_ram_delta"
+                | "workload.bytes_written"
+                | "workload.duration"
+                | "workload.peak_ram_delta"
+        )));
     }
 
     #[test]
@@ -7225,10 +7301,18 @@ mod tests {
 
     #[test]
     fn cookout_adapter_maps_matrix_run_repeats() {
-        let run = run_with(
+        let mut run = run_with(
             "ignored-source-name",
             &[("none", &[], &[10, 20]), ("1", &[1], &[8, 9])],
         );
+        run.workload = Some(WorkloadSpec::api_disk_lifecycle());
+        for repeat in
+            run.results.iter_mut().flat_map(|result| &mut result.repeats)
+        {
+            repeat.workload_bytes = Some(5);
+            repeat.workload_secs = Some(2);
+            repeat.workload_peak_delta_bytes = Some(1);
+        }
         let document = cookout_adapter::matrix_run_to_experiment(
             &run,
             Path::new("matrix.json"),
@@ -7241,6 +7325,14 @@ mod tests {
             .iter()
             .all(|run| run.outcome == cookout::model::RunOutcome::Completed));
         assert_eq!(document.identity.name, "Voxel performance report");
+        assert_eq!(
+            document.identity.description.as_deref(),
+            Some(
+                "Compares host NVMe writes, launch duration, and peak memory across Voxel \
+                 storage-tuning variants during simulated Oxide rack launch and API disk \
+                 lifecycle workloads."
+            )
+        );
         assert_eq!(
             document.extensions["oxide.voxel"]["source_display"],
             "matrix.json"
@@ -7287,6 +7379,11 @@ mod tests {
     fn cookout_adapter_preserves_schema_v4_partial_aggregate_failure() {
         let mut run = run_with("partial", &[("none", &[], &[10, 20])]);
         run.repeat = 3;
+        run.workload = schema_v5_fixture("matrix-complete-v5.json").workload;
+        run.results[0].repeats[0].peak_ram_bytes = Some(1024);
+        run.results[0].repeats[0].workload_bytes = Some(2048);
+        run.results[0].repeats[0].workload_secs = Some(2);
+        run.results[0].repeats[0].workload_peak_delta_bytes = Some(512);
         run.results[0].error = Some("third repeat failed".into());
 
         let document = cookout_adapter::matrix_run_to_experiment(
@@ -7313,6 +7410,51 @@ mod tests {
         assert_eq!(
             document.runs[2].failure.as_ref().unwrap().message,
             "third repeat failed"
+        );
+        assert_eq!(
+            document.runs[0].extensions["oxide.voxel"]["launch_memory_semantics"],
+            "launch-baseline-delta"
+        );
+        assert_eq!(
+            document.runs[0].extensions["oxide.voxel"]["workload_memory_semantics"],
+            "workload-baseline-delta"
+        );
+        let conditions = document.extensions["oxide.voxel"]["conditions"]
+            .as_array()
+            .unwrap();
+        assert!(conditions.iter().any(|condition| {
+            condition["label"] == "Launch memory semantics"
+                && condition["value"] == "Launch baseline-adjusted delta"
+        }));
+        assert!(conditions.iter().any(|condition| {
+            condition["label"] == "Workload memory semantics"
+                && condition["value"] == "Workload baseline-adjusted delta"
+        }));
+    }
+
+    #[test]
+    fn cookout_adapter_requires_complete_aggregate_workload_for_success() {
+        let mut run = run_with("incomplete-workload", &[("none", &[], &[10])]);
+        run.workload = schema_v5_fixture("matrix-complete-v5.json").workload;
+        let sample = &mut run.results[0].repeats[0];
+        sample.workload_bytes = Some(4096);
+        sample.workload_secs = Some(2);
+        sample.workload_peak_delta_bytes = None;
+
+        let document = cookout_adapter::matrix_run_to_experiment(
+            &run,
+            Path::new("matrix.json"),
+        )
+        .unwrap();
+        let workload = document.runs[0]
+            .phases
+            .iter()
+            .find(|phase| phase.name == "workload")
+            .unwrap();
+        assert_eq!(workload.status, cookout::model::PhaseStatus::Incomplete);
+        assert_eq!(
+            document.runs[0].extensions["oxide.voxel"]["workload_disposition"],
+            "pending"
         );
     }
 
