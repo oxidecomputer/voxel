@@ -108,7 +108,7 @@ pub(crate) fn build_topo(
     let mut sleds = Vec::new();
     for s in cfg.sleds() {
         let n = d.node(&s.name, &cp_img, 8, sled_mem);
-        d.reserve(n, 100);
+        d.reserve(n, cfg.topology.sled_disk_gb as usize);
         sleds.push((s, n));
     }
     let mut routers = Vec::new();
