@@ -39,6 +39,9 @@ pub const CONSOLE_PORT_OFFSET: u16 = 2;
 const GIMLET_PART_NUMBER: &str = "913-0000019";
 /// The (simulated) sidecar SP serial.
 const SIDECAR_SERIAL: &str = "SimSidecar0";
+/// The sidecar board part number. No real one is recorded in sources we can
+/// see, so use sp-emu's placeholder (11-char VPD barcode field cap applies).
+const SIDECAR_PART_NUMBER: &str = "SIDECAR-C";
 
 /// Manufacturing root cert seed - a constant test value shared by every SP's RoT
 /// (matches a4x2's known-good config; attestation is verified against it).
@@ -96,7 +99,7 @@ impl SpBackend {
 pub struct Sp {
     pub role: SpRole,
     pub serial: String,
-    /// Gimlets carry a board part number; the sidecar doesn't.
+    /// Board part number (gimlets real, sidecar a placeholder).
     pub part_number: Option<String>,
     pub root_cert_seed: String,
     pub device_id_seed: String,
@@ -154,9 +157,8 @@ impl Sp {
 
 /// Render one `[[simulated_sps.<key>]]` block (identity + the two per-instance
 /// `network_config`/`ereport_network_config` tables) for `sp`. The sidecar and
-/// gimlet blocks are identical but for the table `key` (and the sidecar's absent
-/// `part_number`, which is `None` so emits nothing); the gimlet's extra host-cpu
-/// `components` block is emitted by the caller.
+/// gimlet blocks are identical but for the table `key`; the gimlet's extra
+/// host-cpu `components` block is emitted by the caller.
 fn render_sp_block(o: &mut String, key: &str, sp: &Sp) {
     writeln!(o, "\n[[simulated_sps.{key}]]").unwrap();
     if let Some(pn) = &sp.part_number {
@@ -217,7 +219,7 @@ impl SpFleet {
         sps.push(Sp {
             role: SpRole::Sidecar,
             serial: SIDECAR_SERIAL.to_string(),
-            part_number: None,
+            part_number: Some(SIDECAR_PART_NUMBER.to_string()),
             root_cert_seed: ROOT_SEED.to_string(),
             device_id_seed: device_seed(0),
             base_port: SP_PORT_BASE,
@@ -360,6 +362,7 @@ mod tests {
         let sidecars = v["simulated_sps"]["sidecar"].as_array().unwrap();
         assert_eq!(sidecars.len(), 1);
         assert_eq!(sidecars[0]["serial_number"].as_str(), Some("SimSidecar0"));
+        assert_eq!(sidecars[0]["part_number"].as_str(), Some("SIDECAR-C"));
 
         let gimlets = v["simulated_sps"]["gimlet"].as_array().unwrap();
         assert_eq!(gimlets.len(), 4);

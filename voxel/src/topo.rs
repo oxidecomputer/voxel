@@ -596,7 +596,7 @@ fn stage_sp_emu(
     // previously the only signal of --emu-rot; the baked path needs it explicit.)
     // Fleet manifest: `rot <0|1>` then `<base_port> <role> <serial> <part>` per
     // SP. sp-emu 1.x sets the reported VPD from SP_EMU_VPD_SERIAL/PART, so voxel
-    // carries each SP's fleet identity here (the sidecar has no part number).
+    // carries each SP's fleet identity here ("-" marks a missing part number).
     let mut manifest = format!("rot {}\n", if emu_rot { 1 } else { 0 });
     for sp in &emu {
         let role =
