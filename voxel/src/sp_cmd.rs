@@ -13,10 +13,8 @@
 use anyhow::{Context, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use indoc::formatdoc;
-use voxel_config::sp::{
-    PORT_STRIDE, SP_PORT_BASE, Sp, SpBackend, SpFleet, SpRole,
-};
-use voxel_config::{SLED_SERIAL_PREFIX, VoxelConfig};
+use voxel_config::VoxelConfig;
+use voxel_config::sp::{SP_PORT_BASE, Sp, SpBackend, SpFleet, SpRole};
 
 use crate::SpCmd;
 use crate::access::resolve_switch;
@@ -138,19 +136,10 @@ fn resolve_port(fleet: &SpFleet, target: &str) -> anyhow::Result<u16> {
     ))
 }
 
-/// The board serial an emu SP reports, mirroring sp-emu's `build_vpd_eeprom`:
-/// the sidecar is fixed; gimlets are port-derived `2FAKE00<idx>` where
-/// idx = (base_port - 33300) / 10.
+/// The board serial an SP reports: the fleet's configured serial, which voxel
+/// feeds to the SP itself (sp-sim config / sp-emu SP_EMU_VPD_SERIAL).
 fn sp_serial(sp: &Sp) -> String {
-    match sp.role {
-        SpRole::Sidecar => "FAKE-SWITCH".to_string(),
-        SpRole::Gimlet(_) => {
-            format!(
-                "{SLED_SERIAL_PREFIX}{}",
-                (sp.base_port - SP_PORT_BASE) / PORT_STRIDE
-            )
-        }
-    }
+    sp.serial.clone()
 }
 
 /// Make sure faux-mgs is present in the switch zone; copy it from the pre-staged
@@ -295,7 +284,9 @@ async fn sp_faux(
         clear_cached_ip(&sw);
         return Err(e);
     }
-    faux_on(&ip, port, args, 5, 15000).inspect_err(|_| clear_cached_ip(&sw))
+    // 30s per attempt: sprot-backed verbs (`state`, rot-*) take the emu gimlets
+    // ~20s under post-init MGS load; 15s timed out on every attempt.
+    faux_on(&ip, port, args, 3, 30000).inspect_err(|_| clear_cached_ip(&sw))
 }
 
 /// `voxel sp reflash <target> <image>` - re-flash a live SP (or the shared RoT)
@@ -321,10 +312,12 @@ async fn sp_reflash(
     let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
     // The baked sp-emu fleet must be present - reflash is meaningless on a
     // sp-sim rack (there's no flash file / voxel-sp-emu service to swap).
-    let have =
-        ssh_capture(&ip, &format!("test -x {SP_EMU_ZONE}/sp-emu && echo ok"))
-            .map(|o| o.contains("ok"))
-            .unwrap_or(false);
+    let have = ssh_capture(
+        &ip,
+        &format!("test -x {SWITCH_ZONE_ROOT}{SP_EMU_ZONE}/sp-emu && echo ok"),
+    )
+    .map(|o| o.contains("ok"))
+    .unwrap_or(false);
     if !have {
         clear_cached_ip(&sw);
         return Err(anyhow!(
@@ -382,12 +375,13 @@ async fn sp_reflash(
         clear_cached_ip(&sw);
         return Err(anyhow!("scp of hubris image into {sw} failed"));
     }
-    // Flash in-zone into a temp file (the baked sp-emu does `flash a`), swap it
-    // atomically over the live <port>.flash, then restart just that SP's service.
+    // Stop the SP's service, flash slot a of its per-instance state dir in-zone
+    // (identity/RoT NVM there are preserved), then bring it back up.
     let script = format!(
-        "set -e; SP_EMU_FLASH=/var/tmp/reflash.{port} {SP_EMU_ZONE}/sp-emu flash a /var/tmp/{zip}; \
-         mv /var/tmp/reflash.{port} {SP_EMU_ZONE}/{port}.flash; rm -f /var/tmp/{zip}; \
-         svcadm restart svc:/oxide/voxel-sp-emu:sp{port}; echo REFLASH_OK"
+        "set -e; svcadm disable -s svc:/oxide/voxel-sp-emu:sp{port}; \
+         SP_EMU_STATE_DIR={SP_EMU_ZONE}/state/{port} {SP_EMU_ZONE}/sp-emu flash a /var/tmp/{zip}; \
+         rm -f /var/tmp/{zip}; \
+         svcadm enable svc:/oxide/voxel-sp-emu:sp{port}; echo REFLASH_OK"
     );
     let out =
         ssh_output(&ip, &zlogin(&format!("{} 2>&1", shell_quote(&script))))
@@ -678,10 +672,12 @@ async fn sp_dump(
         .unwrap_or_else(|_| "humility".to_string());
 
     // A baked sp-emu (emu rack) is required - sp-sim has no dump dir to arm.
-    let have =
-        ssh_capture(&ip, &format!("test -x {SP_EMU_ZONE}/sp-emu && echo ok"))
-            .map(|o| o.contains("ok"))
-            .unwrap_or(false);
+    let have = ssh_capture(
+        &ip,
+        &format!("test -x {SWITCH_ZONE_ROOT}{SP_EMU_ZONE}/sp-emu && echo ok"),
+    )
+    .map(|o| o.contains("ok"))
+    .unwrap_or(false);
     if !have {
         clear_cached_ip(&sw);
         return Err(anyhow!(
@@ -864,11 +860,13 @@ async fn sp_ls(
     // script directly to zlogin (NOT via `sh -c`, whose quoting zlogin strips),
     // single-quoted so g0 hands it over as one arg; the zone shell parses it.
     // faux-mgs's slog INFO goes to stderr - drop it so `field()` sees clean stdout.
+    // `state` includes a sprot round trip to the RoT, which takes the emu gimlets
+    // ~20s under post-init MGS load, so each attempt needs headroom beyond that.
     let ports: Vec<u16> = fleet.sps.iter().map(|s| s.base_port).collect();
     let plist: String = ports.iter().map(|p| format!(" {p}")).collect();
     let probe = format!(
-        "for p in{plist}; do {FAUX_ZONE} --sp-sim-addr [::1]:$p --max-attempts 3 \
-         --per-attempt-timeout-millis 8000 state >/var/tmp/spls.$p 2>/dev/null & done; wait; \
+        "for p in{plist}; do {FAUX_ZONE} --sp-sim-addr [::1]:$p --max-attempts 2 \
+         --per-attempt-timeout-millis 30000 state >/var/tmp/spls.$p 2>/dev/null & done; wait; \
          for p in{plist}; do echo \"@@SP $p\"; cat /var/tmp/spls.$p; rm -f /var/tmp/spls.$p; done"
     );
     let combined =
