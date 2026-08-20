@@ -6,7 +6,8 @@
 //! kicks RSS on the RSS node).
 
 use crate::sys::{
-    note, read_external_net, replace_in_file, run, run_env, run_quiet, warn,
+    capture, note, read_external_net, replace_in_file, run, run_env, run_quiet,
+    warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -62,6 +63,7 @@ pub fn bring_up() -> Result<()> {
     patch_sled_config(&underlay)?;
     setup_external_networking(&other);
     setup_virtual_hardware();
+    preseed_install_datasets();
     inject_runtime_configs()?;
     unplumb_softnpu_source();
     maybe_start_switch_enforcer()?;
@@ -293,6 +295,123 @@ fn setup_virtual_hardware() {
     wipe_vdevs();
     if !run_env("./xtask", &["virtual-hardware", "create"], &softnpu) {
         warn("virtual-hardware create failed");
+    }
+}
+
+/// Control-plane service zones that live in the install dataset (the
+/// preset-independent set; global-zone software like switch/propolis is not
+/// here). Their hashes must match the target-release TUF repo's zone artifacts.
+const INSTALL_ZONES: &[&str] = &[
+    "clickhouse.tar.gz",
+    "clickhouse_keeper.tar.gz",
+    "clickhouse_server.tar.gz",
+    "cockroachdb.tar.gz",
+    "crucible.tar.gz",
+    "crucible_pantry.tar.gz",
+    "external_dns.tar.gz",
+    "internal_dns.tar.gz",
+    "nexus.tar.gz",
+    "ntp.tar.gz",
+    "oximeter.tar.gz",
+    "probe.tar.gz",
+];
+
+/// Fixed fake measurement corpus, embedded so it is present without a build-time
+/// bake. A non-empty measurement manifest is required for a sled to be eligible
+/// for noop image-source conversion. Voxel TUF repos must carry this same corpus
+/// so the hashes match.
+const CORPUS: &[(&str, &[u8])] = &[
+    (
+        "fake-measurement-id-9830767c45f2a02210a177fabafafe2c84501039289483f72cec299b0c78dbcb.cbor",
+        include_bytes!(
+            "../corpus/fake-measurement-id-9830767c45f2a02210a177fabafafe2c84501039289483f72cec299b0c78dbcb.cbor"
+        ),
+    ),
+    (
+        "fake-measurement-id-ae9279e9135de75e4e137c6da7f939b5a2eae6d931a7f2205df930e37cd58096.cbor",
+        include_bytes!(
+            "../corpus/fake-measurement-id-ae9279e9135de75e4e137c6da7f939b5a2eae6d931a7f2205df930e37cd58096.cbor"
+        ),
+    ),
+];
+
+/// Pre-create and populate the M.2 install datasets before sled-agent adopts
+/// them. sled-agent reads the install-dataset manifest exactly once at startup
+/// and never reloads, so seeding after it starts would need a restart (which on
+/// a scrimlet recreates oxz_switch and wedges the rack). Instead we run in the
+/// window after `virtual-hardware create` made the vdevs but before
+/// `omicron-package activate` starts sled-agent: create a pool on each M.2 vdev,
+/// drop the zones + corpus into `install/`, and leave it imported. sled-agent's
+/// adoption then finds the pool and preserves it, and its first read reports a
+/// non-empty manifest, so the reconfigurator can noop-convert to the TUF repo
+/// with no restart. The pool must NOT be exported: sled-agent's `zpool import`
+/// has no `-d`, so it cannot locate an exported file-vdev pool; an imported one
+/// yields "already created/imported", which its import handler accepts.
+/// Best-effort: on any failure the sled falls back to the manual path.
+fn preseed_install_datasets() {
+    let mut vdevs: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir("/var/tmp") {
+        for e in entries.flatten() {
+            let p = e.path();
+            let is_m2 = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("m2_") && n.ends_with(".vdev"));
+            if is_m2 && let Some(s) = p.to_str() {
+                vdevs.push(s.to_string());
+            }
+        }
+    }
+    if vdevs.is_empty() {
+        warn("preseed: no m2 vdevs in /var/tmp; skipping install-dataset seed");
+        return;
+    }
+    for vdev in &vdevs {
+        let Some(uuid) =
+            capture("uuidgen", &[]).map(|u| u.trim().to_lowercase())
+        else {
+            warn("preseed: uuidgen failed");
+            continue;
+        };
+        let pool = format!("oxi_{uuid}");
+        let mnt = format!("/pool/int/{uuid}/install");
+        if !run("zpool", &["create", "-f", &pool, vdev]) {
+            warn(format!("preseed: zpool create {pool} on {vdev} failed"));
+            continue;
+        }
+        if !run(
+            "zfs",
+            &[
+                "create",
+                "-o",
+                &format!("mountpoint={mnt}"),
+                &format!("{pool}/install"),
+            ],
+        ) {
+            warn(format!("preseed: zfs create {pool}/install failed"));
+            run("zpool", &["destroy", "-f", &pool]);
+            continue;
+        }
+        let meas = format!("{mnt}/measurements");
+        let _ = fs::create_dir_all(&meas);
+        for z in INSTALL_ZONES {
+            let src = format!("/opt/oxide/{z}");
+            if Utf8Path::new(&src).exists()
+                && let Err(e) = fs::copy(&src, format!("{mnt}/{z}"))
+            {
+                warn(format!("preseed: copy {z}: {e}"));
+            }
+        }
+        for (name, bytes) in CORPUS {
+            if let Err(e) = fs::write(format!("{meas}/{name}"), bytes) {
+                warn(format!("preseed: write corpus {name}: {e}"));
+            }
+        }
+        // Leave the pool imported: sled-agent's `zpool import -f` (no `-d`)
+        // cannot find an exported file-vdev pool, but on an already-imported
+        // one it gets "a pool with that name is already created/imported",
+        // which its import handler treats as success, so adoption preserves it.
+        note(format!("preseed: staged install dataset on {vdev} ({pool})"));
     }
 }
 
