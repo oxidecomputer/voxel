@@ -633,6 +633,12 @@ fn stage_sp_emu(
         })?;
         fs::copy(rot, out.join("rot.image"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
+        // Staged bootleby turns on sp-emu secure boot; rot_image must be
+        // self-signed.
+        if let Some(bootleby) = cfg.sp.bootleby_image.as_deref() {
+            fs::copy(bootleby, out.join("bootleby.zip"))
+                .with_context(|| format!("stage bootleby from {bootleby}"))?;
+        }
     }
     // Stage each role's hubris archive; voxel-init flashes a per-instance state
     // directory from it in the zone (sp-emu 1.x flashes from the archive, not a

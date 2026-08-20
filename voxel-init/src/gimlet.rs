@@ -587,7 +587,9 @@ fn setup_sp_emu() {
         }
     }
     // The RoT (oxide-rot-1) now runs in-process inside each SP over sprot, from
-    // this one image; there is no separate rot-serve service.
+    // this one image; there is no separate rot-serve service. A staged bootleby
+    // enables secure boot; rot.image must then be self-signed.
+    let mut bootleby = false;
     if rot {
         let src = pick(
             format!("{SP_EMU_CARGO_DIR}/rot.image"),
@@ -595,6 +597,19 @@ fn setup_sp_emu() {
         );
         if let Err(e) = fs::copy(&src, format!("{SP_EMU_ZONE_DIR}/rot.image")) {
             warn(format!("copy rot.image from {src}: {e}"));
+        }
+        let bl_src = pick(
+            format!("{SP_EMU_CARGO_DIR}/bootleby.zip"),
+            format!("{BAKED}/bootleby.zip"),
+        );
+        if Utf8Path::new(&bl_src).exists() {
+            if let Err(e) =
+                fs::copy(&bl_src, format!("{SP_EMU_ZONE_DIR}/bootleby.zip"))
+            {
+                warn(format!("copy bootleby from {bl_src}: {e}"));
+            } else {
+                bootleby = true;
+            }
         }
     }
     // Flash each SP a per-instance state dir from its archive. sp-emu is an
@@ -615,7 +630,9 @@ fn setup_sp_emu() {
             warn(format!("sp-emu flash failed for port {}", sp.port));
         }
     }
-    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&fleet, rot)) {
+    if let Err(e) =
+        fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&fleet, rot, bootleby))
+    {
         warn(format!("write sp-emu manifest: {e}"));
         return;
     }
@@ -660,7 +677,7 @@ fn setup_sp_emu() {
 /// state dir, and VPD identity go through the method environment. With `rot` each
 /// SP runs oxide-rot-1 in-process over sprot from the shared rot image; there is
 /// no separate RoT service.
-fn sp_emu_manifest(fleet: &[EmuSp], rot: bool) -> String {
+fn sp_emu_manifest(fleet: &[EmuSp], rot: bool, bootleby: bool) -> String {
     let mut s = indoc! {r#"
         <?xml version="1.0"?>
         <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
@@ -690,13 +707,20 @@ fn sp_emu_manifest(fleet: &[EmuSp], rot: bool) -> String {
                 "<envvar name=\"SP_EMU_VPD_PART\" value=\"{part}\"/>\n"
             ));
         }
-        // In-process RoT over sprot; bootleby is skipped until the images are
-        // self-signed.
+        // In-process RoT over sprot; bootleby runs secure boot when staged.
         if rot {
             s.push_str(&formatdoc! {r#"
                 <envvar name="SP_EMU_ROT_FLASH" value="{SP_EMU_IN_ZONE}/rot.image"/>
-                <envvar name="SP_EMU_ROT_NO_BOOTLEBY" value="1"/>
             "#});
+            if bootleby {
+                s.push_str(&format!(
+                    "<envvar name=\"SP_EMU_ROT_BOOTLEBY\" value=\"{SP_EMU_IN_ZONE}/bootleby.zip\"/>\n"
+                ));
+            } else {
+                s.push_str(
+                    "<envvar name=\"SP_EMU_ROT_NO_BOOTLEBY\" value=\"1\"/>\n",
+                );
+            }
         }
         s.push_str(indoc! {r#"
                   </method_environment>
@@ -765,7 +789,7 @@ mod tests {
             emu(33300, "sidecar", "SimSidecar0", "-"),
             emu(33310, "gimlet", "2FAKE000", "913-0000019"),
         ];
-        let m = sp_emu_manifest(&fleet, true);
+        let m = sp_emu_manifest(&fleet, true, true);
         assert_eq!(m.matches("<instance name=\"sp").count(), 2);
         // In-process RoT: no separate rot service or instances.
         assert!(!m.contains("voxel-rot-emu"));
@@ -779,13 +803,20 @@ mod tests {
             m.matches("</instance>").count()
         );
         assert!(m.contains("SP_EMU_ROT_FLASH"));
+        assert!(m.contains("SP_EMU_ROT_BOOTLEBY"));
+        assert!(!m.contains("SP_EMU_ROT_NO_BOOTLEBY"));
         assert!(m.contains("SP_EMU_VPD_SERIAL\" value=\"2FAKE000\""));
         assert!(m.contains("SP_EMU_VPD_PART\" value=\"913-0000019\""));
         // The sidecar has no part number, so no VPD_PART for it.
         assert!(m.contains("SP_EMU_BOARD\" value=\"sidecar\""));
 
+        let no_bl = sp_emu_manifest(&fleet, true, false);
+        assert!(no_bl.contains("SP_EMU_ROT_NO_BOOTLEBY"));
+        assert!(!no_bl.contains("SP_EMU_ROT_BOOTLEBY"));
+
         let plain = sp_emu_manifest(
             &[emu(33310, "gimlet", "2FAKE000", "913-0000019")],
+            false,
             false,
         );
         assert!(!plain.contains("SP_EMU_ROT_FLASH"));

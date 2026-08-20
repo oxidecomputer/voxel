@@ -218,6 +218,10 @@ pub struct SpCfg {
     /// RoT firmware image (oxide-rot-1) run as a second emulated core beside
     /// the sidecar SP so MGS/Nexus see a real Root of Trust. Optional.
     pub rot_image: Option<String>,
+    /// bootleby image. When set, sp-emu runs secure boot and `rot_image`
+    /// must be a self-signed (dice-self) build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootleby_image: Option<String>,
 }
 
 impl SpCfg {
