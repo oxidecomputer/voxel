@@ -482,6 +482,89 @@ pub fn switch_enforcer(slot: u8) {
     // zone is up by now). Idempotent + reboot-safe (startd owns them).
     setup_sp_emu();
     open_switch_zone_ssh();
+
+    // A later sled-agent restart recreates oxz_switch and wipes the staged emu
+    // fleet (baked sp-sim returns with the zone; the staged emu fleet does not).
+    // Stay resident and re-stage it when that happens, so a scrimlet bounce
+    // self-heals instead of wedging the rack. No-op on sp-sim racks.
+    if emu_fleet_configured() {
+        monitor_emu_fleet(slot);
+    }
+}
+
+/// True on an emu rack: the `ports` manifest lists at least one emulated SP.
+fn emu_fleet_configured() -> bool {
+    fs::read_to_string(format!("{SP_EMU_CARGO_DIR}/ports"))
+        .map(|m| {
+            m.lines().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() == 4 && f[0].parse::<u16>().is_ok()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The staged emu binary inside the switch zone. Absent means the zone was
+/// recreated (a sled-agent restart) and the staged fleet was lost.
+fn fleet_staged_in_zone() -> bool {
+    Utf8Path::new(&format!("{SP_EMU_ZONE_DIR}/sp-emu")).exists()
+}
+
+/// Resident watch, in the global zone, so it survives switch-zone recreation.
+/// When a sled-agent restart recreates oxz_switch and drops the emu fleet,
+/// re-stage the fleet, re-assert this scrimlet's MGS slot, and recover the
+/// softnpu fabric. Without this a scrimlet bounce loses the fleet, darkens the
+/// dataplane, and wedges the rack.
+fn monitor_emu_fleet(slot: u8) {
+    let mgs_staged = format!("{CARGO_BAY}/mgs-config-switch{slot}.toml");
+    loop {
+        std::thread::sleep(Duration::from_secs(20));
+        // Act only once the zone is back and the fleet is actually gone.
+        if !switch_zone_running() || fleet_staged_in_zone() {
+            continue;
+        }
+        note("switch zone recreated without emu fleet; re-staging");
+        setup_sp_emu();
+        if Utf8Path::new(&mgs_staged).exists()
+            && !files_equal(SWITCH_ZONE_MGS, &mgs_staged)
+        {
+            if let Err(e) = fs::copy(&mgs_staged, SWITCH_ZONE_MGS) {
+                warn(format!("re-copy switch{slot} MGS config: {e}"));
+            }
+            run(
+                "zlogin",
+                &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgs:default"],
+            );
+        }
+        recover_fabric();
+        open_switch_zone_ssh();
+        note("emu fleet re-staged after switch-zone recreation");
+    }
+}
+
+/// Recover the softnpu dataplane after a switch-zone recreation: reload the P4
+/// program into propolis, bounce dendrite/tfport (they bind the ASIC), kick
+/// mg-ddm (underlay routes) and mgd (BGP). Mirrors the manual recipe; idempotent.
+fn recover_fabric() {
+    run(
+        "/opt/oxide/sidecar/scadm",
+        &["propolis", "load-program", "/opt/oxide/sidecar/libsidecar_lite.so"],
+    );
+    run(
+        "zlogin",
+        &[
+            "oxz_switch",
+            "svcadm",
+            "restart",
+            "svc:/oxide/dendrite:default",
+            "svc:/oxide/tfport:default",
+        ],
+    );
+    run("svcadm", &["restart", "svc:/oxide/mg-ddm:default"]);
+    run(
+        "zlogin",
+        &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgd:default"],
+    );
 }
 
 fn files_equal(a: &str, b: &str) -> bool {
