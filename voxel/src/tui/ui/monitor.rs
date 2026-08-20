@@ -318,11 +318,8 @@ fn draw_topology(
 ) {
     let rack = app.session.selected_rack;
     let expanded = app.session.monitoring_expanded(MonitoringPane::Topology);
-    let outer = section_block(
-        "Topology",
-        expanded,
-        app.session.monitoring_pane == MonitoringPane::Topology,
-    );
+    let focused = app.session.monitoring_pane == MonitoringPane::Topology;
+    let outer = section_block("Topology", expanded, focused);
     frame.render_widget(outer.clone(), area);
     if !expanded || outer.inner(area).height == 0 {
         return;
@@ -337,7 +334,8 @@ fn draw_topology(
         app.session.monitor_scroll,
     );
     super::topology::draw(frame, &scene, app);
-    let edge = Style::default().fg(OX_GREEN_LIGHT);
+    let edge =
+        Style::default().fg(if focused { TUI_YELLOW } else { OX_GREEN_LIGHT });
     for y in layout.divider.y..layout.divider.bottom() {
         let line = if mode == LayoutMode::Wide {
             "│".to_string()
@@ -1012,6 +1010,32 @@ mod height_tests {
         assert_eq!(buffer[(47, 0)].symbol(), "┐");
         assert_eq!(buffer[(0, 1)].symbol(), "└");
         assert_eq!(buffer[(47, 1)].symbol(), "┘");
+    }
+
+    #[test]
+    fn topology_divider_follows_focus_without_recoloring_selection() {
+        let area = Rect::new(0, 0, 160, 20);
+        let layout = middle_layout(area, LayoutMode::Wide);
+        let render = |app: &App| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(160, 20)).unwrap();
+            terminal
+                .draw(|frame| draw_topology(frame, area, app, LayoutMode::Wide))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+
+        let focused = render(&app());
+        assert_eq!(focused[(layout.divider.x, area.y)].fg, TUI_YELLOW);
+        assert_eq!(focused[(layout.divider.x, area.y + 1)].fg, TUI_YELLOW);
+        assert_eq!(focused[(layout.inspector.x + 1, area.y)].fg, TUI_PURPLE);
+
+        let mut inactive_app = app();
+        inactive_app.session.monitoring_pane = MonitoringPane::TopZones;
+        let inactive = render(&inactive_app);
+        assert_eq!(inactive[(layout.divider.x, area.y)].fg, OX_GREEN_LIGHT);
+        assert_eq!(inactive[(layout.divider.x, area.y + 1)].fg, OX_GREEN_LIGHT);
+        assert_eq!(inactive[(layout.inspector.x + 1, area.y)].fg, TUI_PURPLE);
     }
 
     #[test]

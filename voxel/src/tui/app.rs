@@ -870,7 +870,7 @@ impl App {
                     self.session.help_scroll = 0;
                 }
             }
-            Action::ToggleExternalMonitoring
+            Action::RequestCancelAndDestroy
                 if self.session.view == View::Monitor
                     && self.session.confirmation.is_none() =>
             {
@@ -1701,6 +1701,17 @@ mod factual_outcome_tests {
         app.update(AppEvent::Action(Action::SwitchView(View::Monitor)));
 
         assert_eq!(app.session.selected_resource, Some(descriptor.id));
+    }
+
+    #[test]
+    fn monitoring_x_opens_external_monitoring() {
+        let mut app = App::new(vec![], 8, 8);
+        app.session.view = View::Monitor;
+
+        app.update(AppEvent::Action(Action::RequestCancelAndDestroy));
+
+        assert!(app.session.external_monitoring_open);
+        assert!(app.session.confirmation.is_none());
     }
 
     #[test]

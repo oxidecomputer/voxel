@@ -48,7 +48,6 @@ pub fn key_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Enter => Action::Activate,
         KeyCode::Char(' ') => Action::ToggleSection,
         KeyCode::Char('?') | KeyCode::F(1) => Action::ToggleHelp,
-        KeyCode::Char('o') => Action::ToggleExternalMonitoring,
         KeyCode::Char('s') => Action::CopyExternalMonitoringSelected,
         KeyCode::Char('a') => Action::CopyExternalMonitoringAll,
         KeyCode::Char('u') => Action::CopyExternalMonitoringGuide,
@@ -333,7 +332,6 @@ mod tests {
             (KeyCode::Char(' '), Action::ToggleSection),
             (KeyCode::Char('?'), Action::ToggleHelp),
             (KeyCode::F(1), Action::ToggleHelp),
-            (KeyCode::Char('o'), Action::ToggleExternalMonitoring),
             (KeyCode::Char('s'), Action::CopyExternalMonitoringSelected),
             (KeyCode::Char('a'), Action::CopyExternalMonitoringAll),
             (KeyCode::Char('u'), Action::CopyExternalMonitoringGuide),
@@ -352,6 +350,7 @@ mod tests {
         }
         assert_eq!(key_action(k(KeyCode::Char('3'))), None);
         assert_eq!(key_action(k(KeyCode::Char('4'))), None);
+        assert_eq!(key_action(k(KeyCode::Char('o'))), None);
         assert_eq!(
             key_action(KeyEvent {
                 kind: KeyEventKind::Release,

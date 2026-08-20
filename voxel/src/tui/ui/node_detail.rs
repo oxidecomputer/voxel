@@ -156,7 +156,7 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(Line::styled(
-            " ▶ Resource detail — Enter/Esc closes ",
+            " ▶ Resource detail ",
             selection_style().add_modifier(Modifier::REVERSED),
         ))
         .border_style(health_style(resource_health_state(app, id)));

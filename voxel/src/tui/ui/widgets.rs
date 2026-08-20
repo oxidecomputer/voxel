@@ -333,10 +333,8 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     if app.session.view == View::Monitor {
         let pane = app.session.monitoring_pane;
         let expanded = app.session.monitoring_expanded(pane);
-        let mut groups = vec![
-            group("Space", if expanded { "fold" } else { "expand" }),
-            group("o", "external monitoring"),
-        ];
+        let mut groups =
+            vec![group("Space", if expanded { "fold" } else { "expand" })];
         if expanded {
             match pane {
                 crate::tui::event::MonitoringPane::RackSummary => {
@@ -490,4 +488,47 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::telemetry::{
+        RackId, ResourceDescriptor, ResourceId, ResourceKind,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn screen_text(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn resource_detail_title_omits_redundant_close_instruction() {
+        let descriptor = ResourceDescriptor {
+            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
+            rack: Some(RackId(0)),
+            kind: ResourceKind::Sled,
+            name: "g0".into(),
+            host: None,
+        };
+        let mut app = App::new(vec![descriptor.clone()], 8, 8);
+        app.session.view = View::Monitor;
+        app.session.selected_resource = Some(descriptor.id);
+        app.session.detail_open = true;
+
+        let text = screen_text(&app);
+
+        assert!(text.contains("Resource detail"));
+        assert!(!text.contains("Enter/Esc closes"));
+        assert!(text.contains("Enter/Esc"));
+        assert!(text.contains("close"));
+    }
 }

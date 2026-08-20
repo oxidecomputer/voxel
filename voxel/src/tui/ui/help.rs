@@ -33,7 +33,7 @@ const MONITORING: &[(&str, &str)] = &[
     ("Top Zones ↑ / ↓", "Browse the rack-wide traffic ranking"),
     ("Detail ↑ / ↓", "Browse peers; detail stays open; section unchanged"),
     ("Detail Enter/Esc", "Close resource detail"),
-    ("o", "External monitoring and OpenTelemetry receiver handoff"),
+    ("x", "External monitoring"),
 ];
 const DIALOGS: &[(&str, &str)] = &[
     ("↑ / ↓", "Choose a confirmation option"),
@@ -400,7 +400,7 @@ mod tests {
                 "Browse peers; detail stays open; section unchanged",
             ),
             ("Detail Enter/Esc", "Close resource detail"),
-            ("o", "External monitoring and OpenTelemetry receiver handoff"),
+            ("x", "External monitoring"),
             ("↑ / ↓", "Choose a confirmation option"),
             ("Enter", "Confirm selected safe-default option"),
             ("y", "Copy full fallback command from Detach"),

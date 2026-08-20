@@ -166,7 +166,6 @@ pub enum Action {
     Activate,
     ToggleSection,
     ToggleHelp,
-    ToggleExternalMonitoring,
     CopyExternalMonitoringSelected,
     CopyExternalMonitoringAll,
     CopyExternalMonitoringGuide,

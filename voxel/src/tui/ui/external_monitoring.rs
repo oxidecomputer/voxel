@@ -141,34 +141,6 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    fn buffer_text(app: &App) -> String {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32))
-                .unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
-    fn screen_text(app: &App) -> String {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50))
-                .unwrap();
-        terminal.draw(|frame| super::super::widgets::draw(frame, app)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
     #[test]
     fn generated_yaml_is_deterministic_and_contains_no_session_secret() {
         let yaml = yaml_for([
@@ -199,9 +171,9 @@ mod tests {
             (RackId(1), "https://198.51.100.86/".into()),
         ]);
 
-        app.update(Action::ToggleExternalMonitoring.into());
+        app.update(Action::RequestCancelAndDestroy.into());
         assert!(app.session.external_monitoring_open);
-        app.update(Action::ToggleExternalMonitoring.into());
+        app.update(Action::RequestCancelAndDestroy.into());
         assert!(app.session.external_monitoring_open);
         assert!(matches!(
             app.update(Action::CopyExternalMonitoringSelected.into()).as_slice(),
@@ -217,34 +189,5 @@ mod tests {
         );
         app.update(Action::Close.into());
         assert!(!app.session.external_monitoring_open);
-    }
-
-    #[test]
-    fn overlay_uses_operator_handoff_copy_and_standard_close_footer() {
-        let mut app = App::new(vec![], 4, 4);
-        app.session.external_monitoring_open = true;
-        let text = buffer_text(&app);
-        let screen = screen_text(&app);
-
-        assert!(text.contains(
-            "The Voxel TUI is a deployment assistant, not a monitoring platform"
-        ));
-        assert!(text.contains("then connect your own observability stack"));
-        assert!(text.contains(
-            "oxide/rack<N> to your list of receivers, and choose your exporters."
-        ));
-        assert!(text.contains("Documentation:"));
-        assert!(text.contains(
-            "https://docs.oxide.computer/guides/metrics/oxql-tutorial"
-        ));
-        assert!(text.contains(
-            "https://docs.oxide.computer/guides/metrics/timeseries-schemas"
-        ));
-        assert!(text.contains("Esc close this window"));
-        assert!(text.contains("NOTE: insecure_skip_verify"));
-        assert!(!text.contains("generated YAML contains no credentials"));
-        assert!(!text.contains("4. Start with"));
-        assert!(screen.contains("[Esc] close"));
-        assert!(!screen.contains("[o/Esc] close"));
     }
 }

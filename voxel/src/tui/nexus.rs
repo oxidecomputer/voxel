@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::{Context, anyhow, ensure};
 use chrono::{DateTime, Utc};
@@ -7,7 +7,7 @@ use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use voxel_config::{RecoverySiloCfg, VoxelConfig};
+use voxel_config::{Network, RecoverySiloCfg, VoxelConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryLogin {
@@ -26,13 +26,28 @@ impl RecoveryLogin {
     }
 }
 
+fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
+    let Ok(first) = network.service_pool_first.parse::<Ipv4Addr>() else {
+        return Vec::new();
+    };
+    let last = network.service_pool_last.parse::<Ipv4Addr>().unwrap_or(first);
+    let lo = u32::from(first);
+    let hi = u32::from(last).max(lo).min(lo.saturating_add(31));
+    let dns: Vec<&str> =
+        network.external_dns_ips.iter().map(String::as_str).collect();
+    let (rest, dns_members): (Vec<Ipv4Addr>, Vec<Ipv4Addr>) = (lo..=hi)
+        .map(Ipv4Addr::from)
+        .partition(|addr| !dns.contains(&addr.to_string().as_str()));
+    rest.into_iter().chain(dns_members).collect()
+}
+
 pub(crate) fn rack_endpoints(
     config: &VoxelConfig,
     rack: usize,
 ) -> anyhow::Result<Vec<Url>> {
     ensure!(rack < config.topology.racks(), "unknown rack {}", rack + 1);
     let network = config.network.for_rack(rack);
-    let candidates = crate::commtest::api_candidates(&network);
+    let candidates = api_candidates(&network);
     ["http", "https"]
         .into_iter()
         .flat_map(|scheme| {
