@@ -80,6 +80,35 @@ pub fn draw(
         .get(&rack)
         .map(|sample| rss_summary(app, sample))
         .unwrap_or_else(|| "RSS unavailable (no sample)".into());
+    let zfs = app
+        .observability
+        .zfs_headroom
+        .get(&rack)
+        .and_then(|sample| sample.good.as_ref())
+        .map(|sample| {
+            let available: u64 =
+                sample.value.iter().map(|pool| pool.available_bytes()).sum();
+            let total: u64 =
+                sample.value.iter().map(|pool| pool.total_bytes).sum();
+            format!(
+                "ZFS {:.1}/{:.1} GiB free",
+                available as f64 / 1024.0_f64.powi(3),
+                total as f64 / 1024.0_f64.powi(3)
+            )
+        })
+        .unwrap_or_else(|| "ZFS —".into());
+    let exceptions = app
+        .observability
+        .oximeter_exceptions
+        .get(&rack)
+        .and_then(|sample| sample.good.as_ref())
+        .map(|sample| {
+            format!(
+                "Oximeter collection health: {} failures / {} dropped",
+                sample.value.failed_collections, sample.value.dropped_samples
+            )
+        })
+        .unwrap_or_else(|| "Oximeter collection health unavailable".into());
     let compact = area.width < 100;
     let title = if compact {
         format!(" Rack {} ◀ {}/{} ▶ ", rack.0, selected_index + 1, racks.len())
@@ -107,14 +136,14 @@ pub fn draw(
         ));
     let rate_text = if compact {
         format!(
-            "RX {} TX {} Σ{} · {healthy}/{unhealthy}/{checking}",
+            "RX {} TX {} Σ{} · {healthy}/{unhealthy}/{checking} · {zfs} · {exceptions}",
             format_rate(rate.rx_bytes_sec),
             format_rate(rate.tx_bytes_sec),
             format_rate(rate.total_bytes_sec())
         )
     } else {
         format!(
-            "RX {} · TX {} · Total {} · health {healthy} ok / {unhealthy} bad / {checking} checking",
+            "RX {} · TX {} · Total {} · health {healthy} ok / {unhealthy} bad / {checking} checking · {zfs} · {exceptions}",
             format_rate(rate.rx_bytes_sec),
             format_rate(rate.tx_bytes_sec),
             format_rate(rate.total_bytes_sec())
@@ -160,15 +189,23 @@ pub fn draw(
             .unwrap_or_default();
         if data.is_empty() {
             frame.render_widget(
-                Paragraph::new("Rack history: collecting (no samples)"),
+                Paragraph::new("Rack traffic (this TUI session): collecting"),
                 history_area,
             );
         } else {
+            let label = "Rack traffic (this TUI session) ";
+            let label_width = label.len().min(history_area.width.into()) as u16;
+            frame.render_widget(Paragraph::new(label), history_area);
             frame.render_widget(
                 Sparkline::default()
                     .data(&data)
                     .style(Style::default().fg(Color::Cyan)),
-                history_area,
+                Rect::new(
+                    history_area.x.saturating_add(label_width),
+                    history_area.y,
+                    history_area.width.saturating_sub(label_width),
+                    history_area.height,
+                ),
             );
         }
     }

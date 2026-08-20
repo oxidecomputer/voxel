@@ -1,6 +1,7 @@
 pub mod colors;
 pub mod confirm_dialog;
 pub mod deployment;
+pub mod external_monitoring;
 pub mod help;
 pub mod logs;
 pub mod monitor;

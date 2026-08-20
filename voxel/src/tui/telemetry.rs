@@ -164,6 +164,28 @@ pub struct BidirectionalRate {
     pub tx_packets_sec: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BidirectionalErrors {
+    pub rx_sec: f64,
+    pub tx_sec: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum TrafficSource {
+    Oximeter,
+    #[default]
+    DirectProbe,
+}
+
+impl TrafficSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Oximeter => "Oximeter",
+            Self::DirectProbe => "direct probe",
+        }
+    }
+}
+
 impl BidirectionalRate {
     pub fn total_bytes_sec(self) -> f64 {
         self.rx_bytes_sec + self.tx_bytes_sec
@@ -191,13 +213,64 @@ pub struct ZoneTraffic {
     pub name: String,
     pub short_name: String,
     pub rate: BidirectionalRate,
+    pub errors: BidirectionalErrors,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrafficSample {
     pub total: BidirectionalRate,
     pub links: BTreeMap<String, BidirectionalRate>,
     pub zones: Vec<ZoneTraffic>,
+    pub errors: BidirectionalErrors,
+    pub source: TrafficSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoneCpu {
+    pub id: ResourceId,
+    pub name: String,
+    pub kind: String,
+    pub user_percent: f64,
+    pub system_percent: f64,
+    pub wait_percent: f64,
+}
+
+impl ZoneCpu {
+    pub fn total_percent(&self) -> f64 {
+        self.user_percent + self.system_percent
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZfsHeadroom {
+    pub id: ResourceId,
+    pub pool: String,
+    pub allocated_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl ZfsHeadroom {
+    pub fn available_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.allocated_bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OximeterExceptions {
+    pub failed_collections: u64,
+    pub dropped_samples: u64,
+}
+
+impl Default for TrafficSample {
+    fn default() -> Self {
+        Self {
+            total: Default::default(),
+            links: Default::default(),
+            zones: Default::default(),
+            errors: Default::default(),
+            source: TrafficSource::DirectProbe,
+        }
+    }
 }
 
 impl From<BidirectionalRate> for TrafficSample {
@@ -276,6 +349,7 @@ impl ResourceTelemetry {
                     name: zone.name.clone(),
                     short_name: zone.short_name.clone(),
                     rate,
+                    errors: Default::default(),
                 }
             })
             .collect();
@@ -407,6 +481,28 @@ impl TelemetryModel {
                 captured_at: now,
                 rate: resource.current_rate,
             });
+        }
+    }
+
+    pub fn set_oximeter_samples(
+        &mut self,
+        id: &ResourceId,
+        generation: Instant,
+        samples: impl IntoIterator<Item = (Instant, TrafficSample)>,
+    ) {
+        let Some(resource) = self.resources.get_mut(id) else {
+            return;
+        };
+        for (captured_at, sample) in samples {
+            resource.current_rate = sample.total;
+            resource.current_sample = sample;
+            resource.history.push(HistoryPoint {
+                captured_at,
+                rate: resource.current_rate,
+            });
+        }
+        if resource.current_sample.source == TrafficSource::Oximeter {
+            resource.current_at = Some(generation);
         }
     }
 
@@ -1121,7 +1217,9 @@ mod tests {
                 name: "oxz_nexus_deadbeef0".into(),
                 short_name: "nexus".into(),
                 rate: BidirectionalRate::default(),
+                errors: Default::default(),
             }],
+            ..Default::default()
         };
         assert_eq!(sample.total.total_bytes_sec(), 10.0);
         assert!(sample.links.contains_key("net0"));

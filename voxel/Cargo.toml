@@ -37,6 +37,8 @@ serde_json = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { workspace = true, features = ["derive"] }
 libc = "0.2"
+reqwest.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).

@@ -15,8 +15,9 @@ use crate::tui::reconcile::{
     RssObservation,
 };
 use crate::tui::telemetry::{
-    HealthDiagnostic, LatestSample, NodeAddresses, RackId, ResourceDescriptor,
-    ResourceId, TelemetryModel,
+    HealthDiagnostic, LatestSample, NodeAddresses, OximeterExceptions, RackId,
+    ResourceDescriptor, ResourceId, ResourceScope, TelemetryModel,
+    TrafficSample, TrafficSource, ZfsHeadroom, ZoneCpu,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +51,7 @@ pub struct SessionState {
     pub top_zones_scroll: usize,
     pub help_scroll: usize,
     pub help_open: bool,
+    pub external_monitoring_open: bool,
     pub selected_rack: Option<RackId>,
     pub selected_resource: Option<ResourceId>,
     pub terminal: TerminalSize,
@@ -250,6 +252,10 @@ pub struct ObservabilityState {
     pub health: BTreeMap<ResourceId, LatestSample<HealthDiagnostic>>,
     pub addresses: BTreeMap<ResourceId, LatestSample<NodeAddresses>>,
     pub traffic_failures: BTreeMap<ResourceId, LatestSample<()>>,
+    direct_traffic: BTreeMap<ResourceId, LatestSample<TrafficSample>>,
+    pub zone_cpu: BTreeMap<RackId, LatestSample<Vec<ZoneCpu>>>,
+    pub zfs_headroom: BTreeMap<RackId, LatestSample<Vec<ZfsHeadroom>>>,
+    pub oximeter_exceptions: BTreeMap<RackId, LatestSample<OximeterExceptions>>,
     pub latest_traffic_generation: Option<Instant>,
 }
 
@@ -263,6 +269,7 @@ pub struct App {
     pub logs_filter: LogFilter,
     pub durable_log_path: String,
     pub reattach_command: Option<String>,
+    pub external_monitoring_endpoints: BTreeMap<RackId, String>,
     pub clipboard_copied: bool,
     pub now: Option<Instant>,
     next_operation_request_id: Option<OperationRequestId>,
@@ -284,6 +291,10 @@ impl App {
             .iter()
             .map(|d| (d.id.clone(), LatestSample::default()))
             .collect();
+        let direct_traffic = topology
+            .iter()
+            .map(|d| (d.id.clone(), LatestSample::default()))
+            .collect();
         let addresses = topology
             .iter()
             .map(|d| (d.id.clone(), LatestSample::default()))
@@ -293,6 +304,10 @@ impl App {
             .filter_map(|d| d.rack)
             .map(|rack| (rack, LatestSample::default()))
             .collect();
+        let racks = topology
+            .iter()
+            .filter_map(|descriptor| descriptor.rack)
+            .collect::<BTreeSet<_>>();
         let mut app = Self {
             session: SessionState {
                 view: View::Deployment,
@@ -306,6 +321,7 @@ impl App {
                 top_zones_scroll: 0,
                 help_scroll: 0,
                 help_open: false,
+                external_monitoring_open: false,
                 selected_rack: None,
                 selected_resource: None,
                 terminal: TerminalSize { width: 0, height: 0 },
@@ -339,12 +355,26 @@ impl App {
                 health,
                 addresses,
                 traffic_failures,
+                direct_traffic,
+                zone_cpu: racks
+                    .iter()
+                    .map(|rack| (*rack, LatestSample::default()))
+                    .collect(),
+                zfs_headroom: racks
+                    .iter()
+                    .map(|rack| (*rack, LatestSample::default()))
+                    .collect(),
+                oximeter_exceptions: racks
+                    .iter()
+                    .map(|rack| (*rack, LatestSample::default()))
+                    .collect(),
                 latest_traffic_generation: None,
             },
             logs: BoundedLogs::new(log_capacity),
             logs_filter: LogFilter::All,
             durable_log_path: "voxel-tui.log".into(),
             reattach_command: None,
+            external_monitoring_endpoints: BTreeMap::new(),
             clipboard_copied: false,
             now: None,
             next_operation_request_id: Some(OperationRequestId::FIRST),
@@ -394,6 +424,43 @@ impl App {
             AppEvent::Traffic { id, at, sample } => {
                 if self.observability.telemetry.resources.contains_key(&id)
                     && Self::accept_attempt(
+                        &self.observability.direct_traffic[&id],
+                        at,
+                    )
+                {
+                    let oximeter_is_active = self
+                        .observability
+                        .telemetry
+                        .resources
+                        .get(&id)
+                        .is_some_and(|resource| {
+                            resource.current_at.is_some()
+                                && resource.current_sample.source
+                                    == TrafficSource::Oximeter
+                        });
+                    self.observability
+                        .direct_traffic
+                        .entry(id.clone())
+                        .or_default()
+                        .record_success(at, sample.clone());
+                    if !oximeter_is_active && self.accept_traffic_generation(at)
+                    {
+                        self.observability
+                            .telemetry
+                            .set_current_sample(&id, at, sample);
+                        self.observability.telemetry.rebuild_aggregates(at);
+                        self.observability
+                            .traffic_failures
+                            .entry(id)
+                            .or_default()
+                            .record_success(at, ());
+                    }
+                }
+            }
+            AppEvent::OximeterTraffic { id, at, samples } => {
+                if self.observability.telemetry.resources.contains_key(&id)
+                    && !samples.is_empty()
+                    && Self::accept_attempt(
                         &self.observability.traffic_failures[&id],
                         at,
                     )
@@ -401,7 +468,7 @@ impl App {
                 {
                     self.observability
                         .telemetry
-                        .set_current_sample(&id, at, sample);
+                        .set_oximeter_samples(&id, at, samples);
                     self.observability.telemetry.rebuild_aggregates(at);
                     self.observability
                         .traffic_failures
@@ -410,20 +477,73 @@ impl App {
                         .record_success(at, ());
                 }
             }
-            AppEvent::TrafficFailed { id, at, message } => {
-                if self
-                    .observability
-                    .traffic_failures
-                    .get(&id)
-                    .is_some_and(|sample| Self::accept_attempt(sample, at))
-                    && self.accept_traffic_generation(at)
-                {
-                    let sample = self
+            AppEvent::OximeterTrafficFailed { rack, at, message } => {
+                if self.accept_traffic_generation(at) {
+                    let ids = self
                         .observability
-                        .traffic_failures
-                        .get_mut(&id)
-                        .unwrap();
-                    sample.record_error(at, message);
+                        .telemetry
+                        .resources
+                        .keys()
+                        .filter(|id| id.scope == ResourceScope::Rack(rack))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for id in ids {
+                        let fallback = self
+                            .observability
+                            .direct_traffic
+                            .get(&id)
+                            .and_then(|sample| sample.good.as_ref())
+                            .map(|good| good.value.clone());
+                        if let Some(sample) = fallback {
+                            self.observability
+                                .telemetry
+                                .set_current_sample(&id, at, sample);
+                            self.observability
+                                .traffic_failures
+                                .entry(id)
+                                .or_default()
+                                .record_success(at, ());
+                        } else {
+                            self.observability
+                                .traffic_failures
+                                .entry(id)
+                                .or_default()
+                                .record_error(at, message.clone());
+                        }
+                    }
+                    self.observability.telemetry.rebuild_aggregates(at);
+                }
+            }
+            AppEvent::TrafficFailed { id, at, message } => {
+                if self.observability.direct_traffic.contains_key(&id)
+                    && Self::accept_attempt(
+                        &self.observability.direct_traffic[&id],
+                        at,
+                    )
+                {
+                    self.observability
+                        .direct_traffic
+                        .entry(id.clone())
+                        .or_default()
+                        .record_error(at, message.clone());
+                    let oximeter_is_active = self
+                        .observability
+                        .telemetry
+                        .resources
+                        .get(&id)
+                        .is_some_and(|resource| {
+                            resource.current_at.is_some()
+                                && resource.current_sample.source
+                                    == TrafficSource::Oximeter
+                        });
+                    if !oximeter_is_active && self.accept_traffic_generation(at)
+                    {
+                        self.observability
+                            .traffic_failures
+                            .entry(id)
+                            .or_default()
+                            .record_error(at, message);
+                    }
                 }
             }
             AppEvent::Health { id, at, diagnostic } => {
@@ -447,6 +567,52 @@ impl App {
                 {
                     let sample =
                         self.observability.health.get_mut(&id).unwrap();
+                    sample.record_error(at, message);
+                }
+            }
+            AppEvent::ZoneCpu { rack, at, zones } => {
+                if let Some(sample) = self.observability.zone_cpu.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
+                    sample.record_success(at, zones);
+                }
+            }
+            AppEvent::ZoneCpuFailed { rack, at, message } => {
+                if let Some(sample) = self.observability.zone_cpu.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
+                    sample.record_error(at, message);
+                }
+            }
+            AppEvent::ZfsHeadroom { rack, at, pools } => {
+                if let Some(sample) =
+                    self.observability.zfs_headroom.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
+                    sample.record_success(at, pools);
+                }
+            }
+            AppEvent::ZfsHeadroomFailed { rack, at, message } => {
+                if let Some(sample) =
+                    self.observability.zfs_headroom.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
+                    sample.record_error(at, message);
+                }
+            }
+            AppEvent::OximeterExceptions { rack, at, exceptions } => {
+                if let Some(sample) =
+                    self.observability.oximeter_exceptions.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
+                    sample.record_success(at, exceptions);
+                }
+            }
+            AppEvent::OximeterExceptionsFailed { rack, at, message } => {
+                if let Some(sample) =
+                    self.observability.oximeter_exceptions.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
                     sample.record_error(at, message);
                 }
             }
@@ -591,6 +757,32 @@ impl App {
                 _ => vec![],
             };
         }
+        if self.session.external_monitoring_open {
+            return match action {
+                Action::Close => {
+                    self.session.external_monitoring_open = false;
+                    vec![]
+                }
+                Action::CopyExternalMonitoringSelected => {
+                    vec![Effect::CopyToClipboard(
+                        crate::tui::ui::external_monitoring::selected_yaml(
+                            self,
+                        ),
+                    )]
+                }
+                Action::CopyExternalMonitoringAll => {
+                    vec![Effect::CopyToClipboard(
+                        crate::tui::ui::external_monitoring::all_yaml(self),
+                    )]
+                }
+                Action::CopyExternalMonitoringGuide => {
+                    vec![Effect::CopyToClipboard(
+                        crate::tui::ui::external_monitoring::GUIDE_URL.into(),
+                    )]
+                }
+                _ => vec![],
+            };
+        }
         if self.session.detail_open {
             return match action {
                 Action::Activate | Action::Close => {
@@ -677,6 +869,12 @@ impl App {
                 if self.session.help_open {
                     self.session.help_scroll = 0;
                 }
+            }
+            Action::ToggleExternalMonitoring
+                if self.session.view == View::Monitor
+                    && self.session.confirmation.is_none() =>
+            {
+                self.session.external_monitoring_open = true;
             }
             Action::Close => {
                 if self.session.confirmation.take().is_some() {
@@ -1239,7 +1437,7 @@ impl App {
             .session
             .selected_resource
             .as_ref()
-            .is_some_and(|r| !resources.contains(r))
+            .is_none_or(|r| !resources.contains(r))
         {
             self.session.selected_resource = resources.first().cloned();
         }
@@ -1459,7 +1657,12 @@ fn command_succeeded(outcome: &CommandOutcome) -> bool {
 mod factual_outcome_tests {
     use super::*;
     use crate::tui::operation::LaunchPhase;
+    use crate::tui::telemetry::{
+        BidirectionalRate, RackId, ResourceDescriptor, ResourceId,
+        ResourceKind, TrafficSample, TrafficSource,
+    };
     use std::os::unix::process::ExitStatusExt;
+    use std::time::Duration;
 
     fn active_app() -> App {
         let mut app = App::new(vec![], 8, 8);
@@ -1482,6 +1685,91 @@ mod factual_outcome_tests {
             status: std::process::ExitStatus::from_raw(0),
             stderr_summary: vec![],
         }
+    }
+
+    #[test]
+    fn switching_to_monitoring_selects_first_resource() {
+        let descriptor = ResourceDescriptor {
+            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
+            rack: Some(RackId(0)),
+            kind: ResourceKind::Sled,
+            name: "g0".into(),
+            host: None,
+        };
+        let mut app = App::new(vec![descriptor.clone()], 8, 8);
+
+        app.update(AppEvent::Action(Action::SwitchView(View::Monitor)));
+
+        assert_eq!(app.session.selected_resource, Some(descriptor.id));
+    }
+
+    #[test]
+    fn oximeter_supersedes_direct_until_its_next_failure() {
+        let id = ResourceId::rack(RackId(0), ResourceKind::Sled, "g0");
+        let descriptor = ResourceDescriptor {
+            id: id.clone(),
+            rack: Some(RackId(0)),
+            kind: ResourceKind::Sled,
+            name: "g0".into(),
+            host: None,
+        };
+        let mut app = App::new(vec![descriptor], 8, 8);
+        let started = Instant::now();
+        let direct = TrafficSample {
+            total: BidirectionalRate {
+                rx_bytes_sec: 10.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.update(AppEvent::Traffic {
+            id: id.clone(),
+            at: started,
+            sample: direct,
+        });
+        app.update(AppEvent::Traffic {
+            id: id.clone(),
+            at: started + Duration::from_secs(2),
+            sample: TrafficSample {
+                total: BidirectionalRate {
+                    rx_bytes_sec: 30.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        });
+        app.update(AppEvent::OximeterTraffic {
+            id: id.clone(),
+            // The request completed after the newer direct probe, while the
+            // Oximeter sample itself retains its source timestamp.
+            at: started + Duration::from_secs(3),
+            samples: vec![(
+                started + Duration::from_secs(1),
+                TrafficSample {
+                    total: BidirectionalRate {
+                        rx_bytes_sec: 20.0,
+                        ..Default::default()
+                    },
+                    source: TrafficSource::Oximeter,
+                    ..Default::default()
+                },
+            )],
+        });
+
+        let state = &app.observability.telemetry.resources[&id];
+        assert_eq!(state.current_sample.source, TrafficSource::Oximeter);
+        assert_eq!(state.current_rate.rx_bytes_sec, 20.0);
+
+        app.update(AppEvent::OximeterTrafficFailed {
+            rack: RackId(0),
+            at: started + Duration::from_secs(4),
+            message: "Nexus timed out".into(),
+        });
+
+        let state = &app.observability.telemetry.resources[&id];
+        assert_eq!(state.current_sample.source, TrafficSource::DirectProbe);
+        assert_eq!(state.current_rate.rx_bytes_sec, 30.0);
+        assert!(app.observability.traffic_failures[&id].latest_error.is_none());
     }
 
     #[test]

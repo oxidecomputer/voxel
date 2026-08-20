@@ -37,13 +37,18 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
             d.host.as_deref().unwrap_or("n/a")
         )),
         Line::from(format!(
-            "RX {} ({:.0} pkt/s) TX {} ({:.0} pkt/s) Total {} [{:?}]",
+            "RX {} ({:.0} pkt/s) TX {} ({:.0} pkt/s) Total {} [{:?}] · source: {}",
             format_rate(rate.rx_bytes_sec),
             rate.rx_packets_sec,
             format_rate(rate.tx_bytes_sec),
             rate.tx_packets_sec,
             format_rate(rate.total_bytes_sec()),
-            TrafficSeverity::for_bytes_per_sec(rate.total_bytes_sec())
+            TrafficSeverity::for_bytes_per_sec(rate.total_bytes_sec()),
+            t.current_sample.source.label()
+        )),
+        Line::from(format!(
+            "Link errors: RX {:.2}/s TX {:.2}/s",
+            t.current_sample.errors.rx_sec, t.current_sample.errors.tx_sec
         )),
         Line::from(format!("Health: {}", resource_health_summary(app, id))),
     ];
@@ -93,6 +98,52 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
             .map(|e| e.message.as_str())
             .unwrap_or("none")
     )));
+    if let Some(rack) = d.rack {
+        if let Some(cpu) = app
+            .observability
+            .zone_cpu
+            .get(&rack)
+            .and_then(|sample| sample.good.as_ref())
+        {
+            let summary = cpu
+                .value
+                .iter()
+                .take(3)
+                .map(|zone| {
+                    format!(
+                        "{} {:.1}% wait {:.1}%",
+                        zone.name,
+                        zone.total_percent(),
+                        zone.wait_percent
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            lines.push(Line::from(format!("Zone CPU: {summary}")));
+        }
+        if let Some(pools) = app
+            .observability
+            .zfs_headroom
+            .get(&rack)
+            .and_then(|sample| sample.good.as_ref())
+        {
+            let summary = pools
+                .value
+                .iter()
+                .filter(|pool| pool.id == *id)
+                .map(|pool| {
+                    format!(
+                        "{} {:.1}/{:.1} GiB free",
+                        pool.pool,
+                        pool.available_bytes() as f64 / 1024.0_f64.powi(3),
+                        pool.total_bytes as f64 / 1024.0_f64.powi(3)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(Line::from(format!("ZFS: {summary}")));
+        }
+    }
 
     let mut zones = t.current_sample.zones.iter().collect::<Vec<_>>();
     zones.sort_by(|left, right| {

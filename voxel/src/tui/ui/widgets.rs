@@ -115,6 +115,9 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     if app.session.view == View::Monitor && app.session.detail_open {
         super::node_detail::draw(frame, app);
     }
+    if app.session.external_monitoring_open {
+        super::external_monitoring::draw(frame, app);
+    }
     if app.session.help_open {
         super::help::draw(frame, app, root.mode);
     }
@@ -304,6 +307,14 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
             group("n/Esc", "back"),
         ];
     }
+    if app.session.external_monitoring_open {
+        return vec![
+            group("s", "copy rack YAML"),
+            group("a", "copy all YAML"),
+            group("u", "copy guide"),
+            group("Esc", "close"),
+        ];
+    }
     if app.session.help_open {
         let mut groups =
             vec![group("↑/↓/Pg", "scroll"), group("?/Esc", "close")];
@@ -322,8 +333,10 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     if app.session.view == View::Monitor {
         let pane = app.session.monitoring_pane;
         let expanded = app.session.monitoring_expanded(pane);
-        let mut groups =
-            vec![group("Space", if expanded { "fold" } else { "expand" })];
+        let mut groups = vec![
+            group("Space", if expanded { "fold" } else { "expand" }),
+            group("o", "external monitoring"),
+        ];
         if expanded {
             match pane {
                 crate::tui::event::MonitoringPane::RackSummary => {

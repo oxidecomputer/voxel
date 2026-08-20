@@ -4,6 +4,7 @@ mod context;
 mod effects;
 mod event;
 mod logging;
+mod nexus;
 mod operation;
 mod phase;
 mod process;
@@ -95,6 +96,15 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
         .context("enter terminal UI")?;
     let mut app = App::new(topology, 500, 120);
     app.reattach_command = Some(reattach);
+    app.external_monitoring_endpoints = (0..context.config.topology.racks())
+        .filter_map(|rack| {
+            nexus::rack_endpoints(&context.config, rack)
+                .ok()?
+                .into_iter()
+                .find(|endpoint| endpoint.scheme() == "https")
+                .map(|endpoint| (telemetry::RackId(rack), endpoint.to_string()))
+        })
+        .collect();
 
     let mut input = terminal::spawn_input(events_tx.clone(), shutdown.clone());
     let mut ticks = terminal::spawn_ticks(

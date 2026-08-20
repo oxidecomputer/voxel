@@ -424,7 +424,12 @@ fn draw_selected_resource_inspector(
             ]));
         }
         lines.push(if sampled {
-            rate_line(traffic.expect("sampled traffic exists").current_rate)
+            let traffic = traffic.expect("sampled traffic exists");
+            Line::from(format!(
+                "{} · source: {}",
+                rate_line(traffic.current_rate),
+                traffic.current_sample.source.label()
+            ))
         } else {
             Line::from("RX — TX — Total — · collecting")
         });
@@ -495,11 +500,66 @@ fn draw_selected_resource_inspector(
             traffic.current_rate.rx_packets_sec,
             traffic.current_rate.tx_packets_sec
         )));
+        lines.push(Line::from(format!(
+            "Link errors RX {:.2}/s · TX {:.2}/s · source: {}",
+            traffic.current_sample.errors.rx_sec,
+            traffic.current_sample.errors.tx_sec,
+            traffic.current_sample.source.label()
+        )));
     } else {
         lines.push(Line::from("Traffic: collecting/unavailable"));
     }
     if let Some(error) = latest_collection_error(app, id) {
         lines.push(Line::from(format!("Latest error: {}", error.message)));
+    }
+    if let Some(rack) = descriptor.rack {
+        if let Some(zfs) = app
+            .observability
+            .zfs_headroom
+            .get(&rack)
+            .and_then(|sample| sample.good.as_ref())
+        {
+            let pools = zfs.value.iter().filter(|pool| pool.id == *id);
+            let (available, total, count) = pools.fold(
+                (0_u64, 0_u64, 0_usize),
+                |(available, total, count), pool| {
+                    (
+                        available.saturating_add(pool.available_bytes()),
+                        total.saturating_add(pool.total_bytes),
+                        count + 1,
+                    )
+                },
+            );
+            if count > 0 {
+                lines.push(Line::from(format!(
+                    "ZFS {:.1}/{:.1} GiB free · {count} pools",
+                    available as f64 / 1024.0_f64.powi(3),
+                    total as f64 / 1024.0_f64.powi(3)
+                )));
+            }
+        }
+        if let Some(error) = app
+            .observability
+            .zone_cpu
+            .get(&rack)
+            .and_then(|sample| sample.latest_error.as_ref())
+        {
+            lines.push(Line::from(format!(
+                "Zone CPU unavailable: {}",
+                error.message
+            )));
+        }
+        if let Some(error) = app
+            .observability
+            .zfs_headroom
+            .get(&rack)
+            .and_then(|sample| sample.latest_error.as_ref())
+        {
+            lines.push(Line::from(format!(
+                "ZFS unavailable: {}",
+                error.message
+            )));
+        }
     }
     lines.push(Line::from("History (60s)"));
     let guidance_y = area.bottom().saturating_sub(1);
@@ -553,6 +613,31 @@ fn draw_selected_resource_inspector(
             Rect::new(area.x, y, area.width, 1),
         );
         y += 1;
+    }
+    if let Some(rack) = descriptor.rack
+        && let Some(cpu) = app
+            .observability
+            .zone_cpu
+            .get(&rack)
+            .and_then(|sample| sample.good.as_ref())
+    {
+        for zone in cpu
+            .value
+            .iter()
+            .filter(|zone| zone.id == *id)
+            .take(guidance_y.saturating_sub(y) as usize)
+        {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "CPU {} {:.1}% wait {:.1}%",
+                    zone.name,
+                    zone.total_percent(),
+                    zone.wait_percent
+                )),
+                Rect::new(area.x, y, area.width, 1),
+            );
+            y += 1;
+        }
     }
     if zones.is_empty() && y < guidance_y {
         frame.render_widget(
@@ -697,14 +782,12 @@ fn draw_top_zones(
         .values()
         .filter(|state| monitor_scope_contains(app, rack, &state.descriptor))
         .flat_map(|state| {
-            state
-                .current_sample
-                .zones
-                .iter()
-                .map(move |zone| (&state.descriptor.name, zone))
+            state.current_sample.zones.iter().map(move |zone| {
+                (&state.descriptor.id, &state.descriptor.name, zone)
+            })
         })
         .collect::<Vec<_>>();
-    zones.sort_by(|(ra, a), (rb, b)| {
+    zones.sort_by(|(_, ra, a), (_, rb, b)| {
         b.rate
             .total_bytes_sec()
             .total_cmp(&a.rate.total_bytes_sec())
@@ -722,9 +805,13 @@ fn draw_top_zones(
         .min(zones.len().saturating_sub(capacity.max(1)));
     let end = start.saturating_add(capacity).min(zones.len());
     let title = if capacity > 0 && zones.len() > capacity {
-        format!("Top Zones by Traffic {}-{end} of {}", start + 1, zones.len())
+        format!(
+            "Top Zones by Traffic + CPU {}-{end} of {}",
+            start + 1,
+            zones.len()
+        )
     } else {
-        "Top Zones by Traffic".into()
+        "Top Zones by Traffic + CPU".into()
     };
     let block = section_block(
         title,
@@ -738,7 +825,7 @@ fn draw_top_zones(
     if area.height == 3 {
         let sample = zones
             .get(start)
-            .map(|(resource, zone)| {
+            .map(|(_, resource, zone)| {
                 format!(
                     "{resource} · {} · {}",
                     zone.short_name,
@@ -749,20 +836,34 @@ fn draw_top_zones(
         frame.render_widget(Paragraph::new(sample).block(block), area);
         return;
     }
-    let header = Row::new(["Gimlet/Resource", "Zone", "RX", "TX", "Total"])
+    let header = Row::new(["Resource", "Zone", "Total", "CPU", "Wait"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows = zones
         .iter()
         .skip(start)
         .take(capacity)
-        .map(|(resource, zone)| {
+        .map(|(resource_id, resource, zone)| {
             let rates = zone_rate_cells(zone.rate);
+            let cpu = rack
+                .and_then(|rack| app.observability.zone_cpu.get(&rack))
+                .and_then(|sample| sample.good.as_ref())
+                .and_then(|sample| {
+                    sample.value.iter().find(|cpu| {
+                        cpu.id == **resource_id && cpu.name == zone.name
+                    })
+                });
             Row::new([
                 Cell::from((*resource).clone()),
                 Cell::from(zone.short_name.clone()),
-                rates[0].clone(),
-                rates[1].clone(),
                 rates[2].clone(),
+                Cell::from(
+                    cpu.map(|cpu| format!("{:.1}%", cpu.total_percent()))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                Cell::from(
+                    cpu.map(|cpu| format!("{:.1}%", cpu.wait_percent))
+                        .unwrap_or_else(|| "—".into()),
+                ),
             ])
         })
         .collect::<Vec<_>>();
@@ -776,11 +877,11 @@ fn draw_top_zones(
             Table::new(
                 rows,
                 [
-                    Constraint::Percentage(24),
-                    Constraint::Percentage(24),
-                    Constraint::Percentage(17),
-                    Constraint::Percentage(17),
-                    Constraint::Percentage(18),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(28),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(15),
+                    Constraint::Percentage(15),
                 ],
             )
             .header(header)
@@ -843,6 +944,7 @@ mod height_tests {
                         rx_bytes_sec: 987_654.0,
                         ..Default::default()
                     },
+                    errors: Default::default(),
                 }],
                 ..Default::default()
             },
@@ -1046,6 +1148,75 @@ mod height_tests {
         assert!(text.contains("Healthy"), "{text}");
         assert!(!text.contains("Freshness"), "{text}");
         assert!(text.contains("Last success 0s ago"), "{text}");
+        assert!(text.contains("source: direct probe"), "{text}");
+    }
+
+    #[test]
+    fn sled_inspector_explains_unavailable_oximeter_diagnostics() {
+        let mut app = app();
+        let id = app.deployment.topology[0].id.clone();
+        app.session.selected_resource = Some(id);
+        let now = Instant::now();
+        app.update(AppEvent::ZoneCpuFailed {
+            rack: RackId(0),
+            at: now,
+            message: "CPU query timed out".into(),
+        });
+        app.update(AppEvent::ZfsHeadroomFailed {
+            rack: RackId(0),
+            at: now,
+            message: "ZFS response omitted a pool".into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_selected_resource_inspector(frame, frame.area(), &app)
+            })
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("Zone CPU unavailable: CPU query timed out"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ZFS unavailable: ZFS response omitted a pool"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn rack_summary_names_session_traffic_history() {
+        let app = app();
+        let mut terminal = Terminal::new(TestBackend::new(160, 5)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                super::super::rack_selector::draw(
+                    frame,
+                    frame.area(),
+                    &app,
+                    false,
+                    true,
+                )
+            })
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Rack traffic (this TUI session)"), "{text}");
     }
 
     #[test]
@@ -1071,6 +1242,7 @@ mod height_tests {
                             rx_bytes_sec: (8 - index) as f64,
                             ..Default::default()
                         },
+                        errors: Default::default(),
                     })
                     .collect(),
                 ..Default::default()
@@ -1091,7 +1263,7 @@ mod height_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("Top Zones by Traffic 2-5 of 8"), "{text}");
+        assert!(text.contains("Top Zones by Traffic + CPU 2-5 of 8"), "{text}");
         assert!(!text.contains("zone-0"), "{text}");
         for zone in 1..=4 {
             assert!(text.contains(&format!("zone-{zone}")), "{text}");

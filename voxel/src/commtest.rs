@@ -655,7 +655,7 @@ fn derive_api(network: &Network) -> anyhow::Result<String> {
 /// external address from the same pool and lands on one of those. The DNS
 /// addresses follow as a fallback. The range is capped at 32 addresses so a
 /// misconfigured pool cannot stall the probe.
-fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
+pub(crate) fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
     let Ok(first) = network.service_pool_first.parse::<Ipv4Addr>() else {
         return Vec::new();
     };
