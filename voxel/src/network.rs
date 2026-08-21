@@ -130,17 +130,6 @@ pub(crate) fn enable_link(
     Ok(())
 }
 
-/// Whether the switch zone at `ip` is ready to configure: installed,
-/// zlogin-able, and dendrite answering its API.
-pub(crate) fn switch_ready(ip: &str) -> bool {
-    ssh_capture(
-        ip,
-        &zlogin(&format!("{SWADM} link ls >/dev/null 2>&1 && echo DPD_OK")),
-    )
-    .map(|o| o.contains("DPD_OK"))
-    .unwrap_or(false)
-}
-
 /// `voxel network link-up <switch> <port>` - create (if needed) + enable a link
 /// on a switch port (e.g. the interconnect `qsfp2`) in the live switch zone. The
 /// link only reaches `Up` once BOTH ends are enabled, so for an interconnect run

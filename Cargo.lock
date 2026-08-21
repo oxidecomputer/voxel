@@ -122,7 +122,6 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "api_identity"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "omicron-workspace-hack",
  "proc-macro2",
@@ -409,7 +408,6 @@ dependencies = [
 [[package]]
 name = "bootstore"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "bytes",
  "camino",
@@ -438,7 +436,6 @@ dependencies = [
 [[package]]
 name = "bootstrap-agent-lockstep-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "anyhow",
  "chrono",
@@ -453,6 +450,8 @@ dependencies = [
  "sled-hardware-types",
  "slog",
  "strum 0.27.2",
+ "thiserror 2.0.18",
+ "trust-quorum-types",
  "wicketd-commission-types",
 ]
 
@@ -1540,11 +1539,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-ereport-messages"
+version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/management-gateway-service?rev=438cd185666d5f164548885873f0f5df9a38eed1#438cd185666d5f164548885873f0f5df9a38eed1"
+dependencies = [
+ "hubpack",
+ "serde",
+ "zerocopy",
+]
+
+[[package]]
 name = "gateway-messages"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/management-gateway-service?rev=6c0aca2545a73fd75536e149d29faa7108be5862#6c0aca2545a73fd75536e149d29faa7108be5862"
+source = "git+https://github.com/oxidecomputer/management-gateway-service?rev=438cd185666d5f164548885873f0f5df9a38eed1#438cd185666d5f164548885873f0f5df9a38eed1"
 dependencies = [
  "bitflags",
+ "gateway-ereport-messages",
  "hubpack",
  "serde",
  "serde-big-array",
@@ -1559,7 +1569,6 @@ dependencies = [
 [[package]]
 name = "gateway-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "daft",
  "dropshot",
@@ -1627,7 +1636,6 @@ dependencies = [
 [[package]]
 name = "gfss"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "digest 0.10.7",
  "omicron-workspace-hack",
@@ -2774,7 +2782,6 @@ dependencies = [
 [[package]]
 name = "omicron-common"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "anyhow",
  "api_identity",
@@ -2793,6 +2800,7 @@ dependencies = [
  "ipnetwork",
  "itertools 0.14.0",
  "macaddr",
+ "omicron-generation-kinds",
  "omicron-ledger",
  "omicron-uuid-kinds",
  "omicron-workspace-hack",
@@ -2818,9 +2826,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omicron-generation-kinds"
+version = "0.1.0"
+dependencies = [
+ "oxide-generation",
+ "oxide-generation-macros",
+]
+
+[[package]]
 name = "omicron-ledger"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "async-trait",
  "atomicwrites",
@@ -2837,7 +2852,6 @@ dependencies = [
 [[package]]
 name = "omicron-passwords"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "argon2",
  "omicron-workspace-hack",
@@ -2852,7 +2866,6 @@ dependencies = [
 [[package]]
 name = "omicron-uuid-kinds"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "daft",
  "newtype-uuid",
@@ -2907,6 +2920,33 @@ name = "owo-colors"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
+
+[[package]]
+name = "oxide-generation"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e130a1add81f976d13f8f3ab455de3e3fd1f1b9b796520049680dd19a385809c"
+dependencies = [
+ "daft",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "slog",
+]
+
+[[package]]
+name = "oxide-generation-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68b727e329bc9ff425bf3051e7f39986943bea27aefd6e30b43b468ca999a348"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_tokenstream 0.3.0",
+ "syn 3.0.3",
+]
 
 [[package]]
 name = "oxnet"
@@ -3580,7 +3620,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "rack-init-config"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "bootstrap-agent-lockstep-types",
  "iddqd",
@@ -4548,7 +4587,6 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sled-agent-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4578,7 +4616,6 @@ dependencies = [
 [[package]]
 name = "sled-agent-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4592,6 +4629,7 @@ dependencies = [
  "ipnetwork",
  "itertools 0.14.0",
  "omicron-common",
+ "omicron-generation-kinds",
  "omicron-ledger",
  "omicron-passwords",
  "omicron-uuid-kinds",
@@ -4617,7 +4655,6 @@ dependencies = [
 [[package]]
 name = "sled-hardware-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "daft",
  "omicron-workspace-hack",
@@ -5524,9 +5561,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-quorum-types"
+version = "0.1.0"
+dependencies = [
+ "omicron-workspace-hack",
+ "trust-quorum-types-versions",
+]
+
+[[package]]
 name = "trust-quorum-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "byte-wrapper",
  "daft",
@@ -6115,7 +6159,6 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-client"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "iddqd",
  "omicron-uuid-kinds",
@@ -6133,7 +6176,6 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "omicron-workspace-hack",
  "wicketd-commission-types-versions",
@@ -6142,7 +6184,6 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=2e55f4ddac2fe51fc37e9a70e0619a013509750f#2e55f4ddac2fe51fc37e9a70e0619a013509750f"
 dependencies = [
  "gateway-types-versions",
  "iddqd",
@@ -6158,6 +6199,7 @@ dependencies = [
  "slog-error-chain 0.1.0 (git+https://github.com/oxidecomputer/slog-error-chain?branch=main)",
  "thiserror 2.0.18",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -6557,6 +6599,7 @@ version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 
