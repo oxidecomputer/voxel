@@ -8,12 +8,13 @@ use rack_init_config::{
     AllowedSourceIps, BaseboardId, BfdMode, BfdPeerConfig, BgpConfig,
     BgpPeerConfig, BootstrapAddressDiscovery, IdOrdMap, IpRange, Ipv4Range,
     Ipv6Range, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
-    MaxPathConfig, MultirackJoinRequest, PortConfig, RackInitializeRequest,
-    RackNetworkConfig, RecoverySiloConfig, RouteConfig, RouterLifetimeConfig,
-    ServiceIpPoolConfig, SwitchSlot, UnnumberedRouter, UplinkAddress,
-    UplinkAddressConfig, UplinkPorts,
+    MaxPathConfig, PortConfig, RackInitializeRequest, RackNetworkConfig,
+    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, ServiceIpPoolConfig,
+    SwitchSlot, UnnumberedRouter, UplinkAddress, UplinkAddressConfig,
+    UplinkPorts,
 };
 use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
+use wicketd_commission_types_versions::latest::rack_setup::MultirackJoinRequest;
 
 // Well-known service pool identity, matching omicron's v1-to-v2 conversion.
 const SERVICE_POOL_NAME: &str = "oxide-service-pool-v4";
@@ -137,15 +138,14 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
     })
 }
 
-/// A cross-rack sidecar interconnect port: link-local (addrconf) so mg-ddm can
-/// peer over it, no routes or BGP, 100G to match the sidecar rear-port links.
+/// A cross-rack sidecar interconnect port: no layer-3 configuration of its
+/// own, no routes or BGP, 100G to match the sidecar rear-port links.
+/// `allow_ddm_traffic` is what gets it a link-local for mg-ddm to peer over -
+/// dendrite enables IPv6 on the link and tfportd makes the address.
 fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
     Ok(PortConfig {
         routes: vec![],
-        addresses: vec![UplinkAddressConfig {
-            address: UplinkAddress::AddrConf,
-            vlan_id: None,
-        }],
+        addresses: vec![],
         switch: switch_slot(switch)?,
         port: port.to_string(),
         uplink_port_speed: LinkSpeed::Speed100G,

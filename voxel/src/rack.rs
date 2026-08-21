@@ -293,19 +293,13 @@ pub(crate) async fn cmd_launch(
             };
             let tag = rack_label(racks, rack, "rack-init");
             // Multirack: only rack 0 (the cluster) runs RSS. Every other rack
-            // joins it through the bootstrap agent's multirack-join service,
-            // which starts that rack's sled-agents and publishes its network
-            // config - so its front ports, interconnect included, are
-            // programmed by omicron's reconcilers rather than by voxel.
+            // joins it through the multirack-join service, which starts that
+            // rack's sled-agents and publishes its network config - so its
+            // front ports, interconnect included, are programmed by omicron's
+            // reconcilers rather than by voxel.
             if rack > 0 {
                 if let Err(e) = crate::multirack_join::drive(
-                    cfg,
-                    d,
-                    *n,
-                    &s.name,
-                    &s.bootstrap_addr(),
-                    rack,
-                    &tag,
+                    cfg, d, *n, &s.name, rack, &tag,
                 )
                 .await
                 {

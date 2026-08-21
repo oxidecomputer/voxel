@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 /// Extract a `"key":"value"` string field from a flat JSON blob without a JSON
 /// dependency - robust to surrounding serial-console noise.
-pub(crate) fn json_str_field(s: &str, key: &str) -> String {
+fn json_str_field(s: &str, key: &str) -> String {
     let pat = format!("\"{key}\":\"");
     if let Some(i) = s.find(&pat) {
         let rest = &s[i + pat.len()..];
