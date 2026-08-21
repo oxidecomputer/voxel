@@ -426,31 +426,24 @@ pub(crate) fn stage_config(
         )?;
     }
 
-    // One typed config-rss per rack, staged on that rack's RSS node (its first
-    // bootstrap sled - g0 for rack 0, g{rack*sleds} for the rest). Each rack is
-    // an independent RSS domain: the bootstrap set is filtered to that rack and
-    // its customer/service network is offset per rack.
-    for rack in 0..cfg.topology.racks() {
+    // config-rss for rack 0, staged on its RSS node (g0, its first bootstrap
+    // sled). Only rack 0 runs RSS; every other rack is brought up by the
+    // bootstrap agent's multirack join, which voxel drives over the API from
+    // the same VoxelConfig, so those racks get no config-rss at all - and must
+    // not, or voxel-init would inject it and sled-agent would auto-RSS them.
+    {
+        let rack = 0;
         let rss_node = sleds
             .iter()
             .find(|s| s.rss && s.rack == rack)
             .ok_or_else(|| anyhow!("rack {rack} has no RSS sled"))?;
         // For `--wicket-setup` we drive RSS through wicketd, so the config-rss
-        // must NOT be injected by voxel-init (sled-agent would otherwise auto-init
-        // from it). voxel-init only injects `<cargo-bay>/config-rss.toml`, so we
-        // simply generate it OUTSIDE the cargo-bay (in `wicket-setup/rackN/`) -
-        // `wicket_setup::drive` reads it from there to build the wicketd bodies.
+        // must NOT be injected by voxel-init either (sled-agent would otherwise
+        // auto-init from it). voxel-init only injects
+        // `<cargo-bay>/config-rss.toml`, so we simply generate it OUTSIDE the
+        // cargo-bay, where `voxel wicket-dryrun` can still be pointed at it.
         let rss_dir = if wicket_setup {
             let d = Utf8Path::new("wicket-setup").join(format!("rack{rack}"));
-            fs::create_dir_all(&d)?;
-            d
-        } else if rack > 0 {
-            // Multirack: rack 0 is the cluster; rack > 0 boots but does NOT RSS -
-            // it's an unclaimed rack staged for a future cluster-join (RFD 573).
-            // Generate its config-rss OUTSIDE the cargo-bay so voxel-init won't
-            // auto-inject + RSS it; kept under multirack-staged/ for the join flow.
-            let d =
-                Utf8Path::new("multirack-staged").join(format!("rack{rack}"));
             fs::create_dir_all(&d)?;
             d
         } else {

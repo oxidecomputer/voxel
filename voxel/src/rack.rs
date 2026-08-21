@@ -8,13 +8,10 @@ use std::process::Command;
 use voxel_config::VoxelConfig;
 
 use crate::isolated_external::{DryRun, link_mtu, up as external_up};
-use crate::net::{
-    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture,
-    ssh_output, wait_external_reachable, zlogin,
-};
+use crate::net::{ce_static_ip, set_external_route, wait_external_reachable};
 use crate::rss::watch_rss;
 use crate::topo::{
-    Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets,
+    build_topo, reset_node_cargo_bay, stage_config, stage_sprockets,
 };
 
 /// A per-rack progress/label tag: `rackN` (1-based) when the deployment has more
@@ -150,112 +147,6 @@ async fn run_voxel_init(
         }
     });
     futures::future::join_all(handles).await;
-}
-
-/// Bring up the cross-rack interconnect front ports on a HELD (pre-RSS) rack.
-/// rack 0 gets these from early networking during RSS (config-rss carries them
-/// as AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
-/// ports are never configured. Create each interconnect port + its link-local by
-/// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port
-/// config-rss carries for rack 0, so the cross-rack DDM underlay has a live
-/// link on both ends. No-op for a single rack (`interconnect_ports` is empty).
-async fn bring_up_interconnect(
-    d: &Runner,
-    topo: &Topo,
-    cfg: &VoxelConfig,
-    rack: usize,
-) {
-    let ports = cfg.interconnect_ports(rack);
-    if ports.is_empty() {
-        return;
-    }
-    // This rack's scrimlets in slot order, matching `interconnect_ports`' `switch{slot}`.
-    let scrimlets: Vec<(NodeRef, String)> = topo
-        .sleds
-        .iter()
-        .filter(|(s, _)| s.rack == rack && s.scrimlet)
-        .map(|(s, n)| (*n, s.name.clone()))
-        .collect();
-    for (sw, port) in ports {
-        let Some(slot) =
-            sw.strip_prefix("switch").and_then(|s| s.parse::<usize>().ok())
-        else {
-            continue;
-        };
-        let Some((n, sled)) = scrimlets.get(slot) else {
-            continue;
-        };
-        let ip = match resolve_external_ip(cfg, d, sled, *n, false).await {
-            Ok(ip) => ip,
-            Err(e) => {
-                warn!(
-                    d.log,
-                    "rack{}: interconnect {port}: no switch IP ({e})",
-                    rack + 1
-                );
-                continue;
-            }
-        };
-        // The held rack's switch zone may still be installing at this point.
-        // Poll until dendrite answers, then create + enable the link (the
-        // `voxel network link-up` path) and poll its link-local to DAD
-        // complete, all under one deadline. Logs only when the state changes.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(600);
-        let mut up = false;
-        let mut last = String::new();
-        while std::time::Instant::now() < deadline {
-            let step = if !crate::network::switch_ready(&ip) {
-                "waiting for the switch zone (dendrite not answering)"
-                    .to_string()
-            } else if let Err(e) =
-                crate::network::enable_link(&ip, sled, &port, "100G", "none")
-            {
-                format!("link create/enable: {e}")
-            } else {
-                let _ = ssh_output(
-                    &ip,
-                    &zlogin(&format!(
-                        "ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
-                    )),
-                );
-                let state = ssh_capture(
-                    &ip,
-                    &zlogin(&format!(
-                        "ipadm show-addr -po addrobj,state | grep tfport{port}_0"
-                    )),
-                )
-                .unwrap_or_default();
-                if state.contains(":ok") {
-                    up = true;
-                    break;
-                }
-                "waiting for the link-local to reach ok".to_string()
-            };
-            if step != last {
-                info!(
-                    d.log,
-                    "rack{}: interconnect {sled}:{port}: {step}",
-                    rack + 1
-                );
-                last = step;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(5));
-        }
-        if up {
-            info!(
-                d.log,
-                "rack{}: interconnect {sled}:{port} up (link-local)",
-                rack + 1
-            );
-        } else {
-            warn!(
-                d.log,
-                "rack{}: interconnect {sled}:{port}: not up within 600s",
-                rack + 1
-            );
-        }
-    }
 }
 
 pub(crate) async fn cmd_launch(
@@ -395,59 +286,57 @@ pub(crate) async fn cmd_launch(
                 );
             }
             run_voxel_init(d, rack_sleds).await;
-            // Multirack: only rack 0 (the cluster) runs RSS. rack > 0 boots (sleds +
-            // the cross-rack interconnect wired) but is left PRE-RSS - the unclaimed
-            // state a future cluster-join (RFD 573) would start from. omicron can't
-            // join racks into one AZ yet, so we stage it and stop here.
-            if rack > 0 {
-                // RSS won't run here, so early networking never configures this
-                // rack's switch front ports; its interconnect ports are brought up
-                // at the end of launch (see below), after the switch zone has
-                // settled past its startup dendrite restart.
-                info!(
-                    d.log,
-                    "rack{}: booted, left pre-RSS (unclaimed - multirack join not yet supported)",
-                    rack + 1
-                );
-                continue;
-            }
-            if let Some((s, n)) =
+            let Some((s, n)) =
                 topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
-            {
-                let tag = rack_label(racks, rack, "rack-init");
-                // --wicket-setup: nothing auto-inited (no staged config-rss),
-                // so drive rack setup through the commission API; watch_rss
-                // then reports the wicketd-triggered bring-up as usual.
-                if wicket_setup
-                    && let Err(e) = crate::commission::drive(
-                        cfg, d, *n, &s.name, rack, &tag,
-                    )
-                    .await
-                {
-                    warn!(
-                        d.log,
-                        "{tag}: commission setup failed: {e:#}; rack will not initialize"
-                    );
-                }
-                let watch_cap = rss_watch_cap(emu_sp, racks);
-                let known_ip = if cfg.external.isolated() {
-                    cfg.static_external_ips()
-                        .into_iter()
-                        .find(|(name, _)| name == &s.name)
-                        .map(|(_, ip)| ip)
-                } else {
-                    None
-                };
-                watch_rss(
+            else {
+                continue;
+            };
+            let tag = rack_label(racks, rack, "rack-init");
+            // Multirack: only rack 0 (the cluster) runs RSS. Every other rack
+            // joins it through the bootstrap agent's multirack-join service,
+            // which starts that rack's sled-agents and publishes its network
+            // config - so its front ports, interconnect included, are
+            // programmed by omicron's reconcilers rather than by voxel.
+            if rack > 0 {
+                if let Err(e) = crate::multirack_join::drive(
+                    cfg,
                     d,
                     *n,
+                    &s.name,
                     &s.bootstrap_addr(),
+                    rack,
                     &tag,
-                    watch_cap,
-                    known_ip,
                 )
-                .await;
+                .await
+                {
+                    warn!(d.log, "{tag}: multirack join failed: {e:#}");
+                }
+                continue;
             }
+            // --wicket-setup: nothing auto-inited (no staged config-rss), so
+            // drive rack setup through the commission API; watch_rss then
+            // reports the wicketd-triggered bring-up as usual.
+            if wicket_setup
+                && let Err(e) =
+                    crate::commission::drive(cfg, d, *n, &s.name, rack, &tag)
+                        .await
+            {
+                warn!(
+                    d.log,
+                    "{tag}: commission setup failed: {e:#}; rack will not initialize"
+                );
+            }
+            let watch_cap = rss_watch_cap(emu_sp, racks);
+            let known_ip = if cfg.external.isolated() {
+                cfg.static_external_ips()
+                    .into_iter()
+                    .find(|(name, _)| name == &s.name)
+                    .map(|(_, ip)| ip)
+            } else {
+                None
+            };
+            watch_rss(d, *n, &s.bootstrap_addr(), &tag, watch_cap, known_ip)
+                .await;
         }
         info!(d.log, "launch complete");
     }
@@ -459,10 +348,10 @@ pub(crate) async fn cmd_launch(
     // rack's path as the second rack joins).
     if let Some(ce) = topo.node_ref("ce") {
         for rack in 0..racks {
-            // Held racks (rack > 0) never run RSS, so they have no external
-            // services or DNS - there's nothing to route to or wait on, and the
-            // reachability probe would just burn its full timeout on a rack that
-            // never converges. Skip them (their interconnect comes up below).
+            // A joined rack (rack > 0) runs only sled-agents - the multirack
+            // join starts no control plane zones, so it has no external
+            // services or DNS to route to, and the reachability probe would
+            // just burn its full timeout. Reconfigurator adopts it later.
             if rack > 0 {
                 continue;
             }
@@ -484,15 +373,6 @@ pub(crate) async fn cmd_launch(
                 wait_external_reachable(&d.log, dns_ip, &net.dns_zone, &label);
             }
         }
-    }
-
-    // Held racks (rack > 0) never run RSS, so early networking never configures
-    // their switch front ports. Bring up their cross-rack interconnect ports here,
-    // at the end of launch: by now the switch zones are past their startup dendrite
-    // restart (which would otherwise wipe these runtime `swadm` links) and off the
-    // zone-init load, so the create/enable/addr stick.
-    for rack in 1..racks {
-        bring_up_interconnect(d, &topo, cfg, rack).await;
     }
 
     // --emu-rot: nothing to attach here anymore. voxel-init stands up a shared

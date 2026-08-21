@@ -27,6 +27,7 @@ mod cpbuild;
 mod image;
 mod imagebuild;
 mod isolated_external;
+mod multirack_join;
 mod net;
 mod network;
 mod patch;
