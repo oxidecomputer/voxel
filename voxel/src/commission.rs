@@ -454,7 +454,7 @@ impl Tunnel {
             .chain(PASSWORD_AUTH_OPTS)
             .copied()
             .collect();
-        let proxy = format!("ssh {} -W [%h]:%p root@{gz_ip}", opts.join(" "));
+        let proxy = format!("ssh {} -W '[%h]:%p' root@{gz_ip}", opts.join(" "));
         let child = Command::new("ssh")
             .env("SSH_ASKPASS", &askpass)
             .env("SSH_ASKPASS_REQUIRE", "force")
