@@ -1,8 +1,14 @@
 //! `voxel image create` - the per-commit control-plane build.
 //!
-//! TUF can't be used here: its control-plane.tar.gz carries only the service
-//! zones, not the i86pc global-zone software (sled-agent/switch/opte/mgs), so
-//! the GZ half has to be a real i86pc omicron build.
+//! Two source modes. From source: clone and build omicron, package, bake.
+//! `--from-tuf <repo.zip>`: no omicron build at all. Zones and measurement
+//! corpus come from the repo's artifacts (byte exact, so the reconfigurator
+//! can noop-convert against the repo), and the global-zone software
+//! (sled-agent, switch zone, propolis, maghemite) is lifted from the repo's
+//! host OS phase 2 payload, whose /opt/oxide is the installed form of it all.
+//! The only non-repo pieces are the softnpu dendrite (the repo's switch zone
+//! carries the tofino ASIC build; the prebuilt softnpu dpd named by the
+//! pinned package-manifest replaces it) and voxel's own agent.
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -50,9 +56,53 @@ const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
 pub(crate) async fn create(
     commit: Option<&str>,
     src: Option<&Utf8Path>,
+    from_tuf: Option<&Utf8Path>,
+    sled_agent: Option<&Utf8Path>,
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
+    if let Some(repo) = from_tuf {
+        if src.is_some() {
+            bail!("--from-tuf and --src are mutually exclusive");
+        }
+        let t = crate::tufrepo::TufRepoSource::load(repo)?;
+        eprintln!(
+            "[voxel] TUF source {}: system version {}, omicron {}",
+            t.path, t.system_version, t.commit
+        );
+        // Raw-file fetches (package-manifest, schema sources) need a full sha.
+        let full_sha = match commit {
+            Some(c) if c.len() == 40 && c.starts_with(&t.commit) => {
+                c.to_string()
+            }
+            Some(c) => bail!(
+                "commit {c} is not the repo's omicron rev {} as a full sha",
+                t.commit
+            ),
+            None if PINNED_OMICRON_REV.starts_with(&t.commit) => {
+                PINNED_OMICRON_REV.to_string()
+            }
+            None => bail!(
+                "voxel is pinned to omicron {PINNED_OMICRON_REV} but the repo \
+                 was built from {}; repin voxel or pass the repo's full \
+                 40-char omicron sha as <COMMIT>",
+                t.commit
+            ),
+        };
+        let num_gimlets = std::env::var("NUM_GIMLETS")
+            .ok()
+            .and_then(|g| g.parse().ok())
+            .unwrap_or(4);
+        return create_cp_tuf(
+            t,
+            &full_sha,
+            sled_agent,
+            num_gimlets,
+            dataset,
+            external,
+        )
+        .await;
+    }
     let (label, omicron_src, as_is) = match src {
         Some(s) => {
             let s = s
@@ -356,6 +406,472 @@ fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
             .with_context(|| format!("stage {artifact}"))?;
     }
     eprintln!("[voxel] staged scadm + libsidecar_lite.so -> {dest}");
+    Ok(())
+}
+
+/// `--from-tuf`: build the image from the repo's own artifacts with no
+/// omicron compile. See the module doc for the sourcing.
+async fn create_cp_tuf(
+    t: crate::tufrepo::TufRepoSource,
+    full_sha: &str,
+    sled_agent: Option<&Utf8Path>,
+    num_gimlets: usize,
+    dataset: &str,
+    external: Option<&voxel_config::External>,
+) -> Result<()> {
+    let root = repo_root()?;
+    let voxel_image = root.join("voxel-image");
+    let cargo_bay = voxel_image.join("cargo-bay/vbuild");
+    if cargo_bay.exists() {
+        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
+            format!(
+                "clear {cargo_bay} (owned by another user? \
+                 remove it with pfexec rm -rf)"
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&cargo_bay)
+        .with_context(|| format!("mkdir {cargo_bay}"))?;
+    let image_name = format!("voxel-cp-{}-tuf", t.commit);
+
+    // --- 1. zones + measurement corpus, byte exact from the repo -------------
+    let zones = t.extract_zones_into(&cargo_bay.join("zones"))?;
+    eprintln!("[voxel] extracted {} zones from {}", zones.len(), t.path);
+    let n = t.extract_corpus_into(&cargo_bay.join("measurements"))?;
+    eprintln!("[voxel] extracted {n} measurement corpus artifacts");
+
+    // --- 2. global-zone software from the host phase 2 payload ---------------
+    let host_cache = voxel_image.join(".tuf-host");
+    std::fs::create_dir_all(&host_cache)
+        .with_context(|| format!("mkdir {host_cache}"))?;
+    let payload = host_cache.join(format!("phase2-{}.img", t.commit));
+    if !payload.exists() {
+        eprintln!("[voxel] extracting host phase 2 payload -> {payload}");
+        let n = t.extract_host_phase2_payload(&payload)?;
+        eprintln!("[voxel] phase 2 payload: {n} bytes");
+    }
+    stage_gz_from_phase2(
+        &payload,
+        &host_cache.join("mnt"),
+        &cargo_bay.join("gz"),
+    )?;
+
+    // The standard-image sled-agent hardwires scrimlet = tofino ASIC at
+    // compile time (bootstrap/pre_server.rs sled_mode_from_config); softnpu
+    // scrimlets need a switch-softnpu build staged over the phase 2 one.
+    if let Some(pkg) = sled_agent {
+        let dir = cargo_bay.join("gz/sled-agent");
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("clear {dir}"))?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("mkdir {dir}"))?;
+        let f =
+            std::fs::File::open(pkg).with_context(|| format!("open {pkg}"))?;
+        if pkg.as_str().ends_with(".gz") {
+            tar::Archive::new(flate2::read::GzDecoder::new(f)).unpack(&dir)
+        } else {
+            tar::Archive::new(f).unpack(&dir)
+        }
+        .with_context(|| format!("unpack {pkg}"))?;
+        std::fs::copy(
+            dir.join("pkg/manifest.xml"),
+            cargo_bay.join("gz/sled-agent.xml"),
+        )
+        .context("stage the softnpu sled-agent SMF manifest")?;
+        eprintln!("[voxel] staged softnpu sled-agent from {pkg}");
+    } else {
+        eprintln!(
+            "[voxel] WARN: no --sled-agent; the phase 2 sled-agent cannot \
+             run softnpu scrimlets"
+        );
+    }
+
+    // --- 3. pinned single files from the omicron repo ------------------------
+    let manifest =
+        fetch_omicron_raw(&voxel_image, full_sha, "package-manifest.toml")?;
+    // The prerequisites script calls sibling tools scripts; stage its closure.
+    const RUNNER_TOOLS: [&str; 4] = [
+        "install_runner_prerequisites.sh",
+        "install_opte.sh",
+        "opte_version",
+        "opte_version_override",
+    ];
+    let tools = cargo_bay.join("tools");
+    std::fs::create_dir_all(&tools)
+        .with_context(|| format!("mkdir {tools}"))?;
+    for name in RUNNER_TOOLS {
+        let fetched = fetch_omicron_raw(
+            &voxel_image,
+            full_sha,
+            &format!("tools/{name}"),
+        )?;
+        std::fs::copy(&fetched, tools.join(name))
+            .with_context(|| format!("stage tools/{name}"))?;
+    }
+
+    // --- 4. softnpu dendrite over the repo's ASIC switch zone ----------------
+    let dendrite = fetch_dendrite_softnpu(&voxel_image, &manifest)?;
+    let scrimlets = [0usize, num_gimlets.saturating_sub(1)];
+    let fleet = voxel_config::sp::SpFleet::sim(num_gimlets);
+    let mgs_config = voxel_config::mgs::switch_config(0, &fleet, &scrimlets);
+    recompose_switch_zone(
+        &cargo_bay.join("gz/switch.tar.gz"),
+        &dendrite,
+        &mgs_config,
+    )?;
+
+    // --- 5. sidecar-lite + the agent ------------------------------------------
+    fetch_sidecar(&voxel_image, &cargo_bay.join("sidecar"))?;
+    // TUF builds run no compiler: the agent is the prebuilt binary shipped
+    // (and workspace-built) alongside voxel itself.
+    let agent_src = find_voxel_init()?;
+    eprintln!("[voxel] staging voxel-init from {agent_src}");
+    let agent = cargo_bay.join("voxel-init");
+    std::fs::copy(&agent_src, &agent)
+        .with_context(|| format!("stage {agent_src} into the cargo-bay"))?;
+    let _ = Command::new("chmod").arg("+x").arg(&agent).status();
+
+    // --- 6. bake ---------------------------------------------------------------
+    let network = builder_network(external)?;
+    bake(BakeOpts {
+        base_image: "helios-3.0",
+        role: Some("cp"),
+        exec: None,
+        cargo_bay: &cargo_bay,
+        image_name: &image_name,
+        dataset,
+        deploy: "voxel_build",
+        disk_gb: 100,
+        mem_gb: 16,
+        cores: 8,
+        network: &network,
+    })
+    .await?;
+
+    // --- 7. stamps -------------------------------------------------------------
+    // The schema markers live in two source files; fetch them into a
+    // checkout-shaped cache so the detector reads them as usual.
+    fetch_omicron_raw(&voxel_image, full_sha, "sled-agent/src/config.rs")?;
+    fetch_omicron_raw(&voxel_image, full_sha, "sled-hardware/src/lib.rs")?;
+    let schema_root = raw_cache(&voxel_image, full_sha);
+    let (data_links, disks) =
+        crate::topo::schema_from_checkout(&schema_root)
+            .context("derive sled schema from the pinned omicron sources")?;
+    run(
+        Command::new("zfs")
+            .arg("set")
+            .arg(format!(
+                "{}={}",
+                crate::topo::PROP_DATA_LINKS,
+                data_links.as_str()
+            ))
+            .arg(format!("{}={}", crate::topo::PROP_DISKS, disks.as_str()))
+            .arg(format!(
+                "{}={}",
+                crate::topo::PROP_TUF_VERSION,
+                t.system_version
+            ))
+            .arg(format!("{dataset}/img/{image_name}")),
+        "zfs set schema + tuf version on the image",
+    )?;
+
+    println!("built image {image_name}");
+    Ok(())
+}
+
+/// The prebuilt voxel-init to bake: $VOXEL_INIT, else the binary next to this
+/// voxel executable. The workspace builds both together and shipped bundles
+/// carry both, so the sibling is fresh by construction.
+fn find_voxel_init() -> Result<Utf8PathBuf> {
+    if let Ok(p) = std::env::var("VOXEL_INIT") {
+        let p = Utf8PathBuf::from(p);
+        if !p.exists() {
+            bail!("$VOXEL_INIT={p} does not exist");
+        }
+        return Ok(p);
+    }
+    let exe = std::env::current_exe().context("resolve the voxel binary")?;
+    if let Some(dir) = exe.parent() {
+        let sibling = dir.join("voxel-init");
+        if sibling.exists() {
+            return Utf8PathBuf::try_from(sibling)
+                .context("non-utf8 voxel-init path");
+        }
+    }
+    bail!(
+        "no voxel-init next to the voxel binary; build it \
+         (cargo build --release -p voxel-init) or set $VOXEL_INIT"
+    )
+}
+
+/// Mount the phase 2 pool (read only, renamed, under `mnt`) and copy its
+/// /opt/oxide plus the sled-agent SMF manifest into `dest`. Runs under
+/// pfexec, so lofi/zpool/mount are direct.
+fn stage_gz_from_phase2(
+    payload: &Utf8Path,
+    mnt: &Utf8Path,
+    dest: &Utf8Path,
+) -> Result<()> {
+    const POOL: &str = "voxeltuf";
+    std::fs::create_dir_all(dest).with_context(|| format!("mkdir {dest}"))?;
+    std::fs::create_dir_all(mnt.join("ramdisk"))
+        .with_context(|| format!("mkdir {mnt}/ramdisk"))?;
+    // Best effort teardown of a previous run.
+    let _ = Command::new("umount").arg(mnt.join("ramdisk")).output();
+    let _ = Command::new("zpool").args(["export", POOL]).output();
+
+    let dev = {
+        let out = Command::new("lofiadm")
+            .args(["-a", payload.as_str()])
+            .output()
+            .context("run lofiadm -a")?;
+        if out.status.success() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            // Already attached from a previous run; look the device up.
+            let out = Command::new("lofiadm")
+                .arg(payload.as_str())
+                .output()
+                .context("run lofiadm lookup")?;
+            if !out.status.success() {
+                bail!("lofiadm -a {payload} failed");
+            }
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+    };
+    let result = (|| -> Result<()> {
+        // The pool is named rpool inside the image; find its id on our lofi
+        // device and import it renamed so it cannot collide with the host's.
+        let scan = Command::new("zpool")
+            .args(["import", "-d", "/dev/lofi"])
+            .output()
+            .context("run zpool import scan")?;
+        let scan = String::from_utf8_lossy(&scan.stdout).to_string();
+        let dev_name = dev.rsplit('/').next().unwrap_or(&dev);
+        let mut guid = None;
+        let mut current = None;
+        for line in scan.lines() {
+            let line = line.trim();
+            if let Some(id) = line.strip_prefix("id: ") {
+                current = Some(id.trim().to_string());
+            }
+            if line.starts_with(&format!("/dev/lofi/{dev_name}"))
+                || line.starts_with(dev_name)
+            {
+                guid = current.clone();
+            }
+        }
+        let guid = guid.with_context(|| {
+            format!("no importable pool found on {dev} (scan:\n{scan})")
+        })?;
+        run(
+            Command::new("zpool").args([
+                "import",
+                "-d",
+                "/dev/lofi",
+                "-o",
+                "readonly=on",
+                "-R",
+                mnt.as_str(),
+                &guid,
+                POOL,
+            ]),
+            "zpool import phase 2 pool",
+        )?;
+        run(
+            Command::new("mount").args([
+                "-F",
+                "zfs",
+                &format!("{POOL}/ROOT/ramdisk"),
+                mnt.join("ramdisk").as_str(),
+            ]),
+            "mount phase 2 ramdisk root",
+        )?;
+        let oxide = mnt.join("ramdisk/opt/oxide");
+        for e in
+            oxide.read_dir_utf8().with_context(|| format!("read {oxide}"))?
+        {
+            let e = e?;
+            run(
+                Command::new("cp").args([
+                    "-rp",
+                    e.path().as_str(),
+                    dest.as_str(),
+                ]),
+                "copy phase 2 /opt/oxide entry",
+            )?;
+        }
+        std::fs::copy(
+            mnt.join("ramdisk/lib/svc/manifest/site/sled-agent.xml"),
+            dest.join("sled-agent.xml"),
+        )
+        .context("copy sled-agent SMF manifest")?;
+        Ok(())
+    })();
+    let _ = Command::new("umount").arg(mnt.join("ramdisk")).output();
+    let _ = Command::new("zpool").args(["export", POOL]).output();
+    let _ = Command::new("lofiadm").args(["-d", &dev]).output();
+    result
+}
+
+const OMICRON_RAW_URL: &str =
+    "https://raw.githubusercontent.com/oxidecomputer/omicron";
+const BUILDOMAT_URL: &str =
+    "https://buildomat.eng.oxide.computer/public/file/oxidecomputer";
+
+fn raw_cache(voxel_image: &Utf8Path, sha: &str) -> Utf8PathBuf {
+    voxel_image.join(format!(".omicron-raw/{sha}"))
+}
+
+/// Fetch one file from the omicron repo at the pinned sha, via a sha-keyed
+/// cache. This is the only omicron source access in a TUF image build.
+fn fetch_omicron_raw(
+    voxel_image: &Utf8Path,
+    sha: &str,
+    rel: &str,
+) -> Result<Utf8PathBuf> {
+    let cached = raw_cache(voxel_image, sha).join(rel);
+    if cached.exists() {
+        return Ok(cached);
+    }
+    let dir = cached.parent().context("raw cache path has a parent")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
+    eprintln!("[voxel] fetching omicron:{rel} @ {sha}");
+    run(
+        Command::new("curl")
+            .args(["-sSfL", "--retry", "5", "-o"])
+            .arg(&cached)
+            .arg(format!("{OMICRON_RAW_URL}/{sha}/{rel}")),
+        "fetch omicron raw file",
+    )?;
+    Ok(cached)
+}
+
+/// Fetch the prebuilt softnpu dendrite zone the pinned package-manifest names
+/// (repo dendrite, source.commit + sha256), via a rev-keyed cache.
+fn fetch_dendrite_softnpu(
+    voxel_image: &Utf8Path,
+    manifest: &Utf8Path,
+) -> Result<Utf8PathBuf> {
+    let text = std::fs::read_to_string(manifest)
+        .with_context(|| format!("read {manifest}"))?;
+    let doc: toml::Table =
+        text.parse().with_context(|| format!("parse {manifest}"))?;
+    let pkg = doc
+        .get("package")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("dendrite-softnpu"))
+        .context("package-manifest has no dendrite-softnpu package")?;
+    let get = |key: &str| {
+        pkg.get("source").and_then(|s| s.get(key)).and_then(|v| v.as_str())
+    };
+    let commit =
+        get("commit").context("dendrite-softnpu has no source.commit")?;
+    let sha256 =
+        get("sha256").context("dendrite-softnpu has no source.sha256")?;
+    let cached = voxel_image
+        .join(format!(".dendrite-softnpu/{commit}/dendrite-softnpu.tar.gz"));
+    if !cached.exists() {
+        let dir = cached.parent().context("cache path has a parent")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
+        eprintln!("[voxel] fetching dendrite-softnpu @ {commit}");
+        run(
+            Command::new("curl")
+                .args(["-sSfL", "--retry", "10", "-o"])
+                .arg(&cached)
+                .arg(format!(
+                    "{BUILDOMAT_URL}/dendrite/image/{commit}/dendrite-softnpu.tar.gz"
+                )),
+            "fetch dendrite-softnpu",
+        )?;
+    }
+    let out = Command::new("digest")
+        .args(["-a", "sha256", cached.as_str()])
+        .output()
+        .context("run digest -a sha256")?;
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if got != sha256 {
+        let _ = std::fs::remove_file(&cached);
+        bail!("dendrite-softnpu sha256 {got} != manifest {sha256}");
+    }
+    Ok(cached)
+}
+
+/// Rewrite the phase 2 switch zone for voxel: swap the tofino ASIC dendrite
+/// subtrees for the softnpu prebuilt's, and bake voxel's switch0 MGS config
+/// in place of the rack's. Everything else (mgs, wicketd, mgd, omdb) is kept
+/// as shipped.
+fn recompose_switch_zone(
+    switch: &Utf8Path,
+    dendrite: &Utf8Path,
+    mgs_config: &str,
+) -> Result<()> {
+    const DENDRITE_TREES: [&str; 2] =
+        ["root/opt/oxide/dendrite", "root/var/svc/manifest/site/dendrite"];
+    const MGS_CONFIG: &str = "root/var/svc/manifest/site/mgs/config.toml";
+    let staged = switch.with_extension("recomposed");
+    {
+        let out = std::fs::File::create(&staged)
+            .with_context(|| format!("create {staged}"))?;
+        let enc =
+            flate2::write::GzEncoder::new(out, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+
+        let in_dendrite = |p: &str| {
+            DENDRITE_TREES.iter().any(|t| {
+                p == *t || p.strip_prefix(t).is_some_and(|r| r.starts_with('/'))
+            })
+        };
+        copy_tar_entries(switch, &mut builder, |p| {
+            !in_dendrite(p) && p != MGS_CONFIG
+        })?;
+        copy_tar_entries(dendrite, &mut builder, in_dendrite)?;
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(mgs_config.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, MGS_CONFIG, mgs_config.as_bytes())
+            .context("append switch0 MGS config")?;
+        builder.into_inner().context("finish tar")?.finish()?;
+    }
+    std::fs::rename(&staged, switch)
+        .with_context(|| format!("replace {switch}"))?;
+    eprintln!(
+        "[voxel] recomposed switch zone (softnpu dendrite, voxel MGS config)"
+    );
+    Ok(())
+}
+
+/// Copy the entries of a tar.gz whose resolved paths pass `keep`, preserving
+/// long names and links.
+fn copy_tar_entries<W: std::io::Write>(
+    from: &Utf8Path,
+    builder: &mut tar::Builder<W>,
+    keep: impl Fn(&str) -> bool,
+) -> Result<()> {
+    let f =
+        std::fs::File::open(from).with_context(|| format!("open {from}"))?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    for entry in ar.entries().with_context(|| format!("read {from}"))? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let Some(p) = path.to_str() else { continue };
+        if !keep(p) {
+            continue;
+        }
+        let mut header = entry.header().clone();
+        if let Some(link) = entry.link_name()? {
+            builder.append_link(&mut header, &path, &link)?;
+        } else {
+            builder.append_data(&mut header, &path, &mut entry)?;
+        }
+    }
     Ok(())
 }
 

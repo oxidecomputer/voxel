@@ -249,6 +249,9 @@ fn generate_rss_config(
 /// advisory. A rack whose source is absent still launches.
 pub(crate) const PROP_DATA_LINKS: &str = "voxel:data-links-schema";
 pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
+/// TUF system version stamped on `--from-tuf` images: the repo whose zone and
+/// corpus artifacts the image's bytes hash match.
+pub(crate) const PROP_TUF_VERSION: &str = "voxel:tuf-version";
 
 /// Sled-agent config schema read from an omicron checkout; None if the
 /// checkout's sled-agent config source is not readable.
