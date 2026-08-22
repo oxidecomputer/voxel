@@ -22,6 +22,9 @@ const OMICRON: &str = "/opt/oxide/omicron";
 // `<CARGO_BAY>/sled-config.toml` (kept literal: `concat!` can't expand a const).
 const SLED_CFG: &str = "/opt/cargo-bay/sled-config.toml";
 const PATCHED_CFG: &str = "/tmp/sled-config.toml";
+/// Written at bake by `image create --from-tuf`; selects the native (no
+/// omicron tooling) bring-up paths.
+const TUF_MARKER: &str = "/opt/oxide/.voxel-tuf";
 
 /// Pick the `staged` path if it exists on disk, else fall back to `baked` — the
 /// "dev cargo-bay wins, baked image otherwise" rule used to source every sp-emu
@@ -49,36 +52,99 @@ pub fn bring_up() -> Result<()> {
     crash_dump();
     maybe_load_sidecar();
 
-    // The omicron CLI tools are baked into the image at /opt/oxide/omicron, and
-    // xtask/omicron-package run relative to that tree.
-    if !Utf8Path::new(OMICRON).exists() {
-        bail!("{OMICRON} not baked into the image");
+    // TUF images carry no omicron tooling; their virtual hardware and
+    // activation are handled natively below.
+    let tuf = Utf8Path::new(TUF_MARKER).exists();
+    if !tuf {
+        // The omicron CLI tools are baked into the image at /opt/oxide/omicron,
+        // and xtask/omicron-package run relative to that tree.
+        if !Utf8Path::new(OMICRON).exists() {
+            bail!("{OMICRON} not baked into the image");
+        }
+        std::env::set_current_dir(OMICRON)
+            .with_context(|| format!("cd {OMICRON}"))?;
     }
-    std::env::set_current_dir(OMICRON)
-        .with_context(|| format!("cd {OMICRON}"))?;
-    let xtask_bin = format!("{OMICRON}/xtask");
-    let xtask_dl = format!("{OMICRON}/xtask-downloader");
 
     let (underlay, other) = detect_underlay();
-    patch_sled_config(&underlay)?;
+    patch_sled_config(&underlay, tuf)?;
     setup_external_networking(&other);
-    setup_virtual_hardware();
+    if tuf {
+        setup_virtual_hardware_native()?;
+    } else {
+        setup_virtual_hardware();
+    }
     preseed_install_datasets();
     inject_runtime_configs()?;
     unplumb_softnpu_source();
     maybe_start_switch_enforcer()?;
 
-    // Activate the (already-unpacked) control plane. On the RSS node this kicks RSS.
-    // omicron-package reads XTASK_BIN / XTASK_DOWNLOADER_BIN from the environment.
-    if !run_env(
-        "./omicron-package",
-        &["activate"],
-        &[("XTASK_BIN", &xtask_bin), ("XTASK_DOWNLOADER_BIN", &xtask_dl)],
-    ) {
-        warn("omicron-package activate failed");
+    if tuf {
+        activate_native();
+    } else {
+        // Activate the (already-unpacked) control plane. On the RSS node this
+        // kicks RSS. omicron-package reads XTASK_BIN / XTASK_DOWNLOADER_BIN
+        // from the environment.
+        let xtask_bin = format!("{OMICRON}/xtask");
+        let xtask_dl = format!("{OMICRON}/xtask-downloader");
+        if !run_env(
+            "./omicron-package",
+            &["activate"],
+            &[("XTASK_BIN", &xtask_bin), ("XTASK_DOWNLOADER_BIN", &xtask_dl)],
+        ) {
+            warn("omicron-package activate failed");
+        }
     }
     note("gimlet bring-up complete");
     Ok(())
+}
+
+/// TUF images stage no xtask. In propolis softnpu mode `virtual-hardware
+/// create` reduces to creating the config's vdev files (xtask's own default
+/// size); softnpu lives in the switch zone propolis and needs no host setup.
+fn setup_virtual_hardware_native() -> Result<()> {
+    const VDEV_SIZE: u64 = 20 << 30;
+    wipe_vdevs();
+    let text = fs::read_to_string(PATCHED_CFG)
+        .with_context(|| format!("read {PATCHED_CFG}"))?;
+    let doc: toml_edit::DocumentMut =
+        text.parse().with_context(|| format!("parse {PATCHED_CFG}"))?;
+    // The vdev list's location differs by schema era: top level `vdevs`, or
+    // under the `external_disks` table.
+    let vdevs = doc
+        .get("vdevs")
+        .or_else(|| doc.get("external_disks").and_then(|d| d.get("vdevs")))
+        .and_then(|v| v.as_array())
+        .with_context(|| format!("no vdevs array in {PATCHED_CFG}"))?;
+    let mut n = 0;
+    for v in vdevs {
+        let Some(name) = v.as_str() else { continue };
+        let path = if name.starts_with('/') {
+            name.to_string()
+        } else {
+            format!("/var/tmp/{name}")
+        };
+        let f = fs::File::create(&path)
+            .with_context(|| format!("create vdev {path}"))?;
+        f.set_len(VDEV_SIZE).with_context(|| format!("size vdev {path}"))?;
+        n += 1;
+    }
+    if n == 0 {
+        bail!("no vdevs created from {PATCHED_CFG}");
+    }
+    note(format!("created {n} vdev files"));
+    Ok(())
+}
+
+/// TUF images: sled-agent is prestaged; activation is importing its SMF
+/// manifest now that the runtime configs are injected. The manifest's
+/// default instance starts on import.
+fn activate_native() {
+    if !run("svccfg", &["import", "/opt/oxide/sled-agent/pkg/manifest.xml"]) {
+        warn("svccfg import sled-agent manifest failed");
+        return;
+    }
+    run_quiet("svcadm", &["enable", "svc:/oxide/sled-agent:default"]);
+    note("sled-agent activated");
 }
 
 /// SSH convenience for `voxel host login` (was the sourced `setup_ssh`
@@ -165,7 +231,7 @@ fn detect_underlay() -> (Vec<String>, Vec<String>) {
 /// ships placeholders), write the patched copy to /tmp, and seed the xtask
 /// WORKSPACE config (`smf/sled-agent/non-gimlet/config.toml`) that
 /// virtual-hardware reads. Uses `toml_edit`—no `sed`.
-fn patch_sled_config(underlay: &[String]) -> Result<()> {
+fn patch_sled_config(underlay: &[String], tuf: bool) -> Result<()> {
     let text = fs::read_to_string(SLED_CFG)
         .with_context(|| format!("read {SLED_CFG}"))?;
     let mut doc: toml_edit::DocumentMut =
@@ -189,10 +255,13 @@ fn patch_sled_config(underlay: &[String]) -> Result<()> {
     }
     fs::write(PATCHED_CFG, doc.to_string())
         .with_context(|| format!("write {PATCHED_CFG}"))?;
-    // xtask virtual-hardware reads the workspace config (vdevs + sled_mode).
-    let workspace = "smf/sled-agent/non-gimlet/config.toml";
-    fs::copy(PATCHED_CFG, workspace)
-        .with_context(|| format!("seed {workspace}"))?;
+    // xtask virtual-hardware reads the workspace config (vdevs + sled_mode);
+    // TUF images have neither xtask nor the workspace tree.
+    if !tuf {
+        let workspace = "smf/sled-agent/non-gimlet/config.toml";
+        fs::copy(PATCHED_CFG, workspace)
+            .with_context(|| format!("seed {workspace}"))?;
+    }
     Ok(())
 }
 
@@ -316,6 +385,11 @@ const INSTALL_ZONES: &[&str] = &[
     "probe.tar.gz",
 ];
 
+/// Corpus staged by `image create --from-tuf`: the target repo's own
+/// measurement corpus artifacts, byte exact. Preferred over the embedded fake
+/// corpus when present.
+const STAGED_CORPUS: &str = "/opt/oxide/measurements";
+
 /// Fixed fake measurement corpus, embedded so it is present without a build-time
 /// bake. A non-empty measurement manifest is required for a sled to be eligible
 /// for noop image-source conversion. Voxel TUF repos must carry this same corpus
@@ -402,9 +476,21 @@ fn preseed_install_datasets() {
                 warn(format!("preseed: copy {z}: {e}"));
             }
         }
-        for (name, bytes) in CORPUS {
-            if let Err(e) = fs::write(format!("{meas}/{name}"), bytes) {
-                warn(format!("preseed: write corpus {name}: {e}"));
+        let mut staged = 0;
+        if let Ok(entries) = Utf8Path::new(STAGED_CORPUS).read_dir_utf8() {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                match fs::copy(e.path(), format!("{meas}/{name}")) {
+                    Ok(_) => staged += 1,
+                    Err(e) => warn(format!("preseed: copy corpus {name}: {e}")),
+                }
+            }
+        }
+        if staged == 0 {
+            for (name, bytes) in CORPUS {
+                if let Err(e) = fs::write(format!("{meas}/{name}"), bytes) {
+                    warn(format!("preseed: write corpus {name}: {e}"));
+                }
             }
         }
         // Leave the pool imported: sled-agent's `zpool import -f` (no `-d`)
