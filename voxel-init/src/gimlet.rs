@@ -1042,7 +1042,7 @@ pub fn switch_enforcer_svc() {
     while !Utf8Path::new(SLED_CFG).exists() {
         if waited >= 30 {
             note("switch-enforcer-svc: no cargo-bay mount; nothing to enforce");
-            return;
+            park();
         }
         std::thread::sleep(Duration::from_secs(2));
         waited += 2;
@@ -1055,6 +1055,17 @@ pub fn switch_enforcer_svc() {
         None => note(
             "switch-enforcer-svc: no switch slot staged (gimlet); nothing to do",
         ),
+    }
+    park();
+}
+
+/// The service runs under the SMF wait model: the process is the service, so
+/// exiting reads as a death and loops the restarter. Paths with nothing left
+/// to monitor park instead.
+fn park() -> ! {
+    note("switch-enforcer-svc: parked");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
     }
 }
 

@@ -268,10 +268,13 @@ const SWITCH_ENFORCER_MANIFEST: &str = r#"<?xml version="1.0"?>
     </dependency>
     <exec_method type='method' name='start'
       exec='/opt/oxide/voxel-init switch-enforcer-svc'
-      timeout_seconds='1800'/>
-    <exec_method type='method' name='stop' exec=':true' timeout_seconds='60'/>
+      timeout_seconds='0'/>
+    <exec_method type='method' name='stop' exec=':kill' timeout_seconds='60'/>
+    <!-- Wait model: the enforcer stays resident (emu fleet monitor), so the
+         process IS the service; the transient model times its start method
+         out into maintenance. -->
     <property_group name='startd' type='framework'>
-      <propval name='duration' type='astring' value='transient'/>
+      <propval name='duration' type='astring' value='child'/>
     </property_group>
     <stability value='Unstable'/>
     <template>
