@@ -199,6 +199,25 @@ fn install_cp_tuf() -> Result<()> {
         "/opt/oxide/sled-agent/pkg/manifest.xml",
     )
     .map_err(|e| anyhow::anyhow!("stage sled-agent manifest: {e}"))?;
+
+    note("staging host boot image + phase 1 rom ...");
+    let host = format!("{CARGO_BAY}/host");
+    fs::create_dir_all("/opt/voxel/host")
+        .map_err(|e| anyhow::anyhow!("mkdir /opt/voxel/host: {e}"))?;
+    let mut n = 0;
+    for e in Utf8Path::new(&host)
+        .read_dir_utf8()
+        .map_err(|e| anyhow::anyhow!("read {host}: {e}"))?
+    {
+        let e = e.map_err(|e| anyhow::anyhow!("read {host}: {e}"))?;
+        let name = e.file_name();
+        fs::copy(e.path(), format!("/opt/voxel/host/{name}"))
+            .map_err(|e| anyhow::anyhow!("stage host/{name}: {e}"))?;
+        n += 1;
+    }
+    if n == 0 {
+        bail!("no host artifacts staged in {host}");
+    }
     fs::remove_file("/opt/oxide/sled-agent/pkg/config-rss.toml").ok();
     fs::write("/opt/oxide/.voxel-tuf", "")
         .map_err(|e| anyhow::anyhow!("write /opt/oxide/.voxel-tuf: {e}"))?;

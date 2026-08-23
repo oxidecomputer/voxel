@@ -102,6 +102,9 @@ pub fn bring_up() -> Result<()> {
 /// create` reduces to creating the config's vdev files (xtask's own default
 /// size); softnpu lives in the switch zone propolis and needs no host setup.
 fn setup_virtual_hardware_native() -> Result<()> {
+    // M.2 stores hold two repos of update artifacts (composites plus their
+    // derived splits are both retained); 20 GiB pools run out mid-upgrade.
+    const M2_VDEV_SIZE: u64 = 32 << 30;
     const VDEV_SIZE: u64 = 20 << 30;
     wipe_vdevs();
     let text = fs::read_to_string(PATCHED_CFG)
@@ -116,6 +119,7 @@ fn setup_virtual_hardware_native() -> Result<()> {
         .and_then(|v| v.as_array())
         .with_context(|| format!("no vdevs array in {PATCHED_CFG}"))?;
     let mut n = 0;
+    let mut m2_vdevs = Vec::new();
     for v in vdevs {
         let Some(name) = v.as_str() else { continue };
         let path = if name.starts_with('/') {
@@ -123,15 +127,45 @@ fn setup_virtual_hardware_native() -> Result<()> {
         } else {
             format!("/var/tmp/{name}")
         };
+        let is_m2 =
+            path.rsplit('/').next().is_some_and(|f| f.starts_with("m2_"));
         let f = fs::File::create(&path)
             .with_context(|| format!("create vdev {path}"))?;
-        f.set_len(VDEV_SIZE).with_context(|| format!("size vdev {path}"))?;
+        f.set_len(if is_m2 { M2_VDEV_SIZE } else { VDEV_SIZE })
+            .with_context(|| format!("size vdev {path}"))?;
+        if is_m2 {
+            m2_vdevs.push(path.clone());
+        }
         n += 1;
     }
     if n == 0 {
         bail!("no vdevs created from {PATCHED_CFG}");
     }
     note(format!("created {n} vdev files"));
+    seed_boot_images(&m2_vdevs)?;
+    Ok(())
+}
+
+/// Seed each M.2 vdev's boot image sibling from the baked host artifact.
+/// sled-agent reads the sibling as that slot's boot partition, so host
+/// phase 2 inventories at the image's repo version instead of erroring.
+fn seed_boot_images(m2_vdevs: &[String]) -> Result<()> {
+    const HOST_BOOT_IMAGE: &str = "/opt/voxel/host/boot-image.img";
+    if !std::path::Path::new(HOST_BOOT_IMAGE).exists() {
+        bail!("{HOST_BOOT_IMAGE} missing from the image");
+    }
+    for vdev in m2_vdevs {
+        let dest = format!("{vdev}.boot_image");
+        fs::copy(HOST_BOOT_IMAGE, &dest)
+            .with_context(|| format!("seed boot image {dest}"))?;
+        // Deployed sled-agents without the resolved-path fix open the
+        // sibling relative to their cwd (/); bridge with a symlink there.
+        let link = format!("/{}", dest.rsplit('/').next().unwrap_or(&dest));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dest, &link)
+            .with_context(|| format!("link {link}"))?;
+    }
+    note(format!("seeded {} M.2 boot images", m2_vdevs.len()));
     Ok(())
 }
 

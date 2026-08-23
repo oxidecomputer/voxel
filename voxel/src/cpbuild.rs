@@ -444,17 +444,40 @@ async fn create_cp_tuf(
     let host_cache = voxel_image.join(".tuf-host");
     std::fs::create_dir_all(&host_cache)
         .with_context(|| format!("mkdir {host_cache}"))?;
-    let payload = host_cache.join(format!("phase2-{}.img", t.commit));
+    let key: String = t.host_sha().chars().take(12).collect();
+    let boot_image = host_cache.join(format!("boot-image-{key}.img"));
+    let phase1 = host_cache.join(format!("phase1-{key}.rom"));
+    if !boot_image.exists() || !phase1.exists() {
+        eprintln!("[voxel] extracting host artifacts -> {host_cache}");
+        let (b, r) = t.extract_host_artifacts(&boot_image, &phase1)?;
+        eprintln!("[voxel] host boot image {b} bytes, phase 1 rom {r} bytes");
+    }
+    let payload = host_cache.join(format!("phase2-{key}.img"));
     if !payload.exists() {
-        eprintln!("[voxel] extracting host phase 2 payload -> {payload}");
-        let n = t.extract_host_phase2_payload(&payload)?;
-        eprintln!("[voxel] phase 2 payload: {n} bytes");
+        crate::tufrepo::strip_boot_image_header(&boot_image, &payload)?;
     }
     stage_gz_from_phase2(
         &payload,
         &host_cache.join("mnt"),
         &cargo_bay.join("gz"),
     )?;
+
+    // Emulated-fleet firmware, so the SPs a launch flashes come from the same
+    // release as the zones rather than from hand-staged files.
+    let fw_dir = voxel_image.join(format!(".tuf-fw/{key}"));
+    let fw = t.extract_firmware_into(&fw_dir)?;
+    eprintln!("[voxel] extracted SP/RoT firmware -> {fw_dir}");
+
+    // Ship the host artifacts in the image: at launch voxel-init seeds each
+    // M.2's boot image sibling from them so host phase 2 inventories at the
+    // repo's version; the phase 1 rom is staged for the SP QSPI seed.
+    let host_dir = cargo_bay.join("host");
+    std::fs::create_dir_all(&host_dir)
+        .with_context(|| format!("mkdir {host_dir}"))?;
+    std::fs::copy(&boot_image, host_dir.join("boot-image.img"))
+        .context("stage host boot image")?;
+    std::fs::copy(&phase1, host_dir.join("phase1-gimlet.rom"))
+        .context("stage host phase 1 rom")?;
 
     // The standard-image sled-agent hardwires scrimlet = tofino ASIC at
     // compile time (bootstrap/pre_server.rs sled_mode_from_config); softnpu
@@ -576,6 +599,14 @@ async fn create_cp_tuf(
     )?;
 
     println!("built image {image_name}");
+    println!(
+        "\nthis release's emulated-fleet firmware, for [sp] in voxel.toml:\n\
+         gimlet_image = \"{}\"\n\
+         sidecar_image = \"{}\"\n\
+         rot_image = \"{}\"\n\
+         bootleby_image = \"{}\"",
+        fw.gimlet, fw.sidecar, fw.rot_a, fw.bootleby
+    );
     Ok(())
 }
 

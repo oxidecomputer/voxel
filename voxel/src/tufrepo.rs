@@ -7,7 +7,7 @@
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 /// `BootImageHeader` magic + fixed size (nexus_sled_agent_shared); the phase 2
@@ -31,6 +31,36 @@ pub(crate) struct TufRepoSource {
     /// Zip members holding measurement corpus artifacts, with their target
     /// names (member basename minus the sha prefix).
     corpus: Vec<(String, String)>,
+    /// SP, RoT and RoT bootloader artifacts, by kind and name.
+    firmware: Vec<Firmware>,
+}
+
+/// One firmware artifact in the repo. A repo carries every board and keyset
+/// variant, so `kind` alone does not identify an image; `name` picks the board
+/// (`gimlet-c`) or the signing variant (`oxide-rot-1-selfsigned-bart`).
+struct Firmware {
+    kind: String,
+    name: String,
+    member: String,
+}
+
+/// The hubris boards a voxel emulated fleet presents.
+const GIMLET_BOARD: &str = "gimlet-c";
+const SIDECAR_BOARD: &str = "sidecar-c";
+/// The RoT signing variant to take. "bart" is the hubris dev keyset: its SIGN
+/// and the CMPA the emulated RoTs enforce match, so these images are drop-in.
+/// The production and staging variants are signed for keysets only real
+/// hardware holds.
+const ROT_VARIANT: &str = "oxide-rot-1-selfsigned-bart";
+/// The RoT bootloader (bootleby) variant, matching [`ROT_VARIANT`]'s keyset.
+const BOOTLOADER_VARIANT: &str = "bart";
+
+/// Firmware extracted from a repo, as the paths `[sp]` wants.
+pub(crate) struct FirmwareSet {
+    pub gimlet: Utf8PathBuf,
+    pub sidecar: Utf8PathBuf,
+    pub rot_a: Utf8PathBuf,
+    pub bootleby: Utf8PathBuf,
 }
 
 impl TufRepoSource {
@@ -66,11 +96,13 @@ impl TufRepoSource {
         let mut control_plane = None;
         let mut host = None;
         let mut corpus = Vec::new();
+        let mut firmware = Vec::new();
         for a in artifacts {
             let kind = a.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             let Some(target) = a.get("target").and_then(|v| v.as_str()) else {
                 continue;
             };
+            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
             // The index names targets without the sha prefix the zip uses.
             let member = members
                 .iter()
@@ -90,6 +122,18 @@ impl TufRepoSource {
                 "measurement_corpus" => {
                     corpus.push((member.clone(), target.to_string()));
                 }
+                "gimlet_sp"
+                | "switch_sp"
+                | "gimlet_rot"
+                | "switch_rot"
+                | "gimlet_rot_bootloader"
+                | "switch_rot_bootloader" => {
+                    firmware.push(Firmware {
+                        kind: kind.to_string(),
+                        name: name.to_string(),
+                        member: member.clone(),
+                    });
+                }
                 _ => {}
             }
         }
@@ -103,6 +147,7 @@ impl TufRepoSource {
             control_plane: need(control_plane, "control_plane")?,
             host: need(host, "host")?,
             corpus,
+            firmware,
         })
     }
 
@@ -158,47 +203,142 @@ impl TufRepoSource {
         Ok(self.corpus.len())
     }
 
-    /// Write the host artifact's phase 2 ZFS pool image to `dest`, stripping
-    /// the 4096 byte boot image header (verified by magic). The result is a
-    /// lofi mountable pool holding the host OS root, whose /opt/oxide carries
-    /// the global zone software.
-    pub(crate) fn extract_host_phase2_payload(
+    /// Write the host artifact pieces a TUF image carries: the boot image
+    /// (4096 byte header, verified by magic, plus the phase 2 ZFS image; the
+    /// exact bytes installinator writes to a boot partition) and the gimlet
+    /// phase 1 ROM. Returns their sizes.
+    pub(crate) fn extract_host_artifacts(
         &self,
-        dest: &Utf8Path,
-    ) -> Result<u64> {
+        boot_image_dest: &Utf8Path,
+        phase1_dest: &Utf8Path,
+    ) -> Result<(u64, u64)> {
         let (mut child, mut archive) = self.member_tar(&self.host)?;
-        let mut written = None;
+        let mut boot_image = None;
+        let mut phase1 = None;
         for entry in archive.entries().context("read host composite entries")? {
             let mut entry = entry?;
-            let is_zfs =
-                entry.path()?.file_name().is_some_and(|n| n == "zfs.img");
-            if !is_zfs {
-                continue;
+            let path = entry.path()?.into_owned();
+            let name = path.file_name().and_then(|n| n.to_str());
+            match name {
+                Some("zfs.img") => {
+                    let mut header = [0u8; BOOT_IMAGE_HEADER_SIZE];
+                    entry
+                        .read_exact(&mut header)
+                        .context("read boot image header")?;
+                    let magic =
+                        u32::from_le_bytes(header[..4].try_into().unwrap());
+                    if magic != BOOT_IMAGE_MAGIC {
+                        bail!(
+                            "zfs.img in {} has boot image magic {magic:#x}, \
+                             expected {BOOT_IMAGE_MAGIC:#x}",
+                            self.path
+                        );
+                    }
+                    let mut out = fs::File::create(boot_image_dest)
+                        .with_context(|| format!("create {boot_image_dest}"))?;
+                    out.write_all(&header)
+                        .context("write boot image header")?;
+                    let n = std::io::copy(&mut entry, &mut out).with_context(
+                        || format!("write boot image to {boot_image_dest}"),
+                    )?;
+                    boot_image = Some(n + BOOT_IMAGE_HEADER_SIZE as u64);
+                }
+                Some("gimlet.rom") => {
+                    let mut out = fs::File::create(phase1_dest)
+                        .with_context(|| format!("create {phase1_dest}"))?;
+                    let n = std::io::copy(&mut entry, &mut out).with_context(
+                        || format!("write phase 1 rom to {phase1_dest}"),
+                    )?;
+                    phase1 = Some(n);
+                }
+                _ => continue,
             }
-            let mut header = [0u8; BOOT_IMAGE_HEADER_SIZE];
-            entry.read_exact(&mut header).context("read boot image header")?;
-            let magic = u32::from_le_bytes(header[..4].try_into().unwrap());
-            if magic != BOOT_IMAGE_MAGIC {
-                bail!(
-                    "zfs.img in {} has boot image magic {magic:#x}, \
-                     expected {BOOT_IMAGE_MAGIC:#x}",
-                    self.path
-                );
+            if boot_image.is_some() && phase1.is_some() {
+                break;
             }
-            let mut out = fs::File::create(dest)
-                .with_context(|| format!("create {dest}"))?;
-            let n = std::io::copy(&mut entry, &mut out)
-                .with_context(|| format!("write phase 2 payload to {dest}"))?;
-            written = Some(n);
-            break;
         }
-        // Entries can follow zfs.img; drop the reader so unzip sees EPIPE
-        // instead of blocking on a full pipe under wait().
+        // Entries can follow; drop the reader so unzip sees EPIPE instead of
+        // blocking on a full pipe under wait().
         drop(archive);
         wait_ok(&mut child, &self.host)?;
-        written.with_context(|| {
-            format!("host artifact in {} carries no zfs.img", self.path)
-        })
+        let need = |v: Option<u64>, what: &str| {
+            v.with_context(|| {
+                format!("host artifact in {} carries no {what}", self.path)
+            })
+        };
+        Ok((need(boot_image, "zfs.img")?, need(phase1, "gimlet.rom")?))
+    }
+
+    /// Extract the firmware a voxel emulated fleet boots into `dir`: the
+    /// gimlet and sidecar SP images, the RoT slot A image, and the RoT
+    /// bootloader. SP and bootloader artifacts are hubris zips carrying a
+    /// `.tar.gz` name; RoT artifacts really are gzipped tarballs, holding the
+    /// per-slot archives.
+    pub(crate) fn extract_firmware_into(
+        &self,
+        dir: &Utf8Path,
+    ) -> Result<FirmwareSet> {
+        fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
+        let find = |kind: &str, name: &str| -> Result<&str> {
+            self.firmware
+                .iter()
+                .find(|f| f.kind == kind && f.name == name)
+                .map(|f| f.member.as_str())
+                .with_context(|| {
+                    format!("{} has no {kind} named {name}", self.path)
+                })
+        };
+
+        let gimlet = dir.join(format!("sp-{GIMLET_BOARD}.zip"));
+        zip_extract(&self.path, find("gimlet_sp", GIMLET_BOARD)?, &gimlet)?;
+        let sidecar = dir.join(format!("sp-{SIDECAR_BOARD}.zip"));
+        zip_extract(&self.path, find("switch_sp", SIDECAR_BOARD)?, &sidecar)?;
+
+        let bootleby = dir.join("bootleby.zip");
+        let boot_name = format!("gimlet_rot_bootloader-{BOOTLOADER_VARIANT}");
+        zip_extract(
+            &self.path,
+            find("gimlet_rot_bootloader", &boot_name)?,
+            &bootleby,
+        )?;
+
+        // The RoT composite holds archive-a.zip and archive-b.zip; slot A is
+        // what launch flashes, and bootleby verifies it.
+        let rot_member = find("gimlet_rot", ROT_VARIANT)?.to_string();
+        let (mut child, mut archive) = self.member_tar(&rot_member)?;
+        let mut rot_a = None;
+        for entry in archive.entries().context("read RoT composite entries")? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            let is_a = path.file_name().is_some_and(|n| n == "archive-a.zip");
+            if !is_a {
+                continue;
+            }
+            let dest = dir.join("rot-a.zip");
+            entry
+                .unpack(&dest)
+                .with_context(|| format!("unpack RoT slot A into {dir}"))?;
+            rot_a = Some(dest);
+            break;
+        }
+        drop(archive);
+        wait_ok(&mut child, &rot_member)?;
+        let rot_a = rot_a.with_context(|| {
+            format!("{ROT_VARIANT} in {} carries no archive-a.zip", self.path)
+        })?;
+
+        Ok(FirmwareSet { gimlet, sidecar, rot_a, bootleby })
+    }
+
+    /// The host artifact's sha256, parsed from its target member name. Cache
+    /// keys use it rather than the commit: releng rebuilds of the same commit
+    /// produce different artifacts.
+    pub(crate) fn host_sha(&self) -> &str {
+        self.host
+            .strip_prefix("repo/targets/")
+            .and_then(|b| b.split_once('.'))
+            .map(|(sha, _)| sha)
+            .unwrap_or(&self.commit)
     }
 
     /// Every `repo/targets/<sha256>.<name>` member with its sha.
@@ -229,6 +369,22 @@ impl TufRepoSource {
     }
 }
 
+/// Copy `boot_image` minus its 4096 byte header to `dest`: the raw ZFS pool
+/// image, lofi mountable for the global zone software lift.
+pub(crate) fn strip_boot_image_header(
+    boot_image: &Utf8Path,
+    dest: &Utf8Path,
+) -> Result<u64> {
+    let mut src = fs::File::open(boot_image)
+        .with_context(|| format!("open {boot_image}"))?;
+    src.seek(SeekFrom::Start(BOOT_IMAGE_HEADER_SIZE as u64))
+        .context("seek past boot image header")?;
+    let mut out =
+        fs::File::create(dest).with_context(|| format!("create {dest}"))?;
+    std::io::copy(&mut src, &mut out)
+        .with_context(|| format!("write phase 2 payload to {dest}"))
+}
+
 fn wait_ok(child: &mut Child, member: &str) -> Result<()> {
     let status = child.wait().context("wait for unzip")?;
     // The tar reader stops at the archive's logical end; unzip may still be
@@ -252,6 +408,21 @@ fn zip_members(path: &Utf8Path) -> Result<Vec<String>> {
         .lines()
         .map(str::to_string)
         .collect())
+}
+
+/// Stream one zip member to `dest`, as is.
+fn zip_extract(path: &Utf8Path, member: &str, dest: &Utf8Path) -> Result<()> {
+    let mut child = Command::new("unzip")
+        .args(["-p", path.as_str(), member])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("spawn unzip -p")?;
+    let mut out = child.stdout.take().context("unzip stdout")?;
+    let mut file =
+        fs::File::create(dest).with_context(|| format!("create {dest}"))?;
+    std::io::copy(&mut out, &mut file)
+        .with_context(|| format!("write {member} to {dest}"))?;
+    wait_ok(&mut child, member)
 }
 
 /// `unzip -p`: stream one member.
@@ -279,4 +450,38 @@ fn commit_of_version(system_version: &str) -> Result<String> {
             )
         })?;
     Ok(sha.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extraction against a real repo. Ignored by default (needs a multi-GiB
+    /// zip); run with `VOXEL_TEST_REPO=<repo.zip> cargo test -p voxel
+    /// firmware_from_repo -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn firmware_from_repo() {
+        let Ok(repo) = std::env::var("VOXEL_TEST_REPO") else {
+            panic!("set VOXEL_TEST_REPO to a repo.zip");
+        };
+        let repo = Utf8PathBuf::from(repo);
+        let t = TufRepoSource::load(&repo).expect("loaded repo");
+        let dir = Utf8PathBuf::from(format!(
+            "/var/tmp/voxel-fw-test-{}",
+            std::process::id()
+        ));
+        let fw = t.extract_firmware_into(&dir).expect("extracted firmware");
+
+        // Every one of these is a hubris archive, i.e. a zip: SP and
+        // bootloader artifacts carry a .tar.gz name but are zips, and the RoT
+        // slot archives come out of a real tarball.
+        for path in [&fw.gimlet, &fw.sidecar, &fw.rot_a, &fw.bootleby] {
+            let bytes = std::fs::read(path).expect("read extracted firmware");
+            assert!(bytes.len() > 1024, "{path} is implausibly small");
+            assert_eq!(&bytes[..2], b"PK", "{path} is not a zip");
+            println!("{} {} bytes", path, bytes.len());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
