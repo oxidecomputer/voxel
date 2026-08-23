@@ -2,7 +2,7 @@
 //! cargo-bay staging that feeds it (generated sled/RSS/FRR/switch1 config +
 //! sprockets keys).
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use attest_mock::MockData;
 use camino::{Utf8Path, Utf8PathBuf};
 use indoc::formatdoc;
@@ -252,6 +252,27 @@ pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
 /// TUF system version stamped on `--from-tuf` images: the repo whose zone and
 /// corpus artifacts the image's bytes hash match.
 pub(crate) const PROP_TUF_VERSION: &str = "voxel:tuf-version";
+/// Directory of SP/RoT firmware `image create --from-tuf` extracted from the
+/// same repo. `--emu` launches boot this unless `[sp]` overrides it, so a rack
+/// cannot run firmware that disagrees with the release it reports.
+pub(crate) const PROP_TUF_FW: &str = "voxel:tuf-fw";
+
+/// The firmware `image create --from-tuf` extracted for this image, if it is a
+/// TUF image built by a voxel that stamped the directory.
+pub(crate) fn tuf_firmware(image: &str) -> Option<Utf8PathBuf> {
+    let ds = format!("{}/img/{image}", crate::image::falcon_dataset());
+    let out = std::process::Command::new("zfs")
+        .args(["get", "-H", "-o", "value", PROP_TUF_FW])
+        .arg(&ds)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = Utf8PathBuf::from(dir);
+    dir.is_dir().then_some(dir)
+}
 
 /// Sled-agent config schema read from an omicron checkout; None if the
 /// checkout's sled-agent config source is not readable.
@@ -549,6 +570,9 @@ pub(crate) fn stage_config(
         } else {
             voxel_config::sp::SpFleet::sim_for_gimlets(&gimlet_indices)
         };
+        // Firmware the image carries from its own TUF repo; `[sp]` overrides it
+        // (which is how a rack boots older firmware to exercise an update).
+        let fw = emu_sp.then(|| tuf_firmware(&cfg.image.cp_image())).flatten();
         for (slot, s) in rack_sleds.iter().filter(|s| s.scrimlet).enumerate() {
             let dir = cargo_bay(&s.name);
             fs::create_dir_all(&dir)?;
@@ -568,7 +592,7 @@ pub(crate) fn stage_config(
                     fleet.sp_sim_config(),
                 )?;
             }
-            stage_sp_emu(cfg, &fleet, &dir, emu_rot)?;
+            stage_sp_emu(cfg, &fleet, &dir, emu_rot, fw.as_deref())?;
         }
     }
     Ok(())
@@ -585,6 +609,7 @@ fn stage_sp_emu(
     fleet: &voxel_config::sp::SpFleet,
     dir: &Utf8Path,
     emu_rot: bool,
+    fw: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
     let emu = fleet.emu_sps();
     if emu.is_empty() {
@@ -631,15 +656,25 @@ fn stage_sp_emu(
     // Stage the RoT image so each SP can run oxide-rot-1 in-process over sprot
     // (sp-emu 1.x runs the RoT inside the SP process, not as a separate service).
     if emu_rot {
-        let rot = cfg.sp.rot_image.as_deref().ok_or_else(|| {
-            anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
-        })?;
-        fs::copy(rot, out.join("rot.image"))
+        let rot = match (cfg.sp.rot_image.as_deref(), fw) {
+            (Some(p), _) => Utf8PathBuf::from(p),
+            (None, Some(dir)) => dir.join("rot-a.zip"),
+            (None, None) => bail!(
+                "--emu needs a RoT image: build the image with --from-tuf, \
+                 or set [sp].rot_image"
+            ),
+        };
+        fs::copy(&rot, out.join("rot.image"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
         // Staged bootleby turns on sp-emu secure boot; rot_image must be
         // self-signed.
-        if let Some(bootleby) = cfg.sp.bootleby_image.as_deref() {
-            fs::copy(bootleby, out.join("bootleby.zip"))
+        let bootleby = match (cfg.sp.bootleby_image.as_deref(), fw) {
+            (Some(p), _) => Some(Utf8PathBuf::from(p)),
+            (None, Some(dir)) => Some(dir.join("bootleby.zip")),
+            (None, None) => None,
+        };
+        if let Some(bootleby) = bootleby {
+            fs::copy(&bootleby, out.join("bootleby.zip"))
                 .with_context(|| format!("stage bootleby from {bootleby}"))?;
         }
     }
@@ -653,11 +688,19 @@ fn stage_sp_emu(
         if !staged.insert(role) {
             continue;
         }
-        let image = cfg.sp.image_for(&sp.selector()).ok_or_else(|| {
-            let key = format!("{role}_image");
-            anyhow!("[sp].emu includes {role} but [sp].{key} is unset")
-        })?;
-        fs::copy(image, out.join(format!("{role}.archive")))
+        let image = match (cfg.sp.image_for(&sp.selector()), fw) {
+            (Some(p), _) => Utf8PathBuf::from(p),
+            // The repo names SP archives by hubris board.
+            (None, Some(dir)) => dir.join(match role {
+                "sidecar" => "sp-sidecar-c.zip",
+                _ => "sp-gimlet-c.zip",
+            }),
+            (None, None) => bail!(
+                "--emu needs a {role} SP image: build the image with \
+                 --from-tuf, or set [sp].{role}_image"
+            ),
+        };
+        fs::copy(&image, out.join(format!("{role}.archive")))
             .with_context(|| format!("stage {role} archive from {image}"))?;
     }
     Ok(())

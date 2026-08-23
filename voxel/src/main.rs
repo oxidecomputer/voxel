@@ -81,24 +81,14 @@ enum Cmd {
         /// Don't set the host route to the rack's external network after launch.
         #[arg(long)]
         no_route: bool,
-        /// Run real-firmware SPs on `sp-emu` instead of `sp-sim`.
+        /// Run the rack on emulated hardware: real-firmware SPs and RoTs on
+        /// `sp-emu` instead of `sp-sim`, with rack setup driven through wicketd.
         ///
-        /// The whole fleet. Needs `[sp].emu_bin` + the hubris images in `[sp]`.
+        /// Firmware comes from the image's own TUF repo (`image create
+        /// --from-tuf`); `[sp]` overrides it, which is how a rack boots older
+        /// firmware to exercise a firmware update.
         #[arg(long)]
-        emu_sp: bool,
-        /// Also wire the RoT bridge (oxide-rot-1) onto the sidecar SP. Implies --emu-sp.
-        ///
-        /// Needs `[sp].rot_image`. Runs the sidecar as two emulated cores; keep
-        /// OFF during initial bring-up (it wedges handoff).
-        #[arg(long = "emu-rot")]
-        emu_rot: bool,
-        /// Drive rack setup through wicketd (the real operator flow).
-        ///
-        /// Suppresses the staged config-rss so sled-agent waits, then uploads the
-        /// config + a self-signed cert + recovery password to wicketd and POSTs to
-        /// start RSS - fully populating wicket's RACK SETUP page.
-        #[arg(long = "wicket-setup")]
-        wicket_setup: bool,
+        emu: bool,
     },
     /// (debug) Print the wicketd RSS config body that `--wicket-setup` would PUT,
     /// reshaped from a generated config-rss.toml (validates the mapping offline).
@@ -783,21 +773,18 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch {
-            no_progress,
-            no_route,
-            emu_sp,
-            emu_rot,
-            wicket_setup,
-        } => {
+        Cmd::Launch { no_progress, no_route, emu } => {
+            // One flag: emulated SPs, the RoT bridge on top of them, and
+            // wicketd-driven setup are the same configuration in practice, and
+            // the combinations that split them apart are not worth carrying.
             rack::cmd_launch(
                 &load_config(&config_path)?,
                 &cli.name,
                 *no_progress,
                 *no_route,
-                *emu_sp || *emu_rot,
-                *emu_rot,
-                *wicket_setup,
+                *emu,
+                *emu,
+                *emu,
             )
             .await
         }

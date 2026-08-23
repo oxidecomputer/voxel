@@ -594,8 +594,9 @@ async fn create_cp_tuf(
                 crate::topo::PROP_TUF_VERSION,
                 t.system_version
             ))
+            .arg(format!("{}={}", crate::topo::PROP_TUF_FW, fw_dir))
             .arg(format!("{dataset}/img/{image_name}")),
-        "zfs set schema + tuf version on the image",
+        "zfs set schema + tuf version + firmware on the image",
     )?;
 
     println!("built image {image_name}");
