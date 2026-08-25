@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Per-sled sled-agent config (`sled-config.toml`) generation.
 //!
 //! Replaces a4x2's static `config/gN-config.toml` files (which `prep.sh` copied

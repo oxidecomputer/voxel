@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! voxel-init—the in-guest bring-up agent baked into voxel images.
 //!
 //! Replaces the per-node launch shell scripts (`gimlet-launch.sh`,

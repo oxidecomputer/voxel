@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Tiny process/file helpers shared by the role agents. The shell scripts these
 //! replace ran with `set -x` and (for the gimlet) deliberately not `set -e`:
 //! every step is visible and best-effort steps log a warning instead of

@@ -1,5 +1,9 @@
 #!/bin/bash
 #
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
 # patch-image.sh - fold a single prebuilt component into a NEW pinned @base, the
 # safe way: boot the source image as a one-node builder, place the artifact
 # in-guest, clean-halt, and capture (mirrors build-image.sh, which deliberately

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Drive rack setup through wicketd's commission API. The typed request body
 //! is built here; the API is a versioned interface, so it is reached with its
 //! generated progenitor client over an ssh tunnel to its in-zone loopback.
