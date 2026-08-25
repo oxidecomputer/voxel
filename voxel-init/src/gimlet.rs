@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Gimlet (sled) bring-up—replaces `gimlet-launch.sh`. Runs in the voxel-cp
 //! helios guest. The control plane is already installed (`/opt/oxide`); this
 //! applies the per-launch / topology bits that can't be baked: ephemeral virtual

@@ -1,5 +1,9 @@
 #!/bin/bash
 #
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
 # build-sp.sh <hubris-commit> - build the gimlet-c + sidecar-c-emu v25 SP images
 # for the sp-emu `--emu` backend. Parallel to build-cp.sh, but for real Hubris
 # firmware instead of the control plane.

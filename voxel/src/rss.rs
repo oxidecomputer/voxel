@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! RSS bring-up progress (fridge-style): poll the RSS node's bootstrap-agent
 //! status API and render `[n/total]` step transitions. Also hosts `strip_ansi`,
 //! shared with serial-exec output parsing in [`crate::net`].
