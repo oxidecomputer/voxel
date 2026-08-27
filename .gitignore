@@ -7,6 +7,8 @@ cargo-bay.tgz
 .DS_Store
 core
 cargo-bay/
+sp-fleet/
+wicket-setup/
 *.vdev
 .sidecar-lite/
 voxel-image/out/
@@ -19,3 +21,4 @@ voxel-image/.tuf-host/
 voxel-image/.tuf-fw/
 voxel-image/.omicron-raw/
 voxel-image/.dendrite-softnpu/
+old/

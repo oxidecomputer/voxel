@@ -39,6 +39,7 @@ mod repocmd;
 mod rss;
 mod rss_request;
 mod sp_cmd;
+mod sp_host;
 mod topo;
 mod tufrepo;
 mod util;
@@ -89,10 +90,17 @@ enum Cmd {
         /// `sp-emu` instead of `sp-sim`, with rack setup driven through wicketd.
         ///
         /// Firmware comes from the image's own TUF repo (`image create
-        /// --from-tuf`); `[sp]` overrides it, which is how a rack boots older
-        /// firmware to exercise a firmware update.
+        /// --from-tuf`), so an --emu rack runs the release it reports.
         #[arg(long)]
         emu: bool,
+        /// Run the emulated fleet on the firmware in DIR instead of the
+        /// image's own: sp-gimlet-c.zip, sp-sidecar-c.zip, rot-a.zip and
+        /// bootleby.zip, laid out as `image create --from-tuf` extracts them.
+        ///
+        /// For trying a hubris build before it ships. The rack then reports a
+        /// release it is not running, so say so wherever that is claimed.
+        #[arg(long, value_name = "DIR")]
+        sp_firmware: Option<Utf8PathBuf>,
     },
     /// (debug) Print the wicketd RSS config body that `--wicket-setup` would PUT,
     /// reshaped from a generated config-rss.toml (validates the mapping offline).
@@ -495,7 +503,7 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Enable (or `--off`) the in-zone humility debug listeners (gdb/ocd) for one SP.
+    /// Enable (or `--off`) the humility SWD debug listeners for one SP.
     ///
     /// Toggles `SP_EMU_NO_DEBUG` + restarts the SP (~30s preboot). On enable,
     /// prints the humility ports + attach command. Live + ephemeral.
@@ -777,7 +785,7 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route, emu } => {
+        Cmd::Launch { no_progress, no_route, emu, sp_firmware } => {
             // One flag: emulated SPs, the RoT bridge on top of them, and
             // wicketd-driven setup are the same configuration in practice, and
             // the combinations that split them apart are not worth carrying.
@@ -787,8 +795,7 @@ async fn main() -> Result<(), Error> {
                 *no_progress,
                 *no_route,
                 *emu,
-                *emu,
-                *emu,
+                sp_firmware.as_deref(),
             )
             .await
         }

@@ -5,6 +5,7 @@
 //! Rack lifecycle commands: launch, route, destroy, info, status.
 
 use anyhow::{Context, bail};
+use camino::Utf8Path;
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
 use std::collections::HashSet;
@@ -267,9 +268,8 @@ pub(crate) async fn cmd_launch(
     name: &str,
     no_progress: bool,
     no_route: bool,
-    emu_sp: bool,
-    emu_rot: bool,
-    wicket_setup: bool,
+    emu: bool,
+    sp_firmware: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
     // Floor (per rack - each is an independent RSS domain): omicron's control
     // plane can't form below 3 sleds (Crucible 3-way replication,
@@ -323,8 +323,14 @@ pub(crate) async fn cmd_launch(
         lan_mtu_preflight()?;
     }
     reset_node_cargo_bay(cfg)?;
-    stage_config(cfg, emu_sp, emu_rot, wicket_setup)?;
+    stage_config(cfg, emu, sp_firmware)?;
     stage_sprockets(cfg)?;
+    // The SP fleet runs on this host, so it has to exist before any node boots:
+    // each switch zone's MGS dials it, and the scrimlets are staged to reach the
+    // address it binds.
+    if emu {
+        crate::sp_host::up_all(cfg, emu)?;
+    }
     let mut topo = build_topo(cfg, name)?;
     // The all-VMs-at-once boot grabs ~all the guest RAM in one spike; under that
     // pressure falcon's cargo-bay mount over the serial console can transiently
@@ -422,7 +428,7 @@ pub(crate) async fn cmd_launch(
                 // --wicket-setup: nothing auto-inited (no staged config-rss),
                 // so drive rack setup through the commission API; watch_rss
                 // then reports the wicketd-triggered bring-up as usual.
-                if wicket_setup
+                if emu
                     && let Err(e) = crate::commission::drive(
                         cfg, d, *n, &s.name, rack, &tag,
                     )
@@ -433,7 +439,7 @@ pub(crate) async fn cmd_launch(
                         "{tag}: commission setup failed: {e:#}; rack will not initialize"
                     );
                 }
-                let watch_cap = rss_watch_cap(emu_sp, racks);
+                let watch_cap = rss_watch_cap(emu, racks);
                 let known_ip = if cfg.external.isolated() {
                     cfg.static_external_ips()
                         .into_iter()
@@ -599,6 +605,9 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+    // Before teardown, so the fleet still goes away if falcon's own destroy
+    // errors. Scoped by rack, so a co-resident rack keeps its SPs.
+    crate::sp_host::down_all(cfg);
     let topo = build_topo(cfg, name)?;
     teardown(&topo.runner, name)?;
     // Isolated mode's segment stays up (per-host, reused by the next launch);

@@ -373,19 +373,16 @@ mode = "stderr-terminal"
         // The pluggable bit: an emulated fleet swaps the MGS address but keeps
         // the port scheme + structure (still valid, still byte-identical except
         // the host).
-        let host = "[fdb0:a840:2500:1::1]";
+        let host = crate::config::sp_host_addr(0);
         let s = switch_config(
             0,
-            &SpFleet::new(
-                4,
-                crate::sp::SpBackend::Central { host: host.into() },
-            ),
+            &SpFleet::new(4, crate::sp::SpBackend::Emu { addr: host.clone() }),
             &[0, 3],
         );
         let _: toml::Value =
             toml::from_str(&s).expect("emulated switch0 valid TOML");
-        assert!(s.contains(&format!("addr = \"{host}:33300\"")));
-        assert!(s.contains(&format!("addr = \"{host}:33310\"")));
+        assert!(s.contains(&format!("addr = \"[{host}]:33300\"")));
+        assert!(s.contains(&format!("addr = \"[{host}]:33310\"")));
         assert!(!s.contains("[::1]:33300")); // no longer loopback
     }
 
@@ -407,7 +404,11 @@ mode = "stderr-terminal"
     #[test]
     fn emu_fleet_widens_mgs_timeout() {
         // Any emulator-backed SP -> lenient per-attempt RPC timeout.
-        let f = SpFleet::sim_with_emu(&[0, 1, 2, 3], &["sidecar".into()]);
+        let f = SpFleet::sim_with_emu(
+            &[0, 1, 2, 3],
+            &["sidecar".into()],
+            &crate::config::sp_host_addr(0),
+        );
         let s = switch_config(0, &f, &[0, 3]);
         assert!(s.contains("per_attempt_timeout_millis = 15000"));
         assert!(!s.contains("per_attempt_timeout_millis = 2000"));
