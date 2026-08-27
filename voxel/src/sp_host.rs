@@ -376,6 +376,18 @@ pub(crate) fn up(
         if !st.success() {
             bail!("sp-emu flash failed for port {} ({st})", sp.base_port);
         }
+        // Seed the gimlet's host-boot QSPI with the release's phase 1. The
+        // rom is exactly the 32 MiB array sp-emu persists, and sp-emu loads
+        // a pre-existing qspi-flash.bin at startup, so Hubris hashes real
+        // contents and host phase 1 identifies instead of reading as blank.
+        // Launch-time only: a fresh rack starts at the release baseline.
+        let rom = dir.join("host-phase1.rom");
+        if board_of(sp) == "gimlet" && rom.exists() {
+            std::fs::copy(&rom, state.join("qspi-flash.bin"))
+                .with_context(|| {
+                    format!("seed host phase 1 for port {}", sp.base_port)
+                })?;
+        }
     }
 
     let path = manifest_path(rack);

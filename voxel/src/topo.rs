@@ -734,6 +734,26 @@ fn stage_sp_emu(
         fs::copy(&image, out.join(format!("{role}.archive")))
             .with_context(|| format!("stage {role} archive from {image}"))?;
     }
+    // The release's host phase 1, staged for the gimlet QSPI seed (sp_host
+    // writes it into each gimlet SP's host-boot flash so the slot inventories
+    // at the repo's version instead of reading as blank). Cached by cpbuild
+    // next to the firmware dir under the same key; an image whose caches
+    // predate the rom just leaves host phase 1 unknown, as before.
+    let key = fw_dir.file_name().unwrap_or_default();
+    let rom = fw_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join(".tuf-host").join(format!("phase1-{key}.rom")));
+    match rom {
+        Some(rom) if rom.exists() => {
+            fs::copy(&rom, out.join("host-phase1.rom"))
+                .with_context(|| format!("stage host phase 1 from {rom}"))?;
+        }
+        _ => eprintln!(
+            "[voxel] no cached host phase 1 rom for {key}; \
+             gimlet host flash stays blank"
+        ),
+    }
     Ok(())
 }
 

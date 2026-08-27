@@ -772,6 +772,10 @@ fn preseed_install_datasets() {
         warn("preseed: no M.2 storage found; skipping install-dataset seed");
         return;
     }
+    // One MUPdate marker per sled, mirrored onto both M.2s: installinator
+    // stamps the same UUID on both, and sled-agent logs a mismatch otherwise.
+    let mupdate_uuid =
+        capture("uuidgen", &[]).map(|u| u.trim().to_lowercase());
     for vdev in &vdevs {
         let Some(uuid) =
             capture("uuidgen", &[]).map(|u| u.trim().to_lowercase())
@@ -824,6 +828,22 @@ fn preseed_install_datasets() {
                     warn(format!("preseed: write corpus {name}: {e}"));
                 }
             }
+        }
+        // A rack installed by installinator starts with a MUPdate override on
+        // every install dataset, which freezes the reconfigurator until the
+        // operator uploads the matching repo and calls recovery-finish (RFD
+        // 556). Stage the same marker so a fresh voxel rack starts in that
+        // state and exercises the real first step of the update flow, instead
+        // of booting straight into normal operation.
+        match &mupdate_uuid {
+            Some(id) => {
+                let path = format!("{mnt}/mupdate-override.json");
+                let json = format!("{{\"mupdate_uuid\":\"{id}\"}}");
+                if let Err(e) = fs::write(&path, json) {
+                    warn(format!("preseed: write mupdate override: {e}"));
+                }
+            }
+            None => warn("preseed: no uuid for the mupdate override"),
         }
         // Leave the pool imported: sled-agent's `zpool import -f` (no `-d`)
         // cannot find an exported file-vdev pool, but on an already-imported
