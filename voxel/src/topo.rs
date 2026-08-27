@@ -110,9 +110,14 @@ pub(crate) fn build_topo(
     let sled_mem = gb(cfg.topology.sled_memory_gb);
     let router_mem = gb(cfg.topology.router_memory_gb);
     let mut sleds = Vec::new();
+    let dataset = crate::image::falcon_dataset();
     for s in cfg.sleds() {
         let n = d.node(&s.name, &cp_img, 8, sled_mem);
         d.reserve(n, cfg.topology.sled_disk_gb as usize);
+        // The sled's complement of real NVMe disks. The zvols behind them are
+        // created at launch (see crate::disks); describing the devices here is
+        // inert for the non-launch callers of build_topo.
+        crate::disks::attach(&mut d, &dataset, name, &s, n)?;
         sleds.push((s, n));
     }
     let mut routers = Vec::new();
@@ -688,22 +693,24 @@ fn stage_sp_emu(
     }
     // Stage the RoT image so each SP can run oxide-rot-1 in-process over sprot
     // (sp-emu 1.x runs the RoT inside the SP process, not as a separate service).
+    // The image's own firmware wins: an --emu rack should run the release it
+    // reports. `[sp]` is the fallback for an image built without --from-tuf,
+    // which carries no firmware of its own. Bound once, under its own name:
+    // shadowing `dir` here left the archive staging below reading the hubris
+    // zips out of its own output directory.
+    let Some(fw_dir) = fw else {
+        bail!(
+            "--emu needs firmware: build the image with --from-tuf, or \
+             point --sp-firmware at a directory of SP/RoT images"
+        );
+    };
     if emu_rot {
-        // The image's own firmware wins: an --emu rack should run the release
-        // it reports. `[sp]` is the fallback for an image built without
-        // --from-tuf, which carries no firmware of its own.
-        let Some(dir) = fw else {
-            bail!(
-                "--emu needs firmware: build the image with --from-tuf, or \
-                 point --sp-firmware at a directory of SP/RoT images"
-            );
-        };
-        let rot = dir.join("rot-a.zip");
+        let rot = fw_dir.join("rot-a.zip");
         fs::copy(&rot, out.join("rot.image"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
         // Staged bootleby turns on sp-emu secure boot; rot_image must be
         // self-signed.
-        let bootleby = dir.join("bootleby.zip");
+        let bootleby = fw_dir.join("bootleby.zip");
         if bootleby.exists() {
             fs::copy(&bootleby, out.join("bootleby.zip"))
                 .with_context(|| format!("stage bootleby from {bootleby}"))?;
@@ -720,7 +727,7 @@ fn stage_sp_emu(
             continue;
         }
         // The repo names SP archives by hubris board.
-        let image = dir.join(match role {
+        let image = fw_dir.join(match role {
             "sidecar" => "sp-sidecar-c.zip",
             _ => "sp-gimlet-c.zip",
         });
