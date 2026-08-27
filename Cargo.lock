@@ -122,7 +122,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "api_identity"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "omicron-workspace-hack",
  "proc-macro2",
@@ -409,7 +409,7 @@ dependencies = [
 [[package]]
 name = "bootstore"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "bytes",
  "camino",
@@ -438,7 +438,7 @@ dependencies = [
 [[package]]
 name = "bootstrap-agent-lockstep-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1551,7 +1551,7 @@ dependencies = [
 [[package]]
 name = "gateway-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "daft",
  "dropshot",
@@ -1619,7 +1619,7 @@ dependencies = [
 [[package]]
 name = "gfss"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "digest 0.10.7",
  "omicron-workspace-hack",
@@ -2766,7 +2766,7 @@ dependencies = [
 [[package]]
 name = "omicron-common"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "anyhow",
  "api_identity",
@@ -2785,10 +2785,10 @@ dependencies = [
  "ipnetwork",
  "itertools 0.14.0",
  "macaddr",
+ "omicron-generation-kinds",
  "omicron-ledger",
  "omicron-uuid-kinds",
  "omicron-workspace-hack",
- "oxide-generation",
  "oxnet",
  "parse-display",
  "progenitor-client 0.14.0",
@@ -2811,9 +2811,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omicron-generation-kinds"
+version = "0.1.0"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
+dependencies = [
+ "oxide-generation",
+ "oxide-generation-macros",
+]
+
+[[package]]
 name = "omicron-ledger"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "async-trait",
  "atomicwrites",
@@ -2830,7 +2839,7 @@ dependencies = [
 [[package]]
 name = "omicron-passwords"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "argon2",
  "omicron-workspace-hack",
@@ -2845,7 +2854,7 @@ dependencies = [
 [[package]]
 name = "omicron-uuid-kinds"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "daft",
  "newtype-uuid",
@@ -2912,6 +2921,20 @@ dependencies = [
  "serde",
  "serde_json",
  "slog",
+]
+
+[[package]]
+name = "oxide-generation-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68b727e329bc9ff425bf3051e7f39986943bea27aefd6e30b43b468ca999a348"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_tokenstream 0.3.0",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -3586,7 +3609,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "rack-init-config"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "bootstrap-agent-lockstep-types",
  "iddqd",
@@ -4554,7 +4577,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sled-agent-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4584,7 +4607,7 @@ dependencies = [
 [[package]]
 name = "sled-agent-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4598,6 +4621,7 @@ dependencies = [
  "ipnetwork",
  "itertools 0.14.0",
  "omicron-common",
+ "omicron-generation-kinds",
  "omicron-ledger",
  "omicron-passwords",
  "omicron-uuid-kinds",
@@ -4623,7 +4647,7 @@ dependencies = [
 [[package]]
 name = "sled-hardware-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "daft",
  "omicron-workspace-hack",
@@ -5521,7 +5545,7 @@ dependencies = [
 [[package]]
 name = "trust-quorum-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "omicron-workspace-hack",
  "trust-quorum-types-versions",
@@ -5530,7 +5554,7 @@ dependencies = [
 [[package]]
 name = "trust-quorum-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "byte-wrapper",
  "daft",
@@ -6118,7 +6142,7 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-client"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "iddqd",
  "omicron-uuid-kinds",
@@ -6136,7 +6160,7 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "omicron-workspace-hack",
  "wicketd-commission-types-versions",
@@ -6145,7 +6169,7 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=521e1b3903a3e4a1652a15395e0922723fc90cdc#521e1b3903a3e4a1652a15395e0922723fc90cdc"
+source = "git+https://github.com/oxidecomputer/omicron?rev=a41832147bb7fe1517ad8409983b1a9a03ae6691#a41832147bb7fe1517ad8409983b1a9a03ae6691"
 dependencies = [
  "gateway-types-versions",
  "iddqd",

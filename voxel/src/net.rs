@@ -146,7 +146,7 @@ pub(crate) async fn resolve_external_ip(
     n: NodeRef,
     is_router: bool,
 ) -> anyhow::Result<String> {
-    if cfg.external.isolated()
+    if cfg.external.static_addressing()
         && let Some((_, ip)) =
             cfg.static_external_ips().into_iter().find(|(name, _)| name == node)
     {
@@ -156,13 +156,13 @@ pub(crate) async fn resolve_external_ip(
 }
 
 /// ce's stable nexthop, when one is known without touching the guest. An
-/// explicit `[topology].ce_external_ip` wins, otherwise isolated mode's static
+/// explicit `[topology].ce_external_ip` wins, otherwise static addressing's
 /// numbering supplies it.
 pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
     if let Some(ip) = &cfg.topology.ce_external_ip {
         return Some(ip.clone());
     }
-    if !cfg.external.isolated() {
+    if !cfg.external.static_addressing() {
         return None;
     }
     cfg.static_external_ips()

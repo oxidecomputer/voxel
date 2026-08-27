@@ -440,7 +440,7 @@ pub(crate) async fn cmd_launch(
                     );
                 }
                 let watch_cap = rss_watch_cap(emu_sp, racks);
-                let known_ip = if cfg.external.isolated() {
+                let known_ip = if cfg.external.static_addressing() {
                     cfg.static_external_ips()
                         .into_iter()
                         .find(|(name, _)| name == &s.name)
@@ -743,7 +743,7 @@ pub(crate) async fn cmd_status(
     // Multi-rack racks converge under each other's load - watch longer (matches
     // cmd_launch). Duration is Copy, so each watcher closure gets its own.
     let watch_cap = rss_watch_cap(false, racks);
-    let ips = if cfg.external.isolated() {
+    let ips = if cfg.external.static_addressing() {
         cfg.static_external_ips()
     } else {
         Vec::new()

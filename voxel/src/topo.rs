@@ -484,11 +484,12 @@ pub(crate) fn stage_config(
         fs::write(dir.join("ce-external-ip"), ip)?;
     }
 
-    // Isolated mode: no DHCP server; instead stage each node's assigned static
-    // address into its cargo-bay. voxel-init picks it up on both sled and router
-    // roles. The router role also needs the interface name (routers can't jumbo-
-    // probe their way to it the way sleds do); sleds self-classify.
-    if cfg.external.isolated() {
+    // Static addressing (isolated mode, or a lan without DHCP): stage each
+    // node's assigned address into its cargo-bay. voxel-init picks it up on
+    // both sled and router roles. The router role also needs the interface
+    // name (routers can't jumbo-probe their way to it the way sleds do);
+    // sleds self-classify.
+    if cfg.external.static_addressing() {
         let prefix = cfg.external.prefix_length().ok_or_else(|| {
             anyhow!(
                 "[external].subnet '{}' must be CIDR (a.b.c.d/len)",

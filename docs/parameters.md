@@ -77,10 +77,11 @@ rack's RSS config. See the README's "Isolated external network" section.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `mode` | enum | `"lan"` | `lan` attaches node external NICs to `link`, or the host's default-route link (`$EXT_INTERFACE` overrides both). `isolated` builds the segment on a host etherstub with NAT out `uplink`. |
+| `addressing` | enum | `"dhcp"` | `dhcp` leases node addresses from the LAN. `static` stages per-node addresses from `ip_start` for a LAN that runs no DHCP. Ignored in isolated mode, which is always static. |
 | `link` | string | unset | Lan-mode external link (e.g. `igb1`), for hosts whose default-route interface is not the LAN under test. Ignored in isolated mode. |
 | `uplink` | string | unset | Physical link the isolated segment NATs out of (e.g. `igb0`). Required in isolated mode. |
-| `subnet` | string | `"172.30.199.0/24"` | The isolated segment's subnet, chosen to avoid common home/office LANs. `up` refuses if it overlaps a host address. |
-| `host_ip` | string | `"172.30.199.199"` | Host address on the segment: the nodes' default gateway and NAT inside address. Image builds also use `host_ip - 1` for the builder VM. |
+| `subnet` | string | `"172.30.199.0/24"` | The static addressing subnet: the isolated segment's (chosen to avoid common home/office LANs; `up` refuses if it overlaps a host address), or the LAN's under `addressing = "static"`. |
+| `host_ip` | string | `"172.30.199.199"` | The nodes' default gateway. Isolated mode creates it on the etherstub (also the NAT inside address); static lan addressing expects it to already exist on the LAN. Image builds also use `host_ip - 1` for the builder VM. |
 | `ip_start` | string | `"172.30.199.10"` | First static node address. Nodes number contiguously, sleds then `topology.routers`. |
 | `dns` | list | `["1.1.1.1", "9.9.9.9"]` | Nameservers handed to the nodes. |
 | `mtu` | int | `1500` | Etherstub MTU. Must stay below 9000 so voxel-init's jumbo probe classifies external NICs correctly. |

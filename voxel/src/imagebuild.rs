@@ -61,27 +61,35 @@ pub(crate) struct BuilderNetwork {
 /// The builder normally DHCPs an external NIC. In isolated mode that network is
 /// the voxel-managed segment, which runs no DHCP, so the segment is brought up
 /// here and the builder gets the stub plus a static address derived from
-/// `host_ip - 1`. In lan mode falcon's default link and DHCP already work, so
-/// this is empty.
+/// `host_ip - 1`. A lan-mode builder uses `[external] link` when set,
+/// with the same `host_ip - 1` static address under static addressing. Under
+/// DHCP addressing, falcon's default link and a lease already work.
 pub(crate) fn builder_network(
     external: Option<&voxel_config::External>,
 ) -> Result<BuilderNetwork> {
-    let Some(x) = external.filter(|x| x.isolated()) else {
+    let Some(x) = external else {
         return Ok(BuilderNetwork::default());
     };
-    isolated_external::up(x, isolated_external::DryRun::No)
-        .context("bringing up the isolated external segment for the builder")?;
-    let address = x.builder_net().with_context(|| {
-        format!(
-            "cannot derive a usable isolated builder address below host_ip '{}' within \
-             subnet '{}'; choose a host_ip at least two addresses above the subnet network",
-            x.host_ip, x.subnet
-        )
-    })?;
-    Ok(BuilderNetwork {
-        interface: Some(isolated_external::STUB.to_string()),
-        static_address: Some(address),
-    })
+    let interface = if x.isolated() {
+        isolated_external::up(x, isolated_external::DryRun::No).context(
+            "bringing up the isolated external segment for the builder",
+        )?;
+        Some(isolated_external::STUB.to_string())
+    } else {
+        x.link.clone()
+    };
+    let static_address = if x.static_addressing() {
+        Some(x.builder_net().with_context(|| {
+            format!(
+                "cannot derive a usable static builder address below host_ip '{}' within \
+                 subnet '{}'; choose a host_ip at least two addresses above the subnet network",
+                x.host_ip, x.subnet
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok(BuilderNetwork { interface, static_address })
 }
 
 /// Bring up the builder, install, quiesce, capture, tear down.

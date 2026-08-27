@@ -291,12 +291,12 @@ fn mirror_router(cfg: &VoxelConfig) -> anyhow::Result<String> {
         .context("topology.routers has no fabric router to mirror from")
 }
 
-/// A node's external address as voxel assigned it. `None` outside isolated
-/// mode, where addresses are leased and only discoverable from the running
-/// node.
+/// A node's external address as voxel assigned it. This is `None` under DHCP
+/// addressing, where addresses are leased and only discoverable from the
+/// running node.
 fn static_ip(cfg: &VoxelConfig, node: &str) -> Option<String> {
     cfg.external
-        .isolated()
+        .static_addressing()
         .then(|| {
             cfg.static_external_ips()
                 .into_iter()

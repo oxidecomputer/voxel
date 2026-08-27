@@ -183,6 +183,14 @@ test is not the default-route network (say, a lab segment on a second NIC),
 pin the link with `voxel config set external.link igb1` (`$EXT_INTERFACE`
 overrides both).
 
+A LAN that runs no DHCP at all (a fully static lab segment) can keep the
+nodes static instead: `voxel config set external.addressing static` with
+`subnet`, `host_ip` (the LAN's existing gateway), and `ip_start` set to that
+LAN's values. This is still [option 1][how-to-run external networking], the
+network exists and addresses are carved from it, while voxel just stages each
+node's address exactly as isolated mode does below, without owning the
+network.
+
 On a host without such a network, voxel can instead build the whole external
 segment itself, option 2 ("an external network that only exists on your test
 machine") of the same doc, which a4x2 required the user to plumb by hand.

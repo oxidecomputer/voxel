@@ -67,10 +67,10 @@ Omicron commit pulls the whole set.
 
 | Repository | Branch / rev | PR | Carried by | Trajectory |
 | --- | --- | --- | --- | --- |
-| omicron | `zl/mcast-build` leaf | #11128 open, top of the PR stack below | workspace `rack-init-config` pin, via `voxel image create` | stack lands bottom-up into `main`, starting at #9912 |
-| dendrite | `multicast-e2e`, `3d49b131` | #224 open | Omicron `tools/dendrite_*` pins | #224 to `main` |
-| maghemite | `zl/ddm-mcast`, `96a2f153` | #696 open, stacked on `zl/mrib`; related #402 (`zl/mgd-ddm-meta`) | Omicron `tools/maghemite_*` pins | #696 to `main` after `zl/mrib` |
-| opte | `master`, `0525f2f95` (0.41.506) | #1012 merged 2026-07-25 | Omicron `Cargo.toml` / `tools/opte_version` | landed; Omicron pins 0.41.506 intentionally (master's later #1040 is a comment-only xde change) |
+| omicron | `zl/mcast-build` leaf, [`a4183214`](https://github.com/oxidecomputer/omicron/pull/11128/commits/a41832147bb7fe1517ad8409983b1a9a03ae6691) | #11128 open, top of the PR stack below | workspace `rack-init-config` pin, via `voxel image create` | stack lands bottom-up into `main`, starting at #9912 |
+| dendrite | `multicast-e2e`, `447aa04f` | #224 open | Omicron `tools/dendrite_*` pins | #224 to `main` |
+| maghemite | `zl/ddm-mcast`, `36e43651` | #696 open, stacked on `zl/mrib`; related #402 (`zl/mgd-ddm-meta`) | Omicron `tools/maghemite_*` pins | #696 to `main` after `zl/mrib` |
+| opte | `master`, `0525f2f95` (0.41.506) | #1012 merged 2026-07-25; #1049 (`zl/mcast-source-validation`, `3e2615e5`) open | Omicron `Cargo.toml` / `tools/opte_version` | landed; Omicron pins 0.41.506 intentionally (master's later #1040 is a comment-only xde change). #1049 aligns source-address validation with dpd, nexus and mgd, and is not pinned yet |
 | propolis | `zl/multicast`, `3c07d60a` | [#1093] open | Omicron `package-manifest.toml` (guest propolis-server) | [#1093] to `master`; host side also needs the viona V7 tables below |
 | thundermuffin | `zl/multicast-joiner`, `486559bc` | #14 open | Omicron `package-manifest.toml` (probe zone, prebuilt) | #14 to `main` |
 | sidecar-lite | `zl/multicast`, `461cbe19` | #152 open | `voxel image create` (`SIDECAR_LITE_REV`) | #152 to `main` |
@@ -108,12 +108,15 @@ Two pieces sit outside the image, on the host itself:
   group frame. It also needs the SMBIOS type 1 fix from [#1200], which is
   not multicast-specific. Without it falcon's a4x2 identity never reaches
   the sled VM and RSS fails trust quorum validation on any voxel rack. The
-  `mcast-smbios-test` branch (`8bb6a90b`) merges both.
+  `mcast-smbios-test` branch (`8e283bee`) merges those two along with the
+  softnpu management-uart deadlock fix from [#1206]. That branch is the local
+  integration point and is never itself PR'd, so each fix is proposed
+  upstream from its own branch off `master`.
 
   Build it with the `falcon` feature:
 
   ```sh
-  git checkout mcast-smbios-test  # zl/multicast + propolis#1200
+  git checkout mcast-smbios-test  # zl/multicast + propolis#1200 + #1206
   cargo build --release --bin propolis-server --features falcon
   ```
 
@@ -201,9 +204,11 @@ A pool carries a `pool_type` discriminator, `unicast` (the default) or
 - Every range in the pool must be entirely Any-Source Multicast (ASM) or
   entirely Source-Specific Multicast (SSM), never both. SSM is `232.0.0.0/8`
   for IPv4 and the per-scope `ff3x::/32` blocks for IPv6 ([RFC 4607]);
-  everything else is ASM. An ASM group set and an SSM group set therefore
-  need two pools. The split is about address space, not filtering: joins on
-  ASM addresses may still carry `source_ips` (see [Join forms](#join-forms)).
+  everything else is ASM. Within the v4 range, `232.0.0.0/24` is refused,
+  reserved by [RFC 4607] §4.3, so a v4 SSM pool starts at `232.0.1.0`. An
+  ASM group set and an SSM group set therefore need two pools. The split is
+  about address space, not filtering: joins on ASM addresses may still carry
+  `source_ips` (see [Join forms](#join-forms)).
 - A silo may hold at most one default pool per (pool type, IP version) pair,
   four in total. A multicast pool linked non-default is still usable; the group
   is then resolved by address rather than by the silo default.
@@ -870,6 +875,7 @@ from this host-sourced path.
 
 [#1093]: https://github.com/oxidecomputer/propolis/pull/1093
 [#1200]: https://github.com/oxidecomputer/propolis/pull/1200
+[#1206]: https://github.com/oxidecomputer/propolis/pull/1206
 [omicron#11128]: https://github.com/oxidecomputer/omicron/pull/11128
 [omicron#11118]: https://github.com/oxidecomputer/omicron/pull/11118
 [omicron#10520]: https://github.com/oxidecomputer/omicron/pull/10520
