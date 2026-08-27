@@ -359,6 +359,11 @@ pub(crate) async fn cmd_launch(
         }
     }
 
+    // The emulated switches' DLPI streams are open now (softnpu opens them at
+    // instance ensure), so widen their stream-head queues before the guests
+    // start talking across the fabric.
+    widen_fabric_queues();
+
     // Run the in-guest agent, baked into the images at /opt/oxide/voxel-init.
     const GIMLET_LAUNCH: &str =
         "/opt/oxide/voxel-init gimlet 2>&1 | tee /tmp/launch.log";
@@ -584,6 +589,52 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
 /// dirty (RSS falsely reports an already-initialized rack). Ok if the rack is
 /// gone + disks clean, even when falcon's destroy erred but the wipe succeeded.
 /// Shared by `cmd_destroy` and the boot-retry path.
+/// Widen every live dld stream-head queue on the host to 4 MiB.
+///
+/// The stream-head default (STRHIGH, 5120 bytes, unchanged since System V
+/// STREAMS) holds zero complete frames at the fabric's 9000-byte MTU, and dld
+/// never raises it, so softnpu's ingress silently tail-drops whole burst
+/// tails and every TCP flow on the fabric collapses into RTO recovery. With
+/// the queues at 4 MiB the same fabric moves >100 MB/s. Patching live kernel
+/// structures is a testbed workaround: remove once dld itself sets SO_HIWAT
+/// for raw/promisc streams (the stlouis fix). Best effort by design - a
+/// launch on a host without mdb, or without privilege, still works at the
+/// old speed.
+fn widen_fabric_queues() {
+    // The kmem-cache walk finds every dld stream, so this needs no address
+    // list and is idempotent; detached streams (no read queue) error to
+    // stderr and fall out of the pipeline harmlessly. It also widens any
+    // unrelated dld consumer (e.g. a running snoop), which is acceptable
+    // here and arguably a favor.
+    const WALK: &str =
+        "::walk dld_str_cache | ::print -a dld_str_t ds_rq->q_next->q_hiwat";
+    let script = format!(
+        "echo '{WALK}' | pfexec mdb -k | \
+         awk '{{print $1 \"/Z 0x400000\"}}' | pfexec mdb -kw"
+    );
+    match std::process::Command::new("sh").arg("-c").arg(&script).output() {
+        Ok(out) if out.status.success() => {
+            let n = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains("0x400000"))
+                .count();
+            println!(
+                "[voxel] widened {n} dld stream queues to 4 MiB \
+                 (STRHIGH workaround)"
+            );
+        }
+        Ok(out) => eprintln!(
+            "[voxel] fabric queue widening failed ({}); the fabric will run \
+             at STRHIGH-limited speed",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => eprintln!(
+            "[voxel] fabric queue widening skipped ({e}); the fabric will \
+             run at STRHIGH-limited speed"
+        ),
+    }
+}
+
 fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
     if reap_orphan_propolis(name, &runner.log) > 0 {
         // Give the kernel a moment to release the freed VNIC/zvol handles.
