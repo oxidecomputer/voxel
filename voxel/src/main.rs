@@ -35,10 +35,12 @@ mod net;
 mod network;
 mod patch;
 mod rack;
+mod repocmd;
 mod rss;
 mod rss_request;
 mod sp_cmd;
 mod topo;
+mod tufrepo;
 mod util;
 mod wicket_setup;
 
@@ -168,6 +170,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TpCmd,
     },
+    /// TUF repo operator helpers against a live rack.
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
+    },
     /// Build and run Omicron's commit-matched end-to-end connectivity test.
     ///
     /// Arguments after `--` are passed directly to commtest. If no command is
@@ -234,13 +241,25 @@ enum ImageCmd {
     /// (the dev loop: your working-tree edits, warm target).
     Create {
         /// omicron git commit (or tag) to build and pin the image to (default:
-        /// the omicron rev voxel itself is pinned to). With `--src` this is an
-        /// optional image label (default: the checkout's HEAD).
+        /// the omicron rev voxel itself is pinned to, or the rev a `--from-tuf`
+        /// repo was built from). With `--src` this is an optional image label
+        /// (default: the checkout's HEAD).
         commit: Option<String>,
         /// Build from an existing omicron checkout/worktree AS-IS (host build,
         /// for dev): skips clone + checkout so your working-tree edits are built.
         #[arg(long)]
         src: Option<Utf8PathBuf>,
+        /// Build the image from this TUF repo's artifacts with no omicron
+        /// compile: zones + corpus byte exact, GZ software from the host OS
+        /// phase 2 payload, switch zone recomposed for softnpu.
+        #[arg(long, value_name = "REPO_ZIP")]
+        from_tuf: Option<Utf8PathBuf>,
+        /// With --from-tuf: an omicron-sled-agent package tar built with
+        /// switch-softnpu, staged in place of the phase 2 sled-agent. The
+        /// standard-image binary hardwires scrimlet = tofino ASIC, so softnpu
+        /// scrimlets need this build.
+        #[arg(long, value_name = "PKG_TAR", requires = "from_tuf")]
+        sled_agent: Option<Utf8PathBuf>,
     },
     /// Export an image bundle to a file for distribution.
     ///
@@ -578,6 +597,17 @@ enum TpCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum RepoCmd {
+    /// Seed every sled's artifact stores with a repo's targets and cross-sync
+    /// Nexus-derived artifacts, so a just-set target release converges without
+    /// waiting out TUF replication. Run after the repo upload.
+    Seed {
+        /// The TUF repo zip that was uploaded.
+        repo: Utf8PathBuf,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Config loading + project-root resolution
 // ---------------------------------------------------------------------------
@@ -834,10 +864,12 @@ async fn main() -> Result<(), Error> {
                     out.as_deref(),
                 )
             }
-            ImageCmd::Create { commit, src } => {
+            ImageCmd::Create { commit, src, from_tuf, sled_agent } => {
                 cpbuild::create(
                     commit.as_deref(),
                     src.as_deref(),
+                    from_tuf.as_deref(),
+                    sled_agent.as_deref(),
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                 )
@@ -1001,6 +1033,16 @@ async fn main() -> Result<(), Error> {
                     &cli.name,
                     switch,
                     command,
+                )
+                .await
+            }
+        },
+        Cmd::Repo { cmd } => match cmd {
+            RepoCmd::Seed { repo } => {
+                repocmd::cmd_repo_seed(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    repo,
                 )
                 .await
             }

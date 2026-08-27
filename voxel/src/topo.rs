@@ -112,7 +112,7 @@ pub(crate) fn build_topo(
     let mut sleds = Vec::new();
     for s in cfg.sleds() {
         let n = d.node(&s.name, &cp_img, 8, sled_mem);
-        d.reserve(n, 100);
+        d.reserve(n, cfg.topology.sled_disk_gb as usize);
         sleds.push((s, n));
     }
     let mut routers = Vec::new();
@@ -253,6 +253,9 @@ fn generate_rss_config(
 /// advisory. A rack whose source is absent still launches.
 pub(crate) const PROP_DATA_LINKS: &str = "voxel:data-links-schema";
 pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
+/// TUF system version stamped on `--from-tuf` images: the repo whose zone and
+/// corpus artifacts the image's bytes hash match.
+pub(crate) const PROP_TUF_VERSION: &str = "voxel:tuf-version";
 
 /// Sled-agent config schema read from an omicron checkout; None if the
 /// checkout's sled-agent config source is not readable.
@@ -637,6 +640,12 @@ fn stage_sp_emu(
         })?;
         fs::copy(rot, out.join("rot.image"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
+        // Staged bootleby turns on sp-emu secure boot; rot_image must be
+        // self-signed.
+        if let Some(bootleby) = cfg.sp.bootleby_image.as_deref() {
+            fs::copy(bootleby, out.join("bootleby.zip"))
+                .with_context(|| format!("stage bootleby from {bootleby}"))?;
+        }
     }
     // Stage each role's hubris archive; voxel-init flashes a per-instance state
     // directory from it in the zone (sp-emu 1.x flashes from the archive, not a

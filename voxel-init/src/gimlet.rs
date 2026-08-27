@@ -10,7 +10,8 @@
 //! kicks RSS on the RSS node).
 
 use crate::sys::{
-    note, read_external_net, replace_in_file, run, run_env, run_quiet, warn,
+    capture, note, read_external_net, replace_in_file, run, run_env, run_quiet,
+    warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -25,6 +26,9 @@ const OMICRON: &str = "/opt/oxide/omicron";
 // `<CARGO_BAY>/sled-config.toml` (kept literal: `concat!` can't expand a const).
 const SLED_CFG: &str = "/opt/cargo-bay/sled-config.toml";
 const PATCHED_CFG: &str = "/tmp/sled-config.toml";
+/// Written at bake by `image create --from-tuf`; selects the native (no
+/// omicron tooling) bring-up paths.
+const TUF_MARKER: &str = "/opt/oxide/.voxel-tuf";
 
 /// Pick the `staged` path if it exists on disk, else fall back to `baked` — the
 /// "dev cargo-bay wins, baked image otherwise" rule used to source every sp-emu
@@ -52,35 +56,133 @@ pub fn bring_up() -> Result<()> {
     crash_dump();
     maybe_load_sidecar();
 
-    // The omicron CLI tools are baked into the image at /opt/oxide/omicron, and
-    // xtask/omicron-package run relative to that tree.
-    if !Utf8Path::new(OMICRON).exists() {
-        bail!("{OMICRON} not baked into the image");
+    // TUF images carry no omicron tooling; their virtual hardware and
+    // activation are handled natively below.
+    let tuf = Utf8Path::new(TUF_MARKER).exists();
+    if !tuf {
+        // The omicron CLI tools are baked into the image at /opt/oxide/omicron,
+        // and xtask/omicron-package run relative to that tree.
+        if !Utf8Path::new(OMICRON).exists() {
+            bail!("{OMICRON} not baked into the image");
+        }
+        std::env::set_current_dir(OMICRON)
+            .with_context(|| format!("cd {OMICRON}"))?;
     }
-    std::env::set_current_dir(OMICRON)
-        .with_context(|| format!("cd {OMICRON}"))?;
-    let xtask_bin = format!("{OMICRON}/xtask");
-    let xtask_dl = format!("{OMICRON}/xtask-downloader");
 
     let (underlay, other) = detect_underlay();
-    patch_sled_config(&underlay)?;
+    patch_sled_config(&underlay, tuf)?;
     setup_external_networking(&other);
-    setup_virtual_hardware();
+    if tuf {
+        setup_virtual_hardware_native()?;
+    } else {
+        setup_virtual_hardware();
+    }
+    preseed_install_datasets();
     inject_runtime_configs()?;
     unplumb_softnpu_source();
     maybe_start_switch_enforcer()?;
 
-    // Activate the (already-unpacked) control plane. On the RSS node this kicks RSS.
-    // omicron-package reads XTASK_BIN / XTASK_DOWNLOADER_BIN from the environment.
-    if !run_env(
-        "./omicron-package",
-        &["activate"],
-        &[("XTASK_BIN", &xtask_bin), ("XTASK_DOWNLOADER_BIN", &xtask_dl)],
-    ) {
-        warn("omicron-package activate failed");
+    if tuf {
+        activate_native();
+    } else {
+        // Activate the (already-unpacked) control plane. On the RSS node this
+        // kicks RSS. omicron-package reads XTASK_BIN / XTASK_DOWNLOADER_BIN
+        // from the environment.
+        let xtask_bin = format!("{OMICRON}/xtask");
+        let xtask_dl = format!("{OMICRON}/xtask-downloader");
+        if !run_env(
+            "./omicron-package",
+            &["activate"],
+            &[("XTASK_BIN", &xtask_bin), ("XTASK_DOWNLOADER_BIN", &xtask_dl)],
+        ) {
+            warn("omicron-package activate failed");
+        }
     }
     note("gimlet bring-up complete");
     Ok(())
+}
+
+/// TUF images stage no xtask. In propolis softnpu mode `virtual-hardware
+/// create` reduces to creating the config's vdev files (xtask's own default
+/// size); softnpu lives in the switch zone propolis and needs no host setup.
+fn setup_virtual_hardware_native() -> Result<()> {
+    // M.2 stores hold two repos of update artifacts (composites plus their
+    // derived splits are both retained); 20 GiB pools run out mid-upgrade.
+    const M2_VDEV_SIZE: u64 = 32 << 30;
+    const VDEV_SIZE: u64 = 20 << 30;
+    wipe_vdevs();
+    let text = fs::read_to_string(PATCHED_CFG)
+        .with_context(|| format!("read {PATCHED_CFG}"))?;
+    let doc: toml_edit::DocumentMut =
+        text.parse().with_context(|| format!("parse {PATCHED_CFG}"))?;
+    // The vdev list's location differs by schema era: top level `vdevs`, or
+    // under the `external_disks` table.
+    let vdevs = doc
+        .get("vdevs")
+        .or_else(|| doc.get("external_disks").and_then(|d| d.get("vdevs")))
+        .and_then(|v| v.as_array())
+        .with_context(|| format!("no vdevs array in {PATCHED_CFG}"))?;
+    let mut n = 0;
+    let mut m2_vdevs = Vec::new();
+    for v in vdevs {
+        let Some(name) = v.as_str() else { continue };
+        let path = if name.starts_with('/') {
+            name.to_string()
+        } else {
+            format!("/var/tmp/{name}")
+        };
+        let is_m2 =
+            path.rsplit('/').next().is_some_and(|f| f.starts_with("m2_"));
+        let f = fs::File::create(&path)
+            .with_context(|| format!("create vdev {path}"))?;
+        f.set_len(if is_m2 { M2_VDEV_SIZE } else { VDEV_SIZE })
+            .with_context(|| format!("size vdev {path}"))?;
+        if is_m2 {
+            m2_vdevs.push(path.clone());
+        }
+        n += 1;
+    }
+    if n == 0 {
+        bail!("no vdevs created from {PATCHED_CFG}");
+    }
+    note(format!("created {n} vdev files"));
+    seed_boot_images(&m2_vdevs)?;
+    Ok(())
+}
+
+/// Seed each M.2 vdev's boot image sibling from the baked host artifact.
+/// sled-agent reads the sibling as that slot's boot partition, so host
+/// phase 2 inventories at the image's repo version instead of erroring.
+fn seed_boot_images(m2_vdevs: &[String]) -> Result<()> {
+    const HOST_BOOT_IMAGE: &str = "/opt/voxel/host/boot-image.img";
+    if !std::path::Path::new(HOST_BOOT_IMAGE).exists() {
+        bail!("{HOST_BOOT_IMAGE} missing from the image");
+    }
+    for vdev in m2_vdevs {
+        let dest = format!("{vdev}.boot_image");
+        fs::copy(HOST_BOOT_IMAGE, &dest)
+            .with_context(|| format!("seed boot image {dest}"))?;
+        // Deployed sled-agents without the resolved-path fix open the
+        // sibling relative to their cwd (/); bridge with a symlink there.
+        let link = format!("/{}", dest.rsplit('/').next().unwrap_or(&dest));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dest, &link)
+            .with_context(|| format!("link {link}"))?;
+    }
+    note(format!("seeded {} M.2 boot images", m2_vdevs.len()));
+    Ok(())
+}
+
+/// TUF images: sled-agent is prestaged; activation is importing its SMF
+/// manifest now that the runtime configs are injected. The manifest's
+/// default instance starts on import.
+fn activate_native() {
+    if !run("svccfg", &["import", "/opt/oxide/sled-agent/pkg/manifest.xml"]) {
+        warn("svccfg import sled-agent manifest failed");
+        return;
+    }
+    run_quiet("svcadm", &["enable", "svc:/oxide/sled-agent:default"]);
+    note("sled-agent activated");
 }
 
 /// SSH convenience for `voxel host login` (was the sourced `setup_ssh`
@@ -167,7 +269,7 @@ fn detect_underlay() -> (Vec<String>, Vec<String>) {
 /// ships placeholders), write the patched copy to /tmp, and seed the xtask
 /// WORKSPACE config (`smf/sled-agent/non-gimlet/config.toml`) that
 /// virtual-hardware reads. Uses `toml_edit`—no `sed`.
-fn patch_sled_config(underlay: &[String]) -> Result<()> {
+fn patch_sled_config(underlay: &[String], tuf: bool) -> Result<()> {
     let text = fs::read_to_string(SLED_CFG)
         .with_context(|| format!("read {SLED_CFG}"))?;
     let mut doc: toml_edit::DocumentMut =
@@ -191,10 +293,13 @@ fn patch_sled_config(underlay: &[String]) -> Result<()> {
     }
     fs::write(PATCHED_CFG, doc.to_string())
         .with_context(|| format!("write {PATCHED_CFG}"))?;
-    // xtask virtual-hardware reads the workspace config (vdevs + sled_mode).
-    let workspace = "smf/sled-agent/non-gimlet/config.toml";
-    fs::copy(PATCHED_CFG, workspace)
-        .with_context(|| format!("seed {workspace}"))?;
+    // xtask virtual-hardware reads the workspace config (vdevs + sled_mode);
+    // TUF images have neither xtask nor the workspace tree.
+    if !tuf {
+        let workspace = "smf/sled-agent/non-gimlet/config.toml";
+        fs::copy(PATCHED_CFG, workspace)
+            .with_context(|| format!("seed {workspace}"))?;
+    }
     Ok(())
 }
 
@@ -297,6 +402,140 @@ fn setup_virtual_hardware() {
     wipe_vdevs();
     if !run_env("./xtask", &["virtual-hardware", "create"], &softnpu) {
         warn("virtual-hardware create failed");
+    }
+}
+
+/// Control-plane service zones that live in the install dataset (the
+/// preset-independent set; global-zone software like switch/propolis is not
+/// here). Their hashes must match the target-release TUF repo's zone artifacts.
+const INSTALL_ZONES: &[&str] = &[
+    "clickhouse.tar.gz",
+    "clickhouse_keeper.tar.gz",
+    "clickhouse_server.tar.gz",
+    "cockroachdb.tar.gz",
+    "crucible.tar.gz",
+    "crucible_pantry.tar.gz",
+    "external_dns.tar.gz",
+    "internal_dns.tar.gz",
+    "nexus.tar.gz",
+    "ntp.tar.gz",
+    "oximeter.tar.gz",
+    "probe.tar.gz",
+];
+
+/// Corpus staged by `image create --from-tuf`: the target repo's own
+/// measurement corpus artifacts, byte exact. Preferred over the embedded fake
+/// corpus when present.
+const STAGED_CORPUS: &str = "/opt/oxide/measurements";
+
+/// Fixed fake measurement corpus, embedded so it is present without a build-time
+/// bake. A non-empty measurement manifest is required for a sled to be eligible
+/// for noop image-source conversion. Voxel TUF repos must carry this same corpus
+/// so the hashes match.
+const CORPUS: &[(&str, &[u8])] = &[
+    (
+        "fake-measurement-id-9830767c45f2a02210a177fabafafe2c84501039289483f72cec299b0c78dbcb.cbor",
+        include_bytes!(
+            "../corpus/fake-measurement-id-9830767c45f2a02210a177fabafafe2c84501039289483f72cec299b0c78dbcb.cbor"
+        ),
+    ),
+    (
+        "fake-measurement-id-ae9279e9135de75e4e137c6da7f939b5a2eae6d931a7f2205df930e37cd58096.cbor",
+        include_bytes!(
+            "../corpus/fake-measurement-id-ae9279e9135de75e4e137c6da7f939b5a2eae6d931a7f2205df930e37cd58096.cbor"
+        ),
+    ),
+];
+
+/// Pre-create and populate the M.2 install datasets before sled-agent adopts
+/// them. sled-agent reads the install-dataset manifest exactly once at startup
+/// and never reloads, so seeding after it starts would need a restart (which on
+/// a scrimlet recreates oxz_switch and wedges the rack). Instead we run in the
+/// window after `virtual-hardware create` made the vdevs but before
+/// `omicron-package activate` starts sled-agent: create a pool on each M.2 vdev,
+/// drop the zones + corpus into `install/`, and leave it imported. sled-agent's
+/// adoption then finds the pool and preserves it, and its first read reports a
+/// non-empty manifest, so the reconfigurator can noop-convert to the TUF repo
+/// with no restart. The pool must NOT be exported: sled-agent's `zpool import`
+/// has no `-d`, so it cannot locate an exported file-vdev pool; an imported one
+/// yields "already created/imported", which its import handler accepts.
+/// Best-effort: on any failure the sled falls back to the manual path.
+fn preseed_install_datasets() {
+    let mut vdevs: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir("/var/tmp") {
+        for e in entries.flatten() {
+            let p = e.path();
+            let is_m2 = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("m2_") && n.ends_with(".vdev"));
+            if is_m2 && let Some(s) = p.to_str() {
+                vdevs.push(s.to_string());
+            }
+        }
+    }
+    if vdevs.is_empty() {
+        warn("preseed: no m2 vdevs in /var/tmp; skipping install-dataset seed");
+        return;
+    }
+    for vdev in &vdevs {
+        let Some(uuid) =
+            capture("uuidgen", &[]).map(|u| u.trim().to_lowercase())
+        else {
+            warn("preseed: uuidgen failed");
+            continue;
+        };
+        let pool = format!("oxi_{uuid}");
+        let mnt = format!("/pool/int/{uuid}/install");
+        if !run("zpool", &["create", "-f", &pool, vdev]) {
+            warn(format!("preseed: zpool create {pool} on {vdev} failed"));
+            continue;
+        }
+        if !run(
+            "zfs",
+            &[
+                "create",
+                "-o",
+                &format!("mountpoint={mnt}"),
+                &format!("{pool}/install"),
+            ],
+        ) {
+            warn(format!("preseed: zfs create {pool}/install failed"));
+            run("zpool", &["destroy", "-f", &pool]);
+            continue;
+        }
+        let meas = format!("{mnt}/measurements");
+        let _ = fs::create_dir_all(&meas);
+        for z in INSTALL_ZONES {
+            let src = format!("/opt/oxide/{z}");
+            if Utf8Path::new(&src).exists()
+                && let Err(e) = fs::copy(&src, format!("{mnt}/{z}"))
+            {
+                warn(format!("preseed: copy {z}: {e}"));
+            }
+        }
+        let mut staged = 0;
+        if let Ok(entries) = Utf8Path::new(STAGED_CORPUS).read_dir_utf8() {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                match fs::copy(e.path(), format!("{meas}/{name}")) {
+                    Ok(_) => staged += 1,
+                    Err(e) => warn(format!("preseed: copy corpus {name}: {e}")),
+                }
+            }
+        }
+        if staged == 0 {
+            for (name, bytes) in CORPUS {
+                if let Err(e) = fs::write(format!("{meas}/{name}"), bytes) {
+                    warn(format!("preseed: write corpus {name}: {e}"));
+                }
+            }
+        }
+        // Leave the pool imported: sled-agent's `zpool import -f` (no `-d`)
+        // cannot find an exported file-vdev pool, but on an already-imported
+        // one it gets "a pool with that name is already created/imported",
+        // which its import handler treats as success, so adoption preserves it.
+        note(format!("preseed: staged install dataset on {vdev} ({pool})"));
     }
 }
 
@@ -486,6 +725,89 @@ pub fn switch_enforcer(slot: u8) {
     // zone is up by now). Idempotent + reboot-safe (startd owns them).
     setup_sp_emu();
     open_switch_zone_ssh();
+
+    // A later sled-agent restart recreates oxz_switch and wipes the staged emu
+    // fleet (baked sp-sim returns with the zone; the staged emu fleet does not).
+    // Stay resident and re-stage it when that happens, so a scrimlet bounce
+    // self-heals instead of wedging the rack. No-op on sp-sim racks.
+    if emu_fleet_configured() {
+        monitor_emu_fleet(slot);
+    }
+}
+
+/// True on an emu rack: the `ports` manifest lists at least one emulated SP.
+fn emu_fleet_configured() -> bool {
+    fs::read_to_string(format!("{SP_EMU_CARGO_DIR}/ports"))
+        .map(|m| {
+            m.lines().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() == 4 && f[0].parse::<u16>().is_ok()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The staged emu binary inside the switch zone. Absent means the zone was
+/// recreated (a sled-agent restart) and the staged fleet was lost.
+fn fleet_staged_in_zone() -> bool {
+    Utf8Path::new(&format!("{SP_EMU_ZONE_DIR}/sp-emu")).exists()
+}
+
+/// Resident watch, in the global zone, so it survives switch-zone recreation.
+/// When a sled-agent restart recreates oxz_switch and drops the emu fleet,
+/// re-stage the fleet, re-assert this scrimlet's MGS slot, and recover the
+/// softnpu fabric. Without this a scrimlet bounce loses the fleet, darkens the
+/// dataplane, and wedges the rack.
+fn monitor_emu_fleet(slot: u8) {
+    let mgs_staged = format!("{CARGO_BAY}/mgs-config-switch{slot}.toml");
+    loop {
+        std::thread::sleep(Duration::from_secs(20));
+        // Act only once the zone is back and the fleet is actually gone.
+        if !switch_zone_running() || fleet_staged_in_zone() {
+            continue;
+        }
+        note("switch zone recreated without emu fleet; re-staging");
+        setup_sp_emu();
+        if Utf8Path::new(&mgs_staged).exists()
+            && !files_equal(SWITCH_ZONE_MGS, &mgs_staged)
+        {
+            if let Err(e) = fs::copy(&mgs_staged, SWITCH_ZONE_MGS) {
+                warn(format!("re-copy switch{slot} MGS config: {e}"));
+            }
+            run(
+                "zlogin",
+                &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgs:default"],
+            );
+        }
+        recover_fabric();
+        open_switch_zone_ssh();
+        note("emu fleet re-staged after switch-zone recreation");
+    }
+}
+
+/// Recover the softnpu dataplane after a switch-zone recreation: reload the P4
+/// program into propolis, bounce dendrite/tfport (they bind the ASIC), kick
+/// mg-ddm (underlay routes) and mgd (BGP). Mirrors the manual recipe; idempotent.
+fn recover_fabric() {
+    run(
+        "/opt/oxide/sidecar/scadm",
+        &["propolis", "load-program", "/opt/oxide/sidecar/libsidecar_lite.so"],
+    );
+    run(
+        "zlogin",
+        &[
+            "oxz_switch",
+            "svcadm",
+            "restart",
+            "svc:/oxide/dendrite:default",
+            "svc:/oxide/tfport:default",
+        ],
+    );
+    run("svcadm", &["restart", "svc:/oxide/mg-ddm:default"]);
+    run(
+        "zlogin",
+        &["oxz_switch", "svcadm", "restart", "svc:/oxide/mgd:default"],
+    );
 }
 
 fn files_equal(a: &str, b: &str) -> bool {
@@ -591,7 +913,9 @@ fn setup_sp_emu() {
         }
     }
     // The RoT (oxide-rot-1) now runs in-process inside each SP over sprot, from
-    // this one image; there is no separate rot-serve service.
+    // this one image; there is no separate rot-serve service. A staged bootleby
+    // enables secure boot; rot.image must then be self-signed.
+    let mut bootleby = false;
     if rot {
         let src = pick(
             format!("{SP_EMU_CARGO_DIR}/rot.image"),
@@ -599,6 +923,19 @@ fn setup_sp_emu() {
         );
         if let Err(e) = fs::copy(&src, format!("{SP_EMU_ZONE_DIR}/rot.image")) {
             warn(format!("copy rot.image from {src}: {e}"));
+        }
+        let bl_src = pick(
+            format!("{SP_EMU_CARGO_DIR}/bootleby.zip"),
+            format!("{BAKED}/bootleby.zip"),
+        );
+        if Utf8Path::new(&bl_src).exists() {
+            if let Err(e) =
+                fs::copy(&bl_src, format!("{SP_EMU_ZONE_DIR}/bootleby.zip"))
+            {
+                warn(format!("copy bootleby from {bl_src}: {e}"));
+            } else {
+                bootleby = true;
+            }
         }
     }
     // Flash each SP a per-instance state dir from its archive. sp-emu is an
@@ -619,7 +956,9 @@ fn setup_sp_emu() {
             warn(format!("sp-emu flash failed for port {}", sp.port));
         }
     }
-    if let Err(e) = fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&fleet, rot)) {
+    if let Err(e) =
+        fs::write(SP_EMU_MANIFEST, sp_emu_manifest(&fleet, rot, bootleby))
+    {
         warn(format!("write sp-emu manifest: {e}"));
         return;
     }
@@ -664,7 +1003,7 @@ fn setup_sp_emu() {
 /// state dir, and VPD identity go through the method environment. With `rot` each
 /// SP runs oxide-rot-1 in-process over sprot from the shared rot image; there is
 /// no separate RoT service.
-fn sp_emu_manifest(fleet: &[EmuSp], rot: bool) -> String {
+fn sp_emu_manifest(fleet: &[EmuSp], rot: bool, bootleby: bool) -> String {
     let mut s = indoc! {r#"
         <?xml version="1.0"?>
         <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
@@ -694,13 +1033,20 @@ fn sp_emu_manifest(fleet: &[EmuSp], rot: bool) -> String {
                 "<envvar name=\"SP_EMU_VPD_PART\" value=\"{part}\"/>\n"
             ));
         }
-        // In-process RoT over sprot; bootleby is skipped until the images are
-        // self-signed.
+        // In-process RoT over sprot; bootleby runs secure boot when staged.
         if rot {
             s.push_str(&formatdoc! {r#"
                 <envvar name="SP_EMU_ROT_FLASH" value="{SP_EMU_IN_ZONE}/rot.image"/>
-                <envvar name="SP_EMU_ROT_NO_BOOTLEBY" value="1"/>
             "#});
+            if bootleby {
+                s.push_str(&format!(
+                    "<envvar name=\"SP_EMU_ROT_BOOTLEBY\" value=\"{SP_EMU_IN_ZONE}/bootleby.zip\"/>\n"
+                ));
+            } else {
+                s.push_str(
+                    "<envvar name=\"SP_EMU_ROT_NO_BOOTLEBY\" value=\"1\"/>\n",
+                );
+            }
         }
         s.push_str(indoc! {r#"
                   </method_environment>
@@ -734,7 +1080,7 @@ pub fn switch_enforcer_svc() {
     while !Utf8Path::new(SLED_CFG).exists() {
         if waited >= 30 {
             note("switch-enforcer-svc: no cargo-bay mount; nothing to enforce");
-            return;
+            park();
         }
         std::thread::sleep(Duration::from_secs(2));
         waited += 2;
@@ -747,6 +1093,17 @@ pub fn switch_enforcer_svc() {
         None => note(
             "switch-enforcer-svc: no switch slot staged (gimlet); nothing to do",
         ),
+    }
+    park();
+}
+
+/// The service runs under the SMF wait model: the process is the service, so
+/// exiting reads as a death and loops the restarter. Paths with nothing left
+/// to monitor park instead.
+fn park() -> ! {
+    note("switch-enforcer-svc: parked");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
     }
 }
 
@@ -769,7 +1126,7 @@ mod tests {
             emu(33300, "sidecar", "SimSidecar0", "-"),
             emu(33310, "gimlet", "2FAKE000", "913-0000019"),
         ];
-        let m = sp_emu_manifest(&fleet, true);
+        let m = sp_emu_manifest(&fleet, true, true);
         assert_eq!(m.matches("<instance name=\"sp").count(), 2);
         // In-process RoT: no separate rot service or instances.
         assert!(!m.contains("voxel-rot-emu"));
@@ -783,13 +1140,20 @@ mod tests {
             m.matches("</instance>").count()
         );
         assert!(m.contains("SP_EMU_ROT_FLASH"));
+        assert!(m.contains("SP_EMU_ROT_BOOTLEBY"));
+        assert!(!m.contains("SP_EMU_ROT_NO_BOOTLEBY"));
         assert!(m.contains("SP_EMU_VPD_SERIAL\" value=\"2FAKE000\""));
         assert!(m.contains("SP_EMU_VPD_PART\" value=\"913-0000019\""));
         // The sidecar has no part number, so no VPD_PART for it.
         assert!(m.contains("SP_EMU_BOARD\" value=\"sidecar\""));
 
+        let no_bl = sp_emu_manifest(&fleet, true, false);
+        assert!(no_bl.contains("SP_EMU_ROT_NO_BOOTLEBY"));
+        assert!(!no_bl.contains("SP_EMU_ROT_BOOTLEBY"));
+
         let plain = sp_emu_manifest(
             &[emu(33310, "gimlet", "2FAKE000", "913-0000019")],
+            false,
             false,
         );
         assert!(!plain.contains("SP_EMU_ROT_FLASH"));

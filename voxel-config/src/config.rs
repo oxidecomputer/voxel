@@ -222,6 +222,10 @@ pub struct SpCfg {
     /// RoT firmware image (oxide-rot-1) run as a second emulated core beside
     /// the sidecar SP so MGS/Nexus see a real Root of Trust. Optional.
     pub rot_image: Option<String>,
+    /// bootleby image. When set, sp-emu runs secure boot and `rot_image`
+    /// must be a self-signed (dice-self) build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootleby_image: Option<String>,
 }
 
 impl SpCfg {
@@ -284,6 +288,9 @@ pub struct Topology {
     /// Per-sled guest RAM in GiB (default 8), the knob that gates how many
     /// sleds fit in physical RAM.
     pub sled_memory_gb: u64,
+    /// Per-sled virtual disk in GiB (default 100). The guest expands its pool
+    /// into it at boot; TUF artifact replication needs headroom beyond 100.
+    pub sled_disk_gb: u64,
     /// Per-router guest RAM, GiB (default 4).
     pub router_memory_gb: u64,
     /// Static host-LAN address added as a secondary on ce's uplink, giving the
@@ -301,6 +308,7 @@ impl Default for Topology {
             rss_sleds: 0,          // auto: all sleds
             routers: vec!["ce".into(), "cr1".into(), "cr2".into()],
             sled_memory_gb: 8,
+            sled_disk_gb: 100,
             router_memory_gb: 4,
             ce_external_ip: None,
         }
