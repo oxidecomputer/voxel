@@ -44,9 +44,11 @@ impl Topo {
     }
 }
 
-/// Wire a node's external NIC. Precedence: `$EXT_INTERFACE` env, then the
-/// config-driven link (the voxel-managed stub in isolated mode), then falcon's
-/// default (the host's default-route interface).
+/// Wire a node's external NIC.
+///
+/// Precedence: `$EXT_INTERFACE` env, then the config-driven link (the
+/// voxel-managed stub in isolated mode, `[external] link` in lan mode), then
+/// falcon's default (the host's default-route interface).
 fn ext_interface(
     d: &mut Runner,
     n: NodeRef,
@@ -123,9 +125,13 @@ pub(crate) fn build_topo(
     }
 
     // Isolated mode wires every external NIC onto the voxel-managed etherstub
-    // instead of the host LAN ($EXT_INTERFACE still wins inside ext_interface).
-    let ext_if =
-        cfg.external.isolated().then_some(crate::isolated_external::STUB);
+    // instead of the host LAN. Lan mode honors `[external] link` when set
+    // ($EXT_INTERFACE still wins inside ext_interface).
+    let ext_if = if cfg.external.isolated() {
+        Some(crate::isolated_external::STUB)
+    } else {
+        cfg.external.link.as_deref()
+    };
 
     let all_scrimlets: Vec<NodeRef> =
         sleds.iter().filter(|(s, _)| s.scrimlet).map(|(_, n)| *n).collect();

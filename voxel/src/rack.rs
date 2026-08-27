@@ -110,16 +110,21 @@ fn default_route_iface() -> Option<String> {
 /// Refuse a `lan`-mode launch whose external link is jumbo. voxel-init classifies
 /// a sled NIC as underlay iff it accepts mtu=9000. Guest VNICs on a jumbo link
 /// all pass that probe, so the sleds' external NICs get misclassified as
-/// underlay and never come up. Anything below 9000 is fine. Best-effort: if
-/// the link or its MTU can't be read we skip and let falcon surface the
-/// problem.
-fn lan_mtu_preflight() -> anyhow::Result<()> {
+/// underlay and never come up. Anything below 9000 is fine.
+///
+/// This is best-effort: if the link or its MTU can't be read, we skip and let
+/// falcon surface the problem instead. The link checked mirrors
+/// `ext_interface`'s precedence: `$EXT_INTERFACE`, then `[external] link`,
+/// then the default-route interface.
+fn lan_mtu_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
     let link = match std::env::var("EXT_INTERFACE") {
         Ok(l) => l,
-        Err(_) => match default_route_iface() {
-            Some(l) => l,
-            None => return Ok(()),
-        },
+        Err(_) => {
+            match cfg.external.link.clone().or_else(default_route_iface) {
+                Some(l) => l,
+                None => return Ok(()),
+            }
+        }
     };
     if let Some(mtu) = link_mtu(&link)
         && mtu.parse::<u32>().is_ok_and(|m| m >= 9000)
@@ -127,8 +132,9 @@ fn lan_mtu_preflight() -> anyhow::Result<()> {
         bail!(
             "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
              iff they accept mtu=9000, so external NICs on a jumbo link are \
-             misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
-             link or use isolated mode (voxel config set external.mode isolated)."
+             misclassified and never come up. Point [external] link or EXT_INTERFACE \
+             at a sub-9000-mtu link or use isolated mode \
+             (voxel config set external.mode isolated)."
         );
     }
     Ok(())
@@ -320,7 +326,7 @@ pub(crate) async fn cmd_launch(
         external_up(&cfg.external, DryRun::No)
             .context("bringing up the isolated external segment")?;
     } else {
-        lan_mtu_preflight()?;
+        lan_mtu_preflight(cfg)?;
     }
     reset_node_cargo_bay(cfg)?;
     stage_config(cfg, emu_sp, emu_rot, wicket_setup)?;

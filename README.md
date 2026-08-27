@@ -176,9 +176,13 @@ in place, without fetching or changing its Git state.
 ## Isolated external network (optional)
 
 By default (`[external] mode = "lan"`), every node's external NIC lands on the
-host's default-route interface (or `$EXT_INTERFACE`) and leases an address from
-whatever DHCP serves the network that link attaches to. That is option 1 ("an
-existing IPv4 network") of Omicron's [how-to-run external networking].
+host's default-route interface and leases an address from whatever DHCP serves
+the network that link attaches to. That is option 1 ("an existing IPv4
+network") of Omicron's [how-to-run external networking]. When the LAN under
+test is not the default-route network (say, a lab segment on a second NIC),
+pin the link with `voxel config set external.link igb1` (`$EXT_INTERFACE`
+overrides both).
+
 On a host without such a network, voxel can instead build the whole external
 segment itself, option 2 ("an external network that only exists on your test
 machine") of the same doc, which a4x2 required the user to plumb by hand.

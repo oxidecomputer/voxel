@@ -65,6 +65,15 @@ pub enum ExternalMode {
 pub struct External {
     /// lan (default; existing behavior) or isolated.
     pub mode: ExternalMode,
+    /// Link the nodes' external NICs attach to in lan mode (e.g. igb1), for
+    /// hosts whose default-route interface is not the LAN under test.
+    ///
+    /// `$EXT_INTERFACE` still overrides it.
+    ///
+    /// This is ignored in isolated mode, which wires the voxel-managed
+    /// etherstub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
     /// Physical link the isolated subnet NATs out of (e.g. igb0). Required
     /// in isolated mode, and validated before use.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +96,7 @@ impl Default for External {
     fn default() -> Self {
         Self {
             mode: ExternalMode::Lan,
+            link: None,
             uplink: None,
             subnet: "172.30.199.0/24".into(),
             host_ip: "172.30.199.199".into(),
@@ -1397,6 +1407,11 @@ mod tests {
         let cfg = VoxelConfig::from_toml(&out).unwrap();
         assert!(cfg.external.isolated());
         assert_eq!(cfg.external.uplink.as_deref(), Some("igb0"));
+        // The lan-mode link pin round-trips and defaults to unset.
+        assert!(d.external.link.is_none());
+        let out = set(&d.to_toml(), "external.link", "igb1").unwrap();
+        let cfg = VoxelConfig::from_toml(&out).unwrap();
+        assert_eq!(cfg.external.link.as_deref(), Some("igb1"));
         // deny_unknown_fields catches typos.
         assert!(set(&out, "external.uplnk", "igb0").is_err());
     }
