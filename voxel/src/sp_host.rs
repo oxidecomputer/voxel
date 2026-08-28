@@ -194,6 +194,138 @@ pub(crate) fn fleet_dir(rack: usize) -> camino::Utf8PathBuf {
     }
 }
 
+/// The repo's pins.toml, embedded so a shipped voxel binary carries its own
+/// pins. Each entry names a buildomat-published binary and the rev to fetch.
+const PINS: &str = include_str!("../../pins.toml");
+
+/// One pins.toml entry.
+struct Pin {
+    repo: String,
+    series: String,
+    rev: String,
+    artifact: String,
+}
+
+/// Look up one entry of the embedded pins.toml.
+fn pin(name: &str) -> anyhow::Result<Pin> {
+    let doc: toml::Table = PINS.parse().context("parse embedded pins.toml")?;
+    let entry = doc
+        .get(name)
+        .and_then(|v| v.as_table())
+        .with_context(|| format!("pins.toml has no [{name}]"))?;
+    let field = |key: &str| -> anyhow::Result<String> {
+        entry
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .with_context(|| format!("pins.toml [{name}] missing {key}"))
+    };
+    let p = Pin {
+        repo: field("repo")?,
+        series: field("series")?,
+        rev: field("rev")?,
+        artifact: field("artifact")?,
+    };
+    if p.rev.len() != 40 || !p.rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("pins.toml [{name}] rev is not a full git sha: {}", p.rev);
+    }
+    Ok(p)
+}
+
+/// The sp-emu to run the fleet with: [sp].emu_bin, else the pinned
+/// buildomat build, fetched once into ~/.cache/voxel.
+pub(crate) fn ensure_emu_bin(
+    cfg: &voxel_config::VoxelConfig,
+) -> anyhow::Result<camino::Utf8PathBuf> {
+    if let Some(p) = cfg.sp.emu_bin.as_deref() {
+        let p = camino::Utf8PathBuf::from(p);
+        if !p.exists() {
+            bail!("[sp].emu_bin does not exist: {p}");
+        }
+        return Ok(p);
+    }
+    fetch_buildomat_bin(&pin("sp-emu")?)
+}
+
+/// The faux-mgs for the operator sp commands: [sp].faux_mgs, else the pinned
+/// buildomat build (published gzipped).
+pub(crate) fn ensure_faux_mgs(
+    cfg: &voxel_config::VoxelConfig,
+) -> anyhow::Result<camino::Utf8PathBuf> {
+    if let Some(p) = cfg.sp.faux_mgs.as_deref() {
+        let p = camino::Utf8PathBuf::from(p);
+        if !p.exists() {
+            bail!("[sp].faux_mgs does not exist: {p}");
+        }
+        return Ok(p);
+    }
+    fetch_buildomat_bin(&pin("faux-mgs")?)
+}
+
+/// Fetch one published buildomat binary into a rev-keyed cache under
+/// ~/.cache/voxel and verify it against its .sha256.txt sibling. A .gz
+/// artifact is hash-checked as published, then decompressed in place.
+fn fetch_buildomat_bin(p: &Pin) -> anyhow::Result<camino::Utf8PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let Pin { repo, series, rev, artifact } = p;
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let bin_name = artifact.strip_suffix(".gz").unwrap_or(artifact);
+    let dir = camino::Utf8PathBuf::from(home)
+        .join(".cache/voxel/bins")
+        .join(format!("{repo}-{}", &rev[..12]));
+    let bin = dir.join(bin_name);
+    if bin.exists() {
+        return Ok(bin);
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {dir}"))?;
+    let url =
+        format!("{}/{repo}/{series}/{rev}", crate::cpbuild::BUILDOMAT_URL);
+    eprintln!("[voxel] fetching {bin_name} @ {} ([sp] overrides)", &rev[..12]);
+    let curl = |out: &Utf8Path, from: &str| -> anyhow::Result<()> {
+        let ok = Command::new("curl")
+            .args(["-sSfL", "--retry", "5", "-o"])
+            .arg(out)
+            .arg(format!("{url}/{from}"))
+            .status()
+            .context("run curl")?
+            .success();
+        if !ok {
+            bail!("curl {url}/{from} failed");
+        }
+        Ok(())
+    };
+    let fetched = dir.join(artifact);
+    curl(&fetched, artifact)?;
+    let sha_file = dir.join(format!("{artifact}.sha256.txt"));
+    curl(&sha_file, &format!("{artifact}.sha256.txt"))?;
+    let want = std::fs::read_to_string(&sha_file)
+        .with_context(|| format!("read {sha_file}"))?;
+    let want = want.split_whitespace().next().unwrap_or("").to_string();
+    let out = Command::new("digest")
+        .args(["-a", "sha256", fetched.as_str()])
+        .output()
+        .context("run digest -a sha256")?;
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if got != want {
+        let _ = std::fs::remove_file(&fetched);
+        bail!("{artifact} sha256 {got} != published {want}");
+    }
+    if artifact.ends_with(".gz") {
+        let ok = Command::new("gzip")
+            .args(["-d", "-f"])
+            .arg(&fetched)
+            .status()
+            .context("run gzip -d")?
+            .success();
+        if !ok {
+            bail!("gunzip {fetched} failed");
+        }
+    }
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {bin}"))?;
+    Ok(bin)
+}
+
 /// The sp-emu binary driving a rack's fleet.
 pub(crate) fn emu_bin(rack: usize) -> anyhow::Result<camino::Utf8PathBuf> {
     let bin = fleet_dir(rack).join("sp-emu");
@@ -312,8 +444,8 @@ pub(crate) fn up(
     let bin = dir.join("sp-emu");
     if !bin.exists() {
         bail!(
-            "--emu needs an sp-emu binary on the host: set [sp].emu_bin \
-             (the fleet runs here now, not in the switch zone)"
+            "--emu needs an sp-emu binary staged at {bin}: launch stages the \
+             pinned buildomat build, or [sp].emu_bin overrides"
         );
     }
     // IPv6 refuses a global address on a link with no link-local ("Can't assign
@@ -507,5 +639,16 @@ pub(crate) fn up_all(
 pub(crate) fn down_all(cfg: &voxel_config::VoxelConfig) {
     for rack in 0..cfg.topology.racks() {
         down(cfg, rack);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Every pins.toml entry must parse and carry a full git sha, so a bad
+    // pin fails in CI rather than at fetch time on a user's box.
+    #[test]
+    fn pins_parse() {
+        super::pin("sp-emu").unwrap();
+        super::pin("faux-mgs").unwrap();
     }
 }
