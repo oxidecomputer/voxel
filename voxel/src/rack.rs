@@ -266,6 +266,7 @@ pub(crate) async fn cmd_launch(
     emu_sp: bool,
     emu_rot: bool,
     wicket_setup: bool,
+    turbo: bool,
 ) -> anyhow::Result<()> {
     // Floor (per rack, each is an independent RSS domain): omicron's control
     // plane can't form below 3 sleds (Crucible 3-way replication,
@@ -349,7 +350,9 @@ pub(crate) async fn cmd_launch(
     // The emulated switches' DLPI streams are open now (softnpu opens them at
     // instance ensure), widen their stream-head queues before the guests
     // start talking across the fabric.
-    widen_fabric_queues();
+    if turbo {
+        widen_fabric_queues();
+    }
 
     // Run the in-guest agent, baked into the images at /opt/oxide/voxel-init.
     const GIMLET_LAUNCH: &str =
