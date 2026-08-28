@@ -81,74 +81,307 @@ pub fn bring_up() -> Result<()> {
     Ok(())
 }
 
-/// TUF images stage no xtask. In propolis softnpu mode `virtual-hardware
-/// create` reduces to creating the config's vdev files (xtask's own default
-/// size); softnpu lives in the switch zone propolis and needs no host setup.
+/// TUF images stage no xtask, and voxel sleds have real storage: each M.2 and
+/// U.2 is a propolis NVMe device backed by a host zvol. Bring-up is therefore
+/// discovering them, laying down the gimlet M.2 partition layout that omicron
+/// refuses to create itself, seeding the boot image, and naming them in the
+/// sled-agent config. sled-agent then handles them as real disks - none of its
+/// synthetic-disk path runs.
 fn setup_virtual_hardware_native() -> Result<()> {
-    // M.2 stores hold two repos of update artifacts (composites plus their
-    // derived splits are both retained); 20 GiB pools run out mid-upgrade.
-    const M2_VDEV_SIZE: u64 = 32 << 30;
-    const VDEV_SIZE: u64 = 20 << 30;
-    wipe_vdevs();
-    let text = fs::read_to_string(PATCHED_CFG)
-        .with_context(|| format!("read {PATCHED_CFG}"))?;
-    let doc: toml_edit::DocumentMut =
-        text.parse().with_context(|| format!("parse {PATCHED_CFG}"))?;
-    // The vdev list's location differs by schema era: top level `vdevs`, or
-    // under the `external_disks` table.
-    let vdevs = doc
-        .get("vdevs")
-        .or_else(|| doc.get("external_disks").and_then(|d| d.get("vdevs")))
-        .and_then(|v| v.as_array())
-        .with_context(|| format!("no vdevs array in {PATCHED_CFG}"))?;
-    let mut n = 0;
-    let mut m2_vdevs = Vec::new();
-    for v in vdevs {
-        let Some(name) = v.as_str() else { continue };
-        let path = if name.starts_with('/') {
-            name.to_string()
+    let disks = discover_disks()?;
+    if disks.is_empty() {
+        bail!("no NVMe sled disks; was the rack launched by an older voxel?");
+    }
+    for d in &disks {
+        if d.m2 {
+            ensure_m2_layout(d)?;
+            seed_boot_image(d)?;
         } else {
-            format!("/var/tmp/{name}")
-        };
-        let is_m2 =
-            path.rsplit('/').next().is_some_and(|f| f.starts_with("m2_"));
-        let f = fs::File::create(&path)
-            .with_context(|| format!("create vdev {path}"))?;
-        f.set_len(if is_m2 { M2_VDEV_SIZE } else { VDEV_SIZE })
-            .with_context(|| format!("size vdev {path}"))?;
-        if is_m2 {
-            m2_vdevs.push(path.clone());
+            ensure_u2_label(d)?;
         }
-        n += 1;
     }
-    if n == 0 {
-        bail!("no vdevs created from {PATCHED_CFG}");
-    }
-    note(format!("created {n} vdev files"));
-    seed_boot_images(&m2_vdevs)?;
+    write_disk_config(&disks)?;
+    note(format!(
+        "{} sled disks ({} M.2, {} U.2)",
+        disks.len(),
+        disks.iter().filter(|d| d.m2).count(),
+        disks.iter().filter(|d| !d.m2).count()
+    ));
     Ok(())
 }
 
-/// Seed each M.2 vdev's boot image sibling from the baked host artifact.
-/// sled-agent reads the sibling as that slot's boot partition, so host
-/// phase 2 inventories at the image's repo version instead of erroring.
-fn seed_boot_images(m2_vdevs: &[String]) -> Result<()> {
+/// One NVMe sled disk as the guest sees it.
+struct SledDisk {
+    /// The NVMe serial voxel gave the device, e.g. `2FAKE000-M20`. Doubles as
+    /// the disk's `DiskIdentity.serial`.
+    serial: String,
+    m2: bool,
+    /// Index within the variant: M.2 0/1 are slots A/B, U.2 0..4 are bays.
+    index: usize,
+    /// illumos disk name, e.g. `c2t1d0`.
+    disk: String,
+    /// `/devices` path of the blkdev node with no `:slice` suffix, which is
+    /// what sled-agent wants in `paths.devfs_path`.
+    devfs_path: String,
+}
+
+/// Ask the disks what they are. voxel encodes each disk's role and index in the
+/// NVMe serial when it attaches the device, so the guest needs no shared table
+/// of PCI slots to interpret what it finds - and `nvmeadm list` in a wedged
+/// sled still says plainly which disk is which.
+///
+/// The controller path is used rather than `readlink /dev/dsk/<disk>`: the
+/// whole-disk link only appears once a disk carries a label, and a fresh U.2
+/// has none.
+fn discover_disks() -> Result<Vec<SledDisk>> {
+    let out = capture(
+        "nvmeadm",
+        &["list", "-p", "-o", "serial,disk,ctrlpath,namespace"],
+    )
+    .context("nvmeadm list")?;
+    let mut disks = Vec::new();
+    for line in out.lines() {
+        let f: Vec<&str> = line.trim().split(':').collect();
+        if f.len() != 4 {
+            continue;
+        }
+        let (serial, disk, ctrlpath, ns) = (f[0], f[1], f[2], f[3]);
+        // `<sled serial>-{M2,U2}<index>`. Anything else is not one of ours.
+        let Some((_, role)) = serial.rsplit_once('-') else {
+            continue;
+        };
+        if role.len() < 3 {
+            continue;
+        }
+        let (tag, index) = role.split_at(2);
+        let m2 = match tag {
+            "M2" => true,
+            "U2" => false,
+            _ => continue,
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        disks.push(SledDisk {
+            serial: serial.to_string(),
+            m2,
+            index,
+            disk: disk.to_string(),
+            devfs_path: format!("/devices{ctrlpath}/blkdev@{ns},0"),
+        });
+    }
+    // M.2s before U.2s, each by index; the serial already sorts that way.
+    disks.sort_by(|a, b| a.serial.cmp(&b.serial));
+    Ok(disks)
+}
+
+impl SledDisk {
+    /// The gimlet bay number. Nothing on the injected-disk path consults it
+    /// (the variant comes from the config, not from the slot), but matching
+    /// real hardware keeps inventory readable: M.2 A/B are 0x11/0x12.
+    fn slot(&self) -> i64 {
+        if self.m2 { 0x11 + self.index as i64 } else { self.index as i64 }
+    }
+
+    /// Which M.2 the sled booted from. A voxel guest still boots off falcon's
+    /// own disk, so for now this is an assertion rather than an observation.
+    /// Taking it from the SP's active host-boot-flash slot is what an update's
+    /// PostUpdateWait needs, and is the next increment.
+    fn is_boot_disk(&self) -> bool {
+        self.m2 && self.index == 0
+    }
+
+    /// This disk as sled-agent's `UnparsedDisk`. `next_active_slot` is left
+    /// out: it is an `Option`, and TOML has no null.
+    fn config_entry(&self) -> String {
+        format!(
+            "{{ paths = {{ devfs_path = \"{devfs}\", \
+             dev_path = \"/dev/dsk/{disk}\" }}, slot = {slot}, \
+             variant = \"{variant}\", identity = {{ vendor = \"Oxide\", \
+             model = \"propolis-nvme\", serial = \"{serial}\" }}, \
+             is_boot_disk = {boot}, firmware = {{ active_slot = 1, \
+             slot1_read_only = true, number_of_slots = 1, \
+             slot_firmware_versions = [\"voxel\"] }} }}",
+            devfs = self.devfs_path,
+            disk = self.disk,
+            slot = self.slot(),
+            variant = if self.m2 { "M2" } else { "U2" },
+            serial = self.serial,
+            boot = self.is_boot_disk(),
+        )
+    }
+}
+
+/// Sizes of the M.2 partitions voxel fixes; the ZFS pool takes what is left.
+/// The boot image partition has to hold a host phase 2 (~1.2 GiB today).
+const M2_BOOT_IMAGE_BYTES: u64 = 4 << 30;
+const M2_DUMP_BYTES: u64 = 4 << 30;
+const M2_RESERVED_BYTES: u64 = 1 << 20;
+
+/// omicron expects exactly these six on an M.2 - BootImage, three Reserved,
+/// DumpDevice, ZfsPool at indices 0..5 - and refuses to create them itself
+/// (`CannotFormatM2NotImplemented`), so voxel lays them down.
+const M2_PARTITIONS: usize = 6;
+
+/// A `prtvtoc` partition line.
+struct VtocPartition {
+    index: usize,
+    start: u64,
+    count: u64,
+}
+
+/// Read a disk's label: (bytes per sector, partitions).
+fn read_vtoc(disk: &str) -> Result<(u64, Vec<VtocPartition>)> {
+    let out = capture("prtvtoc", &[&format!("/dev/rdsk/{disk}s0")])
+        .with_context(|| format!("prtvtoc {disk}"))?;
+    let mut bytes_per_sector = 0u64;
+    let mut parts = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        // Geometry arrives as a comment: "* 4096 bytes/sector".
+        if let Some(rest) = t.strip_prefix('*') {
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            if f.len() >= 2 && f[1] == "bytes/sector" {
+                bytes_per_sector = f[0].parse().unwrap_or(0);
+            }
+            continue;
+        }
+        let f: Vec<&str> = t.split_whitespace().collect();
+        if f.len() < 5 {
+            continue;
+        }
+        let (Ok(index), Ok(start), Ok(count)) =
+            (f[0].parse(), f[3].parse(), f[4].parse())
+        else {
+            continue;
+        };
+        parts.push(VtocPartition { index, start, count });
+    }
+    if bytes_per_sector == 0 {
+        bail!("prtvtoc {disk}: no bytes/sector in the label");
+    }
+    Ok((bytes_per_sector, parts))
+}
+
+/// Give an M.2 the gimlet partition layout, idempotently.
+///
+/// A fresh NVMe namespace carries only a default VTOC, and `fmthard` can only
+/// edit a real EFI label, so borrow the one `zpool create` writes and reshape
+/// it. Every partition is tagged 4 (usr): `fmthard` rejects tag 0 outright, and
+/// omicron reads intent from the partition index rather than the tag.
+fn ensure_m2_layout(d: &SledDisk) -> Result<()> {
+    if let Ok((_, parts)) = read_vtoc(&d.disk)
+        && parts.iter().filter(|p| p.index < M2_PARTITIONS).count()
+            == M2_PARTITIONS
+    {
+        note(format!("{} ({}): M.2 layout already present", d.disk, d.serial));
+        return Ok(());
+    }
+    let tmp = format!("voxelm2{}", d.index);
+    if !run("zpool", &["create", "-f", &tmp, &d.disk]) {
+        bail!("{}: could not write an EFI label", d.disk);
+    }
+    run("zpool", &["destroy", &tmp]);
+
+    let (bytes_per_sector, parts) = read_vtoc(&d.disk)?;
+    let usable = parts
+        .iter()
+        .find(|p| p.index == 0)
+        .with_context(|| format!("{}: no partition 0 after labeling", d.disk))?;
+    let reserved = parts
+        .iter()
+        .find(|p| p.index == 8)
+        .with_context(|| format!("{}: no reserved partition", d.disk))?;
+
+    let sectors = |bytes: u64| bytes.div_ceil(bytes_per_sector);
+    let boot = sectors(M2_BOOT_IMAGE_BYTES);
+    let small = sectors(M2_RESERVED_BYTES);
+    let dump = sectors(M2_DUMP_BYTES);
+    let first = usable.start;
+    let Some(pool) =
+        reserved.start.checked_sub(first + boot + 3 * small + dump)
+    else {
+        bail!("{} is too small for the M.2 layout", d.disk);
+    };
+
+    let mut start = first;
+    let mut map = String::new();
+    for (i, count) in
+        [boot, small, small, small, dump, pool].into_iter().enumerate()
+    {
+        map.push_str(&format!("{i} 4 00 {start} {count}\n"));
+        start += count;
+    }
+    map.push_str(&format!("8 11 00 {} {}\n", reserved.start, reserved.count));
+
+    let path = format!("/tmp/m2-{}.map", d.disk);
+    fs::write(&path, &map).with_context(|| format!("write {path}"))?;
+    if !run("fmthard", &["-s", &path, &format!("/dev/rdsk/{}s0", d.disk)]) {
+        bail!("{}: fmthard rejected the M.2 layout", d.disk);
+    }
+    note(format!("{} ({}): M.2 layout written", d.disk, d.serial));
+    Ok(())
+}
+
+/// Give a U.2 an EFI label and leave it otherwise empty.
+///
+/// omicron creates the U.2's pool itself, but reaches the disk through its
+/// `/dev/dsk/<disk>` whole-disk path, and illumos only publishes that link once
+/// the disk carries a label. A factory U.2 in a real rack arrives labeled; a
+/// freshly made zvol does not, so hand it the label `zpool create` writes and
+/// give the pool straight back for sled-agent to make on its own terms.
+fn ensure_u2_label(d: &SledDisk) -> Result<()> {
+    if Utf8Path::new(&format!("/dev/dsk/{}", d.disk)).exists() {
+        return Ok(());
+    }
+    let tmp = format!("voxelu2{}", d.index);
+    if !run("zpool", &["create", "-f", &tmp, &d.disk]) {
+        bail!("{}: could not write an EFI label", d.disk);
+    }
+    run("zpool", &["destroy", &tmp]);
+    note(format!("{} ({}): labeled", d.disk, d.serial));
+    Ok(())
+}
+
+/// Write the image's host phase 2 into the M.2's boot image partition, so the
+/// slot inventories at the image's own repo version instead of erroring. On a
+/// real block device this runs at device speed.
+fn seed_boot_image(d: &SledDisk) -> Result<()> {
     const HOST_BOOT_IMAGE: &str = "/opt/voxel/host/boot-image.img";
-    if !std::path::Path::new(HOST_BOOT_IMAGE).exists() {
+    if !Utf8Path::new(HOST_BOOT_IMAGE).exists() {
         bail!("{HOST_BOOT_IMAGE} missing from the image");
     }
-    for vdev in m2_vdevs {
-        let dest = format!("{vdev}.boot_image");
-        fs::copy(HOST_BOOT_IMAGE, &dest)
-            .with_context(|| format!("seed boot image {dest}"))?;
-        // Deployed sled-agents without the resolved-path fix open the
-        // sibling relative to their cwd (/); bridge with a symlink there.
-        let link = format!("/{}", dest.rsplit('/').next().unwrap_or(&dest));
-        let _ = fs::remove_file(&link);
-        std::os::unix::fs::symlink(&dest, &link)
-            .with_context(|| format!("link {link}"))?;
+    let of = format!("of=/dev/rdsk/{}s0", d.disk);
+    if !run("dd", &[&format!("if={HOST_BOOT_IMAGE}"), &of, "bs=1048576"]) {
+        bail!("{}: seeding the host phase 2 failed", d.disk);
     }
-    note(format!("seeded {} M.2 boot images", m2_vdevs.len()));
+    note(format!("{}: host phase 2 seeded", d.disk));
+    Ok(())
+}
+
+/// Name the discovered disks in the sled-agent config.
+///
+/// `ExternalDisks::Hardcoded` carries a list of `UnparsedDisk`s that sled-agent
+/// injects during device polling on any platform that is not an Oxide sled -
+/// which is the path a voxel guest takes. They arrive as REAL disks, with no
+/// omicron change of any kind. `vdevs` goes empty: nothing is file-backed now.
+fn write_disk_config(disks: &[SledDisk]) -> Result<()> {
+    let items: Vec<String> =
+        disks.iter().map(SledDisk::config_entry).collect();
+    let rendered = format!(
+        "external_disks = {{ kind = \"hardcoded\", vdevs = [], \
+         disks = [{}] }}",
+        items.join(", ")
+    );
+    let parsed: toml_edit::DocumentMut =
+        rendered.parse().context("render external_disks")?;
+    let text = fs::read_to_string(PATCHED_CFG)
+        .with_context(|| format!("read {PATCHED_CFG}"))?;
+    let mut doc: toml_edit::DocumentMut =
+        text.parse().with_context(|| format!("parse {PATCHED_CFG}"))?;
+    doc["external_disks"] = parsed["external_disks"].clone();
+    fs::write(PATCHED_CFG, doc.to_string())
+        .with_context(|| format!("write {PATCHED_CFG}"))?;
     Ok(())
 }
 
@@ -513,8 +746,17 @@ const CORPUS: &[(&str, &[u8])] = &[
 /// yields "already created/imported", which its import handler accepts.
 /// Best-effort: on any failure the sled falls back to the manual path.
 fn preseed_install_datasets() {
-    let mut vdevs: Vec<String> = Vec::new();
-    if let Ok(entries) = fs::read_dir("/var/tmp") {
+    // Real sled disks put the internal pool on the M.2's ZfsPool partition
+    // (index 5 -> slice 5). Older, file-backed images fall through below.
+    let mut vdevs: Vec<String> = discover_disks()
+        .unwrap_or_default()
+        .iter()
+        .filter(|d| d.m2)
+        .map(|d| format!("/dev/dsk/{}s5", d.disk))
+        .collect();
+    if vdevs.is_empty()
+        && let Ok(entries) = fs::read_dir("/var/tmp")
+    {
         for e in entries.flatten() {
             let p = e.path();
             let is_m2 = p
@@ -527,9 +769,13 @@ fn preseed_install_datasets() {
         }
     }
     if vdevs.is_empty() {
-        warn("preseed: no m2 vdevs in /var/tmp; skipping install-dataset seed");
+        warn("preseed: no M.2 storage found; skipping install-dataset seed");
         return;
     }
+    // One MUPdate marker per sled, mirrored onto both M.2s: installinator
+    // stamps the same UUID on both, and sled-agent logs a mismatch otherwise.
+    let mupdate_uuid =
+        capture("uuidgen", &[]).map(|u| u.trim().to_lowercase());
     for vdev in &vdevs {
         let Some(uuid) =
             capture("uuidgen", &[]).map(|u| u.trim().to_lowercase())
@@ -582,6 +828,22 @@ fn preseed_install_datasets() {
                     warn(format!("preseed: write corpus {name}: {e}"));
                 }
             }
+        }
+        // A rack installed by installinator starts with a MUPdate override on
+        // every install dataset, which freezes the reconfigurator until the
+        // operator uploads the matching repo and calls recovery-finish (RFD
+        // 556). Stage the same marker so a fresh voxel rack starts in that
+        // state and exercises the real first step of the update flow, instead
+        // of booting straight into normal operation.
+        match &mupdate_uuid {
+            Some(id) => {
+                let path = format!("{mnt}/mupdate-override.json");
+                let json = format!("{{\"mupdate_uuid\":\"{id}\"}}");
+                if let Err(e) = fs::write(&path, json) {
+                    warn(format!("preseed: write mupdate override: {e}"));
+                }
+            }
+            None => warn("preseed: no uuid for the mupdate override"),
         }
         // Leave the pool imported: sled-agent's `zpool import -f` (no `-d`)
         // cannot find an exported file-vdev pool, but on an already-imported

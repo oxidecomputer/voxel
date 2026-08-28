@@ -28,6 +28,7 @@ mod commission;
 mod commtest;
 mod config_cmd;
 mod cpbuild;
+mod disks;
 mod image;
 mod imagebuild;
 mod isolated_external;

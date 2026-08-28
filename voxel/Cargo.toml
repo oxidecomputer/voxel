@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 tokio.workspace = true
 libfalcon.workspace = true
+propolis-client.workspace = true
 anyhow.workspace = true
 slog.workspace = true
 futures.workspace = true

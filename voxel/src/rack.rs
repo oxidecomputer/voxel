@@ -331,6 +331,9 @@ pub(crate) async fn cmd_launch(
     if emu {
         crate::sp_host::up_all(cfg, emu)?;
     }
+    // Real NVMe media for every sled, before any node boots.
+    crate::disks::create_zvols(&crate::image::falcon_dataset(), name, &sleds)
+        .context("creating sled disks")?;
     let mut topo = build_topo(cfg, name)?;
     // The all-VMs-at-once boot grabs ~all the guest RAM in one spike; under that
     // pressure falcon's cargo-bay mount over the serial console can transiently
