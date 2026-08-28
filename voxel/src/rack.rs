@@ -51,7 +51,7 @@ pub(crate) async fn cmd_route(
     Ok(())
 }
 
-/// Physical RAM in GiB via `prtconf -m` (illumos prints total memory in MB).
+/// Physical RAM in GiB via `prtconf -m`
 fn physical_ram_gb() -> Option<u64> {
     let out = Command::new("prtconf").arg("-m").output().ok()?;
     if !out.status.success() {
@@ -66,10 +66,8 @@ fn physical_ram_gb() -> Option<u64> {
 
 /// Refuse a launch that can't physically fit. Guest RAM shows up as `VMM Memory`
 /// (~1.2× the requested guest RAM, from bhyve overhead) and must leave room for
-/// the kernel + a minimal ZFS ARC, or the all-VMs-at-once boot thrashes - which
-/// is what makes falcon's cargo-bay mount time out on the serial console. Better
-/// a clear "won't fit" up front than a cryptic boot-spike timeout. Best-effort:
-/// if physical RAM can't be read we skip; `VOXEL_SKIP_MEM_PREFLIGHT=1` overrides.
+/// the kernel + a minimal ZFS ARC, or the all-VMs-at-once boot thrashes
+/// `VOXEL_SKIP_MEM_PREFLIGHT=1` overrides.
 fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
     if std::env::var("VOXEL_SKIP_MEM_PREFLIGHT").is_ok() {
         return Ok(());
@@ -110,9 +108,7 @@ fn default_route_iface() -> Option<String> {
 /// Refuse a `lan`-mode launch whose external link is jumbo. voxel-init classifies
 /// a sled NIC as underlay iff it accepts mtu=9000. Guest VNICs on a jumbo link
 /// all pass that probe, so the sleds' external NICs get misclassified as
-/// underlay and never come up. Anything below 9000 is fine. Best-effort: if
-/// the link or its MTU can't be read we skip and let falcon surface the
-/// problem.
+/// underlay and never come up.
 fn lan_mtu_preflight() -> anyhow::Result<()> {
     let link = match std::env::var("EXT_INTERFACE") {
         Ok(l) => l,
@@ -126,7 +122,7 @@ fn lan_mtu_preflight() -> anyhow::Result<()> {
     {
         bail!(
             "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
-             iff they accept mtu=9000, so external NICs on a jumbo link are \
+             if they accept mtu=9000, so external NICs on a jumbo link are \
              misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
              link or use isolated mode (voxel config set external.mode isolated)."
         );
@@ -271,7 +267,7 @@ pub(crate) async fn cmd_launch(
     emu_rot: bool,
     wicket_setup: bool,
 ) -> anyhow::Result<()> {
-    // Floor (per rack - each is an independent RSS domain): omicron's control
+    // Floor (per rack, each is an independent RSS domain): omicron's control
     // plane can't form below 3 sleds (Crucible 3-way replication,
     // CockroachDB/trust-quorum majority), and the RSS->Nexus handoff needs both
     // switches, i.e. exactly 2 scrimlets.
@@ -351,7 +347,7 @@ pub(crate) async fn cmd_launch(
     }
 
     // The emulated switches' DLPI streams are open now (softnpu opens them at
-    // instance ensure), so widen their stream-head queues before the guests
+    // instance ensure), widen their stream-head queues before the guests
     // start talking across the fabric.
     widen_fabric_queues();
 
@@ -381,13 +377,10 @@ pub(crate) async fn cmd_launch(
         run_voxel_init(d, sleds).await;
         info!(d.log, "launch complete (progress watch skipped)");
     } else {
-        // **Stagger by rack.** Bring up each rack's sleds and watch its RSS to
+        // Stagger by rack. Bring up each rack's sleds and watch its RSS to
         // completion before starting the next rack. Running two racks' heavy
         // zone-init concurrently thrashes the box hard enough to knock a scrimlet
-        // over mid-bring-up - which loses its runtime switch-slot identity and
-        // wedges that rack's Nexus handoff (the switch1-reverts-to-switch0 bug).
-        // One rack at a time keeps the box within its I/O budget. A single rack
-        // behaves exactly as before.
+        // over mid-bring-up
         for rack in 0..racks {
             let rack_sleds: Vec<(NodeRef, &'static str, String)> = topo
                 .sleds
@@ -514,13 +507,7 @@ pub(crate) async fn cmd_launch(
 /// Kill propolis processes that belong to this deployment but that falcon won't
 /// reap itself. A node whose `.falcon/<node>.pid` went missing (a partially
 /// failed prior teardown) leaves an orphaned propolis holding that node's VNICs
-/// and zvol busy - which then wedges *this* destroy: link teardown aborts with
-/// "Device busy", and the follow-up zvol wipe can't proceed either. We identify
-/// orphans by the deployment-prefixed VNIC paths in their open files
-/// (`/dev/net/<name>_*`, e.g. `/dev/net/voxel_g3_sn_vnic0`), so this is scoped
-/// to this rack and never touches another deployment's propolis. Pids falcon
-/// already tracks via the workspace pid files are left for falcon to kill.
-/// Returns how many it reaped.
+/// and zvol busy
 fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
     // Pids falcon tracks via the workspace pid files - leave those to falcon.
     let mut tracked: HashSet<i32> = HashSet::new();
@@ -570,27 +557,7 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
     reaped
 }
 
-/// Tear down a deployment's falcon resources and guarantee a clean slate. Reap
-/// orphan propolis the workspace can't (a node whose `.falcon/<node>.pid` went
-/// missing leaves one holding VNICs/zvol busy, which would wedge the teardown),
-/// run falcon's own destroy, then unconditionally wipe the node disks - falcon's
-/// destroy tears down nodes -> links -> zvols -> workspace and bails on the first
-/// busy resource, which can leave the persistent `topo/<name>` datasets (and
-/// their stale crucible/trust-quorum ledger) behind, so the next launch boots
-/// dirty (RSS falsely reports an already-initialized rack). Ok if the rack is
-/// gone + disks clean, even when falcon's destroy erred but the wipe succeeded.
-/// Shared by `cmd_destroy` and the boot-retry path.
 /// Widen every live dld stream-head queue on the host to 4 MiB.
-///
-/// The stream-head default (STRHIGH, 5120 bytes, unchanged since System V
-/// STREAMS) holds zero complete frames at the fabric's 9000-byte MTU, and dld
-/// never raises it, so softnpu's ingress silently tail-drops whole burst
-/// tails and every TCP flow on the fabric collapses into RTO recovery. With
-/// the queues at 4 MiB the same fabric moves >100 MB/s. Patching live kernel
-/// structures is a testbed workaround: remove once dld itself sets SO_HIWAT
-/// for raw/promisc streams (the stlouis fix). Best effort by design - a
-/// launch on a host without mdb, or without privilege, still works at the
-/// old speed.
 fn widen_fabric_queues() {
     // The kmem-cache walk finds every dld stream, so this needs no address
     // list and is idempotent; detached streams (no read queue) error to
