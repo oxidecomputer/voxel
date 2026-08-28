@@ -12,6 +12,28 @@ use crate::frr::{FrrNeighbor, FrrRouter, StaticUplink};
 /// SledDesc::bootstrap_addr. Each sled appends :{2*index+1}::1.
 const BOOTSTRAP_NET_PREFIX: &str = "fdb0:a840:2500";
 
+/// SP-fleet IPv6 prefix (first three hextets). It sits inside the bootstrap /40
+/// that every switch zone already routes to its global zone, and clear of the
+/// sleds, which BOOTSTRAP_NET_PREFIX pins to a third hextet of 2500.
+const SP_NET_PREFIX: &str = "fdb0:a840:25ff";
+
+/// Prefix length of a rack's SP network. The scrimlets hold an address in it, so
+/// the fleet is on-link from the host LAN and needs no route.
+pub const SP_NET_PREFIX_LEN: u8 = 64;
+
+/// The falcon host's address on a rack's SP network, which MGS dials and the
+/// fleet binds. One network per rack, so racks cannot collide on the shared LAN.
+pub fn sp_host_addr(rack: usize) -> String {
+    format!("{SP_NET_PREFIX}:{rack}::1")
+}
+
+/// A scrimlet's own address on its rack's SP network, by global sled index. The
+/// host takes ::1, so sleds start at ::2. Formats DECIMAL into a hex hextet, the
+/// same readability tradeoff SledDesc::bootstrap_addr makes.
+pub fn sp_scrimlet_addr(rack: usize, index: usize) -> String {
+    format!("{SP_NET_PREFIX}:{rack}::{}", index + 2)
+}
+
 /// Default rack BGP ASN (the switch's local ASN + the uplink peer_asn it
 /// references). for_rack offsets it by rack index for multi-rack transit.
 const DEFAULT_RACK_ASN: u32 = 65000;
@@ -199,39 +221,19 @@ pub struct Falcon {
     pub propolis_binary: Option<String>,
 }
 
-/// SP provider selection: which SPs run on the real-firmware emulator sp-emu
-/// instead of sp-sim. Empty (default) = all sp-sim.
+/// The binaries voxel stages to run an `--emu` rack's SP fleet. Firmware does
+/// NOT live here: an image built with --from-tuf carries the release's own SP,
+/// RoT and bootloader images and launch uses those, with `--sp-firmware`
+/// overriding them for one launch.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpCfg {
-    /// SPs to back with sp-emu. Selectors: "sidecar", "g{index}" (global
-    /// gimlet index), e.g. ["sidecar", "g0"].
-    pub emu: Vec<String>,
-    /// Path to the sp-emu binary (illumos) staged into the switch zone.
-    /// Required when emu is non-empty.
+    /// Path to the sp-emu binary (illumos) that runs the fleet on the falcon
+    /// host. Required for --emu.
     pub emu_bin: Option<String>,
-    /// Hubris image flashed for the sidecar SP (the sidecar-c-emu build).
-    /// Required when "sidecar" is in emu.
-    pub sidecar_image: Option<String>,
-    /// Hubris image flashed for gimlet SPs (the gimlet-c build). Required when
-    /// any "g{index}" is in emu.
-    pub gimlet_image: Option<String>,
-    /// Path to the faux-mgs binary, staged into the switch zone at --emu
-    /// launch. Optional; operator sp commands need it.
+    /// Path to the faux-mgs binary. Optional; the operator `sp` commands need
+    /// it, launch itself does not.
     pub faux_mgs: Option<String>,
-    /// RoT firmware image (oxide-rot-1) run as a second emulated core beside
-    /// the sidecar SP so MGS/Nexus see a real Root of Trust. Optional.
-    pub rot_image: Option<String>,
-}
-
-impl SpCfg {
-    /// The hubris image for an SP selector.
-    pub fn image_for(&self, selector: &str) -> Option<&str> {
-        match selector {
-            "sidecar" => self.sidecar_image.as_deref(),
-            _ => self.gimlet_image.as_deref(),
-        }
-    }
 }
 
 impl VoxelConfig {
@@ -284,6 +286,9 @@ pub struct Topology {
     /// Per-sled guest RAM in GiB (default 8), the knob that gates how many
     /// sleds fit in physical RAM.
     pub sled_memory_gb: u64,
+    /// Per-sled virtual disk in GiB (default 100). The guest expands its pool
+    /// into it at boot; TUF artifact replication needs headroom beyond 100.
+    pub sled_disk_gb: u64,
     /// Per-router guest RAM, GiB (default 4).
     pub router_memory_gb: u64,
     /// Static host-LAN address added as a secondary on ce's uplink, giving the
@@ -301,6 +306,7 @@ impl Default for Topology {
             rss_sleds: 0,          // auto: all sleds
             routers: vec!["ce".into(), "cr1".into(), "cr2".into()],
             sled_memory_gb: 8,
+            sled_disk_gb: 100,
             router_memory_gb: 4,
             ce_external_ip: None,
         }
@@ -443,6 +449,12 @@ impl SledDesc {
     /// DECIMAL to match the underlay viona MAC byte sled-agent derives it from.
     pub fn bootstrap_addr(&self) -> String {
         format!("{BOOTSTRAP_NET_PREFIX}:{}::1", 2 * self.index + 1)
+    }
+
+    /// The sled's bootstrap /64. A switch zone answers from its bootstrap
+    /// address, so the falcon host routes this back over the SP network.
+    pub fn bootstrap_subnet(&self) -> String {
+        format!("{BOOTSTRAP_NET_PREFIX}:{}::/64", 2 * self.index + 1)
     }
 
     /// This sled's generated sled-agent config; the counts size the scrimlet
@@ -1310,27 +1322,30 @@ mod tests {
 
     #[test]
     fn sp_section_parses_and_defaults_empty() {
-        // Default: no emu, no artifact paths (all-sim, zero-config).
+        // Default: no binaries (all-sim, zero-config).
         let d = VoxelConfig::default();
-        assert!(d.sp.emu.is_empty());
-        assert!(
-            d.sp.emu_bin.is_none()
-                && d.sp.sidecar_image.is_none()
-                && d.sp.gimlet_image.is_none()
-        );
-        // Populated [sp] parses, and image_for routes by selector.
+        assert!(d.sp.emu_bin.is_none() && d.sp.faux_mgs.is_none());
         let cfg = VoxelConfig::from_toml(indoc! {r#"
             [sp]
-            emu = ["sidecar", "g0"]
             emu_bin = "/x/sp-emu"
-            sidecar_image = "/x/sc.zip"
-            gimlet_image = "/x/g.zip"
+            faux_mgs = "/x/faux-mgs"
         "#})
         .unwrap();
-        assert_eq!(cfg.sp.emu, vec!["sidecar".to_string(), "g0".to_string()]);
-        assert_eq!(cfg.sp.image_for("sidecar"), Some("/x/sc.zip"));
-        assert_eq!(cfg.sp.image_for("g0"), Some("/x/g.zip"));
         assert_eq!(cfg.sp.emu_bin.as_deref(), Some("/x/sp-emu"));
+        assert_eq!(cfg.sp.faux_mgs.as_deref(), Some("/x/faux-mgs"));
+    }
+
+    #[test]
+    fn sp_section_rejects_firmware_paths() {
+        // Firmware comes from the image (or --sp-firmware), never from [sp];
+        // a config still carrying the old paths must say so, not be ignored.
+        let err = VoxelConfig::from_toml(indoc! {r#"
+            [sp]
+            gimlet_image = "/x/g.zip"
+        "#})
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gimlet_image"), "{err}");
     }
 
     #[test]

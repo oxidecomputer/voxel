@@ -28,6 +28,7 @@ mod commission;
 mod commtest;
 mod config_cmd;
 mod cpbuild;
+mod disks;
 mod image;
 mod imagebuild;
 mod isolated_external;
@@ -35,10 +36,13 @@ mod net;
 mod network;
 mod patch;
 mod rack;
+mod repocmd;
 mod rss;
 mod rss_request;
 mod sp_cmd;
+mod sp_host;
 mod topo;
+mod tufrepo;
 mod util;
 mod wicket_setup;
 
@@ -83,24 +87,21 @@ enum Cmd {
         /// Don't set the host route to the rack's external network after launch.
         #[arg(long)]
         no_route: bool,
-        /// Run real-firmware SPs on `sp-emu` instead of `sp-sim`.
+        /// Run the rack on emulated hardware: real-firmware SPs and RoTs on
+        /// `sp-emu` instead of `sp-sim`, with rack setup driven through wicketd.
         ///
-        /// The whole fleet. Needs `[sp].emu_bin` + the hubris images in `[sp]`.
+        /// Firmware comes from the image's own TUF repo (`image create
+        /// --from-tuf`), so an --emu rack runs the release it reports.
         #[arg(long)]
-        emu_sp: bool,
-        /// Also wire the RoT bridge (oxide-rot-1) onto the sidecar SP. Implies --emu-sp.
+        emu: bool,
+        /// Run the emulated fleet on the firmware in DIR instead of the
+        /// image's own: sp-gimlet-c.zip, sp-sidecar-c.zip, rot-a.zip and
+        /// bootleby.zip, laid out as `image create --from-tuf` extracts them.
         ///
-        /// Needs `[sp].rot_image`. Runs the sidecar as two emulated cores; keep
-        /// OFF during initial bring-up (it wedges handoff).
-        #[arg(long = "emu-rot")]
-        emu_rot: bool,
-        /// Drive rack setup through wicketd (the real operator flow).
-        ///
-        /// Suppresses the staged config-rss so sled-agent waits, then uploads the
-        /// config + a self-signed cert + recovery password to wicketd and POSTs to
-        /// start RSS - fully populating wicket's RACK SETUP page.
-        #[arg(long = "wicket-setup")]
-        wicket_setup: bool,
+        /// For trying a hubris build before it ships. The rack then reports a
+        /// release it is not running, so say so wherever that is claimed.
+        #[arg(long, value_name = "DIR")]
+        sp_firmware: Option<Utf8PathBuf>,
     },
     /// (debug) Print the wicketd RSS config body that `--wicket-setup` would PUT,
     /// reshaped from a generated config-rss.toml (validates the mapping offline).
@@ -168,6 +169,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TpCmd,
     },
+    /// TUF repo operator helpers against a live rack.
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
+    },
     /// Build and run Omicron's commit-matched end-to-end connectivity test.
     ///
     /// Arguments after `--` are passed directly to commtest. If no command is
@@ -234,13 +240,25 @@ enum ImageCmd {
     /// (the dev loop: your working-tree edits, warm target).
     Create {
         /// omicron git commit (or tag) to build and pin the image to (default:
-        /// the omicron rev voxel itself is pinned to). With `--src` this is an
-        /// optional image label (default: the checkout's HEAD).
+        /// the omicron rev voxel itself is pinned to, or the rev a `--from-tuf`
+        /// repo was built from). With `--src` this is an optional image label
+        /// (default: the checkout's HEAD).
         commit: Option<String>,
         /// Build from an existing omicron checkout/worktree AS-IS (host build,
         /// for dev): skips clone + checkout so your working-tree edits are built.
         #[arg(long)]
         src: Option<Utf8PathBuf>,
+        /// Build the image from this TUF repo's artifacts with no omicron
+        /// compile: zones + corpus byte exact, GZ software from the host OS
+        /// phase 2 payload, switch zone recomposed for softnpu.
+        #[arg(long, value_name = "REPO_ZIP")]
+        from_tuf: Option<Utf8PathBuf>,
+        /// With --from-tuf: an omicron-sled-agent package tar built with
+        /// switch-softnpu, staged in place of the phase 2 sled-agent. The
+        /// standard-image binary hardwires scrimlet = tofino ASIC, so softnpu
+        /// scrimlets need this build.
+        #[arg(long, value_name = "PKG_TAR", requires = "from_tuf")]
+        sled_agent: Option<Utf8PathBuf>,
     },
     /// Export an image bundle to a file for distribution.
     ///
@@ -486,7 +504,7 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Enable (or `--off`) the in-zone humility debug listeners (gdb/ocd) for one SP.
+    /// Enable (or `--off`) the humility SWD debug listeners for one SP.
     ///
     /// Toggles `SP_EMU_NO_DEBUG` + restarts the SP (~30s preboot). On enable,
     /// prints the humility ports + attach command. Live + ephemeral.
@@ -575,6 +593,17 @@ enum TpCmd {
         /// Target switch (`switch0` | `switchN` | `rackR/switchS` | scrimlet node).
         #[arg(default_value = "switch0")]
         switch: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCmd {
+    /// Seed every sled's artifact stores with a repo's targets and cross-sync
+    /// Nexus-derived artifacts, so a just-set target release converges without
+    /// waiting out TUF replication. Run after the repo upload.
+    Seed {
+        /// The TUF repo zip that was uploaded.
+        repo: Utf8PathBuf,
     },
 }
 
@@ -757,21 +786,17 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch {
-            no_progress,
-            no_route,
-            emu_sp,
-            emu_rot,
-            wicket_setup,
-        } => {
+        Cmd::Launch { no_progress, no_route, emu, sp_firmware } => {
+            // One flag: emulated SPs, the RoT bridge on top of them, and
+            // wicketd-driven setup are the same configuration in practice, and
+            // the combinations that split them apart are not worth carrying.
             rack::cmd_launch(
                 &load_config(&config_path)?,
                 &cli.name,
                 *no_progress,
                 *no_route,
-                *emu_sp || *emu_rot,
-                *emu_rot,
-                *wicket_setup,
+                *emu,
+                sp_firmware.as_deref(),
             )
             .await
         }
@@ -834,10 +859,12 @@ async fn main() -> Result<(), Error> {
                     out.as_deref(),
                 )
             }
-            ImageCmd::Create { commit, src } => {
+            ImageCmd::Create { commit, src, from_tuf, sled_agent } => {
                 cpbuild::create(
                     commit.as_deref(),
                     src.as_deref(),
+                    from_tuf.as_deref(),
+                    sled_agent.as_deref(),
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                 )
@@ -1001,6 +1028,16 @@ async fn main() -> Result<(), Error> {
                     &cli.name,
                     switch,
                     command,
+                )
+                .await
+            }
+        },
+        Cmd::Repo { cmd } => match cmd {
+            RepoCmd::Seed { repo } => {
+                repocmd::cmd_repo_seed(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    repo,
                 )
                 .await
             }

@@ -450,6 +450,10 @@ impl Tunnel {
             .env("SSH_ASKPASS", &askpass)
             .env("SSH_ASKPASS_REQUIRE", "force")
             .stdin(Stdio::null())
+            // Attempts before the zone's sshd amendment lands fail by design
+            // and would spam auth denials into the launch log; `dead()` drives
+            // the retry, and the caller's deadline reports a real failure.
+            .stderr(Stdio::null())
             .args(&opts)
             .arg("-o")
             .arg(format!("ProxyCommand={proxy}"))
