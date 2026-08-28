@@ -13,11 +13,12 @@ use rack_init_config::{
     BgpPeerConfig, BootstrapAddressDiscovery, IdOrdMap, IpRange, Ipv4Range,
     Ipv6Range, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
     MaxPathConfig, PortConfig, RackInitializeRequest, RackNetworkConfig,
-    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, RouterPeerType,
-    ServiceIpPoolConfig, SwitchSlot, UplinkAddress, UplinkAddressConfig,
+    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, ServiceIpPoolConfig,
+    SwitchSlot, UnnumberedRouter, UplinkAddress, UplinkAddressConfig,
     UplinkPorts,
 };
 use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
+use wicketd_commission_types_versions::latest::rack_setup::MultirackJoinRequest;
 
 // Well-known service pool identity, matching omicron's v1-to-v2 conversion.
 const SERVICE_POOL_NAME: &str = "oxide-service-pool-v4";
@@ -86,12 +87,13 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
             vec![BgpPeerConfig {
                 asn: p.peer_asn,
                 port: p.port.clone(),
-                addr: RouterPeerType::Unnumbered {
+                addr: UnnumberedRouter {
                     router_lifetime: RouterLifetimeConfig::new(
                         p.router_lifetime,
                     )
                     .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
-                },
+                }
+                .into(),
                 hold_time: None,
                 idle_hold_time: None,
                 delay_open: None,
@@ -136,18 +138,18 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
         autoneg: false,
         lldp: Some(lldp(&p.switch, &p.lldp)),
         tx_eq: None,
+        allow_ddm_traffic: false,
     })
 }
 
-/// A cross-rack sidecar interconnect port: link-local (addrconf) so mg-ddm can
-/// peer over it, no routes or BGP, 100G to match the sidecar rear-port links.
+/// A cross-rack sidecar interconnect port: no layer-3 configuration of its
+/// own, no routes or BGP, 100G to match the sidecar rear-port links.
+/// `allow_ddm_traffic` is what gets it a link-local for mg-ddm to peer over -
+/// dendrite enables IPv6 on the link and tfportd makes the address.
 fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
     Ok(PortConfig {
         routes: vec![],
-        addresses: vec![UplinkAddressConfig {
-            address: UplinkAddress::AddrConf,
-            vlan_id: None,
-        }],
+        addresses: vec![],
         switch: switch_slot(switch)?,
         port: port.to_string(),
         uplink_port_speed: LinkSpeed::Speed100G,
@@ -156,47 +158,30 @@ fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
         autoneg: false,
         lldp: Some(lldp(switch, &format!("interconnect-{port}"))),
         tx_eq: None,
+        allow_ddm_traffic: true,
     })
 }
 
-/// Build the request for a single rack (0-based) of a voxel config. Each rack
-/// is an independent RSS domain: the bootstrap set is filtered to that rack's
-/// sleds and the customer/service network is offset per rack.
-pub fn request_from_config(
-    cfg: &VoxelConfig,
-    rack: usize,
-) -> Result<RackInitializeRequest> {
-    let n = &cfg.network.for_rack(rack);
-
-    let bootstrap_addrs: BTreeSet<Ipv6Addr> = cfg
-        .sleds()
-        .iter()
-        .filter(|s| s.rss && s.rack == rack)
-        .map(|s| s.bootstrap_addr().parse())
-        .collect::<std::result::Result<_, _>>()
-        .context("bootstrap addrs")?;
-
-    let trust_quorum_peers: Vec<BaseboardId> = cfg
-        .sleds()
+/// The baseboards of `rack`'s bootstrap sleds - the trust quorum membership
+/// both rack init and a multirack join are configured with.
+fn trust_quorum_peers(cfg: &VoxelConfig, rack: usize) -> Vec<BaseboardId> {
+    cfg.sleds()
         .iter()
         .filter(|s| s.rss && s.rack == rack)
         .map(|s| BaseboardId {
             serial_number: s.serial_number.clone(),
             part_number: s.part_number.clone(),
         })
-        .collect();
+        .collect()
+}
 
-    let pool = ServiceIpPoolConfig::new(
-        SERVICE_POOL_NAME
-            .parse()
-            .map_err(|e| anyhow::anyhow!("service pool name: {e}"))?,
-        SERVICE_POOL_DESCRIPTION.to_string(),
-        vec![ip_range(&n.service_pool_first, &n.service_pool_last)?],
-    )
-    .context("service pool")?;
-    let service_ip_pools =
-        IdOrdMap::from_iter_unique([pool]).context("service pools")?;
-
+/// One rack's early-networking config: its fabric uplinks plus the cross-rack
+/// interconnect ports, and the BGP/BFD that go with the router mode.
+fn rack_network_config(
+    cfg: &VoxelConfig,
+    rack: usize,
+) -> Result<RackNetworkConfig> {
+    let n = &cfg.network.for_rack(rack);
     let uplink_ports = cfg.uplink_ports(rack);
     let mut ports = Vec::new();
     for p in &uplink_ports {
@@ -210,7 +195,8 @@ pub fn request_from_config(
 
     // Static-mode uplinks are numbered /30s validated against this lot at
     // handoff; Bgp uplinks are unnumbered, so the lot is unused.
-    let (infra_first, infra_last): (IpAddr, IpAddr) = match n.router_mode {
+    let (infra_ip_first, infra_ip_last): (IpAddr, IpAddr) = match n.router_mode
+    {
         RouterMode::Static => {
             let (f, l) = n
                 .infra_ip_range(uplink_ports.len())
@@ -220,10 +206,10 @@ pub fn request_from_config(
         RouterMode::Bgp => ("::".parse()?, "::".parse()?),
     };
 
-    let rack_network_config = RackNetworkConfig {
+    Ok(RackNetworkConfig {
         rack_subnet: n.rack_subnet.parse().context("rack_subnet")?,
-        infra_ip_first: infra_first,
-        infra_ip_last: infra_last,
+        infra_ip_first,
+        infra_ip_last,
         ports,
         bgp: match n.router_mode {
             RouterMode::Bgp => vec![BgpConfig {
@@ -263,7 +249,50 @@ pub fn request_from_config(
                 .collect::<Result<Vec<_>>>()?,
             _ => vec![],
         },
-    };
+    })
+}
+
+/// The body of a rack > 0's `/multirack-join` request (RFD 680). The joining
+/// rack needs only its trust quorum membership and its network config: the
+/// service starts that rack's sled-agents and publishes this config to the
+/// bootstore, which is what gets its front ports programmed.
+pub fn multirack_join_request(
+    cfg: &VoxelConfig,
+    rack: usize,
+) -> Result<MultirackJoinRequest> {
+    Ok(MultirackJoinRequest {
+        trust_quorum_peers: trust_quorum_peers(cfg, rack).into_iter().collect(),
+        rack_network_config: rack_network_config(cfg, rack)?,
+    })
+}
+
+/// Build the request for a single rack (0-based) of a voxel config. Each rack
+/// is an independent RSS domain: the bootstrap set is filtered to that rack's
+/// sleds and the customer/service network is offset per rack.
+pub fn request_from_config(
+    cfg: &VoxelConfig,
+    rack: usize,
+) -> Result<RackInitializeRequest> {
+    let n = &cfg.network.for_rack(rack);
+
+    let bootstrap_addrs: BTreeSet<Ipv6Addr> = cfg
+        .sleds()
+        .iter()
+        .filter(|s| s.rss && s.rack == rack)
+        .map(|s| s.bootstrap_addr().parse())
+        .collect::<std::result::Result<_, _>>()
+        .context("bootstrap addrs")?;
+
+    let pool = ServiceIpPoolConfig::new(
+        SERVICE_POOL_NAME
+            .parse()
+            .map_err(|e| anyhow::anyhow!("service pool name: {e}"))?,
+        SERVICE_POOL_DESCRIPTION.to_string(),
+        vec![ip_range(&n.service_pool_first, &n.service_pool_last)?],
+    )
+    .context("service pool")?;
+    let service_ip_pools =
+        IdOrdMap::from_iter_unique([pool]).context("service pools")?;
 
     let dns_servers = n
         .dns_servers
@@ -280,7 +309,7 @@ pub fn request_from_config(
 
     let silo = &cfg.recovery_silo;
     Ok(RackInitializeRequest {
-        trust_quorum_peers: Some(trust_quorum_peers),
+        trust_quorum_peers: Some(trust_quorum_peers(cfg, rack)),
         bootstrap_discovery: BootstrapAddressDiscovery::OnlyThese {
             addrs: bootstrap_addrs,
         },
@@ -304,7 +333,7 @@ pub fn request_from_config(
                 .parse()
                 .map_err(|e| anyhow::anyhow!("user_password_hash: {e}"))?,
         },
-        rack_network_config,
+        rack_network_config: rack_network_config(cfg, rack)?,
         allowed_source_ips: AllowedSourceIps::Any,
         external_jumbo_frames_opt_in_enabled: false,
     })
@@ -320,6 +349,7 @@ pub fn config_rss_toml(cfg: &VoxelConfig, rack: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rack_init_config::RouterPeerType;
 
     fn config(racks: usize, network: &str) -> VoxelConfig {
         let text = format!(
@@ -358,7 +388,7 @@ mod tests {
         assert_eq!(port.addresses[0].address, UplinkAddress::AddrConf);
         assert!(matches!(
             port.bgp_peers[0].addr,
-            RouterPeerType::Unnumbered { .. }
+            RouterPeerType::Unnumbered(..)
         ));
         assert_eq!(net.infra_ip_first, "::".parse::<IpAddr>().unwrap());
     }
@@ -397,5 +427,25 @@ mod tests {
             rack1.rack_network_config.ports.len(),
             cfg.uplink_ports(1).len() + cfg.interconnect_ports(1).len()
         );
+    }
+
+    #[test]
+    fn join_request_carries_rack1_interconnect() {
+        let cfg = config(2, "router_mode = \"bgp\"");
+        let join = multirack_join_request(&cfg, 1).unwrap();
+        let rss = request_from_config(&cfg, 1).unwrap();
+        // The join is configured from the same per-rack derivation RSS uses.
+        assert_eq!(join.rack_network_config, rss.rack_network_config);
+        assert_eq!(join.trust_quorum_peers.len(), 3);
+        // The interconnect ports are the reason the config is published at all:
+        // allow_ddm_traffic is what makes dendrite give them a link-local.
+        let ddm = join
+            .rack_network_config
+            .ports
+            .iter()
+            .filter(|p| p.allow_ddm_traffic)
+            .count();
+        assert_eq!(ddm, cfg.interconnect_ports(1).len());
+        assert!(ddm > 0);
     }
 }
