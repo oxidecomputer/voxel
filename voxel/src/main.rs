@@ -101,10 +101,6 @@ enum Cmd {
         /// start RSS - fully populating wicket's RACK SETUP page.
         #[arg(long = "wicket-setup")]
         wicket_setup: bool,
-        /// Widen host dld stream-head queues to 4 MiB (STRHIGH workaround).
-        /// Needs pfexec + mdb -kw.
-        #[arg(long)]
-        turbo: bool,
     },
     /// (debug) Print the wicketd RSS config body that `--wicket-setup` would PUT,
     /// reshaped from a generated config-rss.toml (validates the mapping offline).
@@ -767,7 +763,6 @@ async fn main() -> Result<(), Error> {
             emu_sp,
             emu_rot,
             wicket_setup,
-            turbo,
         } => {
             rack::cmd_launch(
                 &load_config(&config_path)?,
@@ -777,7 +772,6 @@ async fn main() -> Result<(), Error> {
                 *emu_sp || *emu_rot,
                 *emu_rot,
                 *wicket_setup,
-                *turbo,
             )
             .await
         }
