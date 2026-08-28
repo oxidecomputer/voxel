@@ -34,7 +34,6 @@ wicketd-commission-client.workspace = true
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
 serde_json = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { workspace = true, features = ["derive"] }
 libc = "0.2"
 reqwest.workspace = true

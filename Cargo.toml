@@ -31,7 +31,7 @@ serde = "1"
 camino = { version = "1.2.2", features = ["serde1"] }
 indoc = "2.0.7"
 toml_edit = "0.25"
-reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "rustls"] }
 
 # sprockets/trust quorum related deps
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d" }

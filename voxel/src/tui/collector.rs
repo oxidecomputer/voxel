@@ -2556,6 +2556,7 @@ impl<E: NodeExecutor> Collector<E> {
             );
             loop {
                 let health_cadence = tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => break,
                     _ = traffic.tick() => false,
                     _ = health.tick() => true,
