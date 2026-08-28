@@ -119,10 +119,8 @@ pub(crate) fn create_zvols(
 ) -> Result<()> {
     for sled in sleds {
         for disk in layout() {
-            let vol = format!(
-                "{dataset}/topo/{deployment}/{}",
-                disk.volume(sled)
-            );
+            let vol =
+                format!("{dataset}/topo/{deployment}/{}", disk.volume(sled));
             // A launch over a half-torn-down rack would otherwise inherit the
             // old media.
             let _ = std::process::Command::new("zfs")

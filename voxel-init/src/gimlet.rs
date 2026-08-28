@@ -284,10 +284,9 @@ fn ensure_m2_layout(d: &SledDisk) -> Result<()> {
     run("zpool", &["destroy", &tmp]);
 
     let (bytes_per_sector, parts) = read_vtoc(&d.disk)?;
-    let usable = parts
-        .iter()
-        .find(|p| p.index == 0)
-        .with_context(|| format!("{}: no partition 0 after labeling", d.disk))?;
+    let usable = parts.iter().find(|p| p.index == 0).with_context(|| {
+        format!("{}: no partition 0 after labeling", d.disk)
+    })?;
     let reserved = parts
         .iter()
         .find(|p| p.index == 8)
@@ -366,8 +365,7 @@ fn seed_boot_image(d: &SledDisk) -> Result<()> {
 /// which is the path a voxel guest takes. They arrive as REAL disks, with no
 /// omicron change of any kind. `vdevs` goes empty: nothing is file-backed now.
 fn write_disk_config(disks: &[SledDisk]) -> Result<()> {
-    let items: Vec<String> =
-        disks.iter().map(SledDisk::config_entry).collect();
+    let items: Vec<String> = disks.iter().map(SledDisk::config_entry).collect();
     let rendered = format!(
         "external_disks = {{ kind = \"hardcoded\", vdevs = [], \
          disks = [{}] }}",
@@ -774,8 +772,7 @@ fn preseed_install_datasets() {
     }
     // One MUPdate marker per sled, mirrored onto both M.2s: installinator
     // stamps the same UUID on both, and sled-agent logs a mismatch otherwise.
-    let mupdate_uuid =
-        capture("uuidgen", &[]).map(|u| u.trim().to_lowercase());
+    let mupdate_uuid = capture("uuidgen", &[]).map(|u| u.trim().to_lowercase());
     for vdev in &vdevs {
         let Some(uuid) =
             capture("uuidgen", &[]).map(|u| u.trim().to_lowercase())
