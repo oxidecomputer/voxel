@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Read a TUF repo zip as an image source: the control plane zones, the
 //! measurement corpus, the host OS phase 2 payload, and the omicron commit
 //! the repo was built from. Targets are streamed out with `unzip -p`; only

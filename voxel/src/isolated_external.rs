@@ -38,7 +38,7 @@ use voxel_config::External;
 /// `fake_external_stub0` name so a manually plumbed fake network can coexist.
 pub(crate) const STUB: &str = "voxel_ext_stub0";
 /// Host VNIC on the stub; owns the gateway address.
-const VNIC: &str = "voxel_ext0";
+pub(crate) const VNIC: &str = "voxel_ext0";
 /// ipadm address object on the VNIC.
 const ADDROBJ: &str = "voxel_ext0/external";
 

@@ -598,13 +598,16 @@ async fn create_cp_tuf(
                 crate::topo::PROP_TUF_VERSION,
                 t.system_version
             ))
+            .arg(format!("{}={}", crate::topo::PROP_TUF_FW, fw_dir))
             .arg(format!("{dataset}/img/{image_name}")),
-        "zfs set schema + tuf version on the image",
+        "zfs set schema + tuf version + firmware on the image",
     )?;
 
     println!("built image {image_name}");
     println!(
-        "\nthis release's emulated-fleet firmware, for [sp] in voxel.toml:\n\
+        "\nthe image carries this release's emulated-fleet firmware and launch \
+         uses it automatically.\n[sp] paths are only a fallback, for an image \
+         built without --from-tuf:\n\
          gimlet_image = \"{}\"\n\
          sidecar_image = \"{}\"\n\
          rot_image = \"{}\"\n\

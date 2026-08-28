@@ -7,8 +7,18 @@ cargo-bay.tgz
 .DS_Store
 core
 cargo-bay/
+sp-fleet/
+wicket-setup/
 *.vdev
 .sidecar-lite/
 voxel-image/out/
 voxel.toml
 *.log
+
+# image create --from-tuf caches: extracted repo artifacts, fetched omicron
+# sources and prebuilt zones. Multi-GiB and reproducible from the repo.
+voxel-image/.tuf-host/
+voxel-image/.tuf-fw/
+voxel-image/.omicron-raw/
+voxel-image/.dendrite-softnpu/
+old/

@@ -316,27 +316,6 @@ pub(crate) fn scp_to(ip: &str, local: &str, remote: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `scp root@<ip>:<remote> <local>` - the reverse of [`scp_to`], to pull an
-/// artifact (e.g. an sp-emu crash dump) out of the switch zone onto the host.
-pub(crate) fn scp_from(ip: &str, remote: &str, local: &str) -> bool {
-    let askpass = match ensure_askpass() {
-        Some(p) => p,
-        None => return false,
-    };
-    std::process::Command::new("scp")
-        .env("SSH_ASKPASS", &askpass)
-        .env("SSH_ASKPASS_REQUIRE", "force")
-        .stdin(std::process::Stdio::null())
-        .args(EPHEMERAL_HOST_OPTS)
-        .args(PASSWORD_AUTH_OPTS)
-        .arg("-q") // no progress meter
-        .arg(format!("root@{ip}:{remote}"))
-        .arg(local)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Confirm a rack's external network is actually reachable end-to-end after the
 /// host route is set - a route in the table isn't the same as a converged
 /// transit. Probes the rack's external DNS (a `dig` SOA query, UDP/53) from the

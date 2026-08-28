@@ -6,7 +6,7 @@
 //! cargo-bay staging that feeds it (generated sled/RSS/FRR/switch1 config +
 //! sprockets keys).
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use attest_mock::MockData;
 use camino::{Utf8Path, Utf8PathBuf};
 use indoc::formatdoc;
@@ -110,9 +110,14 @@ pub(crate) fn build_topo(
     let sled_mem = gb(cfg.topology.sled_memory_gb);
     let router_mem = gb(cfg.topology.router_memory_gb);
     let mut sleds = Vec::new();
+    let dataset = crate::image::falcon_dataset();
     for s in cfg.sleds() {
         let n = d.node(&s.name, &cp_img, 8, sled_mem);
         d.reserve(n, cfg.topology.sled_disk_gb as usize);
+        // The sled's complement of real NVMe disks. The zvols behind them are
+        // created at launch (see crate::disks); describing the devices here is
+        // inert for the non-launch callers of build_topo.
+        crate::disks::attach(&mut d, &dataset, name, &s, n)?;
         sleds.push((s, n));
     }
     let mut routers = Vec::new();
@@ -203,8 +208,41 @@ pub(crate) fn build_topo(
 /// mounted into each guest at `/opt/cargo-bay`).
 const CARGO_BAY: &str = "./cargo-bay";
 
+/// Host-side staging root for the emulated SP fleet, one directory per rack. The
+/// fleet runs here on the falcon host rather than inside a switch zone, so a
+/// rack's SPs outlive the sled reboots they cause and both switch zones share
+/// one flash instead of keeping private copies that drift.
+const SP_FLEET_DIR: &str = "./sp-fleet";
+
 fn cargo_bay(node: &str) -> Utf8PathBuf {
     Utf8Path::new(CARGO_BAY).join(node)
+}
+
+/// The emulated SP fleet for one rack: the sidecar plus one SP per rack sled,
+/// addressed at the fleet the falcon host runs. The single construction point,
+/// so staging, the host fleet and the operator commands cannot disagree about
+/// identities or ports.
+pub(crate) fn emu_fleet(
+    cfg: &VoxelConfig,
+    rack: usize,
+) -> voxel_config::sp::SpFleet {
+    let indices: Vec<usize> = cfg
+        .sleds()
+        .iter()
+        .filter(|s| s.rack == rack)
+        .map(|s| s.index)
+        .collect();
+    voxel_config::sp::SpFleet::for_gimlets(
+        &indices,
+        voxel_config::sp::SpBackend::Emu {
+            addr: voxel_config::config::sp_host_addr(rack),
+        },
+    )
+}
+
+/// A rack's host-side SP fleet directory.
+pub(crate) fn sp_fleet_dir(rack: usize) -> Utf8PathBuf {
+    Utf8Path::new(SP_FLEET_DIR).join(format!("r{rack}"))
 }
 
 /// Clear each node's cargo-bay before staging so it reflects ONLY the current
@@ -256,6 +294,27 @@ pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
 /// TUF system version stamped on `--from-tuf` images: the repo whose zone and
 /// corpus artifacts the image's bytes hash match.
 pub(crate) const PROP_TUF_VERSION: &str = "voxel:tuf-version";
+/// Directory of SP/RoT firmware `image create --from-tuf` extracted from the
+/// same repo. `--emu` launches boot this unless `[sp]` overrides it, so a rack
+/// cannot run firmware that disagrees with the release it reports.
+pub(crate) const PROP_TUF_FW: &str = "voxel:tuf-fw";
+
+/// The firmware `image create --from-tuf` extracted for this image, if it is a
+/// TUF image built by a voxel that stamped the directory.
+pub(crate) fn tuf_firmware(image: &str) -> Option<Utf8PathBuf> {
+    let ds = format!("{}/img/{image}", crate::image::falcon_dataset());
+    let out = std::process::Command::new("zfs")
+        .args(["get", "-H", "-o", "value", PROP_TUF_FW])
+        .arg(&ds)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = Utf8PathBuf::from(dir);
+    dir.is_dir().then_some(dir)
+}
 
 /// Sled-agent config schema read from an omicron checkout; None if the
 /// checkout's sled-agent config source is not readable.
@@ -403,9 +462,8 @@ pub(crate) fn omicron_src() -> Option<Utf8PathBuf> {
 /// Generate + stage per-node config into the cargo-bay before launch.
 pub(crate) fn stage_config(
     cfg: &VoxelConfig,
-    emu_sp: bool,
-    emu_rot: bool,
-    wicket_setup: bool,
+    emu: bool,
+    sp_firmware: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
     let sleds = cfg.sleds();
     // Per-sled sled-agent config (replaces a4x2's config/gN-config.toml). Each
@@ -447,7 +505,7 @@ pub(crate) fn stage_config(
         // from it). voxel-init only injects `<cargo-bay>/config-rss.toml`, so we
         // simply generate it OUTSIDE the cargo-bay (in `wicket-setup/rackN/`) -
         // `wicket_setup::drive` reads it from there to build the wicketd bodies.
-        let rss_dir = if wicket_setup {
+        let rss_dir = if emu {
             let d = Utf8Path::new("wicket-setup").join(format!("rack{rack}"));
             fs::create_dir_all(&d)?;
             d
@@ -543,16 +601,23 @@ pub(crate) fn stage_config(
             rack_sleds.iter().filter(|s| s.scrimlet).map(|s| s.index).collect();
         // The SP fleet (sidecar + one SP per rack sled) is the shared MGS↔SP
         // contract; sim backend today, swappable to a real-firmware host.
-        // `--emu`: every SP is real-firmware on sp-emu (voxel-init disables sp-sim
-        // in-zone). Default: sp-sim for the whole fleet, no emu staging.
-        let fleet = if emu_sp {
-            voxel_config::sp::SpFleet::for_gimlets(
-                &gimlet_indices,
-                voxel_config::sp::SpBackend::Emu,
-            )
+        // `--emu`: every SP is real-firmware on sp-emu, run once for the rack on
+        // the falcon host. Default: sp-sim in each switch zone, no emu staging.
+        let fleet = if emu {
+            emu_fleet(cfg, rack)
         } else {
             voxel_config::sp::SpFleet::sim_for_gimlets(&gimlet_indices)
         };
+        // Firmware the image carries from its own TUF repo, so an --emu rack
+        // runs the release it reports. --sp-firmware overrides it for a launch,
+        // which is how the hubris lane tries a build before it ships.
+        let fw = emu
+            .then(|| {
+                sp_firmware
+                    .map(Utf8Path::to_path_buf)
+                    .or_else(|| tuf_firmware(&cfg.image.cp_image()))
+            })
+            .flatten();
         for (slot, s) in rack_sleds.iter().filter(|s| s.scrimlet).enumerate() {
             let dir = cargo_bay(&s.name);
             fs::create_dir_all(&dir)?;
@@ -566,21 +631,35 @@ pub(crate) fn stage_config(
             )?;
             // Stage sp-sim's config only in the default path; under --emu sp-sim is
             // disabled, so don't stage one (and the enforcer leaves sp-sim alone).
-            if !emu_sp {
+            if !emu {
                 fs::write(
                     dir.join("sp-sim-config.toml"),
                     fleet.sp_sim_config(),
                 )?;
             }
-            stage_sp_emu(cfg, &fleet, &dir, emu_rot)?;
+            // The fleet runs on the falcon host, so a scrimlet needs only an
+            // address on its rack's SP network to reach it. The switch zone
+            // already routes the bootstrap prefix to its own global zone.
+            if emu {
+                fs::write(
+                    dir.join("sp-net"),
+                    format!(
+                        "{}/{}",
+                        voxel_config::config::sp_scrimlet_addr(rack, s.index),
+                        voxel_config::config::SP_NET_PREFIX_LEN
+                    ),
+                )?;
+            }
         }
+        // One fleet for the rack, staged on the host instead of in each zone.
+        stage_sp_emu(cfg, &fleet, &sp_fleet_dir(rack), emu, fw.as_deref())?;
     }
     Ok(())
 }
 
-/// Stage the `sp-emu` binary + each emulated SP's flashed hubris image into a
-/// scrimlet's cargo-bay (`sp-emu/`), so `voxel-init` can run the real-firmware SPs
-/// in that switch zone. Each emu SP's image is flashed into `<base_port>.flash`
+/// Stage the `sp-emu` binary + each emulated SP's flashed hubris image into the
+/// rack's host fleet directory (`sp-emu/`), so the falcon host can run the
+/// real-firmware SPs once for the whole rack. Each emu SP's image is flashed into `<base_port>.flash`
 /// (the filename carries the MGS port; voxel-init derives the board from it).
 /// No-op when no SP in the fleet is emulator-backed. Staged pre-launch, so it's
 /// present at boot (no 9p-visibility issue).
@@ -589,6 +668,7 @@ fn stage_sp_emu(
     fleet: &voxel_config::sp::SpFleet,
     dir: &Utf8Path,
     emu_rot: bool,
+    fw: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
     let emu = fleet.emu_sps();
     if emu.is_empty() {
@@ -596,30 +676,9 @@ fn stage_sp_emu(
     }
     let out = dir.join("sp-emu");
     fs::create_dir_all(&out)?;
-    // Always write the fleet manifest (`rot <0|1>` + `<port> <role>` lines) so
-    // voxel-init knows the SP set, each SP's role, and whether --emu-rot is on —
-    // even when it boots from the image's BAKED /opt/oxide/sp-emu artifacts
-    // (self-contained) rather than these staged copies. (The staged rot.flash was
-    // previously the only signal of --emu-rot; the baked path needs it explicit.)
-    // Fleet manifest: `rot <0|1>` then `<base_port> <role> <serial> <part>` per
-    // SP. sp-emu 1.x sets the reported VPD from SP_EMU_VPD_SERIAL/PART, so voxel
-    // carries each SP's fleet identity here ("-" marks a missing part number).
-    let mut manifest = format!("rot {}\n", if emu_rot { 1 } else { 0 });
-    for sp in &emu {
-        let role =
-            if sp.selector() == "sidecar" { "sidecar" } else { "gimlet" };
-        let part = sp.part_number.as_deref().unwrap_or("-");
-        manifest.push_str(&format!(
-            "{} {} {} {}\n",
-            sp.base_port, role, sp.serial, part
-        ));
-    }
-    let ports_manifest = out.join("ports");
-    fs::write(&ports_manifest, manifest)
-        .with_context(|| format!("write {}", ports_manifest))?;
-    // Dev override: with [sp].emu_bin set, stage the binary + hubris archives from
-    // the local build for fast iteration (no rebake). Unset -> voxel-init uses the
-    // baked image artifacts.
+    // The host fleet needs the binary and archives here: there is no baked
+    // in-guest copy to fall back on now that it runs outside the switch zone.
+    // sp_host reports the missing binary rather than silently starting nothing.
     let Some(emu_bin) = cfg.sp.emu_bin.as_deref() else {
         return Ok(());
     };
@@ -634,16 +693,26 @@ fn stage_sp_emu(
     }
     // Stage the RoT image so each SP can run oxide-rot-1 in-process over sprot
     // (sp-emu 1.x runs the RoT inside the SP process, not as a separate service).
+    // The image's own firmware wins: an --emu rack should run the release it
+    // reports. `[sp]` is the fallback for an image built without --from-tuf,
+    // which carries no firmware of its own. Bound once, under its own name:
+    // shadowing `dir` here left the archive staging below reading the hubris
+    // zips out of its own output directory.
+    let Some(fw_dir) = fw else {
+        bail!(
+            "--emu needs firmware: build the image with --from-tuf, or \
+             point --sp-firmware at a directory of SP/RoT images"
+        );
+    };
     if emu_rot {
-        let rot = cfg.sp.rot_image.as_deref().ok_or_else(|| {
-            anyhow!("--emu-rot requires [sp].rot_image (the oxide-rot-1 image)")
-        })?;
-        fs::copy(rot, out.join("rot.image"))
+        let rot = fw_dir.join("rot-a.zip");
+        fs::copy(&rot, out.join("rot.image"))
             .with_context(|| format!("stage RoT image from {rot}"))?;
         // Staged bootleby turns on sp-emu secure boot; rot_image must be
         // self-signed.
-        if let Some(bootleby) = cfg.sp.bootleby_image.as_deref() {
-            fs::copy(bootleby, out.join("bootleby.zip"))
+        let bootleby = fw_dir.join("bootleby.zip");
+        if bootleby.exists() {
+            fs::copy(&bootleby, out.join("bootleby.zip"))
                 .with_context(|| format!("stage bootleby from {bootleby}"))?;
         }
     }
@@ -657,12 +726,33 @@ fn stage_sp_emu(
         if !staged.insert(role) {
             continue;
         }
-        let image = cfg.sp.image_for(&sp.selector()).ok_or_else(|| {
-            let key = format!("{role}_image");
-            anyhow!("[sp].emu includes {role} but [sp].{key} is unset")
-        })?;
-        fs::copy(image, out.join(format!("{role}.archive")))
+        // The repo names SP archives by hubris board.
+        let image = fw_dir.join(match role {
+            "sidecar" => "sp-sidecar-c.zip",
+            _ => "sp-gimlet-c.zip",
+        });
+        fs::copy(&image, out.join(format!("{role}.archive")))
             .with_context(|| format!("stage {role} archive from {image}"))?;
+    }
+    // The release's host phase 1, staged for the gimlet QSPI seed (sp_host
+    // writes it into each gimlet SP's host-boot flash so the slot inventories
+    // at the repo's version instead of reading as blank). Cached by cpbuild
+    // next to the firmware dir under the same key; an image whose caches
+    // predate the rom just leaves host phase 1 unknown, as before.
+    let key = fw_dir.file_name().unwrap_or_default();
+    let rom = fw_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join(".tuf-host").join(format!("phase1-{key}.rom")));
+    match rom {
+        Some(rom) if rom.exists() => {
+            fs::copy(&rom, out.join("host-phase1.rom"))
+                .with_context(|| format!("stage host phase 1 from {rom}"))?;
+        }
+        _ => eprintln!(
+            "[voxel] no cached host phase 1 rom for {key}; \
+             gimlet host flash stays blank"
+        ),
     }
     Ok(())
 }
