@@ -24,5 +24,6 @@ cargo clippy --all-targets -- --deny warnings
 banner "build"
 ptime -m cargo build --release
 
-mkdir -p /out
+pfexec mkdir -p /out
+pfexec chown "$USER" /out
 cp target/release/voxel /out/

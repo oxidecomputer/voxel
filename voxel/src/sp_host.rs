@@ -383,10 +383,9 @@ pub(crate) fn up(
         // Launch-time only: a fresh rack starts at the release baseline.
         let rom = dir.join("host-phase1.rom");
         if board_of(sp) == "gimlet" && rom.exists() {
-            std::fs::copy(&rom, state.join("qspi-flash.bin"))
-                .with_context(|| {
-                    format!("seed host phase 1 for port {}", sp.base_port)
-                })?;
+            std::fs::copy(&rom, state.join("qspi-flash.bin")).with_context(
+                || format!("seed host phase 1 for port {}", sp.base_port),
+            )?;
         }
     }
 
