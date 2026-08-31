@@ -355,6 +355,15 @@ pub(crate) async fn cmd_launch(
                 );
                 let _ = teardown(&topo.runner, name);
                 std::thread::sleep(std::time::Duration::from_secs(3));
+                // teardown's `zfs destroy -r` reaps the sled media along with
+                // the rest of the deployment, so a retry that skipped this
+                // would hand propolis backend paths that no longer resolve.
+                crate::disks::create_zvols(
+                    &crate::image::falcon_dataset(),
+                    name,
+                    &sleds,
+                )
+                .context("recreating sled disks for boot retry")?;
                 topo = build_topo(cfg, name)?;
                 attempt += 1;
             }

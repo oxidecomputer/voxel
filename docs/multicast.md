@@ -729,6 +729,27 @@ The deny source is any address other than the host's, here `172.30.199.198`,
 so the joined filter excludes the actual sender and the dataplane must drop
 the traffic.
 
+Those source addresses belong to the isolated segment. In `lan` mode the
+sender is the host on the LAN itself, so both take addresses from
+`[external]`: the real source is `host_ip`, and the deny source is any other
+address on `subnet` that the sender does not hold. With the static LAN
+configured here (`subnet = 192.168.1.0/24`, `host_ip = 192.168.1.199`):
+
+```sh
+voxel network multicast up --group 239.100.0.1 --group 239.100.0.2 \
+    --group 232.100.0.1 --group 239.100.0.9
+
+voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
+    --test-duration 200s --warmup 10s --packet-rate 10 \
+    --mcast-group 239.100.0.1 \
+    --mcast-group 239.100.0.2@192.168.1.199 \
+    --mcast-group 232.100.0.1@192.168.1.199 \
+    --mcast-deny-group 239.100.0.9@192.168.1.198
+```
+
+The group addresses do not change with the mode, since they are rack-side
+pool addresses rather than LAN addresses. Only the sources move around.
+
 With no `--mcast-group`, voxel supplies `239.1.1.1`, which then needs its own
 host route, mirror filter, and link-layer membership. See the commtest
 section of the [README] for the build and privilege details.
