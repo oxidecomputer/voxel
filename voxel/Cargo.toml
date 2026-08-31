@@ -17,6 +17,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 base64.workspace = true
 libfalcon.workspace = true
+propolis-client.workspace = true
 anyhow.workspace = true
 slog.workspace = true
 futures.workspace = true
@@ -35,6 +36,9 @@ wicketd-commission-client.workspace = true
 toml = "0.9"
 serde_json = "1"
 serde = { workspace = true, features = ["derive"] }
+# Unpack TUF control-plane composites (GNU tar format; illumos tar rejects it).
+tar = "0.4"
+flate2 = "1"
 libc = "0.2"
 reqwest.workspace = true
 chrono = { version = "0.4", features = ["serde"] }

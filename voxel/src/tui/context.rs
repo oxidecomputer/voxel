@@ -159,13 +159,7 @@ mod tests {
     fn launch_does_not_enable_optional_flags() {
         let args = context().command_spec(PublicCommand::Launch).args;
 
-        for flag in [
-            "--no-progress",
-            "--no-route",
-            "--emu-sp",
-            "--emu-rot",
-            "--wicket-setup",
-        ] {
+        for flag in ["--no-progress", "--no-route", "--emu", "--sp-firmware"] {
             assert!(!args.contains(&OsString::from(flag)));
         }
     }

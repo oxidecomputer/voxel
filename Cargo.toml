@@ -11,9 +11,9 @@ members = [
 anyhow = "1.0.102"
 # The omicron commit voxel is pinned to. Bumping this rev is the new-omicron
 # motion; build.rs surfaces it to voxel image create. Keep both revs identical.
-rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "7950023e5971625c2f5fe7c2d808558bfc2653c0" }
-wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "7950023e5971625c2f5fe7c2d808558bfc2653c0" }
-wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "7950023e5971625c2f5fe7c2d808558bfc2653c0" }
+rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
+wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
+wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
@@ -24,6 +24,8 @@ ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 base64 = "0.22"
 libfalcon = { git = "https://github.com/oxidecomputer/falcon", branch = "main" }
+# Must be the rev libfalcon pins, so instance-spec component types unify.
+propolis-client = { git = "https://github.com/oxidecomputer/propolis", rev = "36f20be9bb4c3b362029237f5feb6377c982395f" }
 futures = "0.3"
 oxnet = "0.1"
 slog = "2.7"
