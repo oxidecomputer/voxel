@@ -343,33 +343,46 @@ rather than as a Cargo dependency, so build it and point voxel at it.
    cd sp-emu && cargo build --release        # produces target/release/sp-emu
    ```
 
-2. Point voxel at it in `voxel.toml`, with the Hubris `-c-emu` images to run:
+2. Point voxel at it in `voxel.toml`:
 
    ```toml
    [sp]
-   emu = ["sidecar"]                  # SPs running real firmware: "sidecar", "g0", ...
+   emu = ["sidecar", "g0", "g1", "g2"]   # SPs running real firmware
    emu_bin = "/path/to/sp-emu/target/release/sp-emu"
-   sidecar_image = "/path/to/hubris/.../build-sidecar-c-emu-image-default.zip"
-   gimlet_image  = "/path/to/hubris/.../build-gimlet-c-emu-image-default.zip"
-   rot_image     = "/path/to/hubris/target/oxide-rot-1/dist/a/final.bin"
-   faux_mgs      = "/path/to/faux-mgs"   # optional, for `voxel sp` operator commands
+   faux_mgs = "/path/to/faux-mgs"        # optional, for `voxel sp` operator commands
    ```
 
-3. Launch with the emulated fleet:
+3. Launch the emulated fleet:
 
    ```
-   voxel launch --emu-sp                  # real SP firmware behind MGS
-   voxel launch --emu-rot                 # also a real RoT (implies --emu-sp; needs rot_image)
-   voxel launch --emu-rot --wicket-setup  # drive rack setup through wicketd (real operator flow)
+   voxel launch --emu
    ```
 
-   `--wicket-setup` runs rack setup through wicketd instead of the file-based
+   `--emu` runs real SP and RoT firmware behind MGS and drives rack setup
+   through wicketd (the real operator flow) rather than the file-based
    sled-agent auto-init.
 
-When you build a cp image, voxel bakes the sp-emu binary and per-role firmware
-into the image from `[sp]`, so a launched rack is self-contained and `emu_bin`
-can be left unset at launch. Setting `emu_bin` at launch stages it on the fly
-instead, which is useful for iterating on sp-emu without rebaking.
+The firmware itself comes from the image's own TUF repo: `image create
+--from-tuf` extracts the gimlet and sidecar SP archives, the RoT slot A image
+and the RoT bootloader, and stamps their location on the image, so a rack
+cannot boot firmware that disagrees with the release it reports.
+
+To boot *different* firmware - which is how you give a firmware update
+something to do, or test a hubris change - name the images in `[sp]` and they
+win over the image's own:
+
+```toml
+[sp]
+gimlet_image  = "/path/to/hubris/.../build-gimlet-image-c.zip"
+sidecar_image = "/path/to/hubris/.../build-sidecar-image-c.zip"
+rot_image     = "/path/to/rot-bart-a.zip"
+bootleby_image = "/path/to/bootleby-bart.zip"
+```
+
+When you build a cp image, voxel bakes the sp-emu binary into it, so a launched
+rack is self-contained and `emu_bin` can be left unset at launch. Setting
+`emu_bin` at launch stages it on the fly instead, which is useful for iterating
+on sp-emu without rebaking.
 
 [multicast]: docs/multicast.md
 [parameters]: docs/parameters.md

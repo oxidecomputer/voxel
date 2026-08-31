@@ -22,6 +22,212 @@ const READY_MARKER: &str = "/var/voxel-image-ready";
 const CARGO_BAY: &str = "/opt/cargo-bay";
 const AGENT_DST: &str = "/opt/oxide/voxel-init";
 
+/// Source-build bake: prerequisites, `omicron-package unpack`, and the whole
+/// omicron CLI dir baked for launch-time activate + virtual-hardware.
+fn install_cp_omicron() -> Result<()> {
+    // The builder runs us from /opt/cargo-bay; the staged omicron dir is here.
+    let omicron = format!("{CARGO_BAY}/omicron");
+    std::env::set_current_dir(&omicron)
+        .map_err(|e| anyhow::anyhow!("cd {omicron}: {e}"))?;
+    for f in ["omicron-package", "xtask", "xtask-downloader"] {
+        run_quiet("chmod", &["+x", f]);
+    }
+    run_quiet("sh", &["-c", "chmod +x tools/*.sh tools/ci* 2>/dev/null"]);
+
+    let xtask = format!("{omicron}/xtask");
+    let xtask_dl = format!("{omicron}/xtask-downloader");
+    let envs = [
+        ("XTASK_BIN", xtask.as_str()),
+        ("XTASK_DOWNLOADER_BIN", xtask_dl.as_str()),
+    ];
+    let mut attempt = 0;
+    while !crate::sys::run_env(
+        "./tools/install_runner_prerequisites.sh",
+        &["-y"],
+        &envs,
+    ) {
+        attempt += 1;
+        if attempt >= 5 {
+            bail!(
+                "install_runner_prerequisites failed after {attempt} attempts"
+            );
+        }
+        note(format!(
+            "prerequisites attempt {attempt} failed; retrying in 20s"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(20));
+    }
+
+    note("unpacking control-plane zone artifacts into /opt/oxide ...");
+    if !crate::sys::run_env("./omicron-package", &["--force", "unpack"], &envs)
+    {
+        bail!("omicron-package unpack failed");
+    }
+    let artifacts = capture("find", &["/opt/oxide", "-name", "*.tar.gz"])
+        .map(|o| o.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+    if artifacts == 0 {
+        bail!("omicron-package unpack produced no artifacts in /opt/oxide");
+    }
+    note(format!("unpacked {artifacts} zone artifacts into /opt/oxide"));
+
+    // Strip the default config-rss.toml that omicron v20+ ships in the sled-agent
+    // non-gimlet package. sled-agent's SMF auto-starts at boot and would RSS-init
+    // from that default (rack_subnet fd00:1122:3344) BEFORE voxel injects its
+    // per-launch config - then RSS retries with voxel's and sled-agent refuses
+    // ("Sled Agent already running" with a different request).
+    fs::remove_file("/opt/oxide/sled-agent/pkg/config-rss.toml").ok();
+    note(
+        "removed baked default config-rss (RSS will use voxel's injected one)",
+    );
+
+    // --- bake launch-time bits ---
+    // Bake the WHOLE staged omicron dir: `omicron-package activate` reads
+    // out/target/active and `xtask virtual-hardware` needs out/npuzone/, so we
+    // can't cherry-pick. The out/*.tar.gz zones duplicate the unpacked
+    // /opt/oxide, which is the price of a self-contained activate.
+    const BAKE: &str = "/opt/oxide/omicron";
+    note(format!("baking omicron CLI dir into {BAKE}"));
+    fs::create_dir_all(BAKE).ok();
+    if !run("cp", &["-r", ".", BAKE]) {
+        bail!("baking omicron dir into {BAKE} failed");
+    }
+    for f in ["omicron-package", "xtask", "xtask-downloader"] {
+        run_quiet("chmod", &["+x", &format!("{BAKE}/{f}")]);
+    }
+    run_quiet(
+        "sh",
+        &["-c", &format!("chmod +x {BAKE}/tools/*.sh 2>/dev/null")],
+    );
+    Ok(())
+}
+
+/// TUF image bake: zones and GZ software are prestaged repo files (cargo-bay
+/// zones/ + gz/); no omicron tooling exists or is baked. Launch detects
+/// /opt/oxide/.voxel-tuf and replaces `xtask virtual-hardware` and
+/// `omicron-package activate` natively.
+fn install_cp_tuf() -> Result<()> {
+    // The prerequisites script resolves sibling tools relative to itself;
+    // stage the whole staged tools dir.
+    let src_tools = format!("{CARGO_BAY}/tools");
+    fs::create_dir_all("/tmp/tools").ok();
+    for e in Utf8Path::new(&src_tools)
+        .read_dir_utf8()
+        .map_err(|e| anyhow::anyhow!("read {src_tools}: {e}"))?
+    {
+        let e = e.map_err(|e| anyhow::anyhow!("read {src_tools}: {e}"))?;
+        let name = e.file_name();
+        fs::copy(e.path(), format!("/tmp/tools/{name}"))
+            .map_err(|e| anyhow::anyhow!("stage tools/{name}: {e}"))?;
+    }
+    run_quiet("sh", &["-c", "chmod +x /tmp/tools/*.sh"]);
+    // The script's one xtask use is `download softnpu`, which only matters in
+    // softnpu zone mode; voxel runs propolis mode. Satisfy the hook with true.
+    let envs = [("XTASK_BIN", "/usr/bin/true")];
+    let mut attempt = 0;
+    while !crate::sys::run_env(
+        "/tmp/tools/install_runner_prerequisites.sh",
+        &["-y"],
+        &envs,
+    ) {
+        attempt += 1;
+        if attempt >= 5 {
+            bail!(
+                "install_runner_prerequisites failed after {attempt} attempts"
+            );
+        }
+        note(format!(
+            "prerequisites attempt {attempt} failed; retrying in 20s"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(20));
+    }
+
+    note("staging TUF control-plane zones into /opt/oxide ...");
+    let zones = format!("{CARGO_BAY}/zones");
+    let mut n = 0;
+    for e in Utf8Path::new(&zones)
+        .read_dir_utf8()
+        .map_err(|e| anyhow::anyhow!("read {zones}: {e}"))?
+    {
+        let e = e.map_err(|e| anyhow::anyhow!("read {zones}: {e}"))?;
+        let name = e.file_name();
+        fs::copy(e.path(), format!("/opt/oxide/{name}"))
+            .map_err(|e| anyhow::anyhow!("stage zone {name}: {e}"))?;
+        n += 1;
+    }
+    if n == 0 {
+        bail!("no zones staged in {zones}");
+    }
+    note(format!("staged {n} zone artifacts into /opt/oxide"));
+
+    note("staging global-zone software from the host phase 2 payload ...");
+    let gz = format!("{CARGO_BAY}/gz");
+    for e in Utf8Path::new(&gz)
+        .read_dir_utf8()
+        .map_err(|e| anyhow::anyhow!("read {gz}: {e}"))?
+    {
+        let e = e.map_err(|e| anyhow::anyhow!("read {gz}: {e}"))?;
+        let name = e.file_name();
+        if name == "sled-agent.xml" {
+            continue;
+        }
+        if !run("cp", &["-r", e.path().as_str(), "/opt/oxide/"]) {
+            bail!("stage {name} into /opt/oxide failed");
+        }
+    }
+    // The 9p mount drops exec bits; these directories hold binaries.
+    for d in [
+        "sled-agent",
+        "mg-ddm",
+        "opte",
+        "oxlog",
+        "pumpkind",
+        "crucible_utils",
+        "bin",
+    ] {
+        run_quiet(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "find /opt/oxide/{d} -type f -exec chmod +x {{}} + \
+                     2>/dev/null"
+                ),
+            ],
+        );
+    }
+    // The SMF manifest is imported at LAUNCH, after config injection.
+    // Importing here would autostart sled-agent at first boot unconfigured.
+    fs::copy(
+        format!("{gz}/sled-agent.xml"),
+        "/opt/oxide/sled-agent/pkg/manifest.xml",
+    )
+    .map_err(|e| anyhow::anyhow!("stage sled-agent manifest: {e}"))?;
+
+    note("staging host boot image + phase 1 rom ...");
+    let host = format!("{CARGO_BAY}/host");
+    fs::create_dir_all("/opt/voxel/host")
+        .map_err(|e| anyhow::anyhow!("mkdir /opt/voxel/host: {e}"))?;
+    let mut n = 0;
+    for e in Utf8Path::new(&host)
+        .read_dir_utf8()
+        .map_err(|e| anyhow::anyhow!("read {host}: {e}"))?
+    {
+        let e = e.map_err(|e| anyhow::anyhow!("read {host}: {e}"))?;
+        let name = e.file_name();
+        fs::copy(e.path(), format!("/opt/voxel/host/{name}"))
+            .map_err(|e| anyhow::anyhow!("stage host/{name}: {e}"))?;
+        n += 1;
+    }
+    if n == 0 {
+        bail!("no host artifacts staged in {host}");
+    }
+    fs::remove_file("/opt/oxide/sled-agent/pkg/config-rss.toml").ok();
+    fs::write("/opt/oxide/.voxel-tuf", "")
+        .map_err(|e| anyhow::anyhow!("write /opt/oxide/.voxel-tuf: {e}"))?;
+    Ok(())
+}
+
 /// The static address staged as `builder-net` when the host built this image on
 /// an isolated external segment (no DHCP server to lease from).
 struct BuilderNet {
@@ -85,10 +291,13 @@ const SWITCH_ENFORCER_MANIFEST: &str = r#"<?xml version="1.0"?>
     </dependency>
     <exec_method type='method' name='start'
       exec='/opt/oxide/voxel-init switch-enforcer-svc'
-      timeout_seconds='1800'/>
-    <exec_method type='method' name='stop' exec=':true' timeout_seconds='60'/>
+      timeout_seconds='0'/>
+    <exec_method type='method' name='stop' exec=':kill' timeout_seconds='60'/>
+    <!-- Wait model: the enforcer stays resident (emu fleet monitor), so the
+         process IS the service; the transient model times its start method
+         out into maintenance. -->
     <property_group name='startd' type='framework'>
-      <propval name='duration' type='astring' value='transient'/>
+      <propval name='duration' type='astring' value='child'/>
     </property_group>
     <stability value='Unstable'/>
     <template>
@@ -180,81 +389,13 @@ pub fn build_control_plane_image() -> Result<()> {
         sleep2();
     }
 
-    // The builder runs us from /opt/cargo-bay; the staged omicron dir is here.
-    let omicron = format!("{CARGO_BAY}/omicron");
-    std::env::set_current_dir(&omicron)
-        .map_err(|e| anyhow::anyhow!("cd {omicron}: {e}"))?;
-    for f in ["omicron-package", "xtask", "xtask-downloader"] {
-        run_quiet("chmod", &["+x", f]);
+    // TUF images stage prebuilt zones + GZ software; source builds stage the
+    // whole omicron dir and unpack through omicron-package.
+    if Utf8Path::new(&format!("{CARGO_BAY}/zones")).exists() {
+        install_cp_tuf()?;
+    } else {
+        install_cp_omicron()?;
     }
-    run_quiet("sh", &["-c", "chmod +x tools/*.sh tools/ci* 2>/dev/null"]);
-
-    // --- control-plane prerequisites + unpack (THE bake) ---
-    let xtask = format!("{omicron}/xtask");
-    let xtask_dl = format!("{omicron}/xtask-downloader");
-    let envs = [
-        ("XTASK_BIN", xtask.as_str()),
-        ("XTASK_DOWNLOADER_BIN", xtask_dl.as_str()),
-    ];
-    let mut attempt = 0;
-    while !crate::sys::run_env(
-        "./tools/install_runner_prerequisites.sh",
-        &["-y"],
-        &envs,
-    ) {
-        attempt += 1;
-        if attempt >= 5 {
-            bail!(
-                "install_runner_prerequisites failed after {attempt} attempts"
-            );
-        }
-        note(format!(
-            "prerequisites attempt {attempt} failed; retrying in 20s"
-        ));
-        std::thread::sleep(std::time::Duration::from_secs(20));
-    }
-
-    note("unpacking control-plane zone artifacts into /opt/oxide ...");
-    if !crate::sys::run_env("./omicron-package", &["--force", "unpack"], &envs)
-    {
-        bail!("omicron-package unpack failed");
-    }
-    let artifacts = capture("find", &["/opt/oxide", "-name", "*.tar.gz"])
-        .map(|o| o.lines().filter(|l| !l.trim().is_empty()).count())
-        .unwrap_or(0);
-    if artifacts == 0 {
-        bail!("omicron-package unpack produced no artifacts in /opt/oxide");
-    }
-    note(format!("unpacked {artifacts} zone artifacts into /opt/oxide"));
-
-    // Strip the default config-rss.toml that omicron v20+ ships in the sled-agent
-    // non-gimlet package. sled-agent's SMF auto-starts at boot and would RSS-init
-    // from that default (rack_subnet fd00:1122:3344) BEFORE voxel injects its
-    // per-launch config - then RSS retries with voxel's and sled-agent refuses
-    // ("Sled Agent already running" with a different request).
-    fs::remove_file("/opt/oxide/sled-agent/pkg/config-rss.toml").ok();
-    note(
-        "removed baked default config-rss (RSS will use voxel's injected one)",
-    );
-
-    // --- bake launch-time bits ---
-    // Bake the WHOLE staged omicron dir: `omicron-package activate` reads
-    // out/target/active and `xtask virtual-hardware` needs out/npuzone/, so we
-    // can't cherry-pick. The out/*.tar.gz zones duplicate the unpacked
-    // /opt/oxide, which is the price of a self-contained activate.
-    const BAKE: &str = "/opt/oxide/omicron";
-    note(format!("baking omicron CLI dir into {BAKE}"));
-    fs::create_dir_all(BAKE).ok();
-    if !run("cp", &["-r", ".", BAKE]) {
-        bail!("baking omicron dir into {BAKE} failed");
-    }
-    for f in ["omicron-package", "xtask", "xtask-downloader"] {
-        run_quiet("chmod", &["+x", &format!("{BAKE}/{f}")]);
-    }
-    run_quiet(
-        "sh",
-        &["-c", &format!("chmod +x {BAKE}/tools/*.sh 2>/dev/null")],
-    );
 
     // SoftNPU sidecar_lite; scrimlets load it into propolis at launch. Staged
     // into the cargo-bay by `image create` because the builder VM may not reach
@@ -277,6 +418,21 @@ pub fn build_control_plane_image() -> Result<()> {
         bail!("sidecar not staged at {sc_dir}");
     }
 
+    // Measurement corpus staged by `image create --from-tuf`; the preseed
+    // serves these instead of the embedded fake corpus when present.
+    let meas_dir = format!("{CARGO_BAY}/measurements");
+    if let Ok(entries) = Utf8Path::new(&meas_dir).read_dir_utf8() {
+        fs::create_dir_all("/opt/oxide/measurements").ok();
+        let mut n = 0;
+        for e in entries.flatten() {
+            let name = e.file_name();
+            fs::copy(e.path(), format!("/opt/oxide/measurements/{name}"))
+                .map_err(|e| anyhow::anyhow!("bake corpus {name}: {e}"))?;
+            n += 1;
+        }
+        note(format!("baked {n} measurement corpus artifacts"));
+    }
+
     bake_agent()?;
 
     note("baking voxel-switch-enforcer SMF service");
@@ -292,6 +448,9 @@ pub fn build_control_plane_image() -> Result<()> {
         );
     }
 
+    let artifacts = capture("find", &["/opt/oxide", "-name", "*.tar.gz"])
+        .map(|o| o.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
     // Clearing /etc/path_to_inst is the bake's LAST exec before capture;
     // doing it here doesn't stick (later steps regenerate it for this VM).
     mark_ready(&format!(

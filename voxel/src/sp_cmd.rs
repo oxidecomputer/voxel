@@ -14,35 +14,14 @@
 //!    (`inventory`, `component-details`, `read-sensor-value`, `dump`,
 //!    `read-caboose`, `power-state`, `rot-boot-info`, ...).
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use indoc::formatdoc;
 use voxel_config::VoxelConfig;
-use voxel_config::sp::{SP_PORT_BASE, Sp, SpBackend, SpFleet, SpRole};
+use voxel_config::sp::{SP_PORT_BASE, Sp, SpFleet, SpRole};
 
 use crate::SpCmd;
 use crate::access::resolve_switch;
-use crate::net::{
-    SWITCH_ZONE_ROOT, resolve_external_ip, scp_from, scp_to, serial_bounded,
-    ssh_capture, ssh_output, zlogin,
-};
 use crate::topo::{Topo, build_topo};
-use crate::util::shell_quote;
-
-/// In-zone path we run faux-mgs from (also where we stage it on demand). The
-/// GZ-visible view is `SWITCH_ZONE_ROOT + FAUX_ZONE` (see `ensure_faux`).
-const FAUX_ZONE: &str = "/var/tmp/faux-mgs";
-/// Pre-boot cargo-bay copy (staged by `topo::stage_sp_emu` when `[sp].faux_mgs`).
-const FAUX_CARGO: &str = "/opt/cargo-bay/sp-emu/faux-mgs";
-/// Baked-into-the-image copy (install-cp.sh, the self-contained path - present
-/// even when neither `[sp].faux_mgs` nor `[sp].emu_bin` is configured at launch).
-const FAUX_BAKED: &str = "/opt/oxide/sp-emu/faux-mgs";
-/// The baked sp-emu fleet dir, in-zone and (from the sled GZ) GZ-visible. The
-/// per-SP flash files (`<port>.flash`), the shared RoT flash (`rot.flash`), and
-/// the `sp-emu` binary all live here; `voxel-init` starts one
-/// `svc:/oxide/voxel-sp-emu:sp<port>` (and `voxel-rot-emu:rot<port>`) per SP off
-/// these. `reflash` swaps a flash + restarts the matching service.
-const SP_EMU_ZONE: &str = "/opt/oxide/sp-emu";
 
 pub(crate) async fn cmd_sp(
     cfg: &VoxelConfig,
@@ -101,24 +80,6 @@ pub(crate) async fn cmd_sp(
 
 // --- operator commands (faux-mgs in the switch zone) -----------------------
 
-/// Build the rack's SP fleet (the port map) for the rack `switch` lives in, and
-/// return the scrimlet node whose switch zone we drive faux-mgs from.
-fn switch_fleet(
-    topo: &Topo,
-    switch: &str,
-) -> anyhow::Result<(SpFleet, libfalcon::NodeRef, String)> {
-    let (s, n) = resolve_switch(topo, switch)?;
-    let indices: Vec<usize> = topo
-        .sleds
-        .iter()
-        .filter(|(d, _)| d.rack == s.rack)
-        .map(|(d, _)| d.index)
-        .collect();
-    // The backend doesn't affect the port map; this is an --emu rack.
-    let fleet = SpFleet::for_gimlets(&indices, SpBackend::Emu);
-    Ok((fleet, *n, s.name.clone()))
-}
-
 /// The MGS loopback port for an SP target. Accepts (in order): a node selector
 /// (`sidecar` | `g0` | `g1` ...), a board serial (e.g. `2FAKE001`), or a raw
 /// sim address (`[::1]:33310` | `33310`).
@@ -146,56 +107,6 @@ fn sp_serial(sp: &Sp) -> String {
     sp.serial.clone()
 }
 
-/// Make sure faux-mgs is present in the switch zone; copy it from the pre-staged
-/// cargo-bay binary if not. `ip` is the scrimlet's host-LAN address (we drive the
-/// zone over ssh, since `runner.exec` + `zlogin` doesn't terminate). Errors point
-/// at `[sp].faux_mgs` when it can't be found.
-fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
-    // GZ-visible view of the in-zone faux-mgs path.
-    let faux_gz = format!("{SWITCH_ZONE_ROOT}{FAUX_ZONE}");
-    let present =
-        ssh_capture(ip, &format!("test -x {faux_gz} && echo present"))
-            .map(|o| o.contains("present"))
-            .unwrap_or(false);
-    if present {
-        return Ok(());
-    }
-    // Preferred: scp it straight from the configured host binary - the proven path,
-    // independent of in-zone 9p visibility of the cargo-bay copy.
-    if let Some(faux) = host_faux
-        && Utf8Path::new(faux).exists()
-        && scp_to(ip, faux, &faux_gz)
-        && ssh_capture(ip, &format!("chmod +x {faux_gz} && echo ok"))
-            .map(|o| o.contains("ok"))
-            .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    // Fallback: copy from a scrimlet-local binary - the baked image copy (the
-    // self-contained path) or the pre-staged cargo-bay copy (if 9p exposes it).
-    // Both live in the scrimlet GZ, so a single `cp` into the zone's /var/tmp
-    // (faux_gz) works without re-scp from the box.
-    let staged = ssh_capture(
-        ip,
-        &format!(
-            "for s in {FAUX_BAKED} {FAUX_CARGO}; do \
-               if test -x $s; then cp $s {faux_gz} && chmod +x {faux_gz} && echo staged && break; fi; \
-             done"
-        ),
-    )
-    .map(|o| o.contains("staged"))
-    .unwrap_or(false);
-    if staged {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "couldn't get faux-mgs into the switch zone. Set `[sp].faux_mgs` to the faux-mgs \
-             binary (currently {}) - `voxel sp` scps it in, or relaunch `--emu` to stage it.",
-            host_faux.unwrap_or("unset")
-        ))
-    }
-}
-
 /// Run a faux-mgs command against one SP (by port) inside the switch zone over
 /// ssh, returning its combined output. The emulator can drop the first request
 /// under load, so retry (callers pick how hard). Uses [`ssh_output`] (not
@@ -203,71 +114,73 @@ fn ensure_faux(ip: &str, host_faux: Option<&str>) -> anyhow::Result<()> {
 /// (e.g. "the image caboose does not contain 'GITC'", "code: Unconfigured") - a
 /// bad arg or an empty slot is the SP answering, not the rack being down. Only a
 /// genuine ssh transport failure (None) maps to "is the switch zone reachable".
-fn faux_on(
-    ip: &str,
+/// The rack, switch slot and SP fleet behind a `--switch` selector. The slot is
+/// the scrimlet's position among its rack's scrimlets, which is what mgs.rs
+/// numbers switch0/switch1 by and which view port the host fleet answers on.
+fn switch_target(
+    cfg: &VoxelConfig,
+    topo: &Topo,
+    switch: &str,
+) -> anyhow::Result<(SpFleet, usize, u16, String)> {
+    let (s, _) = resolve_switch(topo, switch)?;
+    let slot = topo
+        .sleds
+        .iter()
+        .filter(|(d, _)| d.scrimlet && d.rack == s.rack)
+        .position(|(d, _)| d.name == s.name)
+        .unwrap_or(0) as u16;
+    // Built the same way launch and the host fleet build it, so the operator
+    // commands cannot disagree with the SPs that are actually running.
+    Ok((crate::topo::emu_fleet(cfg, s.rack), s.rack, slot, s.name.clone()))
+}
+
+/// The faux-mgs to drive the fleet with: the copy staged beside the rack's
+/// fleet, else `[sp].faux_mgs`.
+fn faux_bin(cfg: &VoxelConfig, rack: usize) -> anyhow::Result<Utf8PathBuf> {
+    let staged = crate::topo::sp_fleet_dir(rack).join("sp-emu/faux-mgs");
+    if staged.exists() {
+        return Ok(staged);
+    }
+    match cfg.sp.faux_mgs.as_deref().map(Utf8PathBuf::from) {
+        Some(p) if p.exists() => Ok(p),
+        _ => bail!(
+            "no faux-mgs for the SP fleet: set [sp].faux_mgs to the faux-mgs \
+             binary (management-gateway-service)"
+        ),
+    }
+}
+
+/// Run a faux-mgs verb against the rack's host fleet. The fleet runs here, so
+/// this is a plain local process: no switch zone, no ssh hop, no cached
+/// scrimlet IP to go stale. faux-mgs logs to stderr and answers on stdout, so
+/// combine them the way the in-zone `2>&1` did.
+fn faux_run(
+    bin: &Utf8Path,
+    addr: &str,
     port: u16,
     args: &[&str],
     attempts: u32,
     timeout_ms: u32,
 ) -> anyhow::Result<String> {
-    let remote = zlogin(&format!(
-        "{FAUX_ZONE} --sp-sim-addr [::1]:{port} \
-         --max-attempts {attempts} --per-attempt-timeout-millis {timeout_ms} {} 2>&1",
-        args.join(" ")
-    ));
-    ssh_output(ip, &remote)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "couldn't reach faux-mgs in the switch zone (SP port {port}) - is the switch zone \
-             reachable? (`voxel status`)"
-            )
-        })
-}
-
-/// The scrimlet host-LAN IP whose switch zone we drive faux-mgs in. Cached per
-/// scrimlet so repeated `sp` calls skip the serial-console IP lookup (the console
-/// wedges under RSS/console load; ssh to the cached IP is unaffected). The first
-/// lookup runs under [`serial_bounded`]'s two-stage deadline. A stale cache
-/// (after a relaunch) is cleared on the next ssh miss by the callers.
-async fn switch_ip(
-    cfg: &VoxelConfig,
-    topo: &Topo,
-    switch: &str,
-) -> anyhow::Result<(SpFleet, String, String)> {
-    let (fleet, node, sw) = switch_fleet(topo, switch)?;
-    if let Some(ip) = read_cached_ip(&sw) {
-        return Ok((fleet, ip, sw));
+    let out = std::process::Command::new(bin.as_str())
+        .arg("--sp-sim-addr")
+        .arg(format!("[{addr}]:{port}"))
+        .arg("--max-attempts")
+        .arg(attempts.to_string())
+        .arg("--per-attempt-timeout-millis")
+        .arg(timeout_ms.to_string())
+        .args(args)
+        .output()
+        .with_context(|| format!("run {bin}"))?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    if text.trim().is_empty() {
+        bail!(
+            "faux-mgs said nothing for SP port {port} at [{addr}] - is the \
+             fleet up? (svcs -a | grep voxel-sp-emu)"
+        );
     }
-    let ip = serial_bounded(
-        &format!("resolving {sw}'s IP"),
-        resolve_external_ip(cfg, &topo.runner, &sw, node, false),
-    )
-    .await
-    .context(
-        "is the rack up? (`voxel status`). Retry once `voxel host ls` works.",
-    )?;
-    write_cached_ip(&sw, &ip);
-    Ok((fleet, ip, sw))
-}
-
-/// Per-scrimlet host-LAN IP cache (workdir-relative; voxel anchors to the project
-/// root). Lets `sp` commands reach the switch zone over ssh without re-touching
-/// the serial console after the first resolve.
-fn ip_cache(node: &str) -> Utf8PathBuf {
-    Utf8PathBuf::from(".falcon").join(format!(".sp-ip-{node}"))
-}
-fn read_cached_ip(node: &str) -> Option<String> {
-    std::fs::read_to_string(ip_cache(node))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-fn write_cached_ip(node: &str, ip: &str) {
-    let _ = std::fs::write(ip_cache(node), ip);
-}
-fn clear_cached_ip(node: &str) {
-    let _ = std::fs::remove_file(ip_cache(node));
+    Ok(text)
 }
 
 /// `sp <verb...>` against a named target: resolve switch + port, stage faux-mgs,
@@ -280,17 +193,20 @@ async fn sp_faux(
     args: &[&str],
 ) -> anyhow::Result<String> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
-    let port = resolve_port(&fleet, target)?;
-    // An ssh miss usually means a stale cached IP (rack was relaunched) - drop it
-    // so the next call re-resolves.
-    if let Err(e) = ensure_faux(&ip, cfg.sp.faux_mgs.as_deref()) {
-        clear_cached_ip(&sw);
-        return Err(e);
-    }
+    let (fleet, rack, slot, _) = switch_target(cfg, &topo, switch)?;
+    // Each SP serves switch0 on its base port and switch1 on the next one.
+    let port = resolve_port(&fleet, target)? + slot;
+    let bin = faux_bin(cfg, rack)?;
     // 30s per attempt: sprot-backed verbs (`state`, rot-*) take the emu gimlets
     // ~20s under post-init MGS load; 15s timed out on every attempt.
-    faux_on(&ip, port, args, 3, 30000).inspect_err(|_| clear_cached_ip(&sw))
+    faux_run(
+        &bin,
+        &voxel_config::config::sp_host_addr(rack),
+        port,
+        args,
+        3,
+        30000,
+    )
 }
 
 /// `voxel sp reflash <target> <image>` - re-flash a live SP (or the shared RoT)
@@ -309,54 +225,30 @@ async fn sp_reflash(
     image: &Utf8Path,
 ) -> anyhow::Result<()> {
     if !image.exists() {
-        return Err(anyhow!("image not found: {image}"));
+        return Err(anyhow!("image not found: {}", image));
     }
-    let local = image.as_str();
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
-    // The baked sp-emu fleet must be present - reflash is meaningless on a
-    // sp-sim rack (there's no flash file / voxel-sp-emu service to swap).
-    let have = ssh_capture(
-        &ip,
-        &format!("test -x {SWITCH_ZONE_ROOT}{SP_EMU_ZONE}/sp-emu && echo ok"),
-    )
-    .map(|o| o.contains("ok"))
-    .unwrap_or(false);
-    if !have {
-        clear_cached_ip(&sw);
-        return Err(anyhow!(
-            "no baked sp-emu in {sw}:{SP_EMU_ZONE} - reflash needs a running --emu / --emu-rot rack"
-        ));
-    }
+    let (fleet, rack, _, _) = switch_target(cfg, &topo, switch)?;
+    // Fails loudly when this is not a running --emu rack: there is no flash
+    // file or voxel-sp-emu instance to swap on an sp-sim one.
+    crate::sp_host::emu_bin(rack)?;
 
     if target == "rot" {
-        // rot.flash is a raw oxide-rot-1 image shared by every voxel-rot-emu
-        // instance (build-cp.sh copies `[sp].rot_image` -> rot.flash). Replace it
-        // and restart them all; the SPs reconnect to the bridge.
-        eprintln!(
-            "[voxel] reflashing shared RoT (rot.flash) on {sw} from {image}"
-        );
-        if !scp_to(
-            &ip,
-            local,
-            &format!("{SWITCH_ZONE_ROOT}{SP_EMU_ZONE}/rot.flash"),
-        ) {
-            clear_cached_ip(&sw);
-            return Err(anyhow!("scp of RoT image into {sw} failed"));
-        }
-        // grep on one word ("voxel-rot-emu") is the nested-ssh-safe way to list
-        // the instances (alternation/brackets silently fail through ssh).
-        let restart = "n=0; for f in $(svcs -H -o fmri | grep voxel-rot-emu); do svcadm restart $f && n=$((n+1)); done; echo RESTARTED $n";
-        let out =
-            ssh_output(&ip, &zlogin(&format!("{} 2>&1", shell_quote(restart))))
-                .unwrap_or_default();
-        if !out.contains("RESTARTED") {
+        // Every SP runs oxide-rot-1 in-process from the fleet's shared RoT
+        // image, so replacing it and restarting the fleet reflashes them all.
+        let rot = crate::sp_host::fleet_dir(rack).join("rot.image");
+        eprintln!("[voxel] reflashing the shared RoT ({rot}) from {image}");
+        std::fs::copy(image, &rot)
+            .with_context(|| format!("copy {image} to {rot}"))?;
+        let n = crate::sp_host::restart_rack(rack);
+        if n == 0 {
             return Err(anyhow!(
-                "RoT image placed but restart failed on {sw}: {}",
-                out.trim()
+                "RoT image placed at {rot} but no sp-emu instance restarted"
             ));
         }
-        eprintln!("[voxel] {}; verifying via rot-boot-info ...", out.trim());
+        eprintln!(
+            "[voxel] restarted {n} SP(s); verifying via rot-boot-info ..."
+        );
         match sp_faux(cfg, name, switch, "sidecar", &["rot-boot-info"]).await {
             Ok(o) => print!("{o}"),
             Err(e) => eprintln!(
@@ -366,40 +258,23 @@ async fn sp_reflash(
         return Ok(());
     }
 
-    // SP reflash: flash the hubris zip into the target port's flash, swap, restart.
+    // The SMF instance is the SP process, one per base port; the switch slot
+    // only picks which view to talk to.
     let port = resolve_port(&fleet, target)?;
-    let zip = image.file_name().ok_or_else(|| anyhow!("bad image filename"))?;
-    eprintln!(
-        "[voxel] reflashing SP {target} (port {port}) on {sw} from {image}"
-    );
-    let remote_zip_gz = format!("{SWITCH_ZONE_ROOT}/var/tmp/{zip}");
-    if !scp_to(&ip, local, &remote_zip_gz) {
-        clear_cached_ip(&sw);
-        return Err(anyhow!("scp of hubris image into {sw} failed"));
-    }
-    // Stop the SP's service, flash slot a of its per-instance state dir in-zone
-    // (identity/RoT NVM there are preserved), then bring it back up.
-    let script = format!(
-        "set -e; svcadm disable -s svc:/oxide/voxel-sp-emu:sp{port}; \
-         SP_EMU_STATE_DIR={SP_EMU_ZONE}/state/{port} {SP_EMU_ZONE}/sp-emu flash a /var/tmp/{zip}; \
-         rm -f /var/tmp/{zip}; \
-         svcadm enable svc:/oxide/voxel-sp-emu:sp{port}; echo REFLASH_OK"
-    );
-    let out =
-        ssh_output(&ip, &zlogin(&format!("{} 2>&1", shell_quote(&script))))
-            .unwrap_or_default();
-    if !out.contains("REFLASH_OK") {
-        return Err(anyhow!("SP reflash failed on {sw}: {}", out.trim()));
-    }
+    eprintln!("[voxel] reflashing SP {target} (port {port}) from {image}");
+    crate::sp_host::flash_sp(rack, port, image)?;
     // The SP re-runs its ~340M-instruction preboot (~30s) before MGS answers;
-    // sp_faux retries generously, so this waits out the boot and returns fresh state.
+    // sp_faux retries generously, so this waits out the boot and returns fresh
+    // state.
     eprintln!(
-        "[voxel] SP {target} reflashed + restarting; waiting for it to boot (~30s) ..."
+        "[voxel] SP {target} reflashed + restarting; waiting for it to boot \
+         (~30s) ..."
     );
     match sp_faux(cfg, name, switch, target, &["state"]).await {
         Ok(o) => print!("{o}"),
         Err(e) => eprintln!(
-            "[voxel] reflashed, but SP {target} not responding yet ({e}); retry `voxel sp info {target}` shortly"
+            "[voxel] reflashed, but SP {target} not responding yet ({e}); \
+             retry `voxel sp info {target}` shortly"
         ),
     }
     Ok(())
@@ -424,21 +299,17 @@ async fn sp_debug(
     off: bool,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
+    let (fleet, rack, _, _) = switch_target(cfg, &topo, switch)?;
+    // The SMF instance is the SP process, one per base port; the switch slot
+    // only picks which view to TALK to, which is not what we are toggling.
     let port = resolve_port(&fleet, target)?;
-    let fmri = format!("svc:/oxide/voxel-sp-emu:sp{port}");
-
-    // Read the current method environment so we only toggle SP_EMU_NO_DEBUG and
-    // keep everything else (board/flash/bridge/rot-service) intact.
-    let env = ssh_capture(
-        &ip,
-        &zlogin(&format!("svcprop -p start/environment {fmri}")),
-    )
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-    .ok_or_else(|| {
-        clear_cached_ip(&sw);
-        anyhow!("couldn't read {fmri} env on {sw} - is this a running --emu / --emu-rot rack?")
+    // Keep everything else in the environment (board, state dir, bridge, RoT)
+    // and toggle only SP_EMU_NO_DEBUG.
+    let env = crate::sp_host::read_env(rack, port).ok_or_else(|| {
+        anyhow!(
+            "couldn't read the SMF environment for SP port {port} - is this a \
+             running --emu rack?"
+        )
     })?;
     let mut tokens: Vec<String> = env
         .split_whitespace()
@@ -448,72 +319,33 @@ async fn sp_debug(
     if off {
         tokens.push("SP_EMU_NO_DEBUG=1".to_string());
     }
-
-    // svccfg command file: re-set the whole (toggled) env list. Each token is
-    // double-quoted so values like `[::1]:33320` survive. Shipped as a FILE to
-    // dodge nested ssh/zlogin quoting of the parens + quotes.
-    let quoted: Vec<String> =
-        tokens.iter().map(|t| format!("\"{t}\"")).collect();
-    let env = quoted.join(" ");
-    let content = formatdoc! {"
-        select {fmri}
-        setprop start/environment = astring: ({env})
-    "};
-    let local =
-        crate::util::temp_dir().join(format!("voxel-sp-env-{port}.scfg"));
-    std::fs::write(&local, &content)
-        .map_err(|e| anyhow!("write {local}: {e}"))?;
-    let remote_gz =
-        format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-env-{port}.scfg");
-    let remote = format!("/var/tmp/voxel-sp-env-{port}.scfg");
-    if !scp_to(&ip, local.as_str(), &remote_gz) {
-        clear_cached_ip(&sw);
-        return Err(anyhow!("scp of the svccfg file into {sw} failed"));
-    }
-    let apply = zlogin(&format!(
-        "'svccfg -f {remote} && svcadm refresh {fmri} && svcadm restart {fmri} && rm -f {remote} && echo APPLIED_OK'"
-    ));
-    let out = ssh_output(&ip, &format!("{apply} 2>&1")).unwrap_or_default();
-    if !out.contains("APPLIED_OK") {
-        return Err(anyhow!(
-            "failed to apply debug toggle on {sw}: {}",
-            out.trim()
-        ));
-    }
-
+    crate::sp_host::set_env(rack, port, &tokens)?;
     if off {
         eprintln!(
-            "[voxel] {target} (port {port}) debug DISABLED on {sw}; sp-emu restarting (listeners off, production mode)"
+            "[voxel] {target} (port {port}) debug DISABLED; sp-emu restarting \
+             (listeners off, production mode)"
         );
         return Ok(());
     }
-    // Per-SP ports: offset by the bridge port (sp-emu src/gdb.rs). gdb=3333+off,
-    // ocd=6666+off, off = base_port - 33300. humility's transports (verified
-    // against this humility build): `-p ocdgdb` (read-only, GDB-RSP) honors
-    // HUMILITY_OCD_PORT -> works on ANY port; `-p ocd` (read+write, OpenOCD-Tcl)
-    // has a HARDCODED port 6666 -> only reaches the SP on bridge 33300.
-    let o = port.wrapping_sub(SP_PORT_BASE);
-    let (gdb, ocd) = (3333 + o, 6666 + o);
+    // Per-SP ports, offset by the bridge port so every SP in the fleet is
+    // debuggable at once (sp-emu gdb.rs: 33300 -> 0, 33310 -> 10, ...). sp-emu
+    // exposes a Glasgow SWD probe, which stock humility speaks directly: the SP
+    // at 4444 + off and its RoT at 4544 + off.
+    let off = port.wrapping_sub(SP_PORT_BASE);
+    let (sp_swd, rot_swd) = (4444 + off, 4544 + off);
     eprintln!(
-        "[voxel] {target} (port {port}) debug ENABLED on {sw}; sp-emu restarting (listeners ready in ~30s after preboot)"
+        "[voxel] {target} (port {port}) debug ENABLED; sp-emu restarting \
+         (listeners ready in ~30s after preboot)"
+    );
+    // The fleet runs here, so the listeners are on this host's loopback and
+    // humility runs here too - no zone to tunnel into.
+    println!("humility attach (listeners on 127.0.0.1 of this host):");
+    println!(
+        "  SP   - humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{sp_swd} <cmd>"
     );
     println!(
-        "humility attach (listeners are 127.0.0.1 inside oxz_switch on {sw} - run humility there, or tunnel):"
+        "  RoT  - humility -a <rot-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{rot_swd} <cmd>"
     );
-    println!("  reads (tasks/readmem/ringbuf/readvar) - GDB-RSP :{gdb}");
-    println!("    ssh -L {gdb}:127.0.0.1:{gdb} root@{ip}");
-    println!(
-        "    HUMILITY_OCD_PORT={gdb} humility -a <archive.zip> -p ocdgdb tasks"
-    );
-    if ocd == 6666 {
-        println!("  read+write (writemem/hiffy) - OpenOCD-Tcl :{ocd}");
-        println!("    ssh -L {ocd}:127.0.0.1:{ocd} root@{ip}");
-        println!("    humility -a <archive.zip> -p ocd <cmd>");
-    } else {
-        println!(
-            "  read+write (-p ocd) needs port 6666 (hardcoded in humility) - only the sidecar (33300); this SP's ocd is :{ocd}"
-        );
-    }
     Ok(())
 }
 
@@ -536,97 +368,132 @@ async fn sp_ipcc(
     if !matches!(command, "identity" | "bsu" | "macs" | "status" | "inventory")
     {
         return Err(anyhow!(
-            "--cmd must be one of identity|bsu|macs|status|inventory (got `{command}`)"
+            "--cmd must be one of identity|bsu|macs|status|inventory (got \
+             `{command}`)"
         ));
     }
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
+    let (fleet, rack, _, _) = switch_target(cfg, &topo, switch)?;
     let port = resolve_port(&fleet, target)?;
-    // The probe is the host sp-emu binary (it carries the `ipcc` subcommand); the
-    // baked in-zone sp-emu already handles SP_EMU_HOST_UART on the SP side.
-    let emu_bin = cfg.sp.emu_bin.as_deref().ok_or_else(|| {
-        anyhow!("[sp].emu_bin not set - need the sp-emu binary (with the `ipcc` subcommand)")
-    })?;
-    if !Utf8Path::new(emu_bin).exists() {
-        return Err(anyhow!("sp-emu binary not found: {emu_bin}"));
-    }
-    if !scp_to(&ip, emu_bin, &format!("{SWITCH_ZONE_ROOT}/var/tmp/sp-emu-ipcc"))
-    {
-        clear_cached_ip(&sw);
-        return Err(anyhow!("scp of sp-emu into {sw} failed"));
+    // sp-emu carries the ipcc subcommands, and it is the same binary already
+    // running the fleet.
+    let bin = crate::sp_host::emu_bin(rack)?;
+    let state = crate::sp_host::state_dir(rack, port);
+    let sp_sock = state.join("ipcc.sock");
+    let ctl_sock = state.join("ipcc-ctl.sock");
+
+    eprintln!("[voxel] {target} (port {port}): ipcc {command}");
+    // Fast path: a broker is already up and holding the SP's UART, so repeats
+    // skip the reboot entirely.
+    let started_broker = match ipcc_req(&bin, &ctl_sock, command) {
+        IpccReply::Reply(out) => {
+            print!("{out}");
+            return Ok(());
+        }
+        IpccReply::Unsupported => {
+            return Err(anyhow!(
+                "{bin} has no ipcc broker (no ipcc-serve / ipcc-req \
+                 subcommands), so there is nothing to drive the SP's host \
+                 UART with - point [sp].emu_bin at an sp-emu built from the \
+                 host-UART line"
+            ));
+        }
+        IpccReply::NoBroker => true,
+        IpccReply::NotConnected => false,
+    };
+    if started_broker {
+        let log = std::fs::File::create(state.join("ipcc-broker.log"))
+            .with_context(|| format!("open the IPCC broker log in {state}"))?;
+        // Detached, so it outlives this command and later calls take the fast
+        // path above.
+        std::process::Command::new(bin.as_str())
+            .args(["ipcc-serve", sp_sock.as_str(), ctl_sock.as_str()])
+            .stdin(std::process::Stdio::null())
+            .stderr(log.try_clone().context("clone the broker log handle")?)
+            .stdout(log)
+            .spawn()
+            .with_context(|| {
+                format!("start the IPCC broker for port {port}")
+            })?;
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    // Orchestration shipped as a FILE (avoids nested ssh/zlogin quoting). A
-    // persistent broker (`ipcc-serve`) holds the SP's UART connection so repeats
-    // skip the reboot: FAST path just asks the broker (`ipcc-req`); on a miss we
-    // start the broker (if down) + arm the SP's UART7 socket + restart it so it
-    // connects, then poll the broker for the reply. Only PORT + CMD vary.
-    let script = format!(
-        r#"set -u
-PORT={port}
-CMD={command}
-FMRI=svc:/oxide/voxel-sp-emu:sp$PORT
-SP=/var/tmp/ipcc-$PORT.sock
-CTL=/var/tmp/ipcc-ctl-$PORT.sock
-BIN=/var/tmp/sp-emu-ipcc
-chmod +x "$BIN"
-# Fast path: broker already up + holding the SP connection.
-FIRST=$("$BIN" ipcc-req "$CTL" "$CMD" 2>/dev/null)
-rc=$?
-if [ "$rc" -eq 0 ]; then
-  printf '%s\n' "$FIRST"
-  exit 0
-fi
-# rc 3 = broker down -> start it (persistent); rc 4 = broker up, SP not connected.
-if [ "$rc" -eq 3 ]; then
-  nohup "$BIN" ipcc-serve "$SP" "$CTL" >/var/tmp/ipcc-broker-$PORT.log 2>&1 </dev/null &
-  sleep 1
-fi
-# Arm the SP's UART7 with the broker socket + restart so it connects at boot.
-cur=$(svcprop -p start/environment "$FMRI" 2>/dev/null)
-q=""
-for t in $(printf '%s\n' $cur | grep -v '^SP_EMU_HOST_UART=') "SP_EMU_HOST_UART=$SP"; do
-  q="$q \"$t\""
-done
-printf 'select %s\nsetprop start/environment = astring: (%s )\n' "$FMRI" "$q" > /var/tmp/ipcc-env-$PORT.scfg
-svccfg -f /var/tmp/ipcc-env-$PORT.scfg && svcadm refresh "$FMRI" && svcadm restart "$FMRI"
-# Wait for the SP to boot + connect, then read the reply through the broker.
-for i in $(seq 1 70); do
-  R=$("$BIN" ipcc-req "$CTL" "$CMD" 2>/dev/null) && {{ printf '%s\n' "$R"; exit 0; }}
-  sleep 1
-done
-echo "[voxel] IPCC timed out"
-exit 1
-"#
-    );
-    let local = crate::util::temp_dir().join(format!("voxel-ipcc-{port}.sh"));
-    std::fs::write(&local, &script)
-        .map_err(|e| anyhow!("write {local}: {e}"))?;
-    if !scp_to(
-        &ip,
-        local.as_str(),
-        &format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-ipcc-{port}.sh"),
-    ) {
-        clear_cached_ip(&sw);
-        return Err(anyhow!("scp of the IPCC script into {sw} failed"));
-    }
-    eprintln!("[voxel] {target} (port {port}) on {sw}: ipcc {command}");
-    let out = ssh_output(
-        &ip,
-        &zlogin(&format!("bash /var/tmp/voxel-ipcc-{port}.sh")),
-    )
-    .filter(|s| !s.trim().is_empty())
-    .ok_or_else(|| {
-        clear_cached_ip(&sw);
-        anyhow!("couldn't run the IPCC probe in {sw}")
+    // Point the SP's UART7 at the broker socket. The environment only takes
+    // effect on (re)start, and a brand new broker needs the SP to reconnect
+    // either way.
+    let env = crate::sp_host::read_env(rack, port).ok_or_else(|| {
+        anyhow!(
+            "couldn't read the SMF environment for SP port {port} - is this a \
+             running --emu rack?"
+        )
     })?;
-    print!("{out}");
-    if !out.contains("SpToHost reply") {
-        return Err(anyhow!(
-            "no decoded IPCC reply (the SP may still be booting - retry `voxel sp ipcc {target}`)"
-        ));
+    let want = format!("SP_EMU_HOST_UART={sp_sock}");
+    if env.split_whitespace().any(|t| t == want) {
+        if started_broker {
+            crate::sp_host::restart(rack, port);
+        }
+    } else {
+        let mut tokens: Vec<String> = env
+            .split_whitespace()
+            .filter(|t| !t.starts_with("SP_EMU_HOST_UART="))
+            .map(String::from)
+            .collect();
+        tokens.push(want);
+        crate::sp_host::set_env(rack, port, &tokens)?;
     }
-    Ok(())
+
+    // Wait out the SP's ~30s preboot, then read the reply through the broker.
+    for _ in 0..70 {
+        if let IpccReply::Reply(out) = ipcc_req(&bin, &ctl_sock, command) {
+            print!("{out}");
+            if !out.contains("SpToHost reply") {
+                return Err(anyhow!(
+                    "no decoded IPCC reply (the SP may still be booting - \
+                     retry `voxel sp ipcc {target}`)"
+                ));
+            }
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Err(anyhow!("IPCC timed out waiting for {target} to answer {command}"))
+}
+
+/// What one IPCC request through the broker produced.
+enum IpccReply {
+    /// A decoded SpToHost reply.
+    Reply(String),
+    /// No broker is listening (sp-emu exit 3).
+    NoBroker,
+    /// The broker is up but the SP has not connected yet (sp-emu exit 4).
+    NotConnected,
+    /// This sp-emu has no ipcc broker at all. It prints its usage and exits 0,
+    /// which would otherwise read as an empty success.
+    Unsupported,
+}
+
+/// One IPCC request through a running broker.
+fn ipcc_req(bin: &Utf8Path, ctl: &Utf8Path, command: &str) -> IpccReply {
+    let Ok(out) = std::process::Command::new(bin.as_str())
+        .args(["ipcc-req", ctl.as_str(), command])
+        .output()
+    else {
+        return IpccReply::NoBroker;
+    };
+    // sp-emu answers on stdout but prints its usage (and its identity
+    // banner) on stderr, so judge the run on both.
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        return match out.status.code() {
+            Some(4) => IpccReply::NotConnected,
+            _ => IpccReply::NoBroker,
+        };
+    }
+    if text.contains("sp-emu flash") && text.contains("usage:") {
+        return IpccReply::Unsupported;
+    }
+    IpccReply::Reply(text)
 }
 
 /// `voxel sp dump <target> [--ringbuf]` - force + decode a crash dump of one live
@@ -648,7 +515,8 @@ async fn sp_dump(
     ringbuf: bool,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
+    let (fleet, rack, _, _) = switch_target(cfg, &topo, switch)?;
+    // The SMF instance is the SP process, one per base port.
     let port = resolve_port(&fleet, target)?;
     let selector = fleet
         .sps
@@ -656,36 +524,23 @@ async fn sp_dump(
         .find(|s| s.base_port == port)
         .map(|s| s.selector())
         .unwrap_or_else(|| target.to_string());
+    // Fails loudly when this is not a running --emu rack: sp-sim has no dump
+    // directory to arm.
+    crate::sp_host::emu_bin(rack)?;
 
-    // The hubris archive for this SP (host path): humility needs it to fill flash
-    // (the dump omits flash) and its image id must match the dump's.
-    let archive = cfg.sp.image_for(&selector).ok_or_else(|| {
-        anyhow!(
-            "no hubris archive for {selector} in [sp] (set sidecar_image / gimlet_image) - \
-             is this an --emu rack?"
-        )
-    })?;
-    if !Utf8Path::new(archive).exists() {
-        return Err(anyhow!("hubris archive not found: {archive}"));
-    }
-    // humility runs on the HOST; don't bake a sibling-repo path - take it from
-    // $VOXEL_HUMILITY, else `humility` on PATH.
-    let humility = std::env::var("VOXEL_HUMILITY")
-        .unwrap_or_else(|_| "humility".to_string());
-
-    // A baked sp-emu (emu rack) is required - sp-sim has no dump dir to arm.
-    let have = ssh_capture(
-        &ip,
-        &format!("test -x {SWITCH_ZONE_ROOT}{SP_EMU_ZONE}/sp-emu && echo ok"),
-    )
-    .map(|o| o.contains("ok"))
-    .unwrap_or(false);
-    if !have {
-        clear_cached_ip(&sw);
+    // The hubris archive for this SP: humility needs it to fill flash (the dump
+    // omits it) and its image id must match the dump's. Take the archive the
+    // fleet was flashed from, so it cannot drift from what is running.
+    let board = if selector == "sidecar" { "sidecar" } else { "gimlet" };
+    let archive =
+        crate::sp_host::fleet_dir(rack).join(format!("{board}.archive"));
+    if !archive.exists() {
         return Err(anyhow!(
-            "no baked sp-emu in {sw}:{SP_EMU_ZONE} - dump needs a running --emu / --emu-rot rack"
+            "no hubris archive at {archive} - is this a running --emu rack?"
         ));
     }
+    let humility = std::env::var("VOXEL_HUMILITY")
+        .unwrap_or_else(|_| "humility".to_string());
 
     // The dump's archive id must equal the archive's image id (humility hydrate
     // rejects a mismatch), so read the SP's running archive id over MGS.
@@ -701,24 +556,17 @@ async fn sp_dump(
             )
         })?;
 
-    let fmri = format!("svc:/oxide/voxel-sp-emu:sp{port}");
-    let dump_dir = format!("/var/tmp/spdump-{port}");
+    let dump_dir = crate::sp_host::state_dir(rack, port).join("dump");
     let want_dir = format!("SP_EMU_DUMP_DIR={dump_dir}");
     let want_id = format!("SP_EMU_DUMP_ARCHIVE_ID={archive_id}");
 
-    // Arm the service with the dump dir + archive id if it isn't already. The env
-    // only takes effect on (re)start, so a first-time arm costs one ~30s preboot;
-    // an already-armed SP triggers immediately. Same svccfg-file edit as sp_debug.
-    let env = ssh_capture(
-        &ip,
-        &zlogin(&format!("svcprop -p start/environment {fmri}")),
-    )
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-    .ok_or_else(|| {
-        clear_cached_ip(&sw);
+    // Arm the instance with the dump dir + archive id if it isn't already. The
+    // environment only takes effect on (re)start, so a first-time arm costs one
+    // ~30s preboot; an already-armed SP triggers immediately.
+    let env = crate::sp_host::read_env(rack, port).ok_or_else(|| {
         anyhow!(
-            "couldn't read {fmri} env on {sw} - is this a running --emu rack?"
+            "couldn't read the SMF environment for SP port {port} - is this a \
+             running --emu rack?"
         )
     })?;
     let armed = env.split_whitespace().any(|t| t == want_dir)
@@ -732,72 +580,66 @@ async fn sp_dump(
             })
             .map(String::from)
             .collect();
-        tokens.push(want_dir.clone());
-        tokens.push(want_id.clone());
-        let quoted: Vec<String> =
-            tokens.iter().map(|t| format!("\"{t}\"")).collect();
-        let env = quoted.join(" ");
-        let content = formatdoc! {"
-            select {fmri}
-            setprop start/environment = astring: ({env})
-        "};
-        let local = crate::util::temp_dir()
-            .join(format!("voxel-sp-dumpenv-{port}.scfg"));
-        std::fs::write(&local, &content)
-            .map_err(|e| anyhow!("write {local}: {e}"))?;
-        let remote_gz =
-            format!("{SWITCH_ZONE_ROOT}/var/tmp/voxel-sp-dumpenv-{port}.scfg");
-        let remote = format!("/var/tmp/voxel-sp-dumpenv-{port}.scfg");
-        if !scp_to(&ip, local.as_str(), &remote_gz) {
-            clear_cached_ip(&sw);
-            return Err(anyhow!("scp of the svccfg file into {sw} failed"));
-        }
-        let apply = zlogin(&format!(
-            "'svccfg -f {remote} && svcadm refresh {fmri} && svcadm restart {fmri} && rm -f {remote} && echo APPLIED_OK'"
-        ));
-        let out = ssh_output(&ip, &format!("{apply} 2>&1")).unwrap_or_default();
-        if !out.contains("APPLIED_OK") {
-            return Err(anyhow!("failed to arm dump on {sw}: {}", out.trim()));
-        }
+        tokens.push(want_dir);
+        tokens.push(want_id);
+        crate::sp_host::set_env(rack, port, &tokens)?;
         eprintln!(
-            "[voxel] armed {target} (port {port}) for dumps on {sw}; sp-emu restarting, waiting for boot (~30s) ..."
+            "[voxel] armed {target} (port {port}) for dumps; sp-emu \
+             restarting, waiting for boot (~30s) ..."
         );
         // Block until the SP answers MGS again (sp_faux retries out the preboot).
         let _ = sp_faux(cfg, name, switch, target, &["state"]).await?;
     }
 
-    // Trigger the dump in-zone, wait for `.done`, and zip the artifact (dump.json +
-    // 0x*.bin at the zip root - exactly what `humility hydrate` reads).
-    eprintln!("[voxel] triggering dump of {target} on {sw} ...");
-    let trigger = format!(
-        "set -e; D={dump_dir}; mkdir -p $D; rm -f $D/.done $D/dump.zip $D/dump.json $D/0x*.bin; \
-         touch $D/.trigger; i=0; while [ ! -f $D/.done ] && [ $i -lt 40 ]; do sleep 0.5; i=$((i+1)); done; \
-         if [ ! -f $D/.done ]; then echo DUMP_TIMEOUT; exit 1; fi; \
-         cd $D && zip -q dump.zip dump.json 0x*.bin && echo DUMP_OK"
-    );
-    let out =
-        ssh_output(&ip, &zlogin(&format!("{} 2>&1", shell_quote(&trigger))))
-            .unwrap_or_default();
-    if !out.contains("DUMP_OK") {
-        return Err(anyhow!("dump trigger failed on {sw}: {}", out.trim()));
+    // The fleet runs here, so the dump lands in the SP's own state directory.
+    eprintln!("[voxel] triggering dump of {target} ...");
+    std::fs::create_dir_all(&dump_dir)
+        .with_context(|| format!("mkdir {dump_dir}"))?;
+    let done = dump_dir.join(".done");
+    let zip_local = dump_dir.join("dump.zip");
+    for stale in [&done, &zip_local, &dump_dir.join("dump.json")] {
+        let _ = std::fs::remove_file(stale);
+    }
+    if let Ok(entries) = std::fs::read_dir(&dump_dir) {
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with("0x") && n.ends_with(".bin") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    std::fs::write(dump_dir.join(".trigger"), "")
+        .with_context(|| format!("trigger a dump in {dump_dir}"))?;
+    let mut waited_ms = 0;
+    while !done.exists() {
+        if waited_ms >= 20_000 {
+            return Err(anyhow!(
+                "timed out waiting for {target} to write its dump in {dump_dir}"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        waited_ms += 500;
+    }
+    // humility hydrate reads dump.json + 0x*.bin from the zip root. Local sh, so
+    // the glob is the shell's own with no nested quoting to survive.
+    let zipped = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("cd {dump_dir} && zip -q dump.zip dump.json 0x*.bin"))
+        .status()
+        .with_context(|| format!("zip the dump in {dump_dir}"))?;
+    if !zipped.success() {
+        return Err(anyhow!(
+            "zipping the dump in {dump_dir} failed ({zipped})"
+        ));
     }
 
-    // Pull the zip to the host and decode it there (humility + archive live here).
-    let host_dir = crate::util::temp_dir().join(format!("voxel-spdump-{port}"));
-    std::fs::create_dir_all(&host_dir)
-        .map_err(|e| anyhow!("mkdir {host_dir}: {e}"))?;
-    let zip_local = host_dir.join("dump.zip");
-    let zip_remote = format!("{SWITCH_ZONE_ROOT}{dump_dir}/dump.zip");
-    if !scp_from(&ip, &zip_remote, zip_local.as_str()) {
-        return Err(anyhow!("couldn't pull the dump zip from {sw}"));
-    }
-    let hydrated = host_dir.join("hydrated.dump");
-    // humility hydrate refuses to overwrite its `-o` target, so clear a stale one
-    // from a previous dump of this SP.
+    let hydrated = dump_dir.join("hydrated.dump");
+    // humility hydrate refuses to overwrite its `-o` target, so clear a stale
+    // one from a previous dump of this SP.
     let _ = std::fs::remove_file(&hydrated);
     eprintln!("[voxel] hydrating with `{humility} -a {archive}` ...");
     let hy = std::process::Command::new(&humility)
-        .args(["-a", archive, "hydrate"])
+        .args(["-a", archive.as_str(), "hydrate"])
         .arg(&zip_local)
         .arg("-o")
         .arg(&hydrated)
@@ -811,11 +653,12 @@ async fn sp_dump(
         }
         Err(e) => {
             return Err(anyhow!(
-                "couldn't run humility (`{humility}`): {e} - put humility on PATH or set $VOXEL_HUMILITY"
+                "couldn't run humility (`{humility}`): {e} - put humility on \
+                 PATH or set $VOXEL_HUMILITY"
             ));
         }
     }
-    // The hydrated dump is self-contained (humility `-d`); no archive needed to decode.
+    // The hydrated dump is self-contained (humility `-d`); no archive needed.
     let cmd = if ringbuf { "ringbuf" } else { "tasks" };
     let dec = std::process::Command::new(&humility)
         .arg("-d")
@@ -826,7 +669,9 @@ async fn sp_dump(
     print!("{}", String::from_utf8_lossy(&dec.stdout));
     eprint!("{}", String::from_utf8_lossy(&dec.stderr));
     eprintln!(
-        "[voxel] dump saved: {hydrated} - inspect further with `{humility} -d {hydrated} <ringbuf|readvar|...>`"
+        "[voxel] dump saved: {} - inspect further with `{humility} -d {} \
+         <ringbuf|readvar|...>`",
+        hydrated, hydrated
     );
     Ok(())
 }
@@ -838,57 +683,45 @@ async fn sp_ls(
     switch: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (fleet, ip, sw) = switch_ip(cfg, &topo, switch).await?;
-    if let Err(e) = ensure_faux(&ip, cfg.sp.faux_mgs.as_deref()) {
-        clear_cached_ip(&sw);
-        return Err(e);
-    }
-    println!("SPs via {sw} (oxz_switch, [::1]):");
+    let (fleet, rack, slot, sw) = switch_target(cfg, &topo, switch)?;
+    let bin = faux_bin(cfg, rack)?;
+    let addr = voxel_config::config::sp_host_addr(rack);
+    println!("SPs via {sw} (host fleet [{addr}]):");
     println!(
         "{:<8}  {:<5}  {:<8}  {:<12}  {:<6}  ARCHIVE",
         "SP", "PORT", "TYPE", "SERIAL", "POWER"
     );
-    // Probe every SP in ONE ssh: a single zlogin runs faux-mgs for each port
-    // in-zone, back to back. Doing 5 separate ssh+zlogin calls (sequential OR
-    // parallel) is the slow/variable path - zone login serializes, so concurrency
-    // just trades steady ~1.2s for frequent multi-second spikes. A warm SP answers
-    // each probe in ~20ms, so the whole table is one round trip (~0.3s). Outputs
-    // are split back out by the `@@SP <port>` markers, in `fleet.sps` order.
-    // One ssh+zlogin, but launch a faux-mgs per SP CONCURRENTLY in the zone (each
-    // to its own temp file), then wait and emit per-port. Probing the 5 SPs
-    // sequentially summed each probe's discovery to ~1.5s under box load; running
-    // them concurrently makes the table ~one probe deep (~0.4s). We pass the
-    // script directly to zlogin (NOT via `sh -c`, whose quoting zlogin strips),
-    // single-quoted so g0 hands it over as one arg; the zone shell parses it.
-    // faux-mgs's slog INFO goes to stderr - drop it so `field()` sees clean stdout.
-    // `state` includes a sprot round trip to the RoT, which takes the emu gimlets
-    // ~20s under post-init MGS load, so each attempt needs headroom beyond that.
-    let ports: Vec<u16> = fleet.sps.iter().map(|s| s.base_port).collect();
-    let plist: String = ports.iter().map(|p| format!(" {p}")).collect();
-    let probe = format!(
-        "for p in{plist}; do {FAUX_ZONE} --sp-sim-addr [::1]:$p --max-attempts 2 \
-         --per-attempt-timeout-millis 30000 state >/var/tmp/spls.$p 2>/dev/null & done; wait; \
-         for p in{plist}; do echo \"@@SP $p\"; cat /var/tmp/spls.$p; rm -f /var/tmp/spls.$p; done"
-    );
-    let combined =
-        ssh_capture(&ip, &zlogin(&shell_quote(&probe))).unwrap_or_default();
-    let outputs: Vec<String> = {
-        let mut v = vec![String::new(); ports.len()];
-        let mut idx: Option<usize> = None;
-        for line in combined.lines() {
-            if let Some(rest) = line.strip_prefix("@@SP ") {
-                idx = rest
-                    .trim()
-                    .parse::<u16>()
-                    .ok()
-                    .and_then(|p| ports.iter().position(|&q| q == p));
-            } else if let Some(i) = idx {
-                v[i].push_str(line);
-                v[i].push('\n');
-            }
-        }
-        v
-    };
+    // The fleet runs here, so probe every SP concurrently as its own process.
+    // A warm SP answers in ~20ms, which makes the table one probe deep rather
+    // than the sum of them. `state` includes a sprot round trip to the RoT,
+    // which takes the emu gimlets ~20s under post-init MGS load, so each
+    // attempt needs headroom beyond that.
+    let kids: Vec<_> = fleet
+        .sps
+        .iter()
+        .map(|sp| {
+            std::process::Command::new(bin.as_str())
+                .arg("--sp-sim-addr")
+                .arg(format!("[{addr}]:{}", sp.base_port + slot))
+                .arg("--max-attempts")
+                .arg("2")
+                .arg("--per-attempt-timeout-millis")
+                .arg("30000")
+                .arg("state")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        })
+        .collect();
+    let outputs: Vec<String> = kids
+        .into_iter()
+        .map(|k| {
+            k.ok()
+                .and_then(|c| c.wait_with_output().ok())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        })
+        .collect();
     let mut answered = false;
     for (sp, out) in fleet.sps.iter().zip(outputs) {
         let typ = match sp.role {
@@ -896,8 +729,7 @@ async fn sp_ls(
             SpRole::Gimlet(_) => "gimlet",
         };
         // An SP that answered has a hubris archive / power even if its serial is
-        // blank (the emu gimlets carry no VPD serial yet) - key "answered" off
-        // that, not serial.
+        // blank, so key "answered" off that, not serial.
         let archive = field(&out, "hubris archive:");
         let power = field(&out, "power state:");
         let responded = !archive.is_empty() || !power.is_empty();
@@ -915,7 +747,7 @@ async fn sp_ls(
         println!(
             "{:<8}  {:<5}  {:<8}  {:<12}  {:<6}  {}",
             sp.selector(),
-            sp.base_port,
+            sp.base_port + slot,
             typ,
             serial,
             power,
@@ -923,12 +755,10 @@ async fn sp_ls(
         );
     }
     if !answered {
-        // Either a stale cached IP or the SPs are wedged - drop the cache so a
-        // retry re-resolves, and tell the operator.
-        clear_cached_ip(&sw);
         eprintln!(
-            "[voxel] no SP answered - the rack may be mid-bring-up, the SPs busy under MGS \
-             load (retry), or the cached IP was stale (now cleared; retry)."
+            "[voxel] no SP answered - the rack may be mid-bring-up, the SPs busy \
+             under MGS load (retry), or the fleet may not be running (svcs -a | \
+             grep voxel-sp-emu)."
         );
     }
     Ok(())
@@ -962,20 +792,17 @@ fn show(name: &str, val: Option<&str>) {
 
 fn ready(cfg: &VoxelConfig) {
     let sp = &cfg.sp;
-    println!("sp-emu artifacts ([sp] in voxel.toml):");
+    println!("sp-emu binaries ([sp] in voxel.toml):");
     show("emu_bin", sp.emu_bin.as_deref());
-    show("sidecar_image", sp.sidecar_image.as_deref());
-    show("gimlet_image", sp.gimlet_image.as_deref());
     show("faux_mgs", sp.faux_mgs.as_deref());
-    let ready = [&sp.emu_bin, &sp.sidecar_image, &sp.gimlet_image]
-        .iter()
-        .all(|v| v.as_deref().map(present).unwrap_or(false));
+    // Firmware is not listed: an image built with --from-tuf carries the
+    // release's own, and --sp-firmware overrides it for one launch.
     println!(
         "\n`voxel launch --emu` ready: {}",
-        if ready {
-            "yes"
+        if sp.emu_bin.as_deref().map(present).unwrap_or(false) {
+            "yes (firmware comes from the image, or --sp-firmware)"
         } else {
-            "no - set/fix the paths above (or `voxel sp build`)"
+            "no - set [sp].emu_bin to the sp-emu binary"
         }
     );
 }
@@ -989,9 +816,9 @@ fn flash(
         anyhow!("[sp].emu_bin is not set (path to the sp-emu binary)")
     })?;
     if !image.exists() {
-        return Err(anyhow!("image not found: {image}"));
+        return Err(anyhow!("image not found: {}", image));
     }
-    eprintln!("[voxel] flashing {image} -> {out}");
+    eprintln!("[voxel] flashing {} -> {}", image, out);
     let status = std::process::Command::new(emu_bin)
         .env("SP_EMU_FLASH", out)
         .args(["flash", "a"])
@@ -1001,20 +828,21 @@ fn flash(
     if !status.success() {
         return Err(anyhow!("sp-emu flash failed"));
     }
-    println!("flashed {out}");
+    println!("flashed {}", out);
     Ok(())
 }
 
 fn build(commit: &str) -> anyhow::Result<()> {
     let script = build_sp_script()?;
     eprintln!(
-        "[voxel] building sp-emu hubris images for {commit} via {script}"
+        "[voxel] building sp-emu hubris images for {commit} via {}",
+        script
     );
     let status = std::process::Command::new("bash")
         .arg(&script)
         .arg(commit)
         .status()
-        .map_err(|e| anyhow!("run {script}: {e}"))?;
+        .map_err(|e| anyhow!("run {}: {e}", script))?;
     if !status.success() {
         return Err(anyhow!("build-sp.sh failed for {commit}"));
     }

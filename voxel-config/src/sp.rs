@@ -74,24 +74,20 @@ pub enum SpRole {
 pub enum SpBackend {
     /// omicron `sp-sim` on loopback in the switch zone (today's default).
     Sim,
-    /// Real Hubris firmware on the native Rust SP emulator (`sp-emu`), running in
-    /// the switch zone on loopback exactly like `sp-sim` - so MGS reaches it at the
-    /// same `[::1]:333xx` unicast surface (the emulator's VLAN/trust/location logic
-    /// is internal to its bridge and never seen by MGS). Selectable per-SP, so a
-    /// fleet can run real firmware for the SPs under test and sim for the rest.
-    Emu,
-    /// Real Hubris firmware reached at an explicit remote `host` (SPs running on
-    /// another box). Future/out-of-zone variant; exercised only by unit tests.
-    Central { host: String },
+    /// Real Hubris firmware on the native Rust SP emulator (`sp-emu`), running on
+    /// the falcon host at `addr` rather than inside a switch zone. One fleet backs
+    /// the whole rack: every SP binds `base_port + 0/1` there, one port per switch
+    /// view, so both switch zones reach the same flash instead of a private copy.
+    Emu { addr: String },
 }
 
 impl SpBackend {
-    /// The host portion MGS connects to. In-zone backends (sim + emu) bind
-    /// loopback; a remote emulator binds an explicit `host`.
-    fn mgs_host(&self) -> &str {
+    /// The bracketed host portion MGS connects to. sp-sim binds loopback inside
+    /// the switch zone; sp-emu binds its rack's address on the falcon host.
+    fn mgs_host(&self) -> String {
         match self {
-            SpBackend::Sim | SpBackend::Emu => "[::1]",
-            SpBackend::Central { host } => host,
+            SpBackend::Sim => "[::1]".to_string(),
+            SpBackend::Emu { addr } => format!("[{addr}]"),
         }
     }
 }
@@ -228,7 +224,7 @@ impl SpFleet {
             device_id_seed: device_seed(0),
             base_port: SP_PORT_BASE,
             ereport_base: EREPORT_BASE,
-            mgs_host: backend.mgs_host().to_string(),
+            mgs_host: backend.mgs_host(),
             fake_interface: "fake-switch0".to_string(),
             ignition_target: 1,
             backend: backend.clone(),
@@ -249,7 +245,7 @@ impl SpFleet {
                 device_id_seed: device_seed(i + 1),
                 base_port: SP_PORT_BASE + PORT_STRIDE * (i as u16 + 1),
                 ereport_base: EREPORT_BASE + PORT_STRIDE * (i as u16 + 1),
-                mgs_host: backend.mgs_host().to_string(),
+                mgs_host: backend.mgs_host(),
                 fake_interface: format!("fake-sled{i}"),
                 ignition_target: ((pos + 2) % (n + 1)) as u8,
                 backend: backend.clone(),
@@ -272,29 +268,37 @@ impl SpFleet {
 
     /// A hybrid fleet for `gimlet_indices`: sp-sim by default, with the SPs named
     /// in `emu` backed by `sp-emu` instead. Selectors are `"sidecar"` / `"g{index}"`
-    /// (e.g. `["sidecar", "g0"]`); unknown selectors are ignored. Both providers run
-    /// in-zone on loopback, so the MGS port surface is unchanged.
-    pub fn sim_with_emu(gimlet_indices: &[usize], emu: &[String]) -> Self {
+    /// (e.g. `["sidecar", "g0"]`); unknown selectors are ignored. The emulated SPs
+    /// move to the host fleet at `addr`; the simulated ones stay on loopback.
+    pub fn sim_with_emu(
+        gimlet_indices: &[usize],
+        emu: &[String],
+        addr: &str,
+    ) -> Self {
         let mut fleet = Self::for_gimlets(gimlet_indices, SpBackend::Sim);
         for sp in &mut fleet.sps {
             if emu.iter().any(|sel| sp.matches_selector(sel)) {
-                sp.backend = SpBackend::Emu;
-                sp.mgs_host = SpBackend::Emu.mgs_host().to_string();
+                let backend = SpBackend::Emu { addr: addr.to_string() };
+                sp.mgs_host = backend.mgs_host();
+                sp.backend = backend;
             }
         }
         fleet
     }
 
     /// Whether any SP is emulator-backed - drives MGS's RPC timeouts (the emulator
-    /// is slow; see [`crate::mgs`]) and the in-zone sp-emu process launch.
+    /// is slow; see [`crate::mgs`]) and the host sp-emu fleet launch.
     pub fn has_emu(&self) -> bool {
-        self.sps.iter().any(|sp| sp.backend == SpBackend::Emu)
+        self.sps.iter().any(|sp| matches!(sp.backend, SpBackend::Emu { .. }))
     }
 
-    /// The emulator-backed SPs in fleet order (sidecar first) - one in-zone sp-emu
-    /// process + flash file each.
+    /// The emulator-backed SPs in fleet order (sidecar first) - one sp-emu process
+    /// + flash file each on the falcon host.
     pub fn emu_sps(&self) -> Vec<&Sp> {
-        self.sps.iter().filter(|sp| sp.backend == SpBackend::Emu).collect()
+        self.sps
+            .iter()
+            .filter(|sp| matches!(sp.backend, SpBackend::Emu { .. }))
+            .collect()
     }
 
     /// The sidecar SP (always present, first).
@@ -420,9 +424,11 @@ mod tests {
     #[test]
     fn hybrid_emu_splits_providers() {
         // sidecar + g0 on the emulator; g1..g3 stay on sp-sim.
+        let host = crate::config::sp_host_addr(0);
         let f = SpFleet::sim_with_emu(
             &[0, 1, 2, 3],
             &["sidecar".into(), "g0".into()],
+            &host,
         );
         assert!(f.has_emu());
         // emu set is sidecar + g0, in fleet order.
@@ -437,9 +443,11 @@ mod tests {
             "emu sidecar not in sp-sim"
         );
         assert_eq!(v["simulated_sps"]["gimlet"].as_array().unwrap().len(), 3);
-        // Both providers are in-zone on loopback - MGS surface is unchanged.
-        assert_eq!(f.sidecar().mgs_host, "[::1]");
-        assert_eq!(f.gimlets()[0].mgs_host, "[::1]");
+        // The emulated SPs point at the host fleet; the simulated ones stay on
+        // loopback in the switch zone.
+        assert_eq!(f.sidecar().mgs_host, format!("[{host}]"));
+        assert_eq!(f.gimlets()[0].mgs_host, format!("[{host}]"));
+        assert_eq!(f.gimlets()[1].mgs_host, "[::1]");
     }
 
     #[test]
@@ -467,10 +475,8 @@ mod tests {
         // Identities + ports are invariant across backends; only the MGS host
         // (the pluggable bit) changes.
         let sim = SpFleet::sim(4);
-        let emu = SpFleet::new(
-            4,
-            SpBackend::Central { host: "[fdb0:a840:2500:1::1]".into() },
-        );
+        let host = crate::config::sp_host_addr(0);
+        let emu = SpFleet::new(4, SpBackend::Emu { addr: host.clone() });
 
         // Same fleet shape + identities.
         assert_eq!(sim.sps.len(), 5); // sidecar + 4 gimlets
@@ -483,6 +489,6 @@ mod tests {
 
         // Only the MGS-facing host differs.
         assert_eq!(sim.sidecar().mgs_host, "[::1]");
-        assert_eq!(emu.sidecar().mgs_host, "[fdb0:a840:2500:1::1]");
+        assert_eq!(emu.sidecar().mgs_host, format!("[{host}]"));
     }
 }

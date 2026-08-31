@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 tokio.workspace = true
 libfalcon.workspace = true
+propolis-client.workspace = true
 anyhow.workspace = true
 slog.workspace = true
 futures.workspace = true
@@ -32,6 +33,9 @@ wicketd-commission-client.workspace = true
 toml = "0.9"
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
+# Unpack TUF control-plane composites (GNU tar format; illumos tar rejects it).
+tar = "0.4"
+flate2 = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 libc = "0.2"
 
