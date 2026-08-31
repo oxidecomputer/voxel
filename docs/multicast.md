@@ -1,16 +1,14 @@
 # Multicast on a voxel rack
 
-Three API objects express multicast on an Oxide rack: a multicast IP pool, a
-group, and its members. An operator creates only the pool directly. Nexus
-implicitly materializes a group when the first member joins an address the pool
-covers, and reaps it when the last member leaves. This document is a reference
-for those objects as they behave on a voxel rack, then covers the host-side
-topology management that gets externally sourced multicast traffic into the
-rack at all.
+Multicast uses three API objects on an Oxide rack: an IP pool, a group, and its
+members. An operator creates the pool. Nexus creates a group when the first
+member joins an address covered by the pool, and removes it after the last
+member leaves. This document also describes the host topology that carries
+externally sourced multicast into the rack.
 
 The traffic here originates on the **host**, not in a guest, so these runs
-exercise the external-to-underlay ingress path, from host through to switch and
-to sled for each subscribing member. Nothing described below drives the
+test the external-to-underlay ingress path, from host through switch to sled for
+each subscribing member. This document does not cover the
 guest-sourced egress path (or OPTE's sled-side next-hop selection). Exercising
 that path would take a sender from inside the rack, where, here, the members
 only answer: a probe's echo reply is unicast, so no guest originates multicast
@@ -22,7 +20,7 @@ underlay addresses for materialized groups alone, so a report is denied rather
 than encapsulated and the sled-side next-hop selection never runs. The rack
 drives forwarding from the API subscription, not from the report. Consuming it
 instead is what [RFD 488]'s dynamic group identification (IGMP snooping and
-querying) proposes, and nothing here exercises that as of yet.
+querying) proposes. This document does not cover that mode.
 
 `voxel commtest --traffic multi` performs every API step below automatically.
 The API sections document what it creates, and how to create the same objects
@@ -52,8 +50,8 @@ by hand when taking a run apart.
 
 ### Dependencies
 
-> TODO: the branches below are in flight and will collapse into their main
-> branches as they land upstream. Until then, the Omicron pin is the pushed leaf
+> TODO: These branches will return to their main branches as they land upstream.
+> Until then, the Omicron pin is the pushed leaf
 > of `zl/mcast-build`, held by the workspace `rack-init-config` dependency in
 > `Cargo.toml`; `build.rs` surfaces this bookmark to `voxel image create`,
 > so that a commitless `voxel image create` builds the pin.
@@ -62,20 +60,26 @@ The multicast stack spans multiple repositories, but voxel itself pins only two
 of them: the Omicron commit handed to `voxel image create` (`OMICRON_REPO`
 selects the clone source) and the sidecar-lite artifact rev the build fetches
 (`SIDECAR_LITE_REV`, already defaulted to the multicast rev). Everything else
-rides the chosen Omicron commit's own pins, so pointing the image at the right
-Omicron commit pulls the whole set.
+comes from the chosen Omicron commit's own pins. Selecting the correct Omicron
+commit selects the rest of the stack.
 
-| Repository | Branch / rev | PR | Carried by | Trajectory |
+| Repository | Branch / rev | PR | Carried by | Merge path |
 | --- | --- | --- | --- | --- |
 | omicron | `zl/mcast-build` leaf, [`a4183214`](https://github.com/oxidecomputer/omicron/pull/11128/commits/a41832147bb7fe1517ad8409983b1a9a03ae6691) | #11128 open, top of the PR stack below | workspace `rack-init-config` pin, via `voxel image create` | stack lands bottom-up into `main`, starting at #9912 |
 | dendrite | `multicast-e2e`, `447aa04f` | #224 open | Omicron `tools/dendrite_*` pins | #224 to `main` |
 | maghemite | `zl/ddm-mcast`, `36e43651` | #696 open, stacked on `zl/mrib`; related #402 (`zl/mgd-ddm-meta`) | Omicron `tools/maghemite_*` pins | #696 to `main` after `zl/mrib` |
 | opte | `master`, `0525f2f95` (0.41.506) | #1012 merged 2026-07-25; #1049 (`zl/mcast-source-validation`, `3e2615e5`) open | Omicron `Cargo.toml` / `tools/opte_version` | landed; Omicron pins 0.41.506 intentionally (master's later #1040 is a comment-only xde change). #1049 aligns source-address validation with dpd, nexus and mgd, and is not pinned yet |
-| propolis | `zl/multicast`, `3c07d60a` | [#1093] open | Omicron `package-manifest.toml` (guest propolis-server) | [#1093] to `master`; host side also needs the viona V7 tables below |
+| propolis (rack image) | `zl/multicast`, `3c07d60a` | [#1093] open | Omicron `package-manifest.toml` (guest propolis-server) | [#1093] to `master` |
 | thundermuffin | `zl/multicast-joiner`, `486559bc` | #14 open | Omicron `package-manifest.toml` (probe zone, prebuilt) | #14 to `main` |
 | sidecar-lite | `zl/multicast`, `461cbe19` | #152 open | `voxel image create` (`SIDECAR_LITE_REV`) | #152 to `main` |
 | softnpu | `zl/multicast`, `284c6830` | #183 open | Omicron `tools/softnpu_version` (xtask `SOFTNPU_COMMIT`) | #183 to `main` |
 | p4 | `zl/multicast` (`p4rs`) | #240 open | transitive, via softnpu and sidecar-lite lockfiles | #240 to `main`, then #183/#152 repoint |
+
+The propolis row above describes only the server shipped inside the rack image.
+The host-side propolis falcon runs is a separate integration checkout, the local
+`mcast-smbios-test` branch (`8e283bee`), selected by `[falcon].propolis_binary`
+rather than by the Omicron package manifest. What it carries and how to build it
+are covered with the host-side pieces below.
 
 The omicron work is a stack of PRs, each based on the branch below it. Voxel
 pins the leaf, so one commit carries the whole chain:
@@ -99,19 +103,20 @@ frame toward the rack. Probe-based commtest requires both.
 
 Two pieces sit outside the image, on the host itself:
 
-- The **host propolis** needs propolis `zl/multicast`'s viona MAC-filter
-  wiring (PR [#1093] above), or the sled VMs receive no multicast at all.
+- The **host propolis** needs the `mcast-smbios-test` integration branch listed
+  above. It combines propolis `zl/multicast`'s viona MAC-filter wiring (PR
+  [#1093]), the SMBIOS type 1 fix from [#1200], and the softnpu management-UART
+  deadlock fix from [#1206]. Without the MAC-filter wiring, the sled VMs
+  receive no multicast at all.
+
   This is the falcon VM boundary, not the rack's guest instances: each sled
   is itself a propolis VM whose illumos `vioif` negotiates
   `VIRTIO_NET_F_CTRL_RX` but never programs a multicast table, so viona
   narrows the link to no-multicast at feature negotiation and drops every
-  group frame. It also needs the SMBIOS type 1 fix from [#1200], which is
-  not multicast-specific. Without it falcon's a4x2 identity never reaches
-  the sled VM and RSS fails trust quorum validation on any voxel rack. The
-  `mcast-smbios-test` branch (`8e283bee`) merges those two along with the
-  softnpu management-uart deadlock fix from [#1206]. That branch is the local
-  integration point and is never itself PR'd, so each fix is proposed
-  upstream from its own branch off `master`.
+  group frame. The SMBIOS fix is not multicast-specific: without it falcon's
+  a4x2 identity never reaches the sled VM and RSS fails trust quorum validation
+  on any voxel rack. The integration branch is local and is never itself PR'd,
+  so each fix is proposed upstream from its own branch off `master`.
 
   Build it with the `falcon` feature:
 
@@ -379,8 +384,8 @@ A probe is the lightest member primitive: it needs no guest, its create
 request pins it to a named sled, and it auto-replies to an echo request sent
 to a group it has joined, so that a plain `ping` observes delivery. This is why
 `commtest` uses probes, and why they are the easiest member to exercise
-manually. *Note* that memberships are fixed at creation. To change them, recreate
-the probe.
+manually. *Note* that memberships are fixed at creation. To change them,
+recreate the probe.
 
 ```sh
 sleds=$(oxide api /v1/system/hardware/sleds | jq -r '.items[].id')
@@ -496,8 +501,8 @@ routers.
 `voxel launch`, not before: it resolves `ce`'s address and reaches `cr1` over
 SSH, both of which need running nodes. **Run it again after every launch**. The
 mirror filter and the link-layer membership are runtime state inside the `cr1`
-VM and go away when it does, so only the host routes carry across, which is what 
-the ownership record described below exists to track. The command is idempotent, 
+VM and go away when it does, so only the host routes carry across, which is what
+the ownership record described below exists to track. The command is idempotent,
 so re-running it over the same groups costs nothing.
 
 ### Host routes
@@ -528,17 +533,17 @@ for group in 239.100.0.1 239.100.0.2 232.100.0.1; do
 done
 ```
 
-The route table belongs to the Helios host rather than to any one, specific 
+The route table belongs to the Helios host rather than to any one, specific
 Falcon environment, so voxel records each group's gateway in
 `.falcon/multicast-<hex environment name>.json` and treats that record, not the
 gateway address, as proof of ownership. `up` writes the record before adding
 the route. An interrupted run then leaves a record with no route, which the
 next `up` overwrites and a groupless `down` reads as nothing to remove. A
 reverse ordering would leave a route that nothing afterwards could prove was
-voxel's to begin with. Both commands stop rather than guess when a group's 
-route is not in the record: `up` refuses the group instead of displacing the 
-route, and `down` leaves it alone and names it. Deleting the record while its 
-routes exist, therefore, locks voxel out of those groups until they are removed 
+voxel's to begin with. Both commands stop rather than guess when a group's
+route is not in the record: `up` refuses the group instead of displacing the
+route, and `down` leaves it alone and names it. Deleting the record while its
+routes exist, therefore, locks voxel out of those groups until they are removed
 by hand with `pfexec route delete -host <group> <gateway>`.
 
 Two isolated-mode environments sharing an `[external]` subnet are the one case
@@ -842,8 +847,9 @@ state it would normally learn from PIM or IGMP. Two static substitutes:
 
 What voxel does not model is the dynamic case: a customer network where PIM
 and IGMP are running end to end, with the upstream building its distribution
-tree from receiver membership. That is the direction [RFD 488]'s IGMP host-proxying
-(future work) targets, and nothing here exercises or validates that signaling.
+tree from receiver membership. That is the direction [RFD 488]'s IGMP
+host-proxying (future work) targets, and nothing here exercises or validates
+that signaling.
 
 > TODO: when [RFD 488]'s host-proxying lands, exercising it here means
 > replacing the static scaffolding for that mode. The emulated upstream would
@@ -866,9 +872,9 @@ tree from receiver membership. That is the direction [RFD 488]'s IGMP host-proxy
 | `up` reports a host route "is not recorded for Falcon environment" | The route predates this environment's `.falcon/` record, either from another environment or from a record that was deleted while its routes remained. Voxel will not displace it. Remove it with `pfexec route delete -host <group> <gateway>` if it is stale. |
 | Every per-group artifact checks out and delivery still fails | The sled dataplane. Run opte's [`opte-mcast-delivery.d`] in a sled's global zone, where `xde` is loaded. `NOFWD` names a missing forwarding entry, `FILTERED` a source-filter drop, and the delivery matrix reports which ports took a copy. The script is not in the sled image, so copy it from an opte checkout. |
 
-*TODO*: IPv6 multicast is not wired up in `commtest` yet, and the isolated external
-segment voxel creates is v4-only. The API objects are not the gap: a `v6`
-multicast pool and its groups work like their v4 counterparts. `lan` mode
+*TODO*: IPv6 multicast is not wired up in `commtest` yet, and the isolated
+external segment voxel creates is v4-only. The API objects are not the gap: a
+`v6` multicast pool and its groups work like their v4 counterparts. `lan` mode
 also inherits whatever v6 the LAN carries, so what is missing is voxel's
 wiring, not the rack or the topology. Until then, v6 groups are out of reach
 from this host-sourced path.
