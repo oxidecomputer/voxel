@@ -46,6 +46,16 @@ fn prepare_probe_mounts(
     Ok(())
 }
 
+async fn reserve_initial_reconciliation(
+    admission: &Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    admission
+        .clone()
+        .acquire_owned()
+        .await
+        .context("reserve initial TUI reconciliation")
+}
+
 pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
     let resumed_claim = session::claim_from_environment()?;
 
@@ -85,6 +95,11 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
     let (effects_tx, effects_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    // Reserve admission before telemetry can contend for it. If collection
+    // wins startup, a timed-out Falcon serial probe can leave a tracked task
+    // that initial reconciliation then waits on indefinitely while holding
+    // this gate, preventing telemetry from ever publishing another sample.
+    let initial_permit = reserve_initial_reconciliation(&admission).await?;
 
     let terminal_writer = OpenOptions::new()
         .read(true)
@@ -132,9 +147,7 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
     let initial_events = events_tx.clone();
     let initial_shutdown = shutdown.clone();
     let initial_executor = executor_drain.clone();
-    let initial_gate = admission.clone();
     let mut initial = tokio::spawn(async move {
-        let _permit = initial_gate.acquire_owned().await;
         initial_executor.drain_serial_tasks().await;
         let at = std::time::Instant::now();
         let _ =
@@ -166,7 +179,7 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
                     .await;
             }
         }
-        drop(_permit);
+        drop(initial_permit);
         initial_shutdown.cancelled().await;
     });
     drop(events_tx);
@@ -311,7 +324,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use camino::Utf8PathBuf;
+    use tokio::sync::TryAcquireError;
     use voxel_config::VoxelConfig;
+
+    #[tokio::test]
+    async fn initial_reconciliation_reserves_admission_before_collection() {
+        let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        let initial =
+            super::reserve_initial_reconciliation(&admission).await.unwrap();
+
+        assert!(matches!(
+            admission.clone().try_acquire_owned(),
+            Err(TryAcquireError::NoPermits)
+        ));
+        drop(initial);
+        assert!(admission.try_acquire_owned().is_ok());
+    }
 
     #[test]
     fn probe_mount_preparation_creates_only_empty_node_directories() {
