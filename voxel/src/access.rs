@@ -17,6 +17,18 @@ pub(crate) async fn cmd_host_exec(
     command: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
+    // Routers: the frr-proto image has no sshd, so exec over the falcon
+    // serial console instead (do not interrupt mid-flight: a cancelled
+    // exec wedges the console).
+    if let Some((_, n)) = topo.routers.iter().find(|(r, _)| r == sled) {
+        let out = topo
+            .runner
+            .exec(*n, command)
+            .await
+            .map_err(|e| anyhow::anyhow!("serial exec on {sled}: {e}"))?;
+        println!("{out}");
+        return Ok(());
+    }
     let (_, n) = topo
         .sleds
         .iter()
