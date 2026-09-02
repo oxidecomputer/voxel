@@ -228,11 +228,11 @@ pub struct Falcon {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpCfg {
-    /// Path to the sp-emu binary (illumos) that runs the fleet on the falcon
-    /// host. Required for --emu.
+    /// sp-emu binary override for the fleet on the falcon host. Unset, launch
+    /// fetches voxel's pinned buildomat build into ~/.cache/voxel.
     pub emu_bin: Option<String>,
-    /// Path to the faux-mgs binary. Optional; the operator `sp` commands need
-    /// it, launch itself does not.
+    /// faux-mgs binary override; fetched pinned like sp-emu when unset. The
+    /// operator `sp` commands need it, launch itself does not.
     pub faux_mgs: Option<String>,
 }
 
