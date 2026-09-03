@@ -18,7 +18,11 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
 # tokio features (they're additive), so we don't need "full".
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+crossterm = "0.28"
+base64 = "0.22"
 libfalcon = { git = "https://github.com/oxidecomputer/falcon", branch = "main" }
 # Must be the rev libfalcon pins, so instance-spec component types unify.
 propolis-client = { git = "https://github.com/oxidecomputer/propolis", rev = "36f20be9bb4c3b362029237f5feb6377c982395f" }
@@ -29,6 +33,7 @@ serde = "1"
 camino = { version = "1.2.2", features = ["serde1"] }
 indoc = "2.0.7"
 toml_edit = "0.25"
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "rustls"] }
 
 # sprockets/trust quorum related deps
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d" }
