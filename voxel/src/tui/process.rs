@@ -223,13 +223,12 @@ fn emit_line(
     errors: &mut Vec<DrainFailure>,
 ) {
     let text = String::from_utf8_lossy(bytes).into_owned();
-    if let Err(error) = durable.write_line(&text) {
-        if !errors
+    if let Err(error) = durable.write_line(&text)
+        && !errors
             .iter()
             .any(|failure| matches!(failure, DrainFailure::DurableLog(_)))
-        {
-            errors.push(DrainFailure::DurableLog(error.to_string()));
-        }
+    {
+        errors.push(DrainFailure::DurableLog(error.to_string()));
     }
     if stream == OutputStream::Stderr {
         if stderr.len() == STDERR_SUMMARY_LINES {

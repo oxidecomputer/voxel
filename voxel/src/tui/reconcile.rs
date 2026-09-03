@@ -221,14 +221,13 @@ pub(crate) fn reduce(
         })
     {
         ObservedDeploymentState::Starting
-    } else if node_uncertain {
-        ObservedDeploymentState::Unknown
-    } else if evidence.intent == LifecycleIntent::Idle
-        && (rss_uncertain
-            || matches!(
-                evidence.routes,
-                RouteEvidence::Unavailable | RouteEvidence::Unknown
-            ))
+    } else if node_uncertain
+        || (evidence.intent == LifecycleIntent::Idle
+            && (rss_uncertain
+                || matches!(
+                    evidence.routes,
+                    RouteEvidence::Unavailable | RouteEvidence::Unknown
+                )))
     {
         ObservedDeploymentState::Unknown
     } else if running == evidence.topology.node_ids.len()

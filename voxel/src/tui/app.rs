@@ -933,14 +933,14 @@ impl App {
                 self.logs_filter = self.logs_filter.next();
                 self.logs.scroll = 0;
             }
-            Action::Scroll { delta, page: false } => {
-                if !self.try_move_focused_content(delta) && delta != 0 {
-                    self.move_item(if delta > 0 {
-                        Direction::Next
-                    } else {
-                        Direction::Previous
-                    });
-                }
+            Action::Scroll { delta, page: false }
+                if !self.try_move_focused_content(delta) && delta != 0 =>
+            {
+                self.move_item(if delta > 0 {
+                    Direction::Next
+                } else {
+                    Direction::Previous
+                });
             }
             Action::Scroll { delta, page: true } => match self.session.view {
                 View::Deployment
@@ -1511,10 +1511,10 @@ impl App {
                 self.logs_filter,
             ),
             OperationEvent::Warning(warning) => {
-                if let Some(active) = self.matching_active_mut(request_id) {
-                    if !active.warnings.contains(&warning) {
-                        active.warnings.push(warning);
-                    }
+                if let Some(active) = self.matching_active_mut(request_id)
+                    && !active.warnings.contains(&warning)
+                {
+                    active.warnings.push(warning);
                 }
             }
             OperationEvent::Finished(outcome) => {

@@ -35,6 +35,7 @@ impl TuiContext {
         &self.executable
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config_path: Utf8PathBuf,
         workdir: Utf8PathBuf,

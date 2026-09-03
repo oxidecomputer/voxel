@@ -656,7 +656,7 @@ mod tests {
             let scene = layout_scene(
                 Rect::new(0, 0, 40, 15),
                 LayoutMode::Wide,
-                &[selected.clone()],
+                std::slice::from_ref(&selected),
                 Some(&selected.id),
                 0,
             );

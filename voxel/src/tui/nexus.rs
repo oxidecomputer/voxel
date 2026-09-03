@@ -164,6 +164,7 @@ impl OxqlTimeseries {
             .collect())
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn numeric_points(
         &self,
     ) -> anyhow::Result<Vec<(Option<DateTime<Utc>>, DateTime<Utc>, Option<f64>)>>

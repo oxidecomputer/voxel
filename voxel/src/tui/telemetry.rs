@@ -289,19 +289,18 @@ pub struct ResourceTelemetry {
 impl ResourceTelemetry {
     pub fn update(&mut self, snapshot: CounterSnapshot) {
         self.link_rates.clear();
-        if let Some(previous) = &self.baseline {
-            if let Some(elapsed) = snapshot
+        if let Some(previous) = &self.baseline
+            && let Some(elapsed) = snapshot
                 .captured_at
                 .checked_duration_since(previous.captured_at)
-            {
-                for (name, current) in &snapshot.links {
-                    if let Some(rate) = previous
-                        .links
-                        .get(name)
-                        .and_then(|old| current.rate_from(*old, elapsed))
-                    {
-                        self.link_rates.insert(name.clone(), rate);
-                    }
+        {
+            for (name, current) in &snapshot.links {
+                if let Some(rate) = previous
+                    .links
+                    .get(name)
+                    .and_then(|old| current.rate_from(*old, elapsed))
+                {
+                    self.link_rates.insert(name.clone(), rate);
                 }
             }
         }
@@ -626,12 +625,11 @@ fn short_zone_name(name: &str) -> String {
         return name.into();
     }
     let stripped = name.strip_prefix("oxz_").unwrap_or(name);
-    if let Some((prefix, suffix)) = stripped.rsplit_once('_') {
-        if suffix.len() > 8
-            && suffix.chars().take(8).all(|c| c.is_ascii_hexdigit())
-        {
-            return prefix.into();
-        }
+    if let Some((prefix, suffix)) = stripped.rsplit_once('_')
+        && suffix.len() > 8
+        && suffix.chars().take(8).all(|c| c.is_ascii_hexdigit())
+    {
+        return prefix.into();
     }
     stripped.into()
 }

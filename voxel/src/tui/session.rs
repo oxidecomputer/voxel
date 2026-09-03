@@ -188,19 +188,19 @@ impl Store {
 }
 
 fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if path == Path::new(SYSTEM_DIRECTORY) {
-            let mut parent_builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                parent_builder.mode(0o700);
-            }
-            match parent_builder.create(parent) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
+    if let Some(parent) = path.parent()
+        && path == Path::new(SYSTEM_DIRECTORY)
+    {
+        let mut parent_builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            parent_builder.mode(0o700);
+        }
+        match parent_builder.create(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
         }
     }
     let mut builder = fs::DirBuilder::new();
