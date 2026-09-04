@@ -79,6 +79,10 @@ fn launch_phase(line: &str) -> Option<LaunchPhase> {
 fn destroy_phase(line: &str) -> Option<DestroyPhase> {
     if line.contains("orphaned propolis") {
         Some(DestroyPhase::OrphanCleanup)
+    } else if line.contains("destroying deployment") {
+        Some(DestroyPhase::FalconTeardown)
+    } else if line.contains("destroying images") {
+        Some(DestroyPhase::StorageCleanup)
     } else {
         None
     }
@@ -92,7 +96,7 @@ fn route_phase(line: &str) -> Option<RoutePhase> {
 mod tests {
     use super::*;
     use crate::tui::operation::{
-        LaunchPhase, OperationKind, OperationPhase, OutputStream,
+        DestroyPhase, LaunchPhase, OperationKind, OperationPhase, OutputStream,
     };
 
     #[test]
@@ -163,6 +167,24 @@ mod tests {
                     line,
                 ),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn falcon_destroy_output_advances_teardown_and_storage() {
+        let mut classifier = PhaseClassifier::default();
+        for (line, phase) in [
+            ("destroying deployment voxel", DestroyPhase::FalconTeardown),
+            ("destroying images", DestroyPhase::StorageCleanup),
+        ] {
+            assert_eq!(
+                classifier.classify(
+                    OperationKind::Destroy,
+                    OutputStream::Stdout,
+                    line,
+                ),
+                Some(PhaseHint::Started(OperationPhase::Destroy(phase)))
             );
         }
     }
