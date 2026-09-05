@@ -135,19 +135,13 @@ fn switch_target(
 }
 
 /// The faux-mgs to drive the fleet with: the copy staged beside the rack's
-/// fleet, else `[sp].faux_mgs`.
+/// fleet, else `[sp].faux_mgs`, else the pinned buildomat build.
 fn faux_bin(cfg: &VoxelConfig, rack: usize) -> anyhow::Result<Utf8PathBuf> {
     let staged = crate::topo::sp_fleet_dir(rack).join("sp-emu/faux-mgs");
     if staged.exists() {
         return Ok(staged);
     }
-    match cfg.sp.faux_mgs.as_deref().map(Utf8PathBuf::from) {
-        Some(p) if p.exists() => Ok(p),
-        _ => bail!(
-            "no faux-mgs for the SP fleet: set [sp].faux_mgs to the faux-mgs \
-             binary (management-gateway-service)"
-        ),
-    }
+    crate::sp_host::ensure_faux_mgs(cfg)
 }
 
 /// Run a faux-mgs verb against the rack's host fleet. The fleet runs here, so
@@ -791,35 +785,27 @@ fn field(out: &str, label: &str) -> String {
 
 // --- artifact commands (was `Ls`, now `Ready`; flash/build unchanged) -------
 
-fn present(p: &str) -> bool {
-    Utf8Path::new(p).exists()
-}
-
-fn show(name: &str, val: Option<&str>) {
-    match val {
-        Some(p) => {
-            println!(
-                "  {name:<14} {p}  [{}]",
-                if present(p) { "present" } else { "MISSING" }
-            )
-        }
-        None => println!("  {name:<14} (unset)"),
-    }
-}
-
 fn ready(cfg: &VoxelConfig) {
-    let sp = &cfg.sp;
-    println!("sp-emu binaries ([sp] in voxel.toml):");
-    show("emu_bin", sp.emu_bin.as_deref());
-    show("faux_mgs", sp.faux_mgs.as_deref());
+    println!(
+        "sp-emu binaries ([sp] overrides, else PATH, else pinned buildomat \
+         builds):"
+    );
+    let emu = crate::sp_host::ensure_emu_bin(cfg);
+    let faux = crate::sp_host::ensure_faux_mgs(cfg);
+    for (name, r) in [("emu_bin", &emu), ("faux_mgs", &faux)] {
+        match r {
+            Ok(p) => println!("  {name:<14} {p}"),
+            Err(e) => println!("  {name:<14} unavailable ({e:#})"),
+        }
+    }
     // Firmware is not listed: an image built with --from-tuf carries the
     // release's own, and --sp-firmware overrides it for one launch.
     println!(
         "\n`voxel launch --emu` ready: {}",
-        if sp.emu_bin.as_deref().map(present).unwrap_or(false) {
+        if emu.is_ok() {
             "yes (firmware comes from the image, or --sp-firmware)"
         } else {
-            "no - set [sp].emu_bin to the sp-emu binary"
+            "no - see above; set [sp].emu_bin or put sp-emu on PATH"
         }
     );
 }
@@ -829,14 +815,12 @@ fn flash(
     image: &Utf8Path,
     out: &Utf8Path,
 ) -> anyhow::Result<()> {
-    let emu_bin = cfg.sp.emu_bin.as_deref().ok_or_else(|| {
-        anyhow!("[sp].emu_bin is not set (path to the sp-emu binary)")
-    })?;
+    let emu_bin = crate::sp_host::ensure_emu_bin(cfg)?;
     if !image.exists() {
         return Err(anyhow!("image not found: {}", image));
     }
     eprintln!("[voxel] flashing {} -> {}", image, out);
-    let status = std::process::Command::new(emu_bin)
+    let status = std::process::Command::new(&emu_bin)
         .env("SP_EMU_FLASH", out)
         .args(["flash", "a"])
         .arg(image)

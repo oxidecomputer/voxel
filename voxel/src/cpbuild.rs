@@ -754,7 +754,7 @@ fn stage_gz_from_phase2(
 
 const OMICRON_RAW_URL: &str =
     "https://raw.githubusercontent.com/oxidecomputer/omicron";
-const BUILDOMAT_URL: &str =
+pub(crate) const BUILDOMAT_URL: &str =
     "https://buildomat.eng.oxide.computer/public/file/oxidecomputer";
 
 fn raw_cache(voxel_image: &Utf8Path, sha: &str) -> Utf8PathBuf {
