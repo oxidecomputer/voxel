@@ -63,7 +63,6 @@ One block per switch. Defaults: `switch0`/`uplink0` and `switch1`/`uplink1`.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `switch` | string | required | `switch0`, `switch1`, ... |
-| `port` | string | `"qsfp0"` | Front port. |
 | `peer_asn` | int | `65000` | Local BGP ASN for the session. |
 | `router_lifetime` | int | `300` | Router advertisement lifetime, seconds. |
 | `port_speed` | string | `"40G"` | Link speed. |
@@ -79,7 +78,7 @@ rack's RSS config. See the README's "Isolated external network" section.
 | `mode` | enum | `"lan"` | `lan` attaches node external NICs to the host's default-route link (or `$EXT_INTERFACE`). `isolated` builds the segment on a host etherstub with NAT out `uplink`. |
 | `uplink` | string | unset | Physical link the isolated segment NATs out of (e.g. `igb0`). Required in isolated mode. |
 | `subnet` | string | `"172.30.199.0/24"` | The isolated segment's subnet, chosen to avoid common home/office LANs. `up` refuses if it overlaps a host address. |
-| `host_ip` | string | `"172.30.199.199"` | Host address on the segment: the nodes' default gateway and NAT inside address. Image builds also use `host_ip - 1` for the builder VM. |
+| `host_ip` | string | `"172.30.199.199"` | Host address on the segment: the nodes' default gateway and NAT inside address. Image builds also use `ip_start - 1` for the builder VM. |
 | `ip_start` | string | `"172.30.199.10"` | First static node address. Nodes number contiguously, sleds then `topology.routers`. |
 | `dns` | list | `["1.1.1.1", "9.9.9.9"]` | Nameservers handed to the nodes. |
 | `mtu` | int | `1500` | Etherstub MTU. Must stay below 9000 so voxel-init's jumbo probe classifies external NICs correctly. |

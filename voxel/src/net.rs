@@ -5,7 +5,7 @@
 //! Host-LAN networking: discover a node's external IPv4 and (re)point the host
 //! route at the rack's external network.
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
 use std::future::Future;
@@ -21,6 +21,10 @@ pub(crate) const SWITCH_ZONE_ROOT: &str = "/zone/oxz_switch/root";
 /// Absolute path to `route`. Not all invoking shells carry /usr/sbin on PATH
 /// (commtest re-executes voxel under a fresh login), so spawn it absolutely.
 pub(crate) const ROUTE: &str = "/usr/sbin/route";
+
+/// Absolute path to `ipadm`, for the same reason as [`ROUTE`]: a login shell
+/// spawned by commtest does not necessarily carry /usr/sbin.
+pub(crate) const IPADM: &str = "/usr/sbin/ipadm";
 
 /// The `zlogin` invocation prefix for the switch zone. Use [`zlogin`] to build a
 /// full command; this bare form is for the interactive login (no command).
@@ -60,7 +64,7 @@ pub(crate) const SERIAL_RESOLVE_HARD_TIMEOUT: Duration =
 ///
 /// # Errors
 ///
-/// Fails when the exec itself fails, or with a timeout error past the hard
+/// This fails when the exec itself fails, or with a timeout error past the hard
 /// deadline.
 pub(crate) async fn serial_bounded<T>(
     what: &str,
@@ -192,6 +196,69 @@ pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
     static_external_ip(cfg, "ce")
 }
 
+/// The host's default-route interface via `route -n get default`.
+///
+/// Returns `None` when there is no default route (falcon reports that on its
+/// own).
+pub(crate) fn default_route_iface() -> Option<String> {
+    crate::isolated_external::probe_out(ROUTE, &["-n", "get", "default"])?
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("interface:"))
+        .map(|s| s.trim().to_string())
+}
+
+/// The host's own address on the external segment. This is the source
+/// address on multicast sent from the host toward the rack.
+///
+/// Only isolated mode can answer this from config because voxel builds that
+/// segment and puts `[external] host_ip` on its own VNIC. In `lan` mode,
+/// `host_ip` names the LAN's existing gateway.
+///
+/// # Errors
+///
+/// This fails when:
+/// - the link cannot be identified
+/// - the link holds no IPv4 address.
+pub(crate) fn host_external_ip(
+    cfg: &voxel_config::VoxelConfig,
+) -> anyhow::Result<String> {
+    if cfg.external.isolated() && cfg.external.host_ip_is_usable() {
+        return Ok(cfg.external.host_ip.clone());
+    }
+    let link = std::env::var("EXT_INTERFACE")
+        .ok()
+        .or_else(|| cfg.external.link.clone())
+        .or_else(default_route_iface)
+        .context(
+            "cannot tell which interface the host sends from: set \
+             [external] link or EXT_INTERFACE",
+        )?;
+
+    let out = std::process::Command::new(IPADM)
+        .args(["show-addr", "-p", "-o", "addrobj,addr"])
+        .output()
+        .with_context(|| format!("read addresses on {link}"))?;
+
+    // Parseable output is `addrobj:addr`, and `show-addr` takes an addrobj
+    // rather than an interface. A v6 row escapes its colons and never parses as
+    // v4.
+    let prefix = format!("{link}/");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(addrobj, _)| addrobj.starts_with(&prefix))
+        .filter_map(|(_, addr)| {
+            addr.split('/').next()?.parse::<std::net::Ipv4Addr>().ok()
+        })
+        .find(|addr| {
+            !addr.is_loopback()
+                && !addr.is_link_local()
+                && !addr.is_unspecified()
+        })
+        .map(|addr| addr.to_string())
+        .with_context(|| format!("no IPv4 address on {link}"))
+}
+
 /// A node's external (host-LAN) IPv4 - the address `voxel route` points at and
 /// `voxel host`/`tp` SSH (in)to.
 ///
@@ -289,13 +356,46 @@ pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// How a remote connection command fails.
+///
+/// Either this is the ssh transport never reaching the node, or the node
+/// running the command and it exiting with a non-zero response.
+#[derive(Debug)]
+pub(crate) enum SshFailure {
+    /// ssh could not connect or authenticate (exit 255), so the node itself
+    /// is unreachable.
+    Unreachable,
+    /// The command ran remotely and failed, or ssh could not be run locally;
+    /// keeps around the failure text.
+    Failed(String),
+}
+
+/// This is similar to [`ssh_capture`], but it keeps the failure mode intact.
+pub(crate) fn ssh_try_capture(
+    ip: &str,
+    remote: &str,
+) -> Result<String, SshFailure> {
+    let Some(out) = ssh_exec(ip, remote) else {
+        return Err(SshFailure::Failed("ssh could not be run locally".into()));
+    };
+    if out.status.code() == Some(255) {
+        return Err(SshFailure::Unreachable);
+    }
+    if !out.status.success() {
+        return Err(SshFailure::Failed(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Like [`ssh_capture`], but returns the remote command's combined output even
-/// when it exits non-zero - for callers (e.g. `sp exec`) that want the remote
+/// when it exits non-zero — for callers (e.g. `sp exec`) that want the remote
 /// tool's OWN error text (faux-mgs prints `Error: ...`, which the caller folds
-/// into stdout via `2>&1`) instead of a generic "is the rack up?". Returns None
-/// only when ssh itself couldn't run or couldn't connect/authenticate (exit 255),
-/// i.e. the node really is unreachable - a non-255 exit means the command ran and
-/// its output (success or error) is meaningful.
+/// into stdout), instead of a generic "is the rack up?".
+///
+/// Returns `None` only when ssh itself couldn't run or couldn't
+/// connect/authenticate (exit 255).
 pub(crate) fn ssh_output(ip: &str, remote: &str) -> Option<String> {
     let out = ssh_exec(ip, remote)?;
     if out.status.code() == Some(255) {
@@ -422,33 +522,59 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
     }
 }
 
-/// (Re)point the host route for the rack's external network (`prefix`) at ce's
-/// current external IP. ce's host-facing NIC gets a fresh random MAC - and thus
-/// a fresh DHCP IP - every launch, so any static route goes stale; discovering
-/// it here keeps the external services reachable without a manual hunt. The
-/// route is keyed by `prefix`, so racks with distinct external prefixes don't
-/// collide. With `apply == false` it just prints the command.
-/// The gateways currently routing `dest` (an IPv4 network address like
-/// `198.51.100.0`), read from `netstat -rn -f inet`. Used to purge every stale
-/// route for a prefix - dead-ce gateways from prior launches pile up otherwise.
-pub(crate) fn route_gateways(dest: &str) -> Vec<String> {
-    let out = match std::process::Command::new("netstat")
+/// A routing-table entry constructed to match `netstat -rn -f inet`.
+pub(crate) struct RouteEntry {
+    pub dest: String,
+    pub gateway: String,
+    pub flags: String,
+}
+
+/// The IPv4 routing table with one entry per line and with at least a
+/// destination and gateway column.
+pub(crate) fn route_entries() -> anyhow::Result<Vec<RouteEntry>> {
+    let out = std::process::Command::new("netstat")
         .args(["-rn", "-f", "inet"])
         .output()
-    {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => return Vec::new(),
-    };
-    out.lines()
+        .context("read the IPv4 route table")?;
+    ensure!(
+        out.status.success(),
+        "netstat failed while reading the IPv4 route table: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(parse_route_entries(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_route_entries(text: &str) -> Vec<RouteEntry> {
+    text.lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
-            let d = it.next()?;
-            let gw = it.next()?;
-            (d == dest).then(|| gw.to_string())
+            Some(RouteEntry {
+                dest: it.next()?.to_string(),
+                gateway: it.next()?.to_string(),
+                flags: it.next().unwrap_or_default().to_string(),
+            })
         })
         .collect()
 }
 
+/// The gateways currently routing `dest` (an IPv4 network address like
+/// `198.51.100.0`).
+///
+/// This is used to purge every stale route for a prefix.
+pub(crate) fn route_gateways(dest: &str) -> anyhow::Result<Vec<String>> {
+    Ok(route_entries()?
+        .into_iter()
+        .filter_map(|e| (e.dest == dest).then_some(e.gateway))
+        .collect())
+}
+
+/// (Re)point the host route for the rack's external network (`prefix`) at ce's
+/// current external IP. Every launch, ce's host-facing NIC gets a fresh random
+/// MAC and a fresh DHCP IP.
+///
+/// The route is keyed by `prefix` to avoid collision.
+///
+/// Note: when `apply == false`, it just prints the command.
 pub(crate) async fn set_external_route(
     d: &Runner,
     ce: NodeRef,
@@ -457,8 +583,8 @@ pub(crate) async fn set_external_route(
     static_ip: Option<&str>,
 ) -> anyhow::Result<()> {
     // A configured static ce address (`[topology].ce_external_ip`) is a stable
-    // nexthop: use it directly and skip the slow, volatile serial-console lease
-    // lookup. Otherwise read ce's DHCP lease as before.
+    // nexthop. If used directly, we can skip the volatile lease lookup.
+    // Otherwise, we read ce's DHCP lease as usual.
     let ip = match static_ip {
         Some(s) => s.to_string(),
         None => serial_bounded(
@@ -473,7 +599,7 @@ pub(crate) async fn set_external_route(
         info!(d.log, "external route (dry-run): route add {} {}", prefix, ip);
         return Ok(());
     }
-    // Drop ALL stale routes for this prefix, then point it at the live ce.
+    // Drop every stale route for this prefix, then point it at the live ce.
     // Dead-ce gateways from prior launches accumulate, and a bare
     // `route delete <prefix>` doesn't reliably clear multiple same-prefix routes -
     // so first enumerate the live gateways for this prefix from the routing table
@@ -482,7 +608,7 @@ pub(crate) async fn set_external_route(
     // successful add), so we key off printed output and re-read the table to
     // confirm the final state.
     let dest = prefix.split('/').next().unwrap_or(prefix);
-    for gw in route_gateways(dest) {
+    for gw in route_gateways(dest)? {
         let _ = std::process::Command::new(ROUTE)
             .args(["delete", prefix, &gw])
             .output();
@@ -524,4 +650,30 @@ pub(crate) async fn set_external_route(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_route_entries;
+
+    #[test]
+    fn route_table_lines_parse_into_entries() {
+        let out = "\
+Routing Table: IPv4
+  Destination           Gateway           Flags  Ref     Use     Interface
+-------------------- -------------------- ----- ----- ---------- ---------
+default              192.168.1.1          UG        2      12345 igb0
+127.0.0.1            127.0.0.1            UH        4         67 lo0
+239.1.1.1            192.168.1.54         UGH       1          0
+";
+        let entries = parse_route_entries(out);
+        let host = entries
+            .iter()
+            .find(|e| e.dest == "239.1.1.1")
+            .expect("group host route");
+        assert_eq!(host.gateway, "192.168.1.54");
+        assert!(host.flags.contains('H'));
+        assert!(entries.iter().any(|e| e.dest == "default"));
+        assert!(parse_route_entries("").is_empty());
+    }
 }

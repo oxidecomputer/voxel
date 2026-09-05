@@ -94,11 +94,16 @@ voxel commtest 43bb5af --traffic unicast
 # Latest origin/main.
 voxel commtest main --traffic unicast
 
+# Multicast phases need the host plumbing set up first
+# (commtest won't run without it).
+voxel network multicast up
+
 # Run both phases from a local multicast-capable checkout, unmodified.
 voxel commtest --source /oxide/workspace/omicron --traffic both
 
 # Pass commit-specific commtest arguments after `--` (the default multicast
 # group is 239.1.1.1 when no --mcast-group is supplied).
+voxel network multicast up --group 239.10.0.1
 voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
   --test-duration 5m --mcast-group 239.10.0.1
 

@@ -18,8 +18,9 @@ use crate::isolated_external::{
     DryRun, link_mtu, probe_out, up as external_up,
 };
 use crate::net::{
-    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture,
-    ssh_output, static_external_ip, wait_external_reachable, zlogin,
+    ce_static_ip, default_route_iface, resolve_external_ip, set_external_route,
+    ssh_capture, ssh_output, static_external_ip, wait_external_reachable,
+    zlogin,
 };
 use crate::network::{enable_link, switch_ready};
 use crate::rss::watch_rss;
@@ -113,14 +114,6 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The host's default-route interface, None without a default route.
-fn default_route_iface() -> Option<String> {
-    probe_out(crate::net::ROUTE, &["-n", "get", "default"])?
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("interface:"))
-        .map(|s| s.trim().to_string())
-}
-
 /// Refuse a lan-mode launch on a jumbo external link: voxel-init classifies a
 /// NIC as underlay iff it accepts mtu 9000, so external NICs never come up.
 fn lan_mtu_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
@@ -135,11 +128,11 @@ fn lan_mtu_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
         && mtu.parse::<u32>().is_ok_and(|m| m >= 9000)
     {
         bail!(
-            "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
-             iff they accept mtu=9000, so external NICs on a jumbo link are \
-             misclassified and never come up. Point [external] link or EXT_INTERFACE \
-             at a sub-9000-mtu link or use isolated mode \
-             (voxel config set external.mode isolated)."
+            "external link {link} has mtu {mtu}: sled NICs are classified \
+             as underlay iff they accept mtu=9000, so external NICs on a \
+             jumbo link are misclassified and never come up. Point \
+             [external] link or EXT_INTERFACE at a sub-9000-mtu link or \
+             use isolated mode (voxel config set external.mode isolated)."
         );
     }
     Ok(())
@@ -359,7 +352,7 @@ pub(crate) async fn cmd_launch(
     // must exist before any node boots.
     if cfg.external.isolated() {
         external_up(&cfg.external, DryRun::No)
-            .context("bringing up the isolated external segment")?;
+            .context("bring up the isolated external segment")?;
     } else {
         lan_mtu_preflight(cfg)?;
     }
@@ -548,10 +541,16 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("`voxel destroy` must run under `pfexec`");
+    }
+    let _mcast_lock = crate::multicast::prepare_destroy(name)?;
     // Before teardown, so the fleet still goes away if falcon's destroy errors.
     sp_host::down_all(cfg);
     let topo = build_topo(cfg, name)?;
-    teardown(&topo.runner, name)
+    teardown(&topo.runner, name)?;
+    _mcast_lock.remove_state_record(name)?;
+    Ok(())
 }
 
 pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {

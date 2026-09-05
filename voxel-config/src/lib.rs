@@ -24,9 +24,10 @@ pub mod sled;
 pub mod sp;
 
 pub use config::{
-    External, ExternalMode, Falcon, Image, Network, RecoverySiloCfg,
-    RouterMode, SLED_SERIAL_PREFIX, SledDataLinksSchema, SledDesc,
-    SledDisksSchema, SpCfg, Topology, UplinkCfg, UplinkPort, VoxelConfig,
+    External, ExternalMode, Falcon, Image, Multicast, MulticastDelivery,
+    Network, RecoverySiloCfg, RouterMode, SLED_SERIAL_PREFIX,
+    SledDataLinksSchema, SledDesc, SledDisksSchema, SpCfg, Topology, UplinkCfg,
+    UplinkPort, VoxelConfig,
 };
 pub use frr::{FrrNeighbor, FrrRouter, StaticUplink};
 pub use sled::SledAgentConfig;

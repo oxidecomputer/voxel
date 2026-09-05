@@ -77,7 +77,7 @@ pub struct VoxelConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExternalMode {
-    /// Wire external VNICs onto an existing LAN with DHCP (default).
+    /// Wire external VNICs onto an existing LAN (default).
     #[default]
     Lan,
     /// Voxel-managed etherstub: NAT out uplink, static per-node addresses.
@@ -587,8 +587,8 @@ impl SledDesc {
     }
 }
 
-/// Which image version to boot. Bundles are named voxel-cp-<version> /
-/// voxel-frr-<version>; cp/frr override the full name when set.
+/// Which image version to boot. Bundles are named `voxel-cp-<version>` /
+/// `voxel-frr-<version>`; cp/frr override the full name when set.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Image {
@@ -680,7 +680,7 @@ impl Image {
     }
 
     /// The omicron commit in the cp image name, locating the checkout under
-    /// build_root; None if the name is not voxel-cp-<commit>[-variant].
+    /// build_root; None if the name is not `voxel-cp-<commit>[-variant]`.
     pub fn cp_commit(&self) -> Option<String> {
         let name = self.cp_image();
         name.strip_prefix("voxel-cp-")
@@ -708,6 +708,34 @@ pub enum RouterMode {
     Static,
 }
 
+/// How much of the rack a group is delivered to.
+///
+/// This is only the default path. The `--steer` override names paths per group
+/// and takes precedence.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MulticastDelivery {
+    /// One path, from the first forwarding router toward switch0.
+    #[default]
+    Single,
+    /// Every switch from every forwarding router. `up` rejects this once a
+    /// rack has more than one switch, as a router may carry one outgoing
+    /// path per group.
+    All,
+}
+
+/// Customer multicast networking parameters.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(default, deny_unknown_fields)]
+pub struct Multicast {
+    /// Delivery for a group whose `up` omits `--steer`.
+    pub delivery: MulticastDelivery,
+}
+
 /// Customer-network / RSS parameters. Maps onto PutRssUserConfigInsensitive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -731,6 +759,7 @@ pub struct Network {
     pub transit_prefix: String,
     /// Static mode: BFD-track the transit routes. Defaults off, matching a4x2.
     pub transit_bfd: bool,
+    pub multicast: Multicast,
     /// Scrimlet uplink ports (one per switch toward the customer routers).
     pub uplinks: Vec<UplinkCfg>,
 }
@@ -753,6 +782,7 @@ impl Default for Network {
             router_mode: RouterMode::Bgp,
             transit_prefix: "198.51.101.0/24".into(),
             transit_bfd: false,
+            multicast: Multicast::default(),
             uplinks: vec![
                 UplinkCfg::default_for("switch0", "uplink0"),
                 UplinkCfg::default_for("switch1", "uplink1"),
@@ -805,7 +835,7 @@ fn offset_v6_rack56(s: &str, rack: usize) -> String {
 
 impl Network {
     /// The network for rack N: v4 nets shift by rack in octet 3, the subnet by
-    /// /56, the ASN by rack; the DNS zone becomes rack{N+1}.<zone> (1-based).
+    /// /56, the ASN by rack; the DNS zone becomes `rack{N+1}.<zone>` (1-based).
     pub fn for_rack(&self, rack: usize) -> Network {
         // Saturating so an absurd rack count cannot wrap onto a lower rack's ASN.
         let rack_asn = u32::try_from(rack).unwrap_or(u32::MAX);
@@ -827,6 +857,7 @@ impl Network {
             router_mode: self.router_mode,
             transit_prefix: offset_v4(&self.transit_prefix, rack),
             transit_bfd: self.transit_bfd,
+            multicast: self.multicast,
             // peer_asn references the switch's local [[bgp]] entry, whose asn
             // is offset above, so it must track the rack's ASN.
             uplinks: self
@@ -858,7 +889,7 @@ impl Network {
 
     /// The transit /30 for router_index to switch_slot; block = router *
     /// n_switches + slot. Single source for both the sidecar and router side.
-    pub fn transit_slash30_for(
+    fn transit_slash30_for(
         &self,
         router_index: usize,
         switch_slot: usize,
@@ -891,8 +922,7 @@ impl Network {
 pub struct UplinkPort {
     pub switch: String,
     pub switch_slot: usize,
-    pub router_index: usize,
-    /// qsfp{router_index}; fabric uplinks take the first front ports.
+    pub router: String,
     pub port: String,
     pub peer_asn: u32,
     pub router_lifetime: u16,
@@ -909,7 +939,6 @@ pub struct UplinkPort {
 #[serde(deny_unknown_fields)]
 pub struct UplinkCfg {
     pub switch: String,
-    pub port: String,
     pub peer_asn: u32,
     pub router_lifetime: u16,
     pub port_speed: String,
@@ -920,7 +949,6 @@ impl UplinkCfg {
     fn default_for(switch: &str, description: &str) -> Self {
         Self {
             switch: switch.into(),
-            port: "qsfp0".into(),
             peer_asn: DEFAULT_RACK_ASN,
             router_lifetime: 300,
             port_speed: "40G".into(),
@@ -984,25 +1012,25 @@ impl VoxelConfig {
     }
 
     /// Generated uplink ports for rack: every switch fans out to every fabric
-    /// router (qsfp{router}); static block = router * n_switches + switch.
+    /// router, the i-th taking qsfp{i}; static block = i * n_switches + switch.
     pub fn uplink_ports(&self, rack: usize) -> Vec<UplinkPort> {
         let net = self.network.for_rack(rack);
-        let n_cr = self.fabric_router_count();
+        let routers = self.multicast_routers();
         let n_sc = self.scrimlets_in_rack(rack);
         let mut out = Vec::new();
         for (sc, u) in net.uplinks.iter().enumerate() {
-            for c in 0..n_cr {
+            for (c, router) in routers.iter().enumerate() {
                 let (gateway, sidecar) =
                     net.transit_slash30_for(c, sc, n_sc).unwrap_or_default();
                 out.push(UplinkPort {
                     switch: u.switch.clone(),
                     switch_slot: sc,
-                    router_index: c,
+                    router: router.clone(),
                     port: format!("qsfp{c}"),
                     peer_asn: u.peer_asn,
                     router_lifetime: u.router_lifetime,
                     port_speed: u.port_speed.clone(),
-                    lldp: format!("{}-cr{}", u.lldp_port_description, c + 1),
+                    lldp: format!("{}-{router}", u.lldp_port_description),
                     sidecar_addr: format!("{sidecar}/30"),
                     gateway,
                 });
@@ -1039,14 +1067,10 @@ impl VoxelConfig {
     /// The enp0sN name of a router's external NIC, derived from build_topo's
     /// link order; voxel-init verifies it against the node's actual links.
     pub fn router_ext_iface(&self, router: &str) -> String {
-        let fabric_router_count =
-            self.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
-        let total_scrimlet_count =
-            self.sleds().into_iter().filter(|s| s.scrimlet).count();
         let n = if router == "ce" {
-            FRR_IFACE_BASE + fabric_router_count
+            FRR_IFACE_BASE + self.fabric_router_count()
         } else {
-            FRR_IFACE_BASE + 1 + total_scrimlet_count
+            FRR_IFACE_BASE + 1 + self.scrimlet_count()
         };
         format!("enp0s{n}")
     }
