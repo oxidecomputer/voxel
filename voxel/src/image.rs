@@ -20,6 +20,24 @@ pub(crate) fn falcon_dataset() -> String {
 /// Fail before staging/booting if a configured image isn't present, with a
 /// message that points at how to get one - rather than the cryptic zfs clone
 /// error falcon throws mid-launch when it can't find `<dataset>/img/<name>@base`.
+/// A zvol's volsize in bytes.
+fn zvol_size(volume: &str) -> anyhow::Result<u64> {
+    let out = std::process::Command::new("zfs")
+        .args(["get", "-Hp", "-o", "value", "volsize", volume])
+        .output()
+        .with_context(|| format!("zfs get volsize {volume}"))?;
+    if !out.status.success() {
+        bail!(
+            "zfs get volsize {volume}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .with_context(|| format!("parse volsize of {volume}"))
+}
+
 pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
     let dataset = falcon_dataset();
     let snap = format!("{dataset}/img/{image}@base");
@@ -278,34 +296,44 @@ pub(crate) fn cmd_image(
             if !exists {
                 bail!("no such image snapshot: {snap} (try `voxel image ls`)");
             }
+            // TODO: read the zvol and compress in process (xz2/zstd) instead
+            // of a shell pipeline; this is the minimal fix for #57.
             let (default_out, pipe) = if *raw {
-                // Portable raw disk image: dd the zvol through xz.
-                let zvol = format!("/dev/zvol/rdsk/{dataset}/img/{name}");
+                // Portable raw disk image: dd the snapshot's zvol through xz.
+                let volsize = zvol_size(&format!("{dataset}/img/{name}"))?;
+                let count = volsize.div_ceil(1 << 20);
+                let zvol = format!("/dev/zvol/rdsk/{snap}");
                 (
                     format!("{name}.raw.xz"),
-                    format!("dd if={zvol} bs=1M status=none | xz -T0 -c"),
+                    format!(
+                        "dd if={} bs=1M count={count} status=none | xz -T0 -c",
+                        shell_quote(&zvol)
+                    ),
                 )
             } else {
                 // ZFS-native stream (allocated blocks only): zfs send through zstd.
                 (
                     format!("{name}.zfs.zst"),
-                    format!("zfs send {snap} | zstd -T0 -c"),
+                    format!("zfs send {} | zstd -T0 -c", shell_quote(&snap)),
                 )
             };
             let out =
                 out.clone().unwrap_or_else(|| Utf8PathBuf::from(default_out));
             eprintln!("[voxel] exporting {snap} -> {}", out);
+            // Stream into a .part sibling and rename on success, so a failed
+            // export leaves no plausible looking file behind.
+            let part = Utf8PathBuf::from(format!("{out}.part"));
             let status = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(format!("{pipe} > {}", shell_quote(out.as_str())))
+                .args(["-o", "pipefail", "-c"])
+                .arg(format!("{pipe} > {}", shell_quote(part.as_str())))
                 .status()
-                .context("export")?;
+                .with_context(|| format!("run export pipeline for {snap}"))?;
             if !status.success() {
-                bail!(
-                    "export failed (need {} on PATH)",
-                    if *raw { "xz" } else { "zstd" }
-                );
+                let _ = std::fs::remove_file(&part);
+                bail!("export of {snap} failed ({status}): {pipe}");
             }
+            std::fs::rename(&part, &out)
+                .with_context(|| format!("move {part} to {out}"))?;
             println!("exported {}", out);
             Ok(())
         }
@@ -332,13 +360,14 @@ pub(crate) fn cmd_image(
             let dst = format!("{dataset}/img/{name}");
             eprintln!("[voxel] importing {} -> {dst}", file);
             let status = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(format!("{decomp} | zfs recv {dst}"))
+                .args(["-o", "pipefail", "-c"])
+                .arg(format!("{decomp} | zfs recv {}", shell_quote(&dst)))
                 .status()
-                .context("import")?;
+                .with_context(|| format!("run import pipeline for {dst}"))?;
             if !status.success() {
                 bail!(
-                    "import failed (need zstd + zfs; {dst} must not already exist)"
+                    "import into {dst} failed ({status}): needs zstd + zfs, and \
+                     {dst} must not already exist"
                 );
             }
             println!(
