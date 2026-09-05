@@ -6,16 +6,18 @@
 //!
 //! Replaces the per-node launch shell scripts (`gimlet-launch.sh`,
 //! `router-launch.sh`): `voxel launch` runs `voxel-init <role>` inside each
-//! guest. One binary, two roles, cross-compiled for both guest OSes—illumos
-//! (the voxel-cp gimlet) and linux (the voxel-frr router). Everything is
+//! guest. One binary, cross-compiled for both guest OSes—illumos
+//! (the voxel-cp gimlet) and linux (FRR and BIRD routers). Everything is
 //! orchestration of OS commands, so the same source builds for both targets;
 //! only the role selected at runtime differs.
 
+mod bird;
 mod gimlet;
 mod install;
 mod router;
 mod sys;
 
+use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -34,6 +36,16 @@ enum Cmd {
     Gimlet,
     /// Bring up a customer router/edge from a voxel-frr image (linux / debian).
     Router,
+    /// Apply a mounted config to a voxel-bird guest, without installing packages.
+    Bird {
+        /// BIRD 2 configuration to copy to /etc/bird/bird.conf.
+        #[arg(long, default_value = "/opt/cargo-bay/bird.conf")]
+        config: Utf8PathBuf,
+        /// Optional trusted Bash script to set up interfaces before starting BIRD.
+        /// Runs as root with `bash -e`; need not be executable on the 9p mount.
+        #[arg(long)]
+        init_script: Option<Utf8PathBuf>,
+    },
     /// Image-BUILD-time install, run inside the builder guest by `image bake`.
     /// Installs baked software only; applies no topology configuration.
     Install {
@@ -60,15 +72,21 @@ enum InstallRole {
     Cp,
     /// voxel-frr router image (linux / debian).
     Frr,
+    /// voxel-bird router image (linux / debian, BIRD 2).
+    Bird,
 }
 
 fn main() {
     let result = match Cli::parse().cmd {
         Cmd::Gimlet => gimlet::bring_up(),
         Cmd::Router => router::bring_up(),
+        Cmd::Bird { config, init_script } => {
+            bird::bring_up(&config, init_script.as_deref())
+        }
         Cmd::Install { role } => match role {
             InstallRole::Cp => install::build_control_plane_image(),
             InstallRole::Frr => install::build_frr_image(),
+            InstallRole::Bird => install::build_bird_image(),
         },
         Cmd::SwitchEnforcer { slot } => {
             gimlet::switch_enforcer(slot);

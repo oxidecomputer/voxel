@@ -465,6 +465,51 @@ pub fn build_frr_image() -> Result<()> {
     let version =
         std::env::var("VOXEL_FRR_VERSION").unwrap_or_else(|_| "unknown".into());
 
+    prepare_debian_router(&["frr", "frr-pythontools", "jq", "openssh-server"])?;
+
+    // bgpd + bfdd on (static mode uses BFD-tracked routes); frr.conf itself is
+    // generated per topology at launch.
+    replace_in_file(
+        "/etc/frr/daemons",
+        &[("bgpd=no", "bgpd=yes"), ("bfdd=no", "bfdd=yes")],
+    );
+    run_quiet("systemctl", &["enable", "frr"]);
+    finish_debian_router("frr")?;
+
+    let frr_ver = capture("dpkg-query", &["-W", "-f=${Version}", "frr"])
+        .unwrap_or_else(|| "?".into());
+    mark_ready(&format!("voxel-frr version={version} frr={frr_ver}"))
+}
+
+/// BIRD 2 and both control clients are baked, but topology configuration and
+/// the first daemon start belong to `voxel-init bird` at launch.
+pub fn build_bird_image() -> Result<()> {
+    prepare_debian_router(&[
+        "bird2",
+        "iproute2",
+        "iputils-ping",
+        "tcpdump",
+        "jq",
+        "openssh-server",
+    ])?;
+    if !run("systemctl", &["disable", "--now", "bird"]) {
+        bail!("disabling BIRD until launch-time configuration failed");
+    }
+    if !run("bird", &["--version"])
+        || !run("test", &["-x", "/usr/sbin/birdc"])
+        || !run("test", &["-x", "/usr/sbin/birdcl"])
+    {
+        bail!("BIRD daemon or control clients missing from image");
+    }
+    finish_debian_router("bird")?;
+    let bird_ver = capture("dpkg-query", &["-W", "-f=${Version}", "bird2"])
+        .ok_or_else(|| anyhow::anyhow!("query installed bird2 version"))?;
+    mark_ready(&format!("voxel-bird version={bird_ver} bird2={bird_ver}"))
+}
+
+/// Shared Debian builder networking and package installation. Only the bake
+/// calls apt; launch-time agents consume the installed software offline.
+fn prepare_debian_router(packages: &[&str]) -> Result<()> {
     // --- reach apt ---
     // falcon's default ext link normally gives the node a DHCP NIC. Isolated
     // mode runs no DHCP server on the segment, so apply the staged static
@@ -509,18 +554,12 @@ pub fn build_frr_image() -> Result<()> {
         &["disable", "--now", "apt-daily-upgrade.timer", "apt-daily.timer"],
     );
 
-    // --- install FRR (baked) ---
+    let mut install_args = vec!["install", "-y"];
+    install_args.extend_from_slice(packages);
     let mut attempt = 0;
     loop {
         let ok = apt_get_noninteractive(&["update", "-y"])
-            && apt_get_noninteractive(&[
-                "install",
-                "-y",
-                "frr",
-                "frr-pythontools",
-                "jq",
-                "openssh-server",
-            ]);
+            && apt_get_noninteractive(&install_args);
         if ok {
             break;
         }
@@ -531,26 +570,22 @@ pub fn build_frr_image() -> Result<()> {
         note(format!("apt attempt {attempt} failed; retrying"));
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
+    Ok(())
+}
 
-    // bgpd + bfdd on (static mode uses BFD-tracked routes); frr.conf itself is
-    // generated per topology at launch.
-    replace_in_file(
-        "/etc/frr/daemons",
-        &[("bgpd=no", "bgpd=yes"), ("bfdd=no", "bfdd=yes")],
-    );
-
+fn finish_debian_router(role: &str) -> Result<()> {
     // Persistent forwarding; per-interface knobs are set at launch.
+    let sysctl_conf = format!("/etc/sysctl.d/99-voxel-{role}.conf");
     fs::write(
-        "/etc/sysctl.d/99-voxel-frr.conf",
+        &sysctl_conf,
         indoc! {"
             net.ipv4.ip_forward=1
             net.ipv6.conf.all.forwarding=1
         "},
     )
     .map_err(|e| anyhow::anyhow!("write sysctl conf: {e}"))?;
-    run("sysctl", &["-p", "/etc/sysctl.d/99-voxel-frr.conf"]);
+    run("sysctl", &["-p", &sysctl_conf]);
 
-    run_quiet("systemctl", &["enable", "frr"]);
     run_quiet("systemctl", &["enable", "ssh"]);
 
     bake_agent()?;
@@ -566,10 +601,7 @@ pub fn build_frr_image() -> Result<()> {
     }
     fs::write("/etc/machine-id", "").ok();
     fs::remove_file("/var/lib/dbus/machine-id").ok();
-
-    let frr_ver = capture("dpkg-query", &["-W", "-f=${Version}", "frr"])
-        .unwrap_or_else(|| "?".into());
-    mark_ready(&format!("voxel-frr version={version} frr={frr_ver}"))
+    Ok(())
 }
 
 /// `apt-get` with the noninteractive frontend the baked install needs.

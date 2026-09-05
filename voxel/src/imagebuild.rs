@@ -5,7 +5,8 @@
 //! `voxel image bake` - build an image by booting a one-node builder, running a
 //! step inside it, and capturing its disk as a registered falcon base image.
 //!
-//! `image create`, `image create-frr` and `image patch` all build through here.
+//! `image create`, `image create-frr`, `image create-bird` and `image patch`
+//! all build through here.
 
 use crate::isolated_external;
 use anyhow::{Context, Result, bail};
@@ -24,7 +25,7 @@ pub(crate) struct BakeOpts<'a> {
     /// Base image to boot: `helios-3.0`, `debian-13.2`, or an existing voxel
     /// image when re-baking one (`image patch`).
     pub base_image: &'a str,
-    /// Agent install role (`cp` / `frr`).
+    /// Agent install role (`cp` / `frr` / `bird`).
     pub role: Option<&'a str>,
     /// An arbitrary in-guest command to run instead of an agent role, for
     /// boot-modify-capture (`image patch` places a component this way). With
@@ -114,7 +115,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 
     // illumos guests use mount(); linux guests need mount_linux() (the guest-side
     // share mechanism differs). Pick from the base image name.
-    let is_linux = ["debian", "ubuntu", "linux"]
+    let is_linux = ["debian", "ubuntu", "linux", "voxel-frr-", "voxel-bird-"]
         .iter()
         .any(|p| o.base_image.starts_with(p));
     let mounted = if is_linux {
@@ -193,29 +194,32 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 
 /// The musl target the Debian router guest needs. Static, so the router gets one
 /// self-contained binary with no glibc or dynamic-linking dependency.
-const FRR_TARGET: &str = "x86_64-unknown-linux-musl";
+const ROUTER_TARGET: &str = "x86_64-unknown-linux-musl";
 
-/// Build a `voxel-frr` router image: cross-compile the agent for the Debian
-/// guest, stage it, bake.
+/// Build a `voxel-frr` or `voxel-bird` router image: cross-compile the agent
+/// for the Debian guest, stage it, bake.
 ///
 /// Cross-compiling needs voxel's own source tree and a Rust toolchain on the
 /// host. That is the remaining host dependency in the way of a fully
 /// self-contained `voxel`; embedding a prebuilt agent in the binary would close
 /// it.
-pub(crate) async fn create_frr(
+pub(crate) async fn create_router(
+    role: &str,
     version: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
     let root = repo_root()?;
     let network = builder_network(external)?;
-    let image_name = format!("voxel-frr-{version}");
-    let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-frr");
+    let image_name = format!("voxel-{role}-{version}");
+    let cargo_bay = root.join(format!("voxel-image/cargo-bay/vbuild-{role}"));
 
-    eprintln!("[voxel] cross-compiling voxel-init for {FRR_TARGET} (static)");
+    eprintln!(
+        "[voxel] cross-compiling voxel-init for {ROUTER_TARGET} (static)"
+    );
     // Best-effort: already-installed targets exit nonzero on some rustup versions.
     let _ = Command::new(toolchain_bin("rustup"))
-        .args(["target", "add", FRR_TARGET])
+        .args(["target", "add", ROUTER_TARGET])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -227,19 +231,19 @@ pub(crate) async fn create_frr(
             "voxel-init",
             "--release",
             "--target",
-            FRR_TARGET,
+            ROUTER_TARGET,
         ])
         .env("RUSTFLAGS", "-C linker=rust-lld -C link-self-contained=yes")
         .status()
         .context("run cargo build -p voxel-init")?;
     if !built.success() {
-        bail!("cross-compiling voxel-init for {FRR_TARGET} failed");
+        bail!("cross-compiling voxel-init for {ROUTER_TARGET} failed");
     }
 
     std::fs::create_dir_all(&cargo_bay)
         .with_context(|| format!("mkdir {cargo_bay}"))?;
     let agent_src =
-        root.join(format!("target/{FRR_TARGET}/release/voxel-init"));
+        root.join(format!("target/{ROUTER_TARGET}/release/voxel-init"));
     let agent_dst = cargo_bay.join("voxel-init");
     std::fs::copy(&agent_src, &agent_dst)
         .with_context(|| format!("stage agent {agent_src}"))?;
@@ -248,7 +252,7 @@ pub(crate) async fn create_frr(
 
     bake(BakeOpts {
         base_image: "debian-13.2",
-        role: Some("frr"),
+        role: Some(role),
         exec: None,
         cargo_bay: &cargo_bay,
         image_name: &image_name,

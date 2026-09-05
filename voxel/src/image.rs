@@ -381,6 +381,9 @@ pub(crate) fn cmd_image(
         ImageCmd::CreateFrr { .. } => {
             bail!("internal: `image create-frr` is dispatched in main")
         }
+        ImageCmd::CreateBird { .. } => {
+            bail!("internal: `image create-bird` is dispatched in main")
+        }
         ImageCmd::RenderSmf { omicron_root, gimlets } => {
             render_smf(omicron_root, *gimlets)
         }

@@ -32,6 +32,10 @@ cargo build
 omicron, pinned to a commit), so `config-rss.toml` is rendered in-process and schema
 drift surfaces at voxel compile time.
 
+For a Debian image with BIRD 2 and its control CLI baked in, use
+`voxel image create-bird proto` on Helios. See [BIRD images](docs/bird-image.md)
+for falcon-lab mounts, launch-time configs/init scripts, and an offline smoke test.
+
 ## Quickstart
 
 1. `cargo build` builds voxel.

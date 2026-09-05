@@ -309,6 +309,12 @@ enum ImageCmd {
         #[arg(default_value = "proto")]
         version: String,
     },
+    /// Build a Debian BIRD 2 image for falcon-lab topologies.
+    CreateBird {
+        /// Image label; the image is named `voxel-bird-<version>`.
+        #[arg(default_value = "proto")]
+        version: String,
+    },
     /// (build helper) Bake an image: boot a one-node builder, run the in-guest
     /// agent's install role, capture the disk.
     #[command(hide = true)]
@@ -318,7 +324,7 @@ enum ImageCmd {
         /// Base image the builder boots.
         #[arg(long, default_value = "helios-3.0")]
         base: String,
-        /// Agent install role (`cp` | `frr`).
+        /// Agent install role (`cp` | `frr` | `bird`).
         #[arg(long)]
         role: Option<String>,
         /// An in-guest command to run instead of an agent role
@@ -871,7 +877,17 @@ async fn main() -> Result<(), Error> {
                 .await
             }
             ImageCmd::CreateFrr { version } => {
-                imagebuild::create_frr(
+                imagebuild::create_router(
+                    "frr",
+                    version,
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
+                )
+                .await
+            }
+            ImageCmd::CreateBird { version } => {
+                imagebuild::create_router(
+                    "bird",
                     version,
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
