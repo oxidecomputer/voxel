@@ -22,8 +22,6 @@ use crate::imagebuild::{
     BakeOpts, bake, builder_network, repo_root, toolchain_bin,
 };
 
-/// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
-const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
 const SIDECAR_URL: &str = "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
 
 /// Build flags matching the validated recipe for building omicron on Helios.
@@ -393,8 +391,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 /// stage them for the image. The builder VM may not reach buildomat.eng - only
 /// the host does - so this happens here rather than in-guest.
 fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
-    let rev = std::env::var("SIDECAR_LITE_REV")
-        .unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
+    let rev = match std::env::var("SIDECAR_LITE_REV") {
+        Ok(rev) => rev,
+        Err(_) => crate::pins::pin_rev("sidecar-lite")?,
+    };
     let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
     std::fs::create_dir_all(&cache)
         .with_context(|| format!("mkdir {cache}"))?;

@@ -36,6 +36,7 @@ mod multicast;
 mod net;
 mod network;
 mod patch;
+mod pins;
 mod rack;
 mod repocmd;
 mod rss;

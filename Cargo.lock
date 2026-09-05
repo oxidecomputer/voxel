@@ -122,7 +122,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "api_identity"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "omicron-workspace-hack",
  "proc-macro2",
@@ -418,7 +418,7 @@ dependencies = [
 [[package]]
 name = "bootstore"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "bytes",
  "camino",
@@ -447,7 +447,7 @@ dependencies = [
 [[package]]
 name = "bootstrap-agent-lockstep-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1579,7 +1579,7 @@ dependencies = [
 [[package]]
 name = "gateway-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "daft",
  "dropshot",
@@ -1647,7 +1647,7 @@ dependencies = [
 [[package]]
 name = "gfss"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "digest 0.10.7",
  "omicron-workspace-hack",
@@ -2793,7 +2793,7 @@ dependencies = [
 [[package]]
 name = "omicron-common"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "anyhow",
  "api_identity",
@@ -2840,7 +2840,7 @@ dependencies = [
 [[package]]
 name = "omicron-generation-kinds"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "oxide-generation",
  "oxide-generation-macros",
@@ -2849,7 +2849,7 @@ dependencies = [
 [[package]]
 name = "omicron-ledger"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "async-trait",
  "atomicwrites",
@@ -2866,7 +2866,7 @@ dependencies = [
 [[package]]
 name = "omicron-passwords"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "argon2",
  "omicron-workspace-hack",
@@ -2881,7 +2881,7 @@ dependencies = [
 [[package]]
 name = "omicron-uuid-kinds"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "daft",
  "newtype-uuid",
@@ -3390,10 +3390,10 @@ dependencies = [
 [[package]]
 name = "propolis-api-types-versions"
 version = "0.0.0"
-source = "git+https://github.com/oxidecomputer/propolis?rev=5e201ec4185ccb9182cc6ffcb09fadd9deee24ca#5e201ec4185ccb9182cc6ffcb09fadd9deee24ca"
+source = "git+https://github.com/oxidecomputer/propolis?branch=zl%2Fvoxel#b7b67633af9b1da945e64f56f4c15ec06a14bc35"
 dependencies = [
  "crucible-client-types",
- "propolis_types 0.0.0 (git+https://github.com/oxidecomputer/propolis?rev=5e201ec4185ccb9182cc6ffcb09fadd9deee24ca)",
+ "propolis_types 0.0.0 (git+https://github.com/oxidecomputer/propolis?branch=zl%2Fvoxel)",
  "schemars 0.8.22",
  "serde",
  "thiserror 1.0.69",
@@ -3403,10 +3403,10 @@ dependencies = [
 [[package]]
 name = "propolis-api-types-versions"
 version = "0.0.0"
-source = "git+https://github.com/oxidecomputer/propolis?rev=93e04e189a76f73b3764c6417928274b0f4df453#93e04e189a76f73b3764c6417928274b0f4df453"
+source = "git+https://github.com/oxidecomputer/propolis?rev=5e201ec4185ccb9182cc6ffcb09fadd9deee24ca#5e201ec4185ccb9182cc6ffcb09fadd9deee24ca"
 dependencies = [
  "crucible-client-types",
- "propolis_types 0.0.0 (git+https://github.com/oxidecomputer/propolis?rev=93e04e189a76f73b3764c6417928274b0f4df453)",
+ "propolis_types 0.0.0 (git+https://github.com/oxidecomputer/propolis?rev=5e201ec4185ccb9182cc6ffcb09fadd9deee24ca)",
  "schemars 0.8.22",
  "serde",
  "thiserror 1.0.69",
@@ -3440,16 +3440,16 @@ dependencies = [
 [[package]]
 name = "propolis_api_types"
 version = "0.0.0"
-source = "git+https://github.com/oxidecomputer/propolis?rev=93e04e189a76f73b3764c6417928274b0f4df453#93e04e189a76f73b3764c6417928274b0f4df453"
+source = "git+https://github.com/oxidecomputer/propolis?branch=zl%2Fvoxel#b7b67633af9b1da945e64f56f4c15ec06a14bc35"
 dependencies = [
  "crucible-client-types",
- "propolis-api-types-versions 0.0.0 (git+https://github.com/oxidecomputer/propolis?rev=93e04e189a76f73b3764c6417928274b0f4df453)",
+ "propolis-api-types-versions 0.0.0 (git+https://github.com/oxidecomputer/propolis?branch=zl%2Fvoxel)",
 ]
 
 [[package]]
 name = "propolis_types"
 version = "0.0.0"
-source = "git+https://github.com/oxidecomputer/propolis?rev=5e201ec4185ccb9182cc6ffcb09fadd9deee24ca#5e201ec4185ccb9182cc6ffcb09fadd9deee24ca"
+source = "git+https://github.com/oxidecomputer/propolis?branch=zl%2Fvoxel#b7b67633af9b1da945e64f56f4c15ec06a14bc35"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -3458,7 +3458,7 @@ dependencies = [
 [[package]]
 name = "propolis_types"
 version = "0.0.0"
-source = "git+https://github.com/oxidecomputer/propolis?rev=93e04e189a76f73b3764c6417928274b0f4df453#93e04e189a76f73b3764c6417928274b0f4df453"
+source = "git+https://github.com/oxidecomputer/propolis?rev=5e201ec4185ccb9182cc6ffcb09fadd9deee24ca#5e201ec4185ccb9182cc6ffcb09fadd9deee24ca"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -3570,7 +3570,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "rack-init-config"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "bootstrap-agent-lockstep-types",
  "iddqd",
@@ -4496,7 +4496,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sled-agent-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4526,7 +4526,7 @@ dependencies = [
 [[package]]
 name = "sled-agent-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4546,7 +4546,7 @@ dependencies = [
  "omicron-uuid-kinds",
  "omicron-workspace-hack",
  "oxnet",
- "propolis-api-types-versions 0.0.0 (git+https://github.com/oxidecomputer/propolis?rev=93e04e189a76f73b3764c6417928274b0f4df453)",
+ "propolis-api-types-versions 0.0.0 (git+https://github.com/oxidecomputer/propolis?branch=zl%2Fvoxel)",
  "propolis_api_types",
  "schemars 0.8.22",
  "serde",
@@ -4566,7 +4566,7 @@ dependencies = [
 [[package]]
 name = "sled-hardware-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "daft",
  "omicron-workspace-hack",
@@ -5475,7 +5475,7 @@ dependencies = [
 [[package]]
 name = "trust-quorum-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "omicron-workspace-hack",
  "trust-quorum-types-versions",
@@ -5484,7 +5484,7 @@ dependencies = [
 [[package]]
 name = "trust-quorum-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "byte-wrapper",
  "daft",
@@ -6012,7 +6012,7 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-client"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "iddqd",
  "omicron-uuid-kinds",
@@ -6030,7 +6030,7 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-types"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "omicron-workspace-hack",
  "wicketd-commission-types-versions",
@@ -6039,7 +6039,7 @@ dependencies = [
 [[package]]
 name = "wicketd-commission-types-versions"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=d41a8c3a2aa5768255ad00545e53d3077b1b56ce#d41a8c3a2aa5768255ad00545e53d3077b1b56ce"
+source = "git+https://github.com/oxidecomputer/omicron?rev=b09b97af0395a1b7501b7432321f3a2d07b61faf#b09b97af0395a1b7501b7432321f3a2d07b61faf"
 dependencies = [
  "gateway-types-versions",
  "iddqd",
