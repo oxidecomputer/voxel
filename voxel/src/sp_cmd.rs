@@ -496,6 +496,34 @@ fn ipcc_req(bin: &Utf8Path, ctl: &Utf8Path, command: &str) -> IpccReply {
     IpccReply::Reply(text)
 }
 
+/// Pack a dump directory for `humility hydrate`: dump.json and the 0x*.bin
+/// memory regions at the zip root, written in process.
+fn zip_dump(dump_dir: &Utf8Path, dest: &Utf8Path) -> anyhow::Result<()> {
+    let mut names = vec!["dump.json".to_string()];
+    for e in std::fs::read_dir(dump_dir)
+        .with_context(|| format!("list {dump_dir}"))?
+    {
+        let n = e?.file_name().to_string_lossy().into_owned();
+        if n.starts_with("0x") && n.ends_with(".bin") {
+            names.push(n);
+        }
+    }
+    names.sort();
+    let file = std::fs::File::create(dest)
+        .with_context(|| format!("create {dest}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    for n in &names {
+        zip.start_file(n, zip::write::SimpleFileOptions::default())
+            .with_context(|| format!("add {n} to {dest}"))?;
+        let mut src = std::fs::File::open(dump_dir.join(n))
+            .with_context(|| format!("open {dump_dir}/{n}"))?;
+        std::io::copy(&mut src, &mut zip)
+            .with_context(|| format!("write {n} into {dest}"))?;
+    }
+    zip.finish().with_context(|| format!("finish {dest}"))?;
+    Ok(())
+}
+
 /// `voxel sp dump <target> [--ringbuf]` - force + decode a crash dump of one live
 /// emulated SP. sp-emu writes a humility-hydrate RAM snapshot on demand: when
 /// `<SP_EMU_DUMP_DIR>/.trigger` appears it dumps RAM (flash comes from the archive)
@@ -620,18 +648,7 @@ async fn sp_dump(
         std::thread::sleep(std::time::Duration::from_millis(500));
         waited_ms += 500;
     }
-    // humility hydrate reads dump.json + 0x*.bin from the zip root. Local sh, so
-    // the glob is the shell's own with no nested quoting to survive.
-    let zipped = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("cd {dump_dir} && zip -q dump.zip dump.json 0x*.bin"))
-        .status()
-        .with_context(|| format!("zip the dump in {dump_dir}"))?;
-    if !zipped.success() {
-        return Err(anyhow!(
-            "zipping the dump in {dump_dir} failed ({zipped})"
-        ));
-    }
+    zip_dump(&dump_dir, &zip_local)?;
 
     let hydrated = dump_dir.join("hydrated.dump");
     // humility hydrate refuses to overwrite its `-o` target, so clear a stale
@@ -852,4 +869,36 @@ fn build(commit: &str) -> anyhow::Result<()> {
 /// Locate `voxel-image/build-sp.sh` (mirrors `image::build_cp_script`).
 fn build_sp_script() -> anyhow::Result<Utf8PathBuf> {
     crate::util::locate_script("VOXEL_BUILD_SP", "build-sp.sh")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// zip_dump packs dump.json and the 0x*.bin regions at the zip root and
+    /// nothing else.
+    #[test]
+    fn zip_dump_packs_json_and_regions() {
+        let dir = crate::util::temp_dir()
+            .join(format!("voxel-zipdump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dump.json"), "{}").unwrap();
+        std::fs::write(dir.join("0x20000000.bin"), [1u8; 4096]).unwrap();
+        std::fs::write(dir.join("0x24000000.bin"), [2u8; 16]).unwrap();
+        std::fs::write(dir.join(".done"), "").unwrap();
+        std::fs::write(dir.join("hydrated.dump"), "x").unwrap();
+        let dest = dir.join("dump.zip");
+        zip_dump(&dir, &dest).unwrap();
+
+        let mut zip =
+            zip::ZipArchive::new(std::fs::File::open(&dest).unwrap()).unwrap();
+        let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        assert_eq!(names, ["0x20000000.bin", "0x24000000.bin", "dump.json"]);
+        let mut buf = Vec::new();
+        zip.by_name("0x20000000.bin").unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, vec![1u8; 4096]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
