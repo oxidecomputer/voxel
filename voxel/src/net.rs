@@ -150,7 +150,8 @@ pub(crate) async fn resolve_external_ip(
     {
         return Ok(ip);
     }
-    node_external_ip(d, n, is_router).await
+    let iface = is_router.then(|| cfg.router_ext_iface(node));
+    node_external_ip(d, n, is_router, iface.as_deref()).await
 }
 
 /// A node's address in isolated mode's static numbering, None if it has none.
@@ -177,20 +178,30 @@ pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
 }
 
 /// A node's external (host-LAN) IPv4 - the address `voxel route` points at and
-/// `voxel host`/`tp` SSH to. Every node's only non-loopback IPv4 is its host-LAN
-/// DHCP lease (the underlay/cr links are IPv6), so we just take the first one.
+/// `voxel host`/`tp` SSH (in)to.
+///
+/// A sled's only non-loopback IPv4 address is its host-LAN address
+/// (the underlay/cr links are IPv6). The first address in the listing wins
+/// out. Routers also carry the PIM `/32`s, which is why router callers
+/// can pass an `iface` to scope the listing to the external NIC.
+///
 /// Routers (Debian) report addresses via `ip`; sleds (Helios) via `ipadm`.
 pub(crate) async fn node_external_ip(
     d: &Runner,
     n: NodeRef,
     is_router: bool,
+    iface: Option<&str>,
 ) -> anyhow::Result<String> {
-    let cmd = if is_router {
-        "ip -4 -br addr show scope global 2>/dev/null"
-    } else {
-        "ipadm show-addr -p -o addr 2>/dev/null"
+    let cmd = match (is_router, iface) {
+        (true, Some(dev)) => {
+            format!("ip -4 -br addr show dev {dev} scope global 2>/dev/null")
+        }
+        (true, None) => {
+            "ip -4 -br addr show scope global 2>/dev/null".to_string()
+        }
+        (false, _) => "ipadm show-addr -p -o addr 2>/dev/null".to_string(),
     };
-    let raw = d.exec(n, cmd).await.context("read external IP")?;
+    let raw = d.exec(n, &cmd).await.context("read external IP")?;
     let out = strip_ansi(&raw);
     out.split_whitespace()
         .filter_map(|t| t.split('/').next()) // drop any CIDR suffix
@@ -437,7 +448,7 @@ pub(crate) async fn set_external_route(
         Some(s) => s.to_string(),
         None => serial_bounded(
             "ce: reading its DHCP lease",
-            node_external_ip(d, ce, true),
+            node_external_ip(d, ce, true, None),
         )
         .await
         .context("ce")?,

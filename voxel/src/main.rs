@@ -651,7 +651,7 @@ fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
     let cfg = VoxelConfig::from_toml(&text)
         .with_context(|| format!("parse {}", path))?;
-    cfg.topology.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    cfg.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     Ok(cfg)
 }
 

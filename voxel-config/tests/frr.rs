@@ -10,8 +10,9 @@
 //!   edge, and just relays (originates nothing - the rack originates the
 //!   service pool, the edge originates the default).
 //! - the customer edge (`ce`) peers with both CRs and originates the default
-//!   route toward the rack.
+//!   route toward the rack. It carries no multicast.
 
+use voxel_config::frr::{PimIface, pim_link_addr};
 use voxel_config::{FrrNeighbor, FrrRouter, StaticUplink};
 
 #[test]
@@ -28,6 +29,19 @@ fn cr1_unnumbered_relay() {
         originate6: vec![],
         static_uplinks: vec![],
         track_bfd: false,
+        // A fabric router takes passive VIFs on rack-facing links and
+        // on the host-facing link.
+        pim: vec![
+            PimIface {
+                interface: "enp0s9".into(),
+                address: Some(pim_link_addr(0, 0, 2)),
+            },
+            PimIface {
+                interface: "enp0s10".into(),
+                address: Some(pim_link_addr(0, 1, 2)),
+            },
+            PimIface { interface: "enp0s11".into(), address: None },
+        ],
     };
     expectorate::assert_contents("tests/output/cr1-frr.conf", &cr1.render());
 }
@@ -45,6 +59,9 @@ fn ce_originates_default() {
         originate6: vec!["::/0".into()],
         static_uplinks: vec![],
         track_bfd: false,
+        // ce carries no multicast. This fixture exercises the base BGP
+        // renderer.
+        pim: vec![],
     };
     expectorate::assert_contents("tests/output/ce-frr.conf", &ce.render());
 }
@@ -66,6 +83,12 @@ fn cr1_static(track_bfd: bool) -> FrrRouter {
             route: "198.51.100.0/24".into(),
         }],
         track_bfd,
+        // Static mode's /30 already numbers the rack-facing link. PIM
+        // needs no address of its own.
+        pim: vec![
+            PimIface { interface: "enp0s9".into(), address: None },
+            PimIface { interface: "enp0s10".into(), address: None },
+        ],
     }
 }
 
