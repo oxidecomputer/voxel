@@ -14,9 +14,12 @@
 //! the staged state all carry the rack index, so tearing one rack down leaves a
 //! co-resident rack running.
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use camino::Utf8Path;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::future::Future;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// SMF service backing the fleet; one instance per SP per rack.
 const SVC: &str = "svc:/oxide/voxel-sp-emu";
@@ -315,33 +318,18 @@ fn fetch_buildomat_bin(
         return Ok(bin);
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {dir}"))?;
-    let url =
-        format!("{}/{repo}/{series}/{rev}", crate::cpbuild::BUILDOMAT_URL);
+    let url = format!(
+        "{}/{repo}/{series}/{rev}/{artifact}",
+        crate::cpbuild::BUILDOMAT_URL
+    );
     eprintln!(
         "[voxel] fetching {bin_name} @ {} ([sp].{key} or PATH overrides)",
         &rev[..12]
     );
-    let curl = |out: &Utf8Path, from: &str| -> anyhow::Result<()> {
-        let ok = Command::new("curl")
-            .args(["-sSfL", "--retry", "5", "-o"])
-            .arg(out)
-            .arg(format!("{url}/{from}"))
-            .status()
-            .context("run curl")?
-            .success();
-        if !ok {
-            bail!("curl {url}/{from} failed");
-        }
-        Ok(())
-    };
-    let fetched = dir.join(format!("{artifact}.part"));
-    curl(&fetched, artifact)?;
-    let sha_file = dir.join(format!("{artifact}.sha256.txt"));
-    curl(&sha_file, &format!("{artifact}.sha256.txt"))?;
-    let want = std::fs::read_to_string(&sha_file)
-        .with_context(|| format!("read {sha_file}"))?;
+    let want = fetch_text(&format!("{url}.sha256.txt"), FETCH)?;
     let want = want.split_whitespace().next().unwrap_or("").to_string();
-    let got = sha256_hex(&fetched)?;
+    let fetched = dir.join(format!("{artifact}.part"));
+    let got = download(&url, &fetched, FETCH)?;
     if got != want {
         let _ = std::fs::remove_file(&fetched);
         bail!("{artifact} sha256 {got} != published {want}");
@@ -366,14 +354,158 @@ fn fetch_buildomat_bin(
     Ok(bin)
 }
 
-/// Hex sha256 of a file.
-fn sha256_hex(path: &Utf8Path) -> anyhow::Result<String> {
+/// Retry and connect bounds for a fetch.
+#[derive(Clone, Copy)]
+struct Fetch {
+    attempts: u32,
+    connect_timeout: Duration,
+}
+
+/// Buildomat fetch bounds: an unreachable host fails in under a minute
+/// rather than holding a launch in TCP retries.
+const FETCH: Fetch =
+    Fetch { attempts: 3, connect_timeout: Duration::from_secs(15) };
+
+fn http_client(f: Fetch) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(f.connect_timeout)
+        .timeout(Duration::from_secs(3600))
+        .build()
+        .context("http client")
+}
+
+/// Run an async fetch to completion from sync code. The callers already sit
+/// on the tokio runtime, so this gets its own thread and runtime instead of
+/// blocking the outer one.
+fn run_fetch<T: Send>(
+    fut: impl Future<Output = anyhow::Result<T>> + Send,
+) -> anyhow::Result<T> {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("fetch runtime")?
+                .block_on(fut)
+        })
+        .join()
+        .map_err(|_| anyhow!("fetch thread panicked"))?
+    })
+}
+
+/// GET a small text body, retried.
+fn fetch_text(url: &str, f: Fetch) -> anyhow::Result<String> {
+    run_fetch(async {
+        let client = http_client(f)?;
+        let mut last = None;
+        for attempt in 1..=f.attempts {
+            let sent = client.get(url).send().await;
+            match sent.and_then(|r| r.error_for_status()) {
+                Ok(r) => {
+                    return r
+                        .text()
+                        .await
+                        .with_context(|| format!("read {url}"));
+                }
+                Err(e) => last = Some(e),
+            }
+            if attempt < f.attempts {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(anyhow!(
+            "GET {url} failed after {} attempts: {}",
+            f.attempts,
+            last.expect("at least one attempt")
+        ))
+    })
+}
+
+/// Stream `url` into `dest` behind a progress bar, returning the body's
+/// sha256 hex. Retried whole; a partial `dest` is overwritten next attempt.
+fn download(url: &str, dest: &Utf8Path, f: Fetch) -> anyhow::Result<String> {
+    run_fetch(async {
+        let client = http_client(f)?;
+        let mut last = None;
+        for attempt in 1..=f.attempts {
+            match stream_to_file(&client, url, dest).await {
+                Ok(sha) => return Ok(sha),
+                Err(e) => {
+                    eprintln!(
+                        "[voxel] fetch attempt {attempt}/{} failed: {e:#}",
+                        f.attempts
+                    );
+                    last = Some(e);
+                }
+            }
+            if attempt < f.attempts {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(last.expect("at least one attempt")).with_context(|| {
+            format!("GET {url} failed after {} attempts", f.attempts)
+        })
+    })
+}
+
+async fn stream_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Utf8Path,
+) -> anyhow::Result<String> {
     use sha2::Digest;
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("open {path}"))?;
-    let mut h = sha2::Sha256::new();
-    std::io::copy(&mut f, &mut h).with_context(|| format!("hash {path}"))?;
-    Ok(format!("{:x}", h.finalize()))
+    use std::io::Write;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .with_context(|| format!("GET {url}"))?;
+    let pb = match resp.content_length() {
+        Some(len) => {
+            let pb = ProgressBar::new(len);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {bar:40.cyan/blue} \
+                     {bytes}/{total_bytes} {bytes_per_sec}",
+                )
+                .context("progress template")?
+                .progress_chars("##-"),
+            );
+            pb
+        }
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {spinner} {bytes} {bytes_per_sec}",
+                )
+                .context("progress template")?,
+            );
+            pb
+        }
+    };
+    let mut file = std::fs::File::create(dest)
+        .with_context(|| format!("create {dest}"))?;
+    let mut hash = sha2::Sha256::new();
+    let mut total = 0u64;
+    while let Some(chunk) =
+        resp.chunk().await.with_context(|| format!("read {url}"))?
+    {
+        file.write_all(&chunk).with_context(|| format!("write {dest}"))?;
+        hash.update(&chunk);
+        total += chunk.len() as u64;
+        pb.inc(chunk.len() as u64);
+    }
+    // The bar is transient; leave one durable line behind it.
+    let secs = pb.elapsed().as_secs_f64();
+    pb.finish_and_clear();
+    eprintln!(
+        "[voxel] fetched {} ({} MiB in {secs:.1}s)",
+        dest.file_name().unwrap_or(dest.as_str()).trim_end_matches(".part"),
+        total >> 20
+    );
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// The sp-emu binary driving a rack's fleet.
@@ -728,5 +860,22 @@ mod tests {
         );
         assert_eq!(super::find_in_path_list(&path, "faux-mgs"), None);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A download from an unreachable host fails within the configured
+    /// bounds instead of hanging in TCP retries.
+    #[test]
+    fn download_fails_fast_when_unreachable() {
+        let dest = crate::util::temp_dir()
+            .join(format!("voxel-dl-{}.part", std::process::id()));
+        let f = super::Fetch {
+            attempts: 2,
+            connect_timeout: std::time::Duration::from_secs(1),
+        };
+        let t0 = std::time::Instant::now();
+        let r = super::download("https://10.255.255.1/nothing", &dest, f);
+        let _ = std::fs::remove_file(&dest);
+        assert!(r.is_err());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
     }
 }

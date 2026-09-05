@@ -5901,6 +5901,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures",
+ "indicatif",
  "indoc",
  "libc",
  "libfalcon",
