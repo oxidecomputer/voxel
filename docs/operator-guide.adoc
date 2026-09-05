@@ -628,9 +628,13 @@ instances where nested virtualization is unavailable. Each probe attaches a
 network endpoint to a VPC, which can then send and receive traffic through the
 rack's data plane.
 
-Voxel includes built-in support for Omicron's end-to-end connectivity test,
-`commtest`, which creates probes on the rack and runs unicast and multicast
-traffic between them to validate the data plane.
+Voxel wraps Omicron's end-to-end connectivity test, `commtest`. It creates
+probes on the rack and sends unicast traffic between them. The multicast
+phase sends from the host instead, through the configured FRR routers and a
+switch to each subscribed probe (member).
+
+NOTE: `voxel network multicast up` must be run first. See
+link:multicast.md[multicast.md] for the setup and the API walkthrough.
 
 Before running `commtest`, grant your account the `net_icmpaccess` privilege
 needed for raw ICMP sockets:
@@ -763,5 +767,7 @@ increasing the rack count.
   stores from a TUF repo, accelerating update convergence.
 - **link:multirack-quicktest.md[Multi-rack DDM quick test]**: a walkthrough
   of DDM prefix propagation across interconnected racks.
+- **link:multicast.md[Multicast]**: host routes, static mroutes on the fabric
+  routers (through FRR), steering, and the pool/group/member API configuration.
 - **https://github.com/oxidecomputer/omicron[Omicron]**: the Oxide control
   plane, including Nexus, sled-agent, Oximeter, and other systems.

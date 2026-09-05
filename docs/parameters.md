@@ -33,7 +33,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. A non-default `version` also stops an unset `cp` from following the associated pin. |
-| `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
+| `cp` | string | unset | Full cp image name. Overrides `version`. Unset follows the workspace's omicron pin (`voxel-cp-<pin>`, the image a commitless `voxel image create` bakes), but only while `version` keeps its default. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
 | `disks_schema` | enum | unset | `vdevs`, `external_disks`, or `hardcoded` (omicron#10948). Unset auto-detects from the image. |
@@ -54,11 +54,14 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `router_mode` | enum | `bgp` | `bgp` (unnumbered eBGP) or `static` (numbered /30 uplinks, static routes, BFD). |
 | `transit_prefix` | string | `"198.51.101.0/24"` | IPv4 /24 carved into per-uplink /30s for `static` mode. |
 | `transit_bfd` | bool | `false` | `static` mode: BFD-track transit routes. Needs a dataplane where softnpu BFD establishes. |
+| `multicast` | table | (see below) | Defaults for `voxel network multicast`. Host-side only, never reaches RSS. |
 | `uplinks` | list of tables | two entries (see below) | Scrimlet uplink ports toward the customer routers. |
 
 ### [[network.uplinks]]
 
 One block per switch. Defaults: `switch0`/`uplink0` and `switch1`/`uplink1`.
+Each block fans out to every fabric router: `cr1` on `qsfp0`, `cr2` on
+`qsfp1`, LLDP description `<lldp_port_description>-<router>`.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
@@ -68,6 +71,15 @@ One block per switch. Defaults: `switch0`/`uplink0` and `switch1`/`uplink1`.
 | `port_speed` | string | `"40G"` | Link speed. |
 | `lldp_port_description` | string | required | LLDP port description. |
 
+### [network.multicast]
+
+The static customer tree carrying externally sourced multicast toward the rack.
+Every launch renders the PIM VIFs and enables `pimd` on the fabric routers.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `delivery` | enum | `"single"` | Delivery for unsteered groups. `single` takes one path: the first forwarding router toward `switch0`. `all` asks for every switch from every forwarding router, which `up` will reject on a rack with more than one switch (i.e., one outgoing path per router, since FRR withdraws a static mroute just by (S,G)). To reach several switches, use `--steer` to take one router per switch, e.g. `--steer GROUP=cr1:switch0,cr2:switch1`. |
+
 ## [external]
 
 Host-side external segment. This is host-only plumbing and never reaches the
@@ -75,10 +87,12 @@ rack's RSS config. See the README's "Isolated external network" section.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `mode` | enum | `"lan"` | `lan` attaches node external NICs to the host's default-route link (or `$EXT_INTERFACE`). `isolated` builds the segment on a host etherstub with NAT out `uplink`. |
+| `mode` | enum | `"lan"` | `lan` attaches node external NICs to `link`, or the host's default-route link (`$EXT_INTERFACE` overrides both). `isolated` builds the segment on a host etherstub with NAT out `uplink`. |
+| `addressing` | enum | `"dhcp"` | `dhcp` leases node addresses from the LAN. `static` stages per-node addresses from `ip_start` for a LAN that runs no DHCP. Ignored in isolated mode, which is always static. |
+| `link` | string | unset | `lan` mode external link (e.g. `igb1`), for hosts whose default-route interface is not the LAN under test. Ignored in isolated mode. |
 | `uplink` | string | unset | Physical link the isolated segment NATs out of (e.g. `igb0`). Required in isolated mode. |
-| `subnet` | string | `"172.30.199.0/24"` | The isolated segment's subnet, chosen to avoid common home/office LANs. `up` refuses if it overlaps a host address. |
-| `host_ip` | string | `"172.30.199.199"` | Host address on the segment: the nodes' default gateway and NAT inside address. Image builds also use `ip_start - 1` for the builder VM. |
+| `subnet` | string | `"172.30.199.0/24"` | The static addressing subnet: the isolated segment's (chosen to avoid common home/office LANs; `up` refuses if it overlaps a host address), or the LAN's under `addressing = "static"`. |
+| `host_ip` | string | `"172.30.199.199"` | The nodes' default gateway. Isolated mode creates it on the etherstub (also the NAT inside address); static lan addressing expects it to already exist on the LAN. Image builds also use `ip_start - 1` for the builder VM. |
 | `ip_start` | string | `"172.30.199.10"` | First static node address. Nodes number contiguously, sleds then `topology.routers`. |
 | `dns` | list | `["1.1.1.1", "9.9.9.9"]` | Nameservers handed to the nodes. |
 | `mtu` | int | `1500` | Etherstub MTU. Must stay below 9000 so voxel-init's jumbo probe classifies external NICs correctly. |
