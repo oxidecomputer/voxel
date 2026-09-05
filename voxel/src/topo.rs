@@ -678,18 +678,21 @@ fn stage_sp_emu(
     fs::create_dir_all(&out)?;
     // The host fleet needs the binary and archives here: there is no baked
     // in-guest copy to fall back on now that it runs outside the switch zone.
-    // sp_host reports the missing binary rather than silently starting nothing.
-    let Some(emu_bin) = cfg.sp.emu_bin.as_deref() else {
-        return Ok(());
-    };
-    fs::copy(emu_bin, out.join("sp-emu"))
+    // [sp].emu_bin overrides; unset fetches the pinned buildomat build.
+    let emu_bin = crate::sp_host::ensure_emu_bin(cfg)?;
+    fs::copy(&emu_bin, out.join("sp-emu"))
         .with_context(|| format!("stage sp-emu binary from {emu_bin}"))?;
-    // Stage `faux-mgs` (the MGS client) alongside it when configured, so
-    // `voxel sp ls/state/exec` can talk to the live SPs from inside the switch
-    // zone. Optional: the operator `sp` commands need it; launch itself doesn't.
-    if let Some(faux) = cfg.sp.faux_mgs.as_deref() {
-        fs::copy(faux, out.join("faux-mgs"))
-            .with_context(|| format!("stage faux-mgs from {faux}"))?;
+    // Stage `faux-mgs` (the MGS client) alongside it, so `voxel sp
+    // ls/state/exec` can talk to the live SPs. The operator commands need it,
+    // launch itself does not, so an unavailable faux-mgs only warns.
+    match crate::sp_host::ensure_faux_mgs(cfg) {
+        Ok(faux) => {
+            fs::copy(&faux, out.join("faux-mgs"))
+                .with_context(|| format!("stage faux-mgs from {faux}"))?;
+        }
+        Err(e) => eprintln!(
+            "[voxel] faux-mgs unavailable ({e:#}); sp commands will not work"
+        ),
     }
     // Stage the RoT image so each SP can run oxide-rot-1 in-process over sprot
     // (sp-emu 1.x runs the RoT inside the SP process, not as a separate service).

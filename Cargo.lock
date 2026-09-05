@@ -5909,6 +5909,7 @@ dependencies = [
  "rack-init-config",
  "reqwest 0.13.4",
  "serde_json",
+ "sha2",
  "slog",
  "sprockets-tls-test-utils",
  "tar",
