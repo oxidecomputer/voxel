@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Build and run Omicron's `commtest` against a Voxel rack.
+//! Build and run Omicron's `commtest` against a voxel rack.
 //!
 //! The source defaults to the checkout matching the configured control-plane
 //! image. An explicit git ref can select another Omicron era (including the
@@ -28,7 +28,15 @@ const RUN_SUBCOMMAND: &str = "run";
 /// TODO: IPv4 only, since commtest rejects v6 groups during validation. Pick a
 /// v6 default once its own `validate_mcast` TODO to add the v6 pool buckets and
 /// a v6 arm in `test_mcast_connectivity` is discharged.
-const DEFAULT_MCAST_GROUP: &str = "239.1.1.1";
+pub(crate) const DEFAULT_MCAST_GROUP: &str = "239.1.1.1";
+/// Loss tolerance appended when the caller does not pass
+/// `--icmp-loss-tolerance`. Commtest defaults to zero, which is the right
+/// threshold for real hardware, but a virtual rack shares one host across
+/// every sled VM and sheds a few packets at the virtio rings under burst.
+/// Omicron's a4x2 CI passes the same value
+/// (`.github/buildomat/jobs/a4x2-deploy.sh`).
+/// Pass `--icmp-loss-tolerance 0` through to restore the strict threshold.
+const DEFAULT_ICMP_LOSS_TOLERANCE: u32 = 500;
 const HELIOS_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
     -C link-arg=-R/usr/platform/oxide/lib/amd64 \
     -C link-arg=-Wl,-znocompstrtab --cfg tokio_unstable";
@@ -74,12 +82,14 @@ pub(crate) struct Options<'a> {
     pub api_override: Option<&'a str>,
     pub traffic: Traffic,
     pub no_build: bool,
+    pub setup_mcast: bool,
     pub allow_root: bool,
     pub passthrough: &'a [String],
 }
 
-pub(crate) fn run(
+pub(crate) async fn run(
     cfg: &VoxelConfig,
+    name: &str,
     options: Options<'_>,
 ) -> anyhow::Result<()> {
     let Options {
@@ -88,6 +98,7 @@ pub(crate) fn run(
         api_override,
         traffic,
         no_build,
+        setup_mcast,
         allow_root,
         passthrough,
     } = options;
@@ -120,9 +131,11 @@ pub(crate) fn run(
         passthrough,
         supports_multicast(&source)?,
     )?;
+    let groups = preflight_groups(traffic, &args);
+    ensure_mcast_plumbing(cfg, name, &groups, setup_mcast).await?;
 
     if !no_build {
-        eprintln!("[voxel] building Omicron commtest from {}", source);
+        eprintln!("[voxel] building Omicron commtest from {source}");
         let mut cargo = Command::new("cargo");
         cargo.current_dir(&source).args([
             "build",
@@ -135,9 +148,8 @@ pub(crate) fn run(
         require_success(cargo.status(), "cargo build commtest")?;
     } else if !bin.is_file() {
         bail!(
-            "{} does not exist; omit --no-build or build it with \
-             `cargo build -p end-to-end-tests --bin commtest`",
-            bin
+            "{bin} does not exist; omit --no-build or build it with \
+             `cargo build -p end-to-end-tests --bin commtest`"
         );
     }
 
@@ -174,13 +186,13 @@ fn run_streamed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("run {}", bin))?;
+        .with_context(|| format!("run {bin}"))?;
     let out = child.stdout.take().expect("stdout piped above");
     let err = child.stderr.take().expect("stderr piped above");
     let t_out = std::thread::spawn(move || tee(out, std::io::stdout(), log));
     let t_err =
         std::thread::spawn(move || tee(err, std::io::stderr(), log_err));
-    let status = child.wait().with_context(|| format!("wait for {}", bin))?;
+    let status = child.wait().with_context(|| format!("wait for {bin}"))?;
     join_tee(t_out, "stdout")?;
     join_tee(t_err, "stderr")?;
     Ok(status)
@@ -250,10 +262,10 @@ fn resolve_source(
 fn validate_source(path: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
     let path = path
         .canonicalize_utf8()
-        .with_context(|| format!("resolve Omicron source {}", path))?;
+        .with_context(|| format!("resolve Omicron source {path}"))?;
     let commtest = path.join("end-to-end-tests/src/bin/commtest.rs");
     if !path.join("Cargo.toml").is_file() || !commtest.is_file() {
-        bail!("{} is not an Omicron checkout with {}", path, commtest);
+        bail!("{path} is not an Omicron checkout with {commtest}");
     }
     Ok(path)
 }
@@ -348,9 +360,9 @@ fn checkout(reference: &str) -> anyhow::Result<Utf8PathBuf> {
         std::env::var("OMICRON_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
 
     std::fs::create_dir_all(&root)
-        .with_context(|| format!("create commtest cache {}", root))?;
+        .with_context(|| format!("create commtest cache {root}"))?;
     if !repository.exists() {
-        eprintln!("[voxel] creating Omicron Git cache in {}", repository);
+        eprintln!("[voxel] creating Omicron Git cache in {repository}");
         let mut clone = Command::new("git");
         clone.args(["clone", "--mirror", "--", &repo]).arg(&repository);
         require_success(clone.status(), "git clone Omicron")?;
@@ -372,13 +384,13 @@ fn checkout(reference: &str) -> anyhow::Result<Utf8PathBuf> {
         validate_worktree(&source, &wanted)?;
     } else {
         std::fs::create_dir_all(&worktrees).with_context(|| {
-            format!("create worktree directory {}", worktrees)
+            format!("create worktree directory {worktrees}")
         })?;
         require_success(
             git_dir_command(&repository).args(["worktree", "prune"]).status(),
             "git worktree prune",
         )?;
-        eprintln!("[voxel] creating detached Omicron worktree {}", source);
+        eprintln!("[voxel] creating detached Omicron worktree {source}");
         require_success(
             git_dir_command(&repository)
                 .args(["worktree", "add", "--detach", "--"])
@@ -398,7 +410,7 @@ fn validate_repository(
     if git_dir_output(repository, &["rev-parse", "--is-bare-repository"])?
         != "true"
     {
-        bail!("{} exists but is not a bare Git repository", repository);
+        bail!("{repository} exists but is not a bare Git repository");
     }
     // `remote get-url` applies the user's `url.<base>.insteadOf` rewrites and
     // can false-mismatch the configured URL. Read the raw remote instead.
@@ -406,11 +418,8 @@ fn validate_repository(
         git_dir_output(repository, &["config", "--get", "remote.origin.url"])?;
     if actual_remote != expected_remote {
         bail!(
-            "{} uses origin '{}', but OMICRON_REPO is '{}'; use a different \
-             BUILD_ROOT for the other repository",
-            repository,
-            actual_remote,
-            expected_remote
+            "{repository} uses origin '{actual_remote}', but OMICRON_REPO is '{expected_remote}'; use a different \
+             BUILD_ROOT for the other repository"
         );
     }
     Ok(())
@@ -442,8 +451,7 @@ fn resolve_reference(
     match matches.as_slice() {
         [commit_id] => Ok(commit_id.clone()),
         [] => bail!(
-            "Omicron commit or ref '{reference}' was not found in {}",
-            repository
+            "Omicron commit or ref '{reference}' was not found in {repository}"
         ),
         _ => bail!(
             "Omicron ref '{reference}' is ambiguous; use a full refs/heads/... \
@@ -505,9 +513,8 @@ fn validate_worktree(source: &Utf8Path, wanted: &str) -> anyhow::Result<()> {
     )?;
     if !dirty.is_empty() {
         bail!(
-            "{} has tracked local changes; move them to a separate checkout and \
-             use --source, or restore this cached worktree",
-            source
+            "{source} has tracked local changes; move them to a separate checkout and \
+             use --source, or restore this cached worktree"
         );
     }
     Ok(())
@@ -581,7 +588,7 @@ fn target_dir(source: &Utf8Path) -> Utf8PathBuf {
     }
 }
 
-/// Reproduce `voxel-image/build-cp.sh`'s build environment, so commtest links
+/// Reproduce `voxel image create`'s build environment, so commtest links
 /// against the same Helios runtime as the image it tests.
 ///
 /// Caller-supplied flags win out: cargo ignores `RUSTFLAGS` once
@@ -675,7 +682,7 @@ fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
 fn supports_multicast(source: &Utf8Path) -> anyhow::Result<bool> {
     let source_file = source.join("end-to-end-tests/src/bin/commtest.rs");
     let text = std::fs::read_to_string(&source_file)
-        .with_context(|| format!("read {}", source_file))?;
+        .with_context(|| format!("read {source_file}"))?;
     Ok(text.contains("skip_unicast") && text.contains("mcast_group"))
 }
 
@@ -698,13 +705,28 @@ fn commtest_args_for(
 
     apply_traffic(source, traffic, supports_multicast, &mut args)?;
 
-    let has_begin = args
-        .iter()
-        .any(|a| a == "--ip-pool-begin" || a.starts_with("--ip-pool-begin="));
-    let has_end = args
-        .iter()
-        .any(|a| a == "--ip-pool-end" || a.starts_with("--ip-pool-end="));
+    if !has_arg(&args, "--icmp-loss-tolerance") {
+        args.push("--icmp-loss-tolerance".into());
+        args.push(DEFAULT_ICMP_LOSS_TOLERANCE.to_string());
+    }
+
+    let has_begin = has_arg(&args, "--ip-pool-begin");
+    let has_end = has_arg(&args, "--ip-pool-end");
     if has_begin && has_end {
+        let begin = arg_value(&args, "--ip-pool-begin")
+            .and_then(|v| v.parse::<Ipv4Addr>().ok());
+        let end = arg_value(&args, "--ip-pool-end")
+            .and_then(|v| v.parse::<Ipv4Addr>().ok());
+        // commtest hands the pair to Nexus as-is, so an inverted range fails
+        // minutes in as a pool creation error rather than here.
+        if let (Some(begin), Some(end)) = (begin, end)
+            && begin > end
+        {
+            bail!(
+                "--ip-pool-begin {begin} is above --ip-pool-end {end}; \
+                 the range is inverted."
+            );
+        }
         return Ok(args);
     }
     // Deriving the missing half of a partial override would pair a caller's
@@ -715,7 +737,7 @@ fn commtest_args_for(
         bail!(
             "pass both --ip-pool-begin and --ip-pool-end, or neither. Voxel \
              derives the pair from [network], and mixing the two produces a \
-             range that overlaps the service pool."
+             range that either overlaps the service pool or becomes inverted."
         );
     }
 
@@ -747,9 +769,8 @@ fn apply_traffic(
         }
         Traffic::Multicast | Traffic::Both if !supports_multicast => {
             bail!(
-                "{} does not support multicast commtest; select --traffic unicast \
-                 or use an Omicron commit containing multicast commtest support",
-                source
+                "{source} does not support multicast commtest; select --traffic unicast \
+                 or use an Omicron commit containing multicast commtest support"
             );
         }
         Traffic::Multicast => {
@@ -780,11 +801,112 @@ fn has_arg(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name || a.starts_with(&format!("{name}=")))
 }
 
+/// The value following `name`, in either `--flag value` or `--flag=value`
+/// spelling, or `None` when the flag is absent or trails without a value.
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
+            return Some(value);
+        }
+        if arg == name {
+            return rest.next().map(String::as_str);
+        }
+    }
+    None
+}
+
 fn add_default_mcast_group(args: &mut Vec<String>) {
     if !has_arg(args, "--mcast-group") && !has_arg(args, "--mcast-deny-group") {
         args.push("--mcast-group".into());
         args.push(DEFAULT_MCAST_GROUP.into());
     }
+}
+
+/// The groups the multicast preflight covers. Empty here when the run skips
+/// the multicast phase (`--traffic unicast`, or a passed-through `--skip-mcast`),
+/// even if an explicit `--mcast-group` rides along in the arguments, so the
+/// preflight cannot block, or under `--setup-mcast` plumb, a phase commtest
+/// never enters.
+fn preflight_groups(traffic: Traffic, args: &[String]) -> Vec<String> {
+    if matches!(traffic, Traffic::Unicast) || has_arg(args, "--skip-mcast") {
+        return Vec::new();
+    }
+    mcast_groups(args)
+}
+
+/// Collect the group addresses from the assembled commtest arguments,
+/// defaulted or passed through, in either `--flag value` or `--flag=value`
+/// spelling.
+///
+/// Deny groups count. They expect no delivery, which is also what missing
+/// plumbing produces, so a deny-only run would otherwise pass without ever
+/// reaching the dataplane it is meant to exercise.
+fn mcast_groups(args: &[String]) -> Vec<String> {
+    const FLAGS: [&str; 2] = ["--mcast-group", "--mcast-deny-group"];
+    let mut out = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if let Some(group) =
+            FLAGS.iter().find_map(|f| arg.strip_prefix(&format!("{f}=")))
+        {
+            out.push(group.to_string());
+        } else if FLAGS.contains(&arg.as_str())
+            && let Some(group) = rest.next()
+        {
+            out.push(group.clone());
+        }
+    }
+    out
+}
+
+/// Refuse to start a multicast run before the host plumbing is in place, or
+/// plumb it here under `setup`.
+///
+/// Without the mirror and host routes the traffic never leaves the host, and
+/// commtest reports that as a receive timeout minutes into the run rather than
+/// as missing setup.
+async fn ensure_mcast_plumbing(
+    cfg: &VoxelConfig,
+    name: &str,
+    groups: &[String],
+    setup: bool,
+) -> anyhow::Result<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let missing = crate::multicast::missing_plumbing(cfg, name, groups).await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if setup {
+        crate::multicast::up(cfg, name, groups, false).await?;
+        let still_missing =
+            crate::multicast::missing_plumbing(cfg, name, groups).await?;
+
+        if still_missing.is_empty() {
+            return Ok(());
+        }
+
+        bail!(
+            "host multicast plumbing still incomplete after setup:\n  {}",
+            still_missing.join("\n  ")
+        );
+    }
+
+    // A groupless `up` already covers the default group, but explicit --group
+    // flags suppress that default, so any other list is spelled out in full.
+    let flags: String = if groups == [DEFAULT_MCAST_GROUP] {
+        String::new()
+    } else {
+        groups.iter().map(|g| format!(" --group {g}")).collect()
+    };
+
+    bail!(
+        "host multicast plumbing is incomplete:\n  {}\nrun `voxel network multicast up{flags}` \
+         first, or pass --setup-mcast",
+        missing.join("\n  ")
+    );
 }
 
 fn derive_pool(
@@ -827,7 +949,7 @@ fn derive_pool(
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     #[test]
@@ -858,6 +980,8 @@ mod test {
             .unwrap(),
             [
                 "run",
+                "--icmp-loss-tolerance",
+                "500",
                 "--ip-pool-begin",
                 "198.51.100.30",
                 "--ip-pool-end",
@@ -873,6 +997,7 @@ mod test {
             "--api-timeout".into(),
             "5m".into(),
             "run".into(),
+            "--icmp-loss-tolerance=0".into(),
             "--ip-pool-begin=203.0.113.10".into(),
             "--ip-pool-end".into(),
             "203.0.113.20".into(),
@@ -906,6 +1031,35 @@ mod test {
     }
 
     #[test]
+    fn defaults_loss_tolerance_alongside_explicit_pool() {
+        let network = Network::default();
+        let explicit = vec![
+            "run".to_string(),
+            "--ip-pool-begin=203.0.113.10".into(),
+            "--ip-pool-end=203.0.113.20".into(),
+        ];
+        let args = commtest_args_for(
+            Utf8Path::new("/tmp/old-omicron"),
+            &network,
+            4,
+            Traffic::Unicast,
+            &explicit,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--ip-pool-begin=203.0.113.10",
+                "--ip-pool-end=203.0.113.20",
+                "--icmp-loss-tolerance",
+                "500",
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_partial_pool_override() {
         let network = Network::default();
         for partial in [
@@ -923,6 +1077,37 @@ mod test {
                     4,
                     Traffic::Unicast,
                     &partial,
+                    false
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_inverted_pool_override() {
+        let network = Network::default();
+        for inverted in [
+            vec![
+                "run".to_string(),
+                "--ip-pool-begin=203.0.113.20".into(),
+                "--ip-pool-end=203.0.113.10".into(),
+            ],
+            vec![
+                "run".to_string(),
+                "--ip-pool-begin".into(),
+                "203.0.113.20".into(),
+                "--ip-pool-end".into(),
+                "203.0.113.10".into(),
+            ],
+        ] {
+            assert!(
+                commtest_args_for(
+                    Utf8Path::new("/tmp/old-omicron"),
+                    &network,
+                    4,
+                    Traffic::Unicast,
+                    &inverted,
                     false
                 )
                 .is_err()
@@ -957,6 +1142,87 @@ mod test {
         assert!(!both.contains(&"--skip-unicast".into()));
         assert!(!both.contains(&"--skip-mcast".into()));
         assert!(both.contains(&DEFAULT_MCAST_GROUP.into()));
+    }
+
+    #[test]
+    fn preflight_reads_back_the_groups_commtest_uses() {
+        // The preflight has to cover passed-through groups, in either spelling,
+        // not just the default this module appends.
+        let network = Network::default();
+        let unicast = commtest_args_for(
+            Utf8Path::new("/tmp/new-omicron"),
+            &network,
+            4,
+            Traffic::Unicast,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert!(mcast_groups(&unicast).is_empty());
+
+        let defaulted = commtest_args_for(
+            Utf8Path::new("/tmp/new-omicron"),
+            &network,
+            4,
+            Traffic::Multicast,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(mcast_groups(&defaulted), [DEFAULT_MCAST_GROUP]);
+
+        let passthrough = [
+            "--mcast-group".to_string(),
+            "224.0.2.5".to_string(),
+            "--mcast-group=224.0.2.6".to_string(),
+        ];
+        let explicit = commtest_args_for(
+            Utf8Path::new("/tmp/new-omicron"),
+            &network,
+            4,
+            Traffic::Multicast,
+            &passthrough,
+            true,
+        )
+        .unwrap();
+        assert_eq!(mcast_groups(&explicit), ["224.0.2.5", "224.0.2.6"]);
+    }
+
+    #[test]
+    fn unicast_never_preflights_a_passthrough_group() {
+        let network = Network::default();
+        let passthrough = vec![
+            "run".to_string(),
+            "--mcast-group".to_string(),
+            "224.0.2.5".to_string(),
+        ];
+        let args = commtest_args_for(
+            Utf8Path::new("/tmp/new-omicron"),
+            &network,
+            4,
+            Traffic::Unicast,
+            &passthrough,
+            true,
+        )
+        .unwrap();
+        // The group rides through to commtest, which ignores it under the
+        // appended --skip-mcast, and the preflight must ignore it too.
+        assert!(args.contains(&"--skip-mcast".into()));
+        assert_eq!(mcast_groups(&args), ["224.0.2.5"]);
+        assert!(preflight_groups(Traffic::Unicast, &args).is_empty());
+
+        // The gate is the phase selection, not the group spelling: the same
+        // passthrough under --traffic both is preflighted.
+        let both = commtest_args_for(
+            Utf8Path::new("/tmp/new-omicron"),
+            &network,
+            4,
+            Traffic::Both,
+            &passthrough,
+            true,
+        )
+        .unwrap();
+        assert_eq!(preflight_groups(Traffic::Both, &both), ["224.0.2.5"]);
     }
 
     #[test]

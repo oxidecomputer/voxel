@@ -10,8 +10,8 @@
 //! kicks RSS on the RSS node).
 
 use crate::sys::{
-    capture, note, read_external_net, replace_in_file, run, run_env, run_quiet,
-    warn,
+    append_authorized_keys, capture, note, read_external_net, replace_in_file,
+    run, run_env, run_quiet, warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -31,7 +31,7 @@ const TUF_MARKER: &str = "/opt/oxide/.voxel-tuf";
 
 pub fn bring_up() -> Result<()> {
     setup_ssh();
-    crash_dump();
+    disable_crash_dump();
     maybe_load_sidecar();
 
     // TUF images carry no omicron tooling; their virtual hardware and
@@ -399,25 +399,7 @@ fn activate_native() {
 /// function). illumos sshd defaults differ from debian's, hence the explicit
 /// config edits.
 fn setup_ssh() {
-    let authorized = format!("{CARGO_BAY}/root_authorized_keys");
-    if Utf8Path::new(&authorized).exists() {
-        let _ = fs::create_dir_all("/root/.ssh");
-        if let Ok(keys) = fs::read(&authorized) {
-            use std::io::Write;
-            match fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/root/.ssh/authorized_keys")
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&keys) {
-                        warn(format!("authorized_keys: {e}"));
-                    }
-                }
-                Err(e) => warn(format!("authorized_keys: {e}")),
-            }
-        }
-    }
+    append_authorized_keys(&format!("{CARGO_BAY}/root_authorized_keys"));
     run("ssh-keygen", &["-A"]);
     replace_in_file(
         "/etc/ssh/sshd_config",
@@ -430,9 +412,23 @@ fn setup_ssh() {
     run("svcadm", &["restart", "svc:/network/ssh:default"]);
 }
 
-fn crash_dump() {
-    run("zfs", &["create", "-p", "-V", "8G", "rpool/dump"]);
-    run("dumpadm", &["-d", "/dev/zvol/dsk/rpool/dump"]);
+/// Disable kernel crash dumps and reclaim the `rpool/dump` zvol.
+///
+/// The guest rpool is about 96G while the sparse U.2/M.2 vdev backing files
+/// staged in /var/tmp hold 140G of combined potential, so the pool is
+/// deliberately overcommitted and only ever fills (file vdevs never return
+/// freed blocks). An 8G dump reservation buys nothing on a debug VM and
+/// giving it back delays the ENOSPC cliff that otherwise kills svc.configd
+/// and leaves dendrite in the switch zone unresponsive.
+///
+/// The destroy also reaps a zvol persisted by an image baked before this change,
+/// since falcon keeps the sled disk across destroy/relaunch.
+/// `dumpadm -d none` must come first because zfs refuses to destroy the active
+/// dump device, and `run_quiet` swallows the expected failure on a fresh disk
+/// with no zvol.
+fn disable_crash_dump() {
+    run("dumpadm", &["-d", "none"]);
+    run_quiet("zfs", &["destroy", "rpool/dump"]);
 }
 
 /// Scrimlets load the baked SoftNPU sidecar P4 program. Gimlets have no softnpu

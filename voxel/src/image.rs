@@ -39,7 +39,7 @@ pub(crate) fn ensure_image(image: &str) -> anyhow::Result<()> {
 
 /// The checkout's short HEAD sha (the default `--src` image label).
 pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::cpbuild::git()
         .arg("-C")
         .arg(src)
         // Under pfexec the checkout is usually owned by the invoking user,
@@ -48,7 +48,7 @@ pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
         .arg(format!("safe.directory={src}"))
         .args(["rev-parse", "--short", "HEAD"])
         .output()
-        .with_context(|| format!("run git in {}", src))?;
+        .with_context(|| format!("run git in {src}"))?;
     if !out.status.success() {
         bail!(
             "git rev-parse HEAD failed in {src}: {}",
@@ -93,9 +93,9 @@ pub(crate) fn render_smf(
     for (rel, text) in writes {
         let path = omicron_root.join(rel);
         let dir = path.parent().expect("smf path has a parent");
-        fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir))?;
-        fs::write(&path, text).with_context(|| format!("write {}", path))?;
-        println!("rendered {}", path);
+        fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
+        fs::write(&path, text).with_context(|| format!("write {path}"))?;
+        println!("rendered {path}");
     }
     Ok(())
 }
@@ -294,7 +294,7 @@ pub(crate) fn cmd_image(
             };
             let out =
                 out.clone().unwrap_or_else(|| Utf8PathBuf::from(default_out));
-            eprintln!("[voxel] exporting {snap} -> {}", out);
+            eprintln!("[voxel] exporting {snap} -> {out}");
             let status = std::process::Command::new("bash")
                 .arg("-c")
                 .arg(format!("{pipe} > {}", shell_quote(out.as_str())))
@@ -306,7 +306,7 @@ pub(crate) fn cmd_image(
                     if *raw { "xz" } else { "zstd" }
                 );
             }
-            println!("exported {}", out);
+            println!("exported {out}");
             Ok(())
         }
         ImageCmd::Import { file } => {
@@ -330,7 +330,7 @@ pub(crate) fn cmd_image(
                 );
             };
             let dst = format!("{dataset}/img/{name}");
-            eprintln!("[voxel] importing {} -> {dst}", file);
+            eprintln!("[voxel] importing {file} -> {dst}");
             let status = std::process::Command::new("bash")
                 .arg("-c")
                 .arg(format!("{decomp} | zfs recv {dst}"))

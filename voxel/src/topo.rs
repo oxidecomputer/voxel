@@ -44,9 +44,11 @@ impl Topo {
     }
 }
 
-/// Wire a node's external NIC. Precedence: `$EXT_INTERFACE` env, then the
-/// config-driven link (the voxel-managed stub in isolated mode), then falcon's
-/// default (the host's default-route interface).
+/// Wire a node's external NIC.
+///
+/// Precedence: `$EXT_INTERFACE` env, then the config-driven link (the
+/// voxel-managed stub in isolated mode, `[external] link` in lan mode), then
+/// falcon's default (the host's default-route interface).
 fn ext_interface(
     d: &mut Runner,
     n: NodeRef,
@@ -128,9 +130,13 @@ pub(crate) fn build_topo(
     }
 
     // Isolated mode wires every external NIC onto the voxel-managed etherstub
-    // instead of the host LAN ($EXT_INTERFACE still wins inside ext_interface).
-    let ext_if =
-        cfg.external.isolated().then_some(crate::isolated_external::STUB);
+    // instead of the host LAN. Lan mode honors `[external] link` when set
+    // ($EXT_INTERFACE still wins inside ext_interface).
+    let ext_if = if cfg.external.isolated() {
+        Some(crate::isolated_external::STUB)
+    } else {
+        cfg.external.link.as_deref()
+    };
 
     let all_scrimlets: Vec<NodeRef> =
         sleds.iter().filter(|(s, _)| s.scrimlet).map(|(_, n)| *n).collect();
@@ -258,8 +264,7 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
     for node in nodes {
         let dir = cargo_bay(&node);
         if dir.exists() {
-            fs::remove_dir_all(&dir)
-                .with_context(|| format!("reset {}", dir))?;
+            fs::remove_dir_all(&dir).with_context(|| format!("reset {dir}"))?;
         }
         fs::create_dir_all(&dir)?;
     }
@@ -540,11 +545,12 @@ pub(crate) fn stage_config(
         fs::write(dir.join("ce-external-ip"), ip)?;
     }
 
-    // Isolated mode: no DHCP server; instead stage each node's assigned static
-    // address into its cargo-bay. voxel-init picks it up on both sled and router
-    // roles. The router role also needs the interface name (routers can't jumbo-
-    // probe their way to it the way sleds do); sleds self-classify.
-    if cfg.external.isolated() {
+    // Static addressing (isolated mode, or a lan without DHCP): stage each
+    // node's assigned address into its cargo-bay. voxel-init picks it up on
+    // both sled and router roles. The router role also needs the interface
+    // name (routers can't jumbo-probe their way to it the way sleds do);
+    // sleds self-classify.
+    if cfg.external.static_addressing() {
         let prefix = cfg.external.prefix_length().ok_or_else(|| {
             anyhow!(
                 "[external].subnet '{}' must be CIDR (a.b.c.d/len)",
@@ -654,7 +660,93 @@ pub(crate) fn stage_config(
         // One fleet for the rack, staged on the host instead of in each zone.
         stage_sp_emu(cfg, &fleet, &sp_fleet_dir(rack), emu, fw.as_deref())?;
     }
+
+    stage_ssh_pubkey(cfg)?;
     Ok(())
+}
+
+/// Stage the operator's SSH public key into every node's cargo-bay as
+/// `root_authorized_keys`, which voxel-init's `setup_ssh` (sled and router
+/// roles alike) appends to root's `authorized_keys`. Plain `ssh root@<node>`
+/// then authenticates by key, with no need for the `SSH_ASKPASS` shim that
+/// supplies the rack's empty root password.
+///
+/// An explicit `[falcon].ssh_pubkey` must exist and validate; the default
+/// probes `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` in that order
+/// (an explicit list, so certificates and surprising `id_*` variants are never
+/// picked up) and skips staging when none exist.
+fn stage_ssh_pubkey(cfg: &VoxelConfig) -> anyhow::Result<()> {
+    let path = if let Some(p) = &cfg.falcon.ssh_pubkey {
+        let p = Utf8PathBuf::from(p);
+        if !p.is_file() {
+            bail!("[falcon].ssh_pubkey '{p}' does not exist");
+        }
+        p
+    } else {
+        let Ok(home) = std::env::var("HOME") else { return Ok(()) };
+        let ssh = Utf8Path::new(&home).join(".ssh");
+        let Some(p) = ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"]
+            .iter()
+            .map(|f| ssh.join(f))
+            .find(|p| p.is_file())
+        else {
+            return Ok(());
+        };
+        p
+    };
+    let body = read_ssh_pubkey(&path)
+        .with_context(|| format!("ssh public key {path}"))?;
+    eprintln!("[voxel] staging ssh public key {path} into the cargo-bays");
+    let mut nodes: Vec<String> =
+        cfg.sleds().into_iter().map(|s| s.name).collect();
+    nodes.extend(cfg.topology.routers.iter().cloned());
+    for node in nodes {
+        let dir = cargo_bay(&node);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("root_authorized_keys"), &body)?;
+    }
+    Ok(())
+}
+
+/// Read and validate a public-key file, returning its normalized content
+/// (CRs stripped, trailing newline). Validation is by content, not filename:
+/// the cargo-bay is mounted into every guest, so an `ssh_pubkey` mispointed
+/// at a private key would hand the secret to the whole rack. Every non-empty
+/// line must carry a recognized public-key algorithm prefix.
+fn read_ssh_pubkey(path: &Utf8Path) -> anyhow::Result<String> {
+    validate_ssh_pubkey(&fs::read_to_string(path)?)
+}
+
+/// The content check behind [`read_ssh_pubkey`], split out for unit tests.
+fn validate_ssh_pubkey(raw: &str) -> anyhow::Result<String> {
+    if raw.contains("PRIVATE KEY") {
+        bail!("this is a private key; refusing to stage it into the guests");
+    }
+    let mut body = String::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let ok = ["ssh-ed25519 ", "ssh-rsa ", "ssh-dss "]
+            .iter()
+            .any(|p| line.starts_with(p))
+            || line.starts_with("ecdsa-sha2-")
+            || line.starts_with("sk-ssh-ed25519@")
+            || line.starts_with("sk-ecdsa-");
+        if !ok {
+            bail!(
+                "line does not look like an OpenSSH public key: '{}...'",
+                line.chars().take(24).collect::<String>()
+            );
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if body.is_empty() {
+        bail!("no keys found");
+    }
+    Ok(body)
 }
 
 /// Stage the `sp-emu` binary + each emulated SP's flashed hubris image into the
@@ -845,6 +937,33 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_and_normalizes_public_keys() {
+        let out = validate_ssh_pubkey(
+            "ssh-ed25519 AAAAC3Nza me@host\r\n\nssh-rsa AAAAB3Nza me@host",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "ssh-ed25519 AAAAC3Nza me@host\nssh-rsa AAAAB3Nza me@host\n"
+        );
+    }
+
+    /// The cargo-bay is mounted into every guest, so a `[falcon].ssh_pubkey`
+    /// mispointed at the private half must hard-fail, not stage.
+    #[test]
+    fn rejects_private_keys_and_non_keys() {
+        let openssh = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk...\n\
+             -----END OPENSSH PRIVATE KEY-----\n";
+        assert!(validate_ssh_pubkey(openssh).is_err());
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n\
+                   -----END RSA PRIVATE KEY-----\n";
+        assert!(validate_ssh_pubkey(pem).is_err());
+        assert!(validate_ssh_pubkey("not a key at all\n").is_err());
+        assert!(validate_ssh_pubkey("\n\n").is_err());
+        assert!(validate_ssh_pubkey("").is_err());
+    }
 
     /// A stand-in checkout carrying the two files the sled-schema detection
     /// reads: the sled-agent config field and the sled-hardware enum variants.

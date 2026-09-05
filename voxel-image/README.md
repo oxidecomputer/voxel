@@ -1,6 +1,6 @@
 # voxel-image (prototype)
 
-Machinery to build pre-built Voxel images via the snapshot-first path: boot one
+Machinery to build pre-built voxel images via the snapshot-first path: boot one
 node, install baked software onto it, then capture its disk as a falcon base image
 (optionally a distributable `<name>_0.raw.xz`). Topologies later boot from these
 images and apply topology-specific config at launch, so one image serves every

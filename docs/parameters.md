@@ -33,7 +33,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. |
-| `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
+| `cp` | string | unset | Full cp image name. Overrides `version`. Unset follows the workspace's omicron pin (`voxel-cp-<pin>`, the image a commitless `voxel image create` bakes). Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
 | `disks_schema` | enum | unset | `vdevs`, `external_disks`, or `hardcoded` (omicron#10948). Unset auto-detects from the image. |
@@ -76,10 +76,12 @@ rack's RSS config. See the README's "Isolated external network" section.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `mode` | enum | `"lan"` | `lan` attaches node external NICs to the host's default-route link (or `$EXT_INTERFACE`). `isolated` builds the segment on a host etherstub with NAT out `uplink`. |
+| `mode` | enum | `"lan"` | `lan` attaches node external NICs to `link`, or the host's default-route link (`$EXT_INTERFACE` overrides both). `isolated` builds the segment on a host etherstub with NAT out `uplink`. |
+| `addressing` | enum | `"dhcp"` | `dhcp` leases node addresses from the LAN. `static` stages per-node addresses from `ip_start` for a LAN that runs no DHCP. Ignored in isolated mode, which is always static. |
+| `link` | string | unset | Lan-mode external link (e.g. `igb1`), for hosts whose default-route interface is not the LAN under test. Ignored in isolated mode. |
 | `uplink` | string | unset | Physical link the isolated segment NATs out of (e.g. `igb0`). Required in isolated mode. |
-| `subnet` | string | `"172.30.199.0/24"` | The isolated segment's subnet, chosen to avoid common home/office LANs. `up` refuses if it overlaps a host address. |
-| `host_ip` | string | `"172.30.199.199"` | Host address on the segment: the nodes' default gateway and NAT inside address. Image builds also use `host_ip - 1` for the builder VM. |
+| `subnet` | string | `"172.30.199.0/24"` | The static addressing subnet: the isolated segment's (chosen to avoid common home/office LANs; `up` refuses if it overlaps a host address), or the LAN's under `addressing = "static"`. |
+| `host_ip` | string | `"172.30.199.199"` | The nodes' default gateway. Isolated mode creates it on the etherstub (also the NAT inside address); static lan addressing expects it to already exist on the LAN. Image builds also use `host_ip - 1` for the builder VM. |
 | `ip_start` | string | `"172.30.199.10"` | First static node address. Nodes number contiguously, sleds then `topology.routers`. |
 | `dns` | list | `["1.1.1.1", "9.9.9.9"]` | Nameservers handed to the nodes. |
 | `mtu` | int | `1500` | Etherstub MTU. Must stay below 9000 so voxel-init's jumbo probe classifies external NICs correctly. |
@@ -102,6 +104,7 @@ Runtime paths. Each unset value resolves via env then built-in default.
 | `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/` and `.falcon/` live under. Absolute. |
 | `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkouts). |
 | `propolis_binary` | string | unset | `propolis-server` the host runs each node under. Unset leaves falcon's own binary, which it downloads on demand. Set it to run a locally built propolis, e.g. for a device-model fix that has not reached a release. Rack nodes only, as the image-build VM keeps falcon's binary. |
+| `ssh_pubkey` | string | first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` | SSH public key staged into every node's cargo-bay as `root_authorized_keys`; voxel-init appends it to root's `authorized_keys`, so `ssh root@<node>` authenticates by key instead of the empty password. Content-validated before staging (a private key is refused). When unset and no default key exists, staging is skipped. |
 
 ## [sp]
 

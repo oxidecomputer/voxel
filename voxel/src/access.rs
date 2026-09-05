@@ -113,8 +113,9 @@ pub(crate) async fn cmd_host_login(
     node: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    // Routers accept the same root SSH login (the FRR image bakes in sshd with
-    // the operator key), so `host login` covers them too.
+    // Routers accept the same root SSH login (the FRR image ships sshd and
+    // voxel-init relaxes its config, plus any staged operator key), so
+    // `host login` covers them too.
     let (n, is_router) = topo
         .sleds
         .iter()

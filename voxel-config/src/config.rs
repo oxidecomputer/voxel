@@ -53,7 +53,7 @@ pub const SLED_SERIAL_PREFIX: &str = "2FAKE00";
 /// Part number shared by all fake sleds.
 pub const SLED_PART_NUMBER: &str = "913-0000019";
 
-/// Top-level Voxel configuration (voxel.toml).
+/// Top-level voxel configuration (`voxel.toml`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VoxelConfig {
@@ -80,6 +80,20 @@ pub enum ExternalMode {
     Isolated,
 }
 
+/// How nodes get their external addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalAddressing {
+    /// Lease from whatever DHCP serves the external network (default).
+    #[default]
+    Dhcp,
+    /// Stage static per-node addresses from `ip_start`, for a LAN that runs
+    /// no DHCP.
+    ///
+    /// Isolated mode always addresses statically.
+    Static,
+}
+
 /// The rack's external segment. Host-only plumbing; never reaches the rack's
 /// RSS config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,13 +101,28 @@ pub enum ExternalMode {
 pub struct External {
     /// lan (default; existing behavior) or isolated.
     pub mode: ExternalMode,
+    /// dhcp (default) or static. Ignored in isolated mode, which is always
+    /// static.
+    pub addressing: ExternalAddressing,
+    /// Link the nodes' external NICs attach to in lan mode (e.g. igb1), for
+    /// hosts whose default-route interface is not the LAN under test.
+    ///
+    /// `$EXT_INTERFACE` still overrides it.
+    ///
+    /// This is ignored in isolated mode, which wires the voxel-managed
+    /// etherstub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
     /// Physical link the isolated subnet NATs out of (e.g. igb0). Required
     /// in isolated mode, and validated before use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uplink: Option<String>,
-    /// The isolated segment's subnet.
+    /// The static addressing subnet: the isolated segment's, or the LAN's
+    /// under `addressing = "static"`.
     pub subnet: String,
-    /// Host address on the etherstub and the nodes' default gateway.
+    /// The nodes' default gateway. Isolated mode creates it as the host's
+    /// address on the etherstub; static lan addressing expects it to already
+    /// exist on the LAN (e.g. the host's own address on `link`).
     pub host_ip: String,
     /// First static node address; nodes number contiguously from here in
     /// sleds() then routers order.
@@ -109,6 +138,8 @@ impl Default for External {
     fn default() -> Self {
         Self {
             mode: ExternalMode::Lan,
+            addressing: ExternalAddressing::Dhcp,
+            link: None,
             uplink: None,
             subnet: "172.30.199.0/24".into(),
             host_ip: "172.30.199.199".into(),
@@ -128,6 +159,12 @@ impl External {
     /// Whether voxel manages an isolated external segment.
     pub fn isolated(&self) -> bool {
         self.mode == ExternalMode::Isolated
+    }
+
+    /// Whether nodes get staged static external addresses rather than DHCP
+    /// leases: isolated mode always, lan mode when `addressing = "static"`.
+    pub fn static_addressing(&self) -> bool {
+        self.isolated() || self.addressing == ExternalAddressing::Static
     }
 
     /// Prefix length parsed from subnet; None if it is not CIDR.
@@ -219,6 +256,15 @@ pub struct Falcon {
     /// Applies to rack nodes only. The image-build VM keeps falcon's own
     /// binary.
     pub propolis_binary: Option<String>,
+    /// SSH public key staged into every node's cargo-bay as
+    /// `root_authorized_keys`, which voxel-init appends to root's
+    /// `authorized_keys`, so plain `ssh root@<node>` authenticates by key
+    /// instead of the empty password. `None` -> the first of
+    /// `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` that exists;
+    /// staging is skipped when none do. The file's content is validated as a
+    /// public key before staging (the cargo-bay is mounted into every guest,
+    /// so a private key must never land there).
+    pub ssh_pubkey: Option<String>,
 }
 
 /// The binaries voxel stages to run an `--emu` rack's SP fleet. Firmware does
@@ -384,7 +430,7 @@ impl Topology {
             for local in 0..self.sleds {
                 let index = rack * self.sleds + local;
                 let name = format!("g{index}");
-                let serial_number = format!("{SLED_SERIAL_PREFIX}{}", index);
+                let serial_number = format!("{SLED_SERIAL_PREFIX}{index}");
                 let part_number = SLED_PART_NUMBER.to_string();
                 out.push(SledDesc {
                     rack,
@@ -608,7 +654,7 @@ pub struct Network {
     /// IPv6 /56. Empty -> not emitted.
     pub rack_subnet: String,
     /// Service IP pool (single range). Rendered as the rack's sole
-    /// service_ip_pools entry.
+    /// `service_ip_pools` entry.
     pub service_pool_first: String,
     pub service_pool_last: String,
     pub bgp_asn: u32,
@@ -920,6 +966,24 @@ impl VoxelConfig {
             FRR_IFACE_BASE + 1 + total_scrimlet_count
         };
         format!("enp0s{n}")
+    }
+
+    /// A fabric router's scrimlet-facing NIC names, in `sleds()` order. Empty
+    /// for `ce`, which links only fabric routers.
+    ///
+    /// Same derivation as [`Self::router_ext_iface`]: a fabric router links
+    /// `ce` at `FRR_IFACE_BASE`, then every scrimlet across every rack, so
+    /// scrimlet `k` sits at `enp0s{FRR_IFACE_BASE + 1 + k}`. A falcon change
+    /// that shifts the base moves these names too, along with the external
+    /// NIC voxel-init verifies at bring-up. These are the ports a host-side
+    /// mirror feeds to reach the rack's switches.
+    pub fn router_scrimlet_ifaces(&self, router: &str) -> Vec<String> {
+        if router == "ce" {
+            return Vec::new();
+        }
+        (0..self.sleds().into_iter().filter(|s| s.scrimlet).count())
+            .map(|k| format!("enp0s{}", FRR_IFACE_BASE + 1 + k))
+            .collect()
     }
 
     /// Each customer router's frr.conf. cr* peer ce plus every scrimlet across
@@ -1385,8 +1449,39 @@ mod tests {
         let cfg = VoxelConfig::from_toml(&out).unwrap();
         assert!(cfg.external.isolated());
         assert_eq!(cfg.external.uplink.as_deref(), Some("igb0"));
+        // The lan-mode link pin round-trips and defaults to unset.
+        assert!(d.external.link.is_none());
+        let out = set(&d.to_toml(), "external.link", "igb1").unwrap();
+        let cfg = VoxelConfig::from_toml(&out).unwrap();
+        assert_eq!(cfg.external.link.as_deref(), Some("igb1"));
         // deny_unknown_fields catches typos.
         assert!(set(&out, "external.uplnk", "igb0").is_err());
+    }
+
+    #[test]
+    fn static_addressing_follows_mode_and_config() {
+        // Default lan mode leases.
+        let d = External::default();
+        assert!(!d.static_addressing());
+        // Lan mode goes static via the knob, without becoming isolated.
+        let lan_static = External {
+            addressing: ExternalAddressing::Static,
+            ..External::default()
+        };
+        assert!(lan_static.static_addressing() && !lan_static.isolated());
+        // Isolated mode is always static, whatever the knob says.
+        let isolated =
+            External { mode: ExternalMode::Isolated, ..External::default() };
+        assert!(isolated.static_addressing());
+        // The knob round-trips through voxel config set.
+        let out = set(
+            &VoxelConfig::default().to_toml(),
+            "external.addressing",
+            "static",
+        )
+        .unwrap();
+        let cfg = VoxelConfig::from_toml(&out).unwrap();
+        assert!(cfg.external.static_addressing() && !cfg.external.isolated());
     }
 
     #[test]
@@ -1791,6 +1886,25 @@ mod tests {
         assert_eq!(cfg.router_ext_iface("ce"), "enp0s10");
         assert_eq!(cfg.router_ext_iface("cr1"), "enp0s13");
         assert_eq!(cfg.router_ext_iface("cr2"), "enp0s13");
+    }
+
+    #[test]
+    fn router_scrimlet_ifaces_slots() {
+        // Scrimlet-facing NICs follow ce at enp0s8, so they start at enp0s9 and
+        // must stop exactly where `router_ext_iface` picks up.
+        let cfg = VoxelConfig::default();
+        assert_eq!(cfg.router_scrimlet_ifaces("cr1"), ["enp0s9", "enp0s10"]);
+        assert_eq!(cfg.router_ext_iface("cr1"), "enp0s11");
+        assert!(cfg.router_scrimlet_ifaces("ce").is_empty());
+
+        let multi =
+            VoxelConfig::from_toml("[topology]\nracks = 2\nsleds = 3\n")
+                .unwrap();
+        assert_eq!(
+            multi.router_scrimlet_ifaces("cr1"),
+            ["enp0s9", "enp0s10", "enp0s11", "enp0s12"]
+        );
+        assert_eq!(multi.router_ext_iface("cr1"), "enp0s13");
     }
 
     #[test]

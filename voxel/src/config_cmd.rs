@@ -33,18 +33,17 @@ pub(crate) fn cmd_config(
                 vcfg::set(&text, key, value).map_err(|e| anyhow!(e))?;
             ensure_parent_dir(path)?;
             fs::write(path, &updated)
-                .with_context(|| format!("write {}", path))?;
+                .with_context(|| format!("write {path}"))?;
             println!("{key} = {value}");
         }
         ConfigCmd::Load { file } => {
             let text = fs::read_to_string(file)
-                .with_context(|| format!("read {}", file))?;
+                .with_context(|| format!("read {file}"))?;
             VoxelConfig::from_toml(&text)
-                .map_err(|e| anyhow!("invalid config {}: {e}", file))?;
+                .map_err(|e| anyhow!("invalid config {file}: {e}"))?;
             ensure_parent_dir(path)?;
-            fs::write(path, &text)
-                .with_context(|| format!("write {}", path))?;
-            println!("loaded {} -> {}", file, path);
+            fs::write(path, &text).with_context(|| format!("write {path}"))?;
+            println!("loaded {file} -> {path}");
         }
     }
     Ok(())
@@ -56,7 +55,7 @@ fn ensure_parent_dir(path: &Utf8Path) -> anyhow::Result<()> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
     {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir))?;
+        fs::create_dir_all(dir).with_context(|| format!("create {dir}"))?;
     }
     Ok(())
 }

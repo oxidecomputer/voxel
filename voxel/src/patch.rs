@@ -31,6 +31,7 @@
 
 use anyhow::{Context, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
+use itertools::Itertools;
 use libfalcon::{NodeRef, Runner};
 use slog::{info, warn};
 use std::time::Duration;
@@ -290,7 +291,7 @@ fn fetch_sha(url: &str) -> anyhow::Result<String> {
 /// download. Returns the local tarball path.
 fn acquire(comp: &Component, reference: &str) -> anyhow::Result<Utf8PathBuf> {
     let dir = cache_dir().join(comp.repo).join(reference);
-    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {dir}"))?;
     let ext = comp.archive.ext();
     let tarball = dir.join(format!("{}.{ext}", comp.pkg));
 
@@ -534,7 +535,7 @@ pub(crate) async fn cmd_rack_patch(
         comp.name,
         comp.repo,
         comp.pkg,
-        nodes.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+        nodes.iter().map(|(n, _)| n.as_str()).join(", "),
         comp.note
     );
     if dry_run {
@@ -643,7 +644,7 @@ pub(crate) fn cmd_image_patch(
     }
     // FALCON_DATASET is already exported by resolve_falcon_env; patch-image.sh +
     // build-image.sh read it.
-    let status = cmd.status().map_err(|e| anyhow!("run {}: {e}", script))?;
+    let status = cmd.status().map_err(|e| anyhow!("run {script}: {e}"))?;
     if !status.success() {
         return Err(anyhow!("patch-image.sh failed"));
     }
