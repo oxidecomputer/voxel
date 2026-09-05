@@ -14,9 +14,12 @@
 //! the staged state all carry the rack index, so tearing one rack down leaves a
 //! co-resident rack running.
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use camino::Utf8Path;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::future::Future;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// SMF service backing the fleet; one instance per SP per rack.
 const SVC: &str = "svc:/oxide/voxel-sp-emu";
@@ -194,6 +197,317 @@ pub(crate) fn fleet_dir(rack: usize) -> camino::Utf8PathBuf {
     }
 }
 
+/// The repo's pins.toml, embedded so a shipped voxel binary carries its own
+/// pins. Each entry names a buildomat-published binary and the rev to fetch.
+const PINS: &str = include_str!("../../pins.toml");
+
+/// One pins.toml entry.
+struct Pin {
+    repo: String,
+    series: String,
+    rev: String,
+    artifact: String,
+}
+
+/// Look up one entry of the embedded pins.toml.
+fn pin(name: &str) -> anyhow::Result<Pin> {
+    let doc: toml::Table = PINS.parse().context("parse embedded pins.toml")?;
+    let entry = doc
+        .get(name)
+        .and_then(|v| v.as_table())
+        .with_context(|| format!("pins.toml has no [{name}]"))?;
+    let field = |key: &str| -> anyhow::Result<String> {
+        entry
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .with_context(|| format!("pins.toml [{name}] missing {key}"))
+    };
+    let p = Pin {
+        repo: field("repo")?,
+        series: field("series")?,
+        rev: field("rev")?,
+        artifact: field("artifact")?,
+    };
+    if p.rev.len() != 40 || !p.rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("pins.toml [{name}] rev is not a full git sha: {}", p.rev);
+    }
+    Ok(p)
+}
+
+/// The sp-emu to run the fleet with: [sp].emu_bin, else sp-emu on PATH,
+/// else the pinned buildomat build, fetched once into ~/.cache/voxel.
+pub(crate) fn ensure_emu_bin(
+    cfg: &voxel_config::VoxelConfig,
+) -> anyhow::Result<camino::Utf8PathBuf> {
+    resolve_bin(cfg.sp.emu_bin.as_deref(), "emu_bin", "sp-emu")
+}
+
+/// The faux-mgs for the operator sp commands: [sp].faux_mgs, else faux-mgs
+/// on PATH, else the pinned buildomat build (published gzipped).
+pub(crate) fn ensure_faux_mgs(
+    cfg: &voxel_config::VoxelConfig,
+) -> anyhow::Result<camino::Utf8PathBuf> {
+    resolve_bin(cfg.sp.faux_mgs.as_deref(), "faux_mgs", "faux-mgs")
+}
+
+/// One fleet binary by precedence: the `[sp].<key>` override, `name` on
+/// PATH, then the pinned buildomat build (`name` is also its pins.toml key).
+fn resolve_bin(
+    override_path: Option<&str>,
+    key: &str,
+    name: &str,
+) -> anyhow::Result<camino::Utf8PathBuf> {
+    if let Some(p) = override_path {
+        let p = camino::Utf8PathBuf::from(p);
+        if !p.is_file() {
+            bail!("[sp].{key} does not exist: {p}");
+        }
+        return Ok(p);
+    }
+    if let Some(p) = find_in_path(name) {
+        return Ok(p);
+    }
+    fetch_buildomat_bin(&pin(name)?, key).with_context(|| {
+        format!(
+            "no {name}: [sp].{key} is unset, none on PATH, and the pinned \
+             build could not be fetched"
+        )
+    })
+}
+
+/// `name` as an executable file on PATH, the way a shell would find it.
+fn find_in_path(name: &str) -> Option<camino::Utf8PathBuf> {
+    find_in_path_list(&std::env::var_os("PATH")?, name)
+}
+
+fn find_in_path_list(
+    path: &std::ffi::OsStr,
+    name: &str,
+) -> Option<camino::Utf8PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| d.join(name))
+        .find(|p| {
+            p.metadata().is_ok_and(|m| {
+                m.is_file() && m.permissions().mode() & 0o111 != 0
+            })
+        })
+        .and_then(|p| camino::Utf8PathBuf::from_path_buf(p).ok())
+}
+
+/// Fetch one published buildomat binary into a rev-keyed cache under
+/// ~/.cache/voxel and verify it against its .sha256.txt sibling. A .gz
+/// artifact is hash-checked as published, then decompressed. The final name
+/// appears only once the file is verified and executable, so an interrupted
+/// fetch is never taken for a cached binary.
+fn fetch_buildomat_bin(
+    p: &Pin,
+    key: &str,
+) -> anyhow::Result<camino::Utf8PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let Pin { repo, series, rev, artifact } = p;
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let bin_name = artifact.strip_suffix(".gz").unwrap_or(artifact);
+    let dir = camino::Utf8PathBuf::from(home)
+        .join(".cache/voxel/bins")
+        .join(format!("{repo}-{}", &rev[..12]));
+    let bin = dir.join(bin_name);
+    if bin.exists() {
+        return Ok(bin);
+    }
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {dir}"))?;
+    let url = format!(
+        "{}/{repo}/{series}/{rev}/{artifact}",
+        crate::cpbuild::BUILDOMAT_URL
+    );
+    eprintln!(
+        "[voxel] fetching {bin_name} @ {} ([sp].{key} or PATH overrides)",
+        &rev[..12]
+    );
+    let want = fetch_text(&format!("{url}.sha256.txt"), FETCH)?;
+    let want = want.split_whitespace().next().unwrap_or("").to_string();
+    let fetched = dir.join(format!("{artifact}.part"));
+    let got = download(&url, &fetched, FETCH)?;
+    if got != want {
+        let _ = std::fs::remove_file(&fetched);
+        bail!("{artifact} sha256 {got} != published {want}");
+    }
+    let staged = if artifact.ends_with(".gz") {
+        let unpacked = dir.join(format!("{bin_name}.part"));
+        let gz = std::fs::File::open(&fetched)
+            .with_context(|| format!("open {fetched}"))?;
+        let mut out = std::fs::File::create(&unpacked)
+            .with_context(|| format!("create {unpacked}"))?;
+        std::io::copy(&mut flate2::read::GzDecoder::new(gz), &mut out)
+            .with_context(|| format!("gunzip {fetched}"))?;
+        let _ = std::fs::remove_file(&fetched);
+        unpacked
+    } else {
+        fetched
+    };
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod {staged}"))?;
+    std::fs::rename(&staged, &bin)
+        .with_context(|| format!("move {staged} to {bin}"))?;
+    Ok(bin)
+}
+
+/// Retry and connect bounds for a fetch.
+#[derive(Clone, Copy)]
+struct Fetch {
+    attempts: u32,
+    connect_timeout: Duration,
+}
+
+/// Buildomat fetch bounds: an unreachable host fails in under a minute
+/// rather than holding a launch in TCP retries.
+const FETCH: Fetch =
+    Fetch { attempts: 3, connect_timeout: Duration::from_secs(15) };
+
+fn http_client(f: Fetch) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(f.connect_timeout)
+        .timeout(Duration::from_secs(3600))
+        .build()
+        .context("http client")
+}
+
+/// Run an async fetch to completion from sync code. The callers already sit
+/// on the tokio runtime, so this gets its own thread and runtime instead of
+/// blocking the outer one.
+fn run_fetch<T: Send>(
+    fut: impl Future<Output = anyhow::Result<T>> + Send,
+) -> anyhow::Result<T> {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("fetch runtime")?
+                .block_on(fut)
+        })
+        .join()
+        .map_err(|_| anyhow!("fetch thread panicked"))?
+    })
+}
+
+/// GET a small text body, retried.
+fn fetch_text(url: &str, f: Fetch) -> anyhow::Result<String> {
+    run_fetch(async {
+        let client = http_client(f)?;
+        let mut last = None;
+        for attempt in 1..=f.attempts {
+            let sent = client.get(url).send().await;
+            match sent.and_then(|r| r.error_for_status()) {
+                Ok(r) => {
+                    return r
+                        .text()
+                        .await
+                        .with_context(|| format!("read {url}"));
+                }
+                Err(e) => last = Some(e),
+            }
+            if attempt < f.attempts {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(anyhow!(
+            "GET {url} failed after {} attempts: {}",
+            f.attempts,
+            last.expect("at least one attempt")
+        ))
+    })
+}
+
+/// Stream `url` into `dest` behind a progress bar, returning the body's
+/// sha256 hex. Retried whole; a partial `dest` is overwritten next attempt.
+fn download(url: &str, dest: &Utf8Path, f: Fetch) -> anyhow::Result<String> {
+    run_fetch(async {
+        let client = http_client(f)?;
+        let mut last = None;
+        for attempt in 1..=f.attempts {
+            match stream_to_file(&client, url, dest).await {
+                Ok(sha) => return Ok(sha),
+                Err(e) => {
+                    eprintln!(
+                        "[voxel] fetch attempt {attempt}/{} failed: {e:#}",
+                        f.attempts
+                    );
+                    last = Some(e);
+                }
+            }
+            if attempt < f.attempts {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Err(last.expect("at least one attempt")).with_context(|| {
+            format!("GET {url} failed after {} attempts", f.attempts)
+        })
+    })
+}
+
+async fn stream_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Utf8Path,
+) -> anyhow::Result<String> {
+    use sha2::Digest;
+    use std::io::Write;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .with_context(|| format!("GET {url}"))?;
+    let pb = match resp.content_length() {
+        Some(len) => {
+            let pb = ProgressBar::new(len);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {bar:40.cyan/blue} \
+                     {bytes}/{total_bytes} {bytes_per_sec}",
+                )
+                .context("progress template")?
+                .progress_chars("##-"),
+            );
+            pb
+        }
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {spinner} {bytes} {bytes_per_sec}",
+                )
+                .context("progress template")?,
+            );
+            pb
+        }
+    };
+    let mut file = std::fs::File::create(dest)
+        .with_context(|| format!("create {dest}"))?;
+    let mut hash = sha2::Sha256::new();
+    let mut total = 0u64;
+    while let Some(chunk) =
+        resp.chunk().await.with_context(|| format!("read {url}"))?
+    {
+        file.write_all(&chunk).with_context(|| format!("write {dest}"))?;
+        hash.update(&chunk);
+        total += chunk.len() as u64;
+        pb.inc(chunk.len() as u64);
+    }
+    // The bar is transient; leave one durable line behind it.
+    let secs = pb.elapsed().as_secs_f64();
+    pb.finish_and_clear();
+    eprintln!(
+        "[voxel] fetched {} ({} MiB in {secs:.1}s)",
+        dest.file_name().unwrap_or(dest.as_str()).trim_end_matches(".part"),
+        total >> 20
+    );
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 /// The sp-emu binary driving a rack's fleet.
 pub(crate) fn emu_bin(rack: usize) -> anyhow::Result<camino::Utf8PathBuf> {
     let bin = fleet_dir(rack).join("sp-emu");
@@ -312,8 +626,8 @@ pub(crate) fn up(
     let bin = dir.join("sp-emu");
     if !bin.exists() {
         bail!(
-            "--emu needs an sp-emu binary on the host: set [sp].emu_bin \
-             (the fleet runs here now, not in the switch zone)"
+            "--emu needs an sp-emu binary staged at {bin}: launch stages \
+             [sp].emu_bin, sp-emu on PATH, or the pinned buildomat build"
         );
     }
     // IPv6 refuses a global address on a link with no link-local ("Can't assign
@@ -507,5 +821,61 @@ pub(crate) fn up_all(
 pub(crate) fn down_all(cfg: &voxel_config::VoxelConfig) {
     for rack in 0..cfg.topology.racks() {
         down(cfg, rack);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Every pins.toml entry must parse and carry a full git sha, so a bad
+    // pin fails in CI rather than at fetch time on a user's box.
+    #[test]
+    fn pins_parse() {
+        super::pin("sp-emu").unwrap();
+        super::pin("faux-mgs").unwrap();
+    }
+
+    /// PATH lookup takes the first executable regular file, skipping dirs
+    /// that lack the name or hold a non-executable one.
+    #[test]
+    fn path_lookup_wants_an_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::util::temp_dir()
+            .join(format!("voxel-pathlookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b, c) = (base.join("a"), base.join("b"), base.join("c"));
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(b.join("sp-emu"), "#!/bin/sh\n").unwrap();
+        std::fs::write(c.join("sp-emu"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            c.join("sp-emu"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let path = std::env::join_paths([&a, &b, &c]).unwrap();
+        assert_eq!(
+            super::find_in_path_list(&path, "sp-emu"),
+            Some(c.join("sp-emu"))
+        );
+        assert_eq!(super::find_in_path_list(&path, "faux-mgs"), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A download from an unreachable host fails within the configured
+    /// bounds instead of hanging in TCP retries.
+    #[test]
+    fn download_fails_fast_when_unreachable() {
+        let dest = crate::util::temp_dir()
+            .join(format!("voxel-dl-{}.part", std::process::id()));
+        let f = super::Fetch {
+            attempts: 2,
+            connect_timeout: std::time::Duration::from_secs(1),
+        };
+        let t0 = std::time::Instant::now();
+        let r = super::download("https://10.255.255.1/nothing", &dest, f);
+        let _ = std::fs::remove_file(&dest);
+        assert!(r.is_err());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
     }
 }
