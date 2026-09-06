@@ -83,6 +83,7 @@ fn uplink_port(
                 asn: p.peer_asn,
                 port: p.port.clone(),
                 addr: types::UserSpecifiedRouterPeerAddr::Unnumbered,
+                src_addr: None,
                 router_lifetime: types::RouterLifetimeConfig::new(
                     p.router_lifetime,
                 )
@@ -343,7 +344,7 @@ pub(crate) async fn drive(
         .await
         .map_err(|e| anyhow!("upload cert: {e}"))?;
     client
-        .post_rss_config_key(&types::PrivateKeyPem(key))
+        .post_rss_config_key(&types::PrivateKeyPem(key.into()))
         .await
         .map_err(|e| anyhow!("upload key: {e}"))?;
     client
