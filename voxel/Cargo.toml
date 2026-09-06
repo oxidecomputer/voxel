@@ -27,6 +27,7 @@ voxel-config = { path = "../voxel-config" }
 rack-init-config.workspace = true
 wicketd-commission-types-versions.workspace = true
 wicketd-commission-client.workspace = true
+sled-agent-types.workspace = true
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
