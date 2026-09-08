@@ -50,7 +50,8 @@ pub(crate) struct CpBuild<'a> {
 
 /// The omicron sha voxel's own rack-init-config dependency is pinned to. Empty while
 /// the dependency is a path dep. Set by build.rs from Cargo.lock.
-const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
+pub(crate) const PINNED_OMICRON_REV: &str =
+    env!("RACK_INIT_CONFIG_OMICRON_REV");
 
 /// `voxel image create`: resolve where the omicron source is and what the image
 /// is called, then build. `--src <path>` builds that checkout as-is with

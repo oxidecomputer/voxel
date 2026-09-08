@@ -44,9 +44,9 @@ fn rack_label(racks: usize, rack: usize, single: &str) -> String {
     if racks > 1 { format!("rack{}", rack + 1) } else { single.to_string() }
 }
 
-/// The sled's static external address in isolated mode, None in lan mode.
+/// The sled's external address under static addressing, None under DHCP.
 fn known_external_ip(cfg: &VoxelConfig, sled: &str) -> Option<String> {
-    if !cfg.external.isolated() {
+    if !cfg.external.static_addressing() {
         return None;
     }
     static_external_ip(cfg, sled)
@@ -123,9 +123,11 @@ fn default_route_iface() -> Option<String> {
 
 /// Refuse a lan-mode launch on a jumbo external link: voxel-init classifies a
 /// NIC as underlay iff it accepts mtu 9000, so external NICs never come up.
-fn lan_mtu_preflight() -> anyhow::Result<()> {
-    let Some(link) =
-        std::env::var("EXT_INTERFACE").ok().or_else(default_route_iface)
+fn lan_mtu_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
+    let Some(link) = std::env::var("EXT_INTERFACE")
+        .ok()
+        .or_else(|| cfg.external.link.clone())
+        .or_else(default_route_iface)
     else {
         return Ok(());
     };
@@ -135,8 +137,9 @@ fn lan_mtu_preflight() -> anyhow::Result<()> {
         bail!(
             "external link {link} has mtu {mtu}: sled NICs are classified as underlay \
              iff they accept mtu=9000, so external NICs on a jumbo link are \
-             misclassified and never come up. Point EXT_INTERFACE at a sub-9000-mtu \
-             link or use isolated mode (voxel config set external.mode isolated)."
+             misclassified and never come up. Point [external] link or EXT_INTERFACE \
+             at a sub-9000-mtu link or use isolated mode \
+             (voxel config set external.mode isolated)."
         );
     }
     Ok(())
@@ -358,7 +361,7 @@ pub(crate) async fn cmd_launch(
         external_up(&cfg.external, DryRun::No)
             .context("bringing up the isolated external segment")?;
     } else {
-        lan_mtu_preflight()?;
+        lan_mtu_preflight(cfg)?;
     }
     reset_node_cargo_bay(cfg)?;
     stage_config(cfg, opts.emu, opts.init_rss, opts.sp_firmware)?;
@@ -384,6 +387,10 @@ pub(crate) async fn cmd_launch(
                 );
                 let _ = teardown(&topo.runner, name);
                 tokio::time::sleep(Duration::from_secs(3)).await;
+                // teardown's `zfs destroy -r` reaps the sled disks along with
+                // the rest of the deployment.
+                disks::create_zvols(&image::falcon_dataset(), name, &sleds)
+                    .context("recreate sled disks for the boot retry")?;
                 attempt += 1;
             }
             Err(e) => bail!("launch failed after {attempt} attempts: {e}"),

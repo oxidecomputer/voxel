@@ -130,8 +130,8 @@ async fn serial_bounded_caps<T>(
 }
 
 /// Resolve a node's external IPv4 without entering the guest when possible.
-/// Isolated mode numbers every node deterministically
-/// ([`VoxelConfig::static_external_ips`]), so we return the staged address
+/// Static addressing numbers every node deterministically
+/// ([`VoxelConfig::static_external_ips`]), so we return the assigned address
 /// directly. The fallback, [`node_external_ip`], execs over the falcon serial
 /// console, which wedges permanently if a prior exec was cancelled mid-flight
 /// (see [`ssh_output`]). Prefer this resolver wherever the config and node
@@ -145,13 +145,28 @@ pub(crate) async fn resolve_external_ip(
     n: NodeRef,
     is_router: bool,
 ) -> anyhow::Result<String> {
-    if cfg.external.isolated()
-        && let Some(ip) = static_external_ip(cfg, node)
-    {
+    if let Some(ip) = static_ip(cfg, node) {
         return Ok(ip);
     }
     let iface = is_router.then(|| cfg.router_ext_iface(node));
     node_external_ip(d, n, is_router, iface.as_deref()).await
+}
+
+/// A node's external address as voxel assigned it. This is `None` under DHCP
+/// addressing, where addresses are leased and only discoverable from the
+/// running node.
+pub(crate) fn static_ip(
+    cfg: &voxel_config::VoxelConfig,
+    node: &str,
+) -> Option<String> {
+    cfg.external
+        .static_addressing()
+        .then(|| {
+            cfg.static_external_ips()
+                .into_iter()
+                .find_map(|(n, ip)| (n == node).then_some(ip))
+        })
+        .flatten()
 }
 
 /// A node's address in isolated mode's static numbering, None if it has none.
@@ -165,13 +180,13 @@ pub(crate) fn static_external_ip(
 }
 
 /// ce's stable nexthop, when one is known without touching the guest. An
-/// explicit `[topology].ce_external_ip` wins, otherwise isolated mode's static
+/// explicit `[topology].ce_external_ip` wins, otherwise static addressing's
 /// numbering supplies it.
 pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
     if let Some(ip) = &cfg.topology.ce_external_ip {
         return Some(ip.clone());
     }
-    if !cfg.external.isolated() {
+    if !cfg.external.static_addressing() {
         return None;
     }
     static_external_ip(cfg, "ce")

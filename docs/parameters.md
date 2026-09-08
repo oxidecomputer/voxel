@@ -32,7 +32,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. |
+| `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. A non-default `version` also stops an unset `cp` from following the associated pin. |
 | `cp` | string | unset | Full cp image name. Overrides `version`. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |

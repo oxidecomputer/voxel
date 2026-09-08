@@ -203,7 +203,7 @@ enum Cmd {
         source: Option<Utf8PathBuf>,
 
         /// Rack to target (1-based).
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = rack_number)]
         rack: usize,
 
         /// Override the derived Nexus API URL.
@@ -649,9 +649,22 @@ fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
 
 fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    let cfg = VoxelConfig::from_toml(&text)
-        .with_context(|| format!("parse {}", path))?;
+    let mut cfg = VoxelConfig::from_toml(&text)
+        .with_context(|| format!("parse {path}"))?;
     cfg.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+
+    // A fully defaulted image selection follows the workspace's omicron pin
+    // (the image a commitless `voxel image create` would build).
+    //
+    // A repin and rebuild-relaunch cycle avoids config changes, while an
+    // explicit control plane or version still selects its own image.
+    if cfg.image.cp.is_none()
+        && cfg.image.version == voxel_config::Image::default().version
+        && !cpbuild::PINNED_OMICRON_REV.is_empty()
+    {
+        cfg.image.cp =
+            Some(format!("voxel-cp-{}", cpbuild::PINNED_OMICRON_REV));
+    }
     Ok(cfg)
 }
 
@@ -660,6 +673,14 @@ fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
 /// the directory voxel was invoked from.
 fn abs_path(s: &str) -> Result<Utf8PathBuf, String> {
     Ok(absolutize(Utf8PathBuf::from(s)))
+}
+
+fn rack_number(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("rack numbering starts at 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Make a path absolute against the current directory, dropping `.`

@@ -97,7 +97,7 @@ pub(crate) fn run(
     {
         ensure_icmp_privilege()?;
     }
-    if rack == 0 || rack > cfg.topology.racks() {
+    if rack > cfg.topology.racks() {
         bail!(
             "rack must be between 1 and {} (got {rack})",
             cfg.topology.racks()

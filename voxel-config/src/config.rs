@@ -84,6 +84,20 @@ pub enum ExternalMode {
     Isolated,
 }
 
+/// How nodes get their external addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalAddressing {
+    /// Lease from whatever DHCP serves the external network (default).
+    #[default]
+    Dhcp,
+    /// Stage static per-node addresses from `ip_start`, for a LAN that runs
+    /// no DHCP.
+    ///
+    /// Isolated mode always addresses statically.
+    Static,
+}
+
 /// The rack's external segment. Host-only plumbing; never reaches the rack's
 /// RSS config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,13 +105,28 @@ pub enum ExternalMode {
 pub struct External {
     /// lan (default; existing behavior) or isolated.
     pub mode: ExternalMode,
+    /// dhcp (default) or static. Ignored in isolated mode, which is always
+    /// static.
+    pub addressing: ExternalAddressing,
+    /// Link the nodes' external NICs attach to in lan mode (e.g. igb1), for
+    /// hosts whose default-route interface is not the LAN under test.
+    ///
+    /// `$EXT_INTERFACE` still overrides it.
+    ///
+    /// This is ignored in isolated mode, which wires the voxel-managed
+    /// etherstub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
     /// Physical link the isolated subnet NATs out of (e.g. igb0). Required
     /// in isolated mode, and validated before use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uplink: Option<String>,
-    /// The isolated segment's subnet.
+    /// The static addressing subnet: the isolated segment's, or the LAN's
+    /// under `addressing = "static"`.
     pub subnet: String,
-    /// Host address on the etherstub and the nodes' default gateway.
+    /// The nodes' default gateway. Isolated mode creates it as the host's
+    /// address on the etherstub. Static lan addressing expects it to already
+    /// exist on the LAN (e.g. the host's own address on `link`).
     pub host_ip: String,
     /// First static node address; nodes number contiguously from here in
     /// sleds() then routers order.
@@ -113,6 +142,8 @@ impl Default for External {
     fn default() -> Self {
         Self {
             mode: ExternalMode::Lan,
+            addressing: ExternalAddressing::Dhcp,
+            link: None,
             uplink: None,
             subnet: "172.30.199.0/24".into(),
             host_ip: "172.30.199.199".into(),
@@ -132,6 +163,30 @@ impl External {
     /// Whether voxel manages an isolated external segment.
     pub fn isolated(&self) -> bool {
         self.mode == ExternalMode::Isolated
+    }
+
+    /// Whether nodes get staged static external addresses rather than DHCP
+    /// leases.
+    ///
+    /// Isolated mode always gets it. Lan mode gets it only when
+    /// `addressing = "static"`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let lan_static = voxel_config::VoxelConfig::from_toml(
+    ///     "[external]\nmode = \"lan\"\naddressing = \"static\"",
+    /// )
+    /// .unwrap();
+    /// assert!(lan_static.external.static_addressing());
+    ///
+    /// let lan_dhcp =
+    ///     voxel_config::VoxelConfig::from_toml("[external]\nmode = \"lan\"")
+    ///         .unwrap();
+    /// assert!(!lan_dhcp.external.static_addressing());
+    /// ```
+    pub fn static_addressing(&self) -> bool {
+        self.isolated() || self.addressing == ExternalAddressing::Static
     }
 
     /// Prefix length parsed from subnet; None if it is not CIDR.
@@ -182,20 +237,18 @@ impl External {
         Some(ip.to_string())
     }
 
-    /// Builder VM address: host_ip - 1 with subnet's prefix length. None if
-    /// either address is unusable.
+    /// Network assignment for the builder VM: ip_start - 1 + the host
+    /// gateway.
     pub fn builder_net(&self) -> Option<String> {
         let host: Ipv4Addr = self.host_ip.parse().ok()?;
         if !self.ip_is_usable(host) {
             return None;
         }
-        let prev = u32::from(host).checked_sub(1)?;
-        let ip = Ipv4Addr::from(prev);
-        if !self.ip_is_usable(ip) {
-            return None;
-        }
+        let start: Ipv4Addr = self.ip_start.parse().ok()?;
+        let ip = Ipv4Addr::from(u32::from(start).checked_sub(1)?);
         let prefix = self.prefix_length()?;
-        Some(format!("{ip}/{prefix} {}", self.host_ip))
+        (self.ip_is_usable(ip) && ip != host)
+            .then(|| format!("{ip}/{prefix} {}", self.host_ip))
     }
 }
 
@@ -259,6 +312,16 @@ impl VoxelConfig {
 
     /// Every node's static external address, sleds then routers; truncates at
     /// the first address node_ip refuses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg =
+    ///     voxel_config::VoxelConfig::from_toml("[topology]\nsleds = 4").unwrap();
+    /// let ips = cfg.static_external_ips();
+    /// assert_eq!(ips[0], ("g0".to_string(), "172.30.199.10".to_string()));
+    /// assert_eq!(ips[1], ("g1".to_string(), "172.30.199.11".to_string()));
+    /// ```
     pub fn static_external_ips(&self) -> Vec<(String, String)> {
         self.sleds()
             .into_iter()
@@ -1530,8 +1593,41 @@ mod tests {
         let cfg = VoxelConfig::from_toml(&out).unwrap();
         assert!(cfg.external.isolated());
         assert_eq!(cfg.external.uplink.as_deref(), Some("igb0"));
+        // The lan-mode link pin round-trips and defaults to unset.
+        assert!(d.external.link.is_none());
+        let out = set(&d.to_toml(), "external.link", "igb1").unwrap();
+        let cfg = VoxelConfig::from_toml(&out).unwrap();
+        assert_eq!(cfg.external.link.as_deref(), Some("igb1"));
         // deny_unknown_fields catches typos.
         assert!(set(&out, "external.uplnk", "igb0").is_err());
+    }
+
+    #[test]
+    fn static_addressing_follows_mode_and_config() {
+        // Default lan mode leases.
+        let d = External::default();
+        assert!(!d.static_addressing());
+        // Lan mode can go static while not being isolated.
+        let lan_static = External {
+            addressing: ExternalAddressing::Static,
+            ..External::default()
+        };
+        assert!(lan_static.static_addressing() && !lan_static.isolated());
+
+        // Isolated mode is always static.
+        let isolated =
+            External { mode: ExternalMode::Isolated, ..External::default() };
+        assert!(isolated.static_addressing());
+
+        // Round-trip the config.
+        let out = set(
+            &VoxelConfig::default().to_toml(),
+            "external.addressing",
+            "static",
+        )
+        .unwrap();
+        let cfg = VoxelConfig::from_toml(&out).unwrap();
+        assert!(cfg.external.static_addressing() && !cfg.external.isolated());
     }
 
     #[test]
@@ -2020,19 +2116,23 @@ mod tests {
     }
 
     #[test]
-    fn builder_net_is_host_ip_minus_one() {
+    fn builder_net_precedes_ip_start() {
         let x = External::default();
         assert_eq!(
             x.builder_net().as_deref(),
-            Some("172.30.199.198/24 172.30.199.199")
+            Some("172.30.199.9/24 172.30.199.199")
         );
 
         let first_usable_gateway = External {
             subnet: "192.0.2.0/24".into(),
             host_ip: "192.0.2.1".into(),
+            ip_start: "192.0.2.10".into(),
             ..External::default()
         };
-        assert_eq!(first_usable_gateway.builder_net(), None);
+        assert_eq!(
+            first_usable_gateway.builder_net().as_deref(),
+            Some("192.0.2.9/24 192.0.2.1")
+        );
 
         let outside_gateway =
             External { host_ip: "198.51.100.1".into(), ..first_usable_gateway };
