@@ -102,6 +102,8 @@ Runtime paths. Each unset value resolves via env then built-in default.
 | `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/` and `.falcon/` live under. Absolute. |
 | `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkouts). |
 | `propolis_binary` | string | unset | `propolis-server` the host runs each node under. Unset leaves falcon's own binary, which it downloads on demand. Set it to run a locally built propolis, e.g. for a device-model fix that has not reached a release. Rack nodes only, as the image-build VM keeps falcon's binary. |
+| `ssh_pubkey` | string | first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` | SSH public key staged into every node's cargo-bay as `root_authorized_keys`; voxel-init replaces the root's `authorized_keys` for `ssh root@<node>` to authenticate by key instead of using a empty password. This is validated before staging (a private key is rejected). When unset and no default key exists, staging is skipped entirely. |
+| `ssh_pubkey_disabled` | `bool` | `false` | This setting overrides `ssh_pubkey` and automatic key discovery. |
 
 ## [sp]
 

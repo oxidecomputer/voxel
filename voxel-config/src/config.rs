@@ -219,6 +219,25 @@ pub struct Falcon {
     /// Applies to rack nodes only. The image-build VM keeps falcon's own
     /// binary.
     pub propolis_binary: Option<String>,
+    /// An SSH public key (as a file path) staged into every node's cargo-bay as
+    /// `root_authorized_keys`, which voxel-init syncs into the root's
+    /// `authorized_keys` file.
+    ///
+    /// This allows a plain `ssh root@<node>` to authenticate by key
+    /// instead of the empty password.
+    ///
+    /// If `None`, it pulls the first of `~/.ssh/id_ed25519.pub`,
+    /// `id_ecdsa.pub`, `id_rsa.pub` that may exist. The file's content
+    /// is validated as a public key before staging.
+    pub ssh_pubkey: Option<String>,
+    /// When set, we stage an empty `root_authorized_keys` file in
+    /// every node's cargo-bay. During bootstrap, the guest's
+    /// `/root/.ssh/authorized_keys` is cleared.
+    ///
+    /// This setting overrides `ssh_pubkey` and automatic key discovery.
+    ///
+    /// Defaults to `false`.
+    pub ssh_pubkey_disabled: bool,
 }
 
 /// The binaries voxel stages to run an `--emu` rack's SP fleet. Firmware does
@@ -1148,6 +1167,23 @@ pub fn set(doc_text: &str, key: &str, value: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use indoc::{formatdoc, indoc};
+
+    #[test]
+    fn ssh_pubkey_disable_defaults_off_and_round_trips() {
+        let cfg = VoxelConfig::from_toml("").unwrap();
+        assert!(!cfg.falcon.ssh_pubkey_disabled);
+
+        let text = set("", "falcon.ssh_pubkey_disabled", "true").unwrap();
+        let cfg = VoxelConfig::from_toml(&text).unwrap();
+        assert!(cfg.falcon.ssh_pubkey_disabled);
+        assert_eq!(VoxelConfig::from_toml(&cfg.to_toml()).unwrap(), cfg);
+
+        let text = set(&text, "falcon.ssh_pubkey_disabled", "false").unwrap();
+        assert!(
+            !VoxelConfig::from_toml(&text).unwrap().falcon.ssh_pubkey_disabled
+        );
+        assert!(set(&text, "falcon.ssh_pubkey_disabled", "invalid").is_err());
+    }
 
     #[test]
     fn get_reads_dotted_keys() {
