@@ -1,4 +1,5 @@
 use super::{
+    colors::OX_RED,
     monitor::{resource_health_state, sparkline_data},
     widgets::{format_rate, section_block, selection_style, traffic_style},
 };
@@ -12,7 +13,7 @@ use crate::{
 };
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::Line,
     widgets::{Paragraph, Sparkline},
 };
@@ -134,6 +135,32 @@ pub fn draw(
             inner.width,
             inner.height.saturating_sub(1),
         ));
+    if let Some(error) = app
+        .observability
+        .nexus
+        .get(&rack)
+        .and_then(|sample| sample.latest_error.as_ref())
+    {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(
+                    "Nexus/control plane unavailable · direct-probe fallback enabled",
+                ),
+                Line::from(format!(
+                    "Oximeter traffic, CPU, ZFS, collector health may be stale · {}",
+                    error.message
+                )),
+            ])
+            .style(Style::default().fg(OX_RED).add_modifier(Modifier::BOLD)),
+            Rect::new(
+                rows[0].x,
+                rows[0].y,
+                rows[0].width,
+                rows[0].height.saturating_add(rows[1].height),
+            ),
+        );
+        return;
+    }
     let rate_text = if compact {
         format!(
             "RX {} TX {} Σ{} · {healthy}/{unhealthy}/{checking} · {zfs} · {exceptions}",
@@ -261,4 +288,64 @@ fn rss_summary(app: &App, sample: &LatestSample<RssObservation>) -> String {
         .map(|error| error.message.as_str())
         .unwrap_or("none");
     format!("RSS {state} · success {age} · error {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::{
+        event::AppEvent,
+        telemetry::{RackId, ResourceDescriptor, ResourceId, ResourceKind},
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::time::{Duration, Instant};
+
+    fn rendered(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 5)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area(), app, true, true))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn nexus_outage_explains_control_plane_impact_until_recovery() {
+        let rack = RackId(0);
+        let mut app = App::new(
+            vec![ResourceDescriptor {
+                id: ResourceId::rack(rack, ResourceKind::Sled, "g0"),
+                rack: Some(rack),
+                kind: ResourceKind::Sled,
+                name: "g0".into(),
+                host: None,
+            }],
+            4,
+            4,
+        );
+        let now = Instant::now();
+        app.update(AppEvent::NexusUnavailable {
+            rack,
+            at: now,
+            message: "Nexus is unavailable".into(),
+        });
+
+        let outage = rendered(&app);
+        assert!(outage.contains("Nexus/control plane unavailable"));
+        assert!(
+            outage.contains("traffic, CPU, ZFS, collector health may be stale")
+        );
+
+        app.update(AppEvent::NexusAvailable {
+            rack,
+            at: now + Duration::from_secs(1),
+        });
+
+        assert!(!rendered(&app).contains("Nexus/control plane unavailable"));
+    }
 }

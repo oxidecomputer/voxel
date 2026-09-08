@@ -399,6 +399,22 @@ impl NexusClient {
         }
     }
 
+    pub(crate) async fn ready(
+        &self,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let _operation = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(anyhow!("cancelled")),
+            operation = self.operation.lock() => operation,
+        };
+        let endpoint = self.endpoint(cancel, &[]).await?;
+        if self.authenticated.lock().await.as_ref() != Some(&endpoint) {
+            self.login(&endpoint, cancel).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn query(
         &self,
         query: &str,
@@ -583,6 +599,45 @@ mod tests {
             Some("00000000-0000-0000-0000-000000000001")
         );
         assert_eq!(fields["ip_addr"].as_str(), None);
+    }
+
+    #[tokio::test]
+    async fn readiness_authenticates_once_without_querying_timeseries() {
+        let (endpoint, requests, server) = test_server(vec![
+            TestResponse {
+                status: "200 OK",
+                headers: "",
+                body: "pong",
+                delay: Duration::ZERO,
+            },
+            TestResponse {
+                status: "204 No Content",
+                headers: "Set-Cookie: session=ready; Path=/; HttpOnly\r\n",
+                body: "",
+                delay: Duration::ZERO,
+            },
+        ])
+        .await;
+        let client = NexusClient::new(
+            vec![endpoint],
+            RecoveryLogin {
+                silo: "recovery".into(),
+                username: "recovery".into(),
+                password: "oxide".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+
+        client.ready(&cancel).await.unwrap();
+        client.ready(&cancel).await.unwrap();
+
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/ping "));
+        assert!(requests[1].starts_with("POST /v1/login/recovery/local "));
     }
 
     #[tokio::test]

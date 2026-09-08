@@ -228,6 +228,15 @@ pub enum AppEvent {
         at: Instant,
         message: String,
     },
+    NexusAvailable {
+        rack: RackId,
+        at: Instant,
+    },
+    NexusUnavailable {
+        rack: RackId,
+        at: Instant,
+        message: String,
+    },
     TrafficFailed {
         id: ResourceId,
         at: Instant,

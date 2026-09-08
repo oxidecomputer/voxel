@@ -256,6 +256,7 @@ pub struct ObservabilityState {
     pub zone_cpu: BTreeMap<RackId, LatestSample<Vec<ZoneCpu>>>,
     pub zfs_headroom: BTreeMap<RackId, LatestSample<Vec<ZfsHeadroom>>>,
     pub oximeter_exceptions: BTreeMap<RackId, LatestSample<OximeterExceptions>>,
+    pub nexus: BTreeMap<RackId, LatestSample<()>>,
     pub latest_traffic_generation: Option<Instant>,
 }
 
@@ -365,6 +366,10 @@ impl App {
                     .map(|rack| (*rack, LatestSample::default()))
                     .collect(),
                 oximeter_exceptions: racks
+                    .iter()
+                    .map(|rack| (*rack, LatestSample::default()))
+                    .collect(),
+                nexus: racks
                     .iter()
                     .map(|rack| (*rack, LatestSample::default()))
                     .collect(),
@@ -512,6 +517,20 @@ impl App {
                         }
                     }
                     self.observability.telemetry.rebuild_aggregates(at);
+                }
+            }
+            AppEvent::NexusAvailable { rack, at } => {
+                if let Some(sample) = self.observability.nexus.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
+                    sample.record_success(at, ());
+                }
+            }
+            AppEvent::NexusUnavailable { rack, at, message } => {
+                if let Some(sample) = self.observability.nexus.get_mut(&rack)
+                    && Self::accept_attempt(sample, at)
+                {
+                    sample.record_error(at, message);
                 }
             }
             AppEvent::TrafficFailed { id, at, message } => {
@@ -1725,6 +1744,48 @@ mod factual_outcome_tests {
 
         assert!(app.session.external_monitoring_open);
         assert!(app.session.confirmation.is_none());
+    }
+
+    #[test]
+    fn nexus_failure_and_recovery_are_rack_scoped() {
+        let descriptors = (0..2)
+            .map(|rack| ResourceDescriptor {
+                id: ResourceId::rack(
+                    RackId(rack),
+                    ResourceKind::Sled,
+                    format!("g{rack}"),
+                ),
+                rack: Some(RackId(rack)),
+                kind: ResourceKind::Sled,
+                name: format!("g{rack}"),
+                host: None,
+            })
+            .collect();
+        let mut app = App::new(descriptors, 8, 8);
+        let started = Instant::now();
+
+        app.update(AppEvent::NexusUnavailable {
+            rack: RackId(0),
+            at: started,
+            message: "Nexus is unavailable".into(),
+        });
+
+        assert_eq!(
+            app.observability.nexus[&RackId(0)]
+                .latest_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("Nexus is unavailable")
+        );
+        assert!(app.observability.nexus[&RackId(1)].latest_error.is_none());
+
+        app.update(AppEvent::NexusAvailable {
+            rack: RackId(0),
+            at: started + Duration::from_secs(1),
+        });
+
+        assert!(app.observability.nexus[&RackId(0)].latest_error.is_none());
+        assert!(app.observability.nexus[&RackId(0)].good.is_some());
     }
 
     #[test]

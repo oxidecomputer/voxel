@@ -2,6 +2,7 @@
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
     use voxel_config::VoxelConfig;
@@ -923,6 +924,81 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn unavailable_nexus_skips_dependent_queries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = reqwest::Url::parse(&format!(
+            "http://{}/",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                let mut buffer = [0; 4096];
+                let _count = connection.read(&mut buffer).await.unwrap();
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                connection
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let collector = Collector {
+            executor: Arc::new(FakeExecutor {
+                generation: AtomicU64::new(0),
+                calls: Default::default(),
+            }),
+            targets: CollectorTargets { resources: vec![], rss: vec![] },
+            baselines: Default::default(),
+            nexus: BTreeMap::from([(
+                RackId(0),
+                Arc::new(
+                    NexusClient::new(
+                        vec![endpoint],
+                        RecoveryLogin {
+                            silo: "recovery".into(),
+                            username: "recovery".into(),
+                            password: "oxide".into(),
+                        },
+                        Duration::from_secs(1),
+                    )
+                    .unwrap(),
+                ),
+            )]),
+            sled_serials: BTreeMap::from([(
+                "serial-0".into(),
+                (RackId(0), "g0".into(), false),
+            )]),
+            oximeter_attempts: Default::default(),
+            oximeter_diagnostic_attempts: Default::default(),
+            concurrency: 1,
+        };
+        let (sender, mut receiver) = mpsc::channel(16);
+
+        assert!(
+            collector
+                .collect_oximeter(&sender, &CancellationToken::new())
+                .await
+        );
+        server.abort();
+        let events: Vec<_> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::NexusUnavailable { rack: RackId(0), .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AppEvent::OximeterTrafficFailed { rack: RackId(0), .. }
+        )));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
     struct FailingSecondRackRss(FakeExecutor);
 
     impl NodeExecutor for FailingSecondRackRss {
@@ -1018,6 +1094,7 @@ const OXIMETER_TRAFFIC_METRICS: [&str; 6] = [
     "sled_data_link:errors_sent",
 ];
 const OXIMETER_INTERVAL: Duration = Duration::from_secs(30);
+const NEXUS_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const ZONE_CPU_ALIGNMENT: Duration = Duration::from_secs(10);
 const ZONE_CPU_QUERY: &str = "get zone:cpu_nsec
     | filter timestamp > @now() - 2m
@@ -2329,6 +2406,60 @@ impl<E: NodeExecutor> Collector<E> {
         if !traffic_due && !diagnostics_due {
             return true;
         }
+
+        let readiness =
+            tokio::time::timeout(NEXUS_READY_TIMEOUT, client.ready(cancel))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "Nexus readiness timed out after {:?}",
+                        NEXUS_READY_TIMEOUT
+                    )
+                })
+                .and_then(|result| result);
+        if let Err(error) = readiness {
+            let completed_at = Instant::now();
+            if traffic_due {
+                self.oximeter_attempts.lock().await.insert(rack, completed_at);
+            }
+            if diagnostics_due {
+                self.oximeter_diagnostic_attempts
+                    .lock()
+                    .await
+                    .insert(rack, completed_at);
+            }
+            let message = error.to_string();
+            if !Self::send(
+                sender,
+                cancel,
+                AppEvent::NexusUnavailable {
+                    rack,
+                    at: completed_at,
+                    message: message.clone(),
+                },
+            )
+            .await
+            {
+                return false;
+            }
+            return !traffic_due
+                || Self::send(
+                    sender,
+                    cancel,
+                    AppEvent::OximeterTrafficFailed {
+                        rack,
+                        at: completed_at,
+                        message: format!("Oximeter traffic: {message}"),
+                    },
+                )
+                .await;
+        }
+        if !Self::send(sender, cancel, AppEvent::NexusAvailable { rack, at })
+            .await
+        {
+            return false;
+        }
+
         let traffic = async {
             !traffic_due
                 || self
