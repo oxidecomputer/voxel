@@ -736,6 +736,19 @@ impl App {
                 _ => {}
             }
         }
+        if self.session.post_operation_exit == Some(PostOperationExit::Detach)
+            && !self.session.quitting
+            && let Action::RequestQuit = action
+        {
+            self.session.post_operation_exit = None;
+            let confirmation = if self.resources_may_exist() {
+                Confirmation::QuitAndDestroy
+            } else {
+                Confirmation::Quit
+            };
+            self.open_confirmation(confirmation);
+            return vec![];
+        }
         if self.session.help_open {
             return match action {
                 Action::ToggleHelp | Action::Close => {
@@ -1996,5 +2009,53 @@ mod factual_outcome_tests {
             vec![Effect::ForceStop { request_id: OperationRequestId::FIRST }]
         );
         app.open_confirmation(Confirmation::ForceStop);
+    }
+
+    #[test]
+    fn detach_during_active_launch_defers_and_cancels() {
+        let mut app = active_app();
+        app.reattach_command = Some("pfexec voxel tui".into());
+
+        app.open_confirmation(Confirmation::Detach);
+        app.update(AppEvent::Action(Action::Scroll {
+            delta: -1,
+            page: false,
+        }));
+        assert_eq!(
+            app.update(AppEvent::Action(Action::Activate)),
+            vec![Effect::Cancel {
+                request_id: OperationRequestId::FIRST,
+                choice: CancelChoice::Leave,
+            }]
+        );
+        assert!(!app.session.quitting);
+        assert_eq!(
+            app.session.post_operation_exit,
+            Some(PostOperationExit::Detach)
+        );
+    }
+
+    #[test]
+    fn quit_is_reachable_while_detach_is_pending() {
+        let mut app = active_app();
+        app.reattach_command = Some("pfexec voxel tui".into());
+        app.deployment.observed = ObservedDeploymentState::Running;
+
+        // Request detach — deferred because a launch is active.
+        app.open_confirmation(Confirmation::Detach);
+        app.update(AppEvent::Action(Action::Scroll {
+            delta: -1,
+            page: false,
+        }));
+        app.update(AppEvent::Action(Action::Activate));
+        assert_eq!(
+            app.session.post_operation_exit,
+            Some(PostOperationExit::Detach)
+        );
+
+        // Quit must still be reachable; it clears the deferred detach.
+        app.update(AppEvent::Action(Action::RequestQuit));
+        assert!(app.session.confirmation.is_some());
+        assert!(app.session.post_operation_exit.is_none());
     }
 }
