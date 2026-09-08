@@ -1,7 +1,7 @@
 use super::{
     monitor::{
         health_style, resource_health_state, resource_health_summary,
-        sparkline_data, zone_rate_cells,
+        sparkline_data, visible_traffic_error, zone_rate_cells,
     },
     widgets::{centered_rect, format_rate, overlay_area, selection_style},
 };
@@ -92,9 +92,7 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     )));
     lines.push(Line::from(format!(
         "Traffic latest error: {}",
-        app.observability.traffic_failures[id]
-            .latest_error
-            .as_ref()
+        visible_traffic_error(app, id)
             .map(|e| e.message.as_str())
             .unwrap_or("none")
     )));
@@ -237,5 +235,67 @@ fn summarize(values: &[String], limit: usize) -> String {
         format!("{shown} (+{})", values.len() - limit)
     } else {
         shown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::{
+        event::AppEvent,
+        reconcile::ObservedDeploymentState,
+        telemetry::{ResourceDescriptor, ResourceId, ResourceKind},
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::time::{Duration, Instant};
+
+    fn render(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn router_detail_hides_pre_reconciliation_traffic_error() {
+        let id = ResourceId::fleet(ResourceKind::Router, "ce");
+        let descriptor = ResourceDescriptor {
+            id: id.clone(),
+            rack: None,
+            kind: ResourceKind::Router,
+            name: "ce".into(),
+            host: None,
+        };
+        let mut app = App::new(vec![descriptor], 4, 4);
+        app.session.selected_resource = Some(id.clone());
+        let before_reconciliation = Instant::now();
+        app.update(AppEvent::TrafficFailed {
+            id: id.clone(),
+            at: before_reconciliation,
+            message: "propolis uuid for ce: No such file".into(),
+        });
+        app.deployment.observed = ObservedDeploymentState::Running;
+        app.deployment.last_reconciliation_at =
+            Some(before_reconciliation + Duration::from_secs(1));
+
+        let pre_reconciliation = render(&app);
+        assert!(!pre_reconciliation.contains("propolis uuid"));
+        assert!(pre_reconciliation.contains("Traffic latest error: none"));
+
+        app.update(AppEvent::TrafficFailed {
+            id,
+            at: before_reconciliation + Duration::from_secs(2),
+            message: "router command failed after readiness".into(),
+        });
+        let after_reconciliation = render(&app);
+        assert!(
+            after_reconciliation
+                .contains("router command failed after readiness")
+        );
     }
 }

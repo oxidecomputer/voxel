@@ -271,10 +271,7 @@ pub(crate) fn resource_health_summary(app: &App, id: &ResourceId) -> String {
             .get(id)
             .and_then(|sample| sample.latest_error.as_ref())
     } else {
-        app.observability
-            .traffic_failures
-            .get(id)
-            .and_then(|sample| sample.latest_error.as_ref())
+        visible_traffic_error(app, id)
     }
     .map(|error| format!("; latest error: {}", error.message))
     .unwrap_or_default();
@@ -282,6 +279,31 @@ pub(crate) fn resource_health_summary(app: &App, id: &ResourceId) -> String {
         "{} (last success {age}){error}",
         health_status_label(resource_health_state(app, id))
     )
+}
+
+pub(crate) fn visible_traffic_error<'a>(
+    app: &'a App,
+    id: &ResourceId,
+) -> Option<&'a crate::tui::telemetry::CollectionError> {
+    let error =
+        app.observability.traffic_failures.get(id)?.latest_error.as_ref()?;
+    collection_error_is_visible(app, id, error).then_some(error)
+}
+
+fn collection_error_is_visible(
+    app: &App,
+    id: &ResourceId,
+    error: &crate::tui::telemetry::CollectionError,
+) -> bool {
+    resource_kind(app, id) != Some(ResourceKind::Router)
+        || (matches!(
+            app.deployment.observed,
+            ObservedDeploymentState::Running
+                | ObservedDeploymentState::Degraded
+        ) && app
+            .deployment
+            .last_reconciliation_at
+            .is_some_and(|ready_at| error.attempted_at >= ready_at))
 }
 
 pub(crate) fn health_style(state: HealthState) -> Style {
@@ -691,11 +713,9 @@ fn latest_collection_error<'a>(
         app.observability
             .addresses
             .get(id)
-            .and_then(|sample| sample.latest_error.as_ref()),
-        app.observability
-            .traffic_failures
-            .get(id)
-            .and_then(|sample| sample.latest_error.as_ref()),
+            .and_then(|sample| sample.latest_error.as_ref())
+            .filter(|error| collection_error_is_visible(app, id, error)),
+        visible_traffic_error(app, id),
     ]
     .into_iter()
     .flatten()
@@ -1176,6 +1196,45 @@ mod height_tests {
     }
 
     #[test]
+    fn compact_inspector_hides_router_errors_before_running_reconciliation() {
+        let id = ResourceId::fleet(ResourceKind::Router, "ce");
+        let descriptor = ResourceDescriptor {
+            id: id.clone(),
+            rack: None,
+            kind: ResourceKind::Router,
+            name: "ce".into(),
+            host: None,
+        };
+        let mut app = App::new(vec![descriptor], 4, 4);
+        app.session.selected_resource = Some(id.clone());
+        let before_reconciliation = Instant::now();
+        app.update(AppEvent::TrafficFailed {
+            id,
+            at: before_reconciliation,
+            message: "propolis uuid for ce: No such file".into(),
+        });
+        app.deployment.observed = ObservedDeploymentState::Stopped;
+        app.deployment.last_reconciliation_at =
+            Some(before_reconciliation + Duration::from_secs(1));
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_selected_resource_inspector(frame, frame.area(), &app)
+            })
+            .unwrap();
+
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!text.contains("propolis uuid"), "{text}");
+    }
+
+    #[test]
     fn sled_inspector_explains_unavailable_oximeter_diagnostics() {
         let mut app = app();
         let id = app.deployment.topology[0].id.clone();
@@ -1298,8 +1357,12 @@ mod height_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::telemetry::BidirectionalRate;
+    use crate::tui::{
+        event::AppEvent,
+        telemetry::{BidirectionalRate, TrafficSample},
+    };
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+    use std::time::Instant;
 
     #[test]
     fn sparkline_fits_width_and_clamps_values() {
@@ -1331,5 +1394,48 @@ mod tests {
         assert_eq!(buffer[(5, 0)].fg, super::super::colors::OX_OFF_WHITE);
         assert_eq!(buffer[(17, 0)].fg, super::super::colors::TUI_YELLOW);
         assert_eq!(buffer[(29, 0)].fg, super::super::colors::OX_RED);
+    }
+
+    #[test]
+    fn router_summary_hides_only_errors_before_running_reconciliation() {
+        let id = ResourceId::fleet(ResourceKind::Router, "ce");
+        let descriptor = ResourceDescriptor {
+            id: id.clone(),
+            rack: None,
+            kind: ResourceKind::Router,
+            name: "ce".into(),
+            host: None,
+        };
+        let mut app = App::new(vec![descriptor], 4, 4);
+        let before_reconciliation = Instant::now();
+        app.update(AppEvent::TrafficFailed {
+            id: id.clone(),
+            at: before_reconciliation,
+            message: "propolis uuid for ce: No such file".into(),
+        });
+        app.deployment.observed = ObservedDeploymentState::Running;
+        app.deployment.last_reconciliation_at =
+            Some(before_reconciliation + Duration::from_secs(1));
+
+        assert!(!resource_health_summary(&app, &id).contains("propolis uuid"));
+
+        let after_reconciliation =
+            before_reconciliation + Duration::from_secs(2);
+        app.update(AppEvent::TrafficFailed {
+            id: id.clone(),
+            at: after_reconciliation,
+            message: "router command failed after readiness".into(),
+        });
+        assert!(
+            resource_health_summary(&app, &id)
+                .contains("router command failed after readiness")
+        );
+
+        app.update(AppEvent::Traffic {
+            id: id.clone(),
+            at: after_reconciliation + Duration::from_secs(1),
+            sample: TrafficSample::default(),
+        });
+        assert!(!resource_health_summary(&app, &id).contains("latest error"));
     }
 }
