@@ -169,6 +169,43 @@ mod tests {
         }
     }
 
+    struct SlowTrafficExecutor {
+        calls: std::sync::Mutex<Vec<(NodeTarget, String)>>,
+    }
+
+    impl SlowTrafficExecutor {
+        fn has_command(&self, command: &str) -> bool {
+            self.calls.lock().unwrap().iter().any(|(_, c)| c == command)
+        }
+
+        fn has_command_starting_with(&self, prefix: &str) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, c)| c.starts_with(prefix))
+        }
+    }
+
+    impl NodeExecutor for SlowTrafficExecutor {
+        fn execute<'a>(
+            &'a self,
+            target: &'a NodeTarget,
+            command: &'a str,
+        ) -> BoxFuture<'a, anyhow::Result<String>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((target.clone(), command.to_owned()));
+            Box::pin(async move {
+                if matches!(command, KSTAT | DLADM | LINUX_COUNTERS) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(response(0, command))
+            })
+        }
+    }
+
     async fn wait_until(mut condition: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while !condition() {
@@ -763,6 +800,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_traffic_does_not_starve_health_cadence() {
+        let config = VoxelConfig::from_toml(
+            "[topology]\nracks = 1\nsleds = 1\nrouters = []\n",
+        )
+        .unwrap();
+        let fake = Arc::new(SlowTrafficExecutor { calls: Default::default() });
+        let collector =
+            Arc::new(Collector::new(fake.clone(), &config, 1).unwrap());
+        let schedule = SchedulerConfig::new(
+            Duration::from_millis(5),
+            Duration::from_millis(15),
+            1,
+        )
+        .unwrap();
+        let (sender, _receiver) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(collector.run_gated(
+            schedule,
+            sender,
+            cancel.clone(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        ));
+
+        wait_until(|| {
+            fake.has_command(IPADM)
+                && fake.has_command_starting_with("curl -s --max-time 5 ")
+        })
+        .await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn stalled_nexus_does_not_block_direct_traffic_cadence() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = reqwest::Url::parse(&format!(
@@ -949,11 +1023,10 @@ const ZONE_CPU_QUERY: &str = "get zone:cpu_nsec
     | filter timestamp > @now() - 2m
     | align mean_within(10s)
     | group_by [sled_serial, zone_name, zone_type, state], sum
+    | filter datum >= 0.0
     | last 1";
-const ZFS_QUERY: &str = r#"{
-get zfs_pool:bytes_allocated;
-get zfs_pool:bytes_total
-} | last 1"#;
+const ZFS_ALLOCATED_QUERY: &str = "get zfs_pool:bytes_allocated | last 1";
+const ZFS_TOTAL_QUERY: &str = "get zfs_pool:bytes_total | last 1";
 const OXIMETER_EXCEPTIONS_QUERY: &str = r#"{
 get oximeter_collector:failed_collections;
 get oximeter_collector:database_samples_dropped
@@ -1426,6 +1499,33 @@ mod oximeter_tests {
                 == "get sled_data_link:errors_sent | filter sled_serial == \"2FAKE\\\"001\" | last 1"
         }));
         assert!(queries.iter().all(|query| !query.contains("2FAKE002")));
+    }
+
+    #[test]
+    fn zfs_queries_request_one_metric_each() {
+        for query in [ZFS_ALLOCATED_QUERY, ZFS_TOTAL_QUERY] {
+            assert_eq!(query.matches("get zfs_pool:").count(), 1);
+        }
+    }
+
+    #[test]
+    fn zone_cpu_query_discards_missing_values_before_selecting_latest() {
+        let operators = ZONE_CPU_QUERY
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('|'))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            operators,
+            [
+                "| filter timestamp > @now() - 2m",
+                "| align mean_within(10s)",
+                "| group_by [sled_serial, zone_name, zone_type, state], sum",
+                "| filter datum >= 0.0",
+                "| last 1",
+            ]
+        );
     }
 
     #[test]
@@ -2193,69 +2293,89 @@ impl<E: NodeExecutor> Collector<E> {
         cancel: &CancellationToken,
     ) -> bool {
         let at = Instant::now();
-        for (rack, client) in &self.nexus {
-            let due = {
-                let attempts = self.oximeter_attempts.lock().await;
-                oximeter_due(&attempts, *rack, at)
-            };
-            if !due {
-                continue;
-            }
-            let result = self.oximeter_traffic(*rack, client, at, cancel).await;
-            let completed_at = Instant::now();
-            self.oximeter_attempts.lock().await.insert(*rack, completed_at);
-            match result {
-                Ok(samples) => {
-                    for (id, samples) in samples {
-                        if !Self::send(
-                            sender,
-                            cancel,
-                            AppEvent::OximeterTraffic {
-                                id,
-                                at: completed_at,
-                                samples,
-                            },
-                        )
-                        .await
-                        {
-                            return false;
-                        }
-                    }
-                }
-                Err(error) => {
-                    if !Self::send(
-                        sender,
-                        cancel,
-                        AppEvent::OximeterTrafficFailed {
-                            rack: *rack,
-                            at: completed_at,
-                            message: format!("Oximeter traffic: {error}"),
-                        },
+        let racks = self
+            .nexus
+            .iter()
+            .map(|(rack, client)| (*rack, Arc::clone(client)))
+            .collect::<Vec<_>>();
+        let concurrency = racks.len().max(1);
+        let jobs = racks.into_iter().map(|(rack, client)| async move {
+            self.collect_oximeter_rack(sender, rack, &client, at, cancel).await
+        });
+        stream::iter(jobs)
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .all(|keep_running| keep_running)
+    }
+
+    async fn collect_oximeter_rack(
+        &self,
+        sender: &mpsc::Sender<AppEvent>,
+        rack: RackId,
+        client: &NexusClient,
+        at: Instant,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let traffic_due = {
+            let attempts = self.oximeter_attempts.lock().await;
+            oximeter_due(&attempts, rack, at)
+        };
+        let diagnostics_due = {
+            let attempts = self.oximeter_diagnostic_attempts.lock().await;
+            oximeter_due(&attempts, rack, at)
+        };
+        if !traffic_due && !diagnostics_due {
+            return true;
+        }
+        let traffic = async {
+            !traffic_due
+                || self
+                    .collect_oximeter_traffic(sender, rack, client, at, cancel)
+                    .await
+        };
+        let diagnostics = async {
+            !diagnostics_due
+                || self
+                    .collect_oximeter_diagnostics(
+                        sender, rack, client, at, cancel,
                     )
                     .await
-                    {
-                        return false;
-                    }
-                }
-            }
+        };
+        let (traffic, diagnostics) = tokio::join!(traffic, diagnostics);
+        traffic && diagnostics
+    }
 
-            let diagnostics_due = {
-                let attempts = self.oximeter_diagnostic_attempts.lock().await;
-                oximeter_due(&attempts, *rack, at)
-            };
-            if diagnostics_due {
-                for event in self
-                    .oximeter_diagnostic_events(*rack, client, at, cancel)
-                    .await
-                {
-                    if !Self::send(sender, cancel, event).await {
-                        return false;
-                    }
-                }
-                self.oximeter_diagnostic_attempts
-                    .lock()
-                    .await
-                    .insert(*rack, Instant::now());
+    async fn collect_oximeter_traffic(
+        &self,
+        sender: &mpsc::Sender<AppEvent>,
+        rack: RackId,
+        client: &NexusClient,
+        at: Instant,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let result = self.oximeter_traffic(rack, client, at, cancel).await;
+        let completed_at = Instant::now();
+        self.oximeter_attempts.lock().await.insert(rack, completed_at);
+        let events = match result {
+            Ok(samples) => samples
+                .into_iter()
+                .map(|(id, samples)| AppEvent::OximeterTraffic {
+                    id,
+                    at: completed_at,
+                    samples,
+                })
+                .collect(),
+            Err(error) => vec![AppEvent::OximeterTrafficFailed {
+                rack,
+                at: completed_at,
+                message: format!("Oximeter traffic: {error}"),
+            }],
+        };
+        for event in events {
+            if !Self::send(sender, cancel, event).await {
+                return false;
             }
         }
         true
@@ -2367,36 +2487,42 @@ impl<E: NodeExecutor> Collector<E> {
         true
     }
 
-    async fn oximeter_diagnostic_events(
+    async fn collect_oximeter_diagnostics(
         &self,
+        sender: &mpsc::Sender<AppEvent>,
         rack: RackId,
         client: &NexusClient,
         at: Instant,
         cancel: &CancellationToken,
-    ) -> Vec<AppEvent> {
-        // A slow high-cardinality query must not prevent independent rack
-        // diagnostics from reaching the UI during the same collection cycle.
-        let (cpu, zfs, exceptions) = tokio::join!(
-            client.query(ZONE_CPU_QUERY, cancel),
-            client.query(ZFS_QUERY, cancel),
-            client.query(OXIMETER_EXCEPTIONS_QUERY, cancel),
-        );
-        let cpu = cpu.and_then(|result| {
-            parse_zone_cpu(result, rack, &self.sled_serials)
-        });
-        let zfs = zfs.and_then(|result| {
-            parse_zfs_headroom(result, rack, &self.sled_serials)
-        });
-        let exceptions = exceptions.and_then(parse_oximeter_exceptions);
-        vec![
-            match cpu {
+    ) -> bool {
+        let mut diagnostics =
+            futures::stream::FuturesUnordered::<BoxFuture<'_, AppEvent>>::new();
+        diagnostics.push(Box::pin(async {
+            match client.query(ZONE_CPU_QUERY, cancel).await.and_then(
+                |result| parse_zone_cpu(result, rack, &self.sled_serials),
+            ) {
                 Ok(zones) => AppEvent::ZoneCpu { rack, at, zones },
                 Err(error) => AppEvent::ZoneCpuFailed {
                     rack,
                     at,
                     message: error.to_string(),
                 },
-            },
+            }
+        }));
+        diagnostics.push(Box::pin(async {
+            let zfs = async {
+                let (allocated, total) = tokio::join!(
+                    client.query(ZFS_ALLOCATED_QUERY, cancel),
+                    client.query(ZFS_TOTAL_QUERY, cancel),
+                );
+                let mut result = allocated?;
+                result.tables.extend(total?.tables);
+                Ok::<_, anyhow::Error>(result)
+            }
+            .await
+            .and_then(|result| {
+                parse_zfs_headroom(result, rack, &self.sled_serials)
+            });
             match zfs {
                 Ok(pools) => AppEvent::ZfsHeadroom { rack, at, pools },
                 Err(error) => AppEvent::ZfsHeadroomFailed {
@@ -2404,8 +2530,14 @@ impl<E: NodeExecutor> Collector<E> {
                     at,
                     message: error.to_string(),
                 },
-            },
-            match exceptions {
+            }
+        }));
+        diagnostics.push(Box::pin(async {
+            match client
+                .query(OXIMETER_EXCEPTIONS_QUERY, cancel)
+                .await
+                .and_then(parse_oximeter_exceptions)
+            {
                 Ok(exceptions) => {
                     AppEvent::OximeterExceptions { rack, at, exceptions }
                 }
@@ -2414,8 +2546,18 @@ impl<E: NodeExecutor> Collector<E> {
                     at,
                     message: error.to_string(),
                 },
-            },
-        ]
+            }
+        }));
+        while let Some(event) = diagnostics.next().await {
+            if !Self::send(sender, cancel, event).await {
+                return false;
+            }
+        }
+        self.oximeter_diagnostic_attempts
+            .lock()
+            .await
+            .insert(rack, Instant::now());
+        true
     }
 
     async fn health_events(
@@ -2546,21 +2688,15 @@ impl<E: NodeExecutor> Collector<E> {
         gate: Arc<tokio::sync::Semaphore>,
     ) {
         let probes = async {
-            let mut traffic = tokio::time::interval(config.traffic_interval);
-            let mut health = tokio::time::interval(config.health_interval);
-            traffic.set_missed_tick_behavior(
-                tokio::time::MissedTickBehavior::Skip,
-            );
-            health.set_missed_tick_behavior(
-                tokio::time::MissedTickBehavior::Skip,
-            );
+            let now = tokio::time::Instant::now();
+            let mut traffic_due = now;
+            let mut health_due = now;
             loop {
-                let health_cadence = tokio::select! {
-                    biased;
+                let next_due = traffic_due.min(health_due);
+                tokio::select! {
                     _ = cancel.cancelled() => break,
-                    _ = traffic.tick() => false,
-                    _ = health.tick() => true,
-                };
+                    _ = tokio::time::sleep_until(next_due) => {},
+                }
                 let permit = tokio::select! {
                     _ = cancel.cancelled() => break,
                     permit = gate.clone().acquire_owned() => match permit {
@@ -2568,6 +2704,7 @@ impl<E: NodeExecutor> Collector<E> {
                         Err(_) => break,
                     },
                 };
+                let health_cadence = health_due < traffic_due;
                 let keep_running = if health_cadence {
                     self.collect_health_with_limit(
                         &sender,
@@ -2583,6 +2720,12 @@ impl<E: NodeExecutor> Collector<E> {
                     )
                     .await
                 };
+                let completed = tokio::time::Instant::now();
+                if health_cadence {
+                    health_due = completed + config.health_interval;
+                } else {
+                    traffic_due = completed + config.traffic_interval;
+                }
                 drop(permit);
                 if !keep_running {
                     break;
