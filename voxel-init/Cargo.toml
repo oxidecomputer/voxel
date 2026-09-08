@@ -20,3 +20,6 @@ clap = { workspace = true }
 indoc = { workspace = true }
 toml_edit = { workspace = true }
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

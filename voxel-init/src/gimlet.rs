@@ -11,7 +11,7 @@
 
 use crate::sys::{
     capture, note, read_external_net, replace_in_file, run, run_env, run_quiet,
-    warn,
+    sync_authorized_keys, warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -399,25 +399,7 @@ fn activate_native() {
 /// function). illumos sshd defaults differ from debian's, hence the explicit
 /// config edits.
 fn setup_ssh() {
-    let authorized = format!("{CARGO_BAY}/root_authorized_keys");
-    if Utf8Path::new(&authorized).exists() {
-        let _ = fs::create_dir_all("/root/.ssh");
-        if let Ok(keys) = fs::read(&authorized) {
-            use std::io::Write;
-            match fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/root/.ssh/authorized_keys")
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&keys) {
-                        warn(format!("authorized_keys: {e}"));
-                    }
-                }
-                Err(e) => warn(format!("authorized_keys: {e}")),
-            }
-        }
-    }
+    sync_authorized_keys(&format!("{CARGO_BAY}/root_authorized_keys"));
     run("ssh-keygen", &["-A"]);
     replace_in_file(
         "/etc/ssh/sshd_config",

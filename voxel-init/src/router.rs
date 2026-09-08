@@ -10,7 +10,7 @@
 
 use crate::sys::{
     ExternalNet, capture, note, read_external_net, replace_in_file, run,
-    run_quiet, warn,
+    run_quiet, sync_authorized_keys, warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -48,31 +48,8 @@ pub fn bring_up() -> Result<()> {
     Ok(())
 }
 
-/// SSH convenience for `voxel host login <router>`, the router-role counterpart
-/// of the gimlet agent's `setup_ssh`. `openssh-server` is already in the image
-/// (install-frr.sh), so this only appends any staged operator key and relaxes
-/// sshd_config: voxel authenticates as root with the rack's empty password, and
-/// Debian's stock `PermitRootLogin prohibit-password` refuses that.
 fn setup_ssh() {
-    let authorized = "/opt/cargo-bay/root_authorized_keys";
-    if Utf8Path::new(authorized).exists() {
-        let _ = fs::create_dir_all("/root/.ssh");
-        if let Ok(keys) = fs::read(authorized) {
-            use std::io::Write;
-            match fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/root/.ssh/authorized_keys")
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&keys) {
-                        warn(format!("authorized_keys: {e}"));
-                    }
-                }
-                Err(e) => warn(format!("authorized_keys: {e}")),
-            }
-        }
-    }
+    sync_authorized_keys("/opt/cargo-bay/root_authorized_keys");
 
     // Debian's stock sshd_config keeps PasswordAuthentication yes but defaults
     // PermitRootLogin to prohibit-password. Flip it so serial-first debugging
