@@ -9,45 +9,45 @@ use ratatui::{
 
 const GLOBAL: &[(&str, &str)] = &[
     ("1 / 2", "Deployment / Monitoring"),
-    ("Tab / Shift-Tab", "Next / previous top-level section unconditionally"),
-    ("Space", "Fold / expand focused section"),
-    ("? / F1", "Open / close Help"),
-    ("Esc", "Close the topmost non-confirmation pane or selection"),
-    ("d", "Detach and leave resources; resume with voxel tui resume"),
-    ("q", "Quit; destroy deployment first unless already stopped"),
+    ("Tab / Shift-Tab", "Next / previous section"),
+    ("Space", "Fold / expand section"),
+    ("? / F1", "Toggle help"),
+    ("Esc", "Close pane or selection"),
+    ("d", "Detach (resume with `voxel tui resume`)"),
+    ("q", "Quit and destroy deployment"),
 ];
 const DEPLOYMENT: &[(&str, &str)] = &[
     ("Sections", "Overall Progress, Phases, Status, Current Phase, Logs"),
-    ("↑ / ↓", "Move nested; at edge/no vertical content, move section"),
-    ("PgUp / PgDn", "Page nested content only"),
+    ("↑ / ↓", "Move item / section"),
+    ("PgUp / PgDn", "Page content"),
     ("f", "Cycle log filter"),
     ("l / r", "Launch / route"),
-    ("c / x", "Cancel and leave / destroy resources"),
+    ("c / x", "Cancel / destroy resources"),
 ];
 const MONITORING: &[(&str, &str)] = &[
     ("Sections", "Rack Summary, Topology, Top Zones by Traffic"),
-    ("← / →", "Previous / next rack in Rack Summary"),
-    ("↑ / ↓", "Move resource; at edge/no vertical content, move section"),
-    ("PgUp / PgDn", "Page Topology resources or Top Zones"),
-    ("Enter", "Open selected resource detail"),
-    ("Top Zones ↑ / ↓", "Browse the rack-wide traffic ranking"),
-    ("Detail ↑ / ↓", "Browse peers; detail stays open; section unchanged"),
-    ("Detail Enter/Esc", "Close resource detail"),
+    ("← / →", "Previous / next rack"),
+    ("↑ / ↓", "Move resource / section"),
+    ("PgUp / PgDn", "Page resources"),
+    ("Enter", "Open resource detail"),
+    ("Top Zones ↑ / ↓", "Browse traffic ranking"),
+    ("Detail ↑ / ↓", "Browse peers"),
+    ("Detail Enter/Esc", "Close detail"),
     ("x", "External monitoring"),
 ];
 const DIALOGS: &[(&str, &str)] = &[
-    ("↑ / ↓", "Choose a confirmation option"),
-    ("Enter", "Confirm selected safe-default option"),
-    ("y", "Copy full fallback command from Detach"),
-    ("n", "Reject confirmation"),
-    ("Esc", "Reject or close topmost dialog"),
-    ("Help ↑/↓ / Pg", "Scroll one wrapped line / page"),
+    ("↑ / ↓", "Select option"),
+    ("Enter", "Confirm selection"),
+    ("y", "Copy fallback command"),
+    ("n", "Reject"),
+    ("Esc", "Close dialog"),
+    ("Help ↑/↓ / Pg", "Scroll line / page"),
 ];
 const TRAFFIC: &[(&str, &str)] =
     &[("Rates", "normal ≤100 KB/s; elevated >100 KB/s–5 MB/s; high >5 MB/s")];
 const HEALTH: &[(&str, &str)] = &[
-    ("States", "● healthy; ◌ checking status; ! degraded / failed"),
-    ("", "? / ◐ / × / ■ checking status"),
+    ("States", "● healthy; ◌ checking; ! degraded / failed"),
+    ("", "? / ◐ / × / ■ checking"),
 ];
 
 fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
