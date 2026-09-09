@@ -1,0 +1,15 @@
+# Prebuilt binaries voxel fetches from buildomat when the matching [sp]
+# override is unset. Each rev is a validated pairing with this voxel commit;
+# bump deliberately. Embedded into the voxel binary at build time.
+
+[sp-emu]
+repo = "sp-emu"
+series = "illumos"
+rev = "2755b40a0fec9c90919c524d6cea9dcae3a173c3"
+artifact = "sp-emu"
+
+[faux-mgs]
+repo = "management-gateway-service"
+series = "bins"
+rev = "da0ac17b9d465db5b1f7a2597d068ae091a89b22"
+artifact = "faux-mgs.gz"
