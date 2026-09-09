@@ -16,6 +16,7 @@ use voxel_config::{Network, VoxelConfig};
 
 const DEFAULT_REPO: &str = "https://github.com/oxidecomputer/omicron";
 const DEFAULT_POOL_SIZE: u32 = 16;
+const DEFAULT_ICMP_LOSS_TOLERANCE: &str = "500";
 /// Commtest's connectivity subcommand. Voxel only derives arguments and demands
 /// privileges for this one, so passthrough naming another subcommand is
 /// forwarded untouched.
@@ -699,14 +700,42 @@ fn commtest_args_for(
     }
 
     apply_traffic(source, traffic, supports_multicast, &mut args)?;
-
-    let has_begin = args
-        .iter()
-        .any(|a| a == "--ip-pool-begin" || a.starts_with("--ip-pool-begin="));
-    let has_end = args
-        .iter()
-        .any(|a| a == "--ip-pool-end" || a.starts_with("--ip-pool-end="));
+    if !has_arg(&args, "--icmp-loss-tolerance") {
+        args.push("--icmp-loss-tolerance".into());
+        args.push(DEFAULT_ICMP_LOSS_TOLERANCE.into());
+    }
+    let has_begin = has_arg(&args, "--ip-pool-begin");
+    let has_end = has_arg(&args, "--ip-pool-end");
     if has_begin && has_end {
+        let begin = arg_value(&args, "--ip-pool-begin")
+            .and_then(|v| v.parse::<Ipv4Addr>().ok());
+        let end = arg_value(&args, "--ip-pool-end")
+            .and_then(|v| v.parse::<Ipv4Addr>().ok());
+
+        if let (Some(begin), Some(end)) = (begin, end) {
+            if begin > end {
+                bail!(
+                    "--ip-pool-begin {begin} is greater than --ip-pool-end \
+                     {end}: the range's first address must be less than or \
+                     equal to the last"
+                );
+            }
+            let service_first: Option<Ipv4Addr> =
+                network.service_pool_first.parse().ok();
+            let service_last: Option<Ipv4Addr> =
+                network.service_pool_last.parse().ok();
+            if let (Some(first), Some(last)) = (service_first, service_last)
+                && begin <= last
+                && first <= end
+            {
+                bail!(
+                    "--ip-pool-begin {begin} and --ip-pool-end {end} overlap \
+                     the service pool {first}-{last}; commtest's floating \
+                     IPs would collide with the rack services. Pick a range \
+                     outside it."
+                );
+            }
+        }
         return Ok(args);
     }
     // Deriving the missing half of a partial override would pair a caller's
@@ -717,7 +746,7 @@ fn commtest_args_for(
         bail!(
             "pass both --ip-pool-begin and --ip-pool-end, or neither. Voxel \
              derives the pair from [network], and mixing the two produces a \
-             range that overlaps the service pool."
+             range that either overlaps the service pool or becomes inverted."
         );
     }
 
@@ -780,6 +809,23 @@ fn apply_traffic(
 
 fn has_arg(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name || a.starts_with(&format!("{name}=")))
+}
+
+/// The value following `name` in either `--flag value` or `--flag=value`
+/// spellings.
+///
+/// Returns `None` when the flag is absent or trails without a value.
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
+            return Some(value);
+        }
+        if arg == name {
+            return rest.next().map(String::as_str);
+        }
+    }
+    None
 }
 
 fn add_default_mcast_group(args: &mut Vec<String>) {
@@ -860,6 +906,8 @@ mod test {
             .unwrap(),
             [
                 "run",
+                "--icmp-loss-tolerance",
+                "500",
                 "--ip-pool-begin",
                 "198.51.100.30",
                 "--ip-pool-end",
@@ -908,6 +956,29 @@ mod test {
     }
 
     #[test]
+    fn explicit_pool_passes_through_untouched() {
+        let network = Network::default();
+        let explicit = vec![
+            "run".to_string(),
+            "--ip-pool-begin=203.0.113.10".into(),
+            "--ip-pool-end=203.0.113.20".into(),
+        ];
+        let args = commtest_args_for(
+            Utf8Path::new("/tmp/old-omicron"),
+            &network,
+            4,
+            Traffic::Unicast,
+            &explicit,
+            false,
+        )
+        .unwrap();
+        let mut expected = explicit.clone();
+        expected.push("--icmp-loss-tolerance".into());
+        expected.push(DEFAULT_ICMP_LOSS_TOLERANCE.into());
+        assert_eq!(args, expected);
+    }
+
+    #[test]
     fn rejects_partial_pool_override() {
         let network = Network::default();
         for partial in [
@@ -925,6 +996,66 @@ mod test {
                     4,
                     Traffic::Unicast,
                     &partial,
+                    false
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_pool_overlapping_the_service_pool() {
+        let network = Network::default();
+        for (begin, end) in [
+            ("198.51.100.20", "198.51.100.29"),
+            ("198.51.100.10", "198.51.100.22"),
+            ("198.51.100.25", "198.51.100.40"),
+            ("198.51.100.10", "198.51.100.40"),
+        ] {
+            let explicit = vec![
+                "run".to_string(),
+                format!("--ip-pool-begin={begin}"),
+                format!("--ip-pool-end={end}"),
+            ];
+            assert!(
+                commtest_args_for(
+                    Utf8Path::new("/tmp/old-omicron"),
+                    &network,
+                    4,
+                    Traffic::Unicast,
+                    &explicit,
+                    false,
+                )
+                .is_err(),
+                "{begin}-{end} overlaps the service pool"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_inverted_pool_override() {
+        let network = Network::default();
+        for inverted in [
+            vec![
+                "run".to_string(),
+                "--ip-pool-begin=203.0.113.20".into(),
+                "--ip-pool-end=203.0.113.10".into(),
+            ],
+            vec![
+                "run".to_string(),
+                "--ip-pool-begin".into(),
+                "203.0.113.20".into(),
+                "--ip-pool-end".into(),
+                "203.0.113.10".into(),
+            ],
+        ] {
+            assert!(
+                commtest_args_for(
+                    Utf8Path::new("/tmp/old-omicron"),
+                    &network,
+                    4,
+                    Traffic::Unicast,
+                    &inverted,
                     false
                 )
                 .is_err()
