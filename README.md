@@ -270,3 +270,30 @@ on sp-emu without rebaking.
 [how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
 [sp-emu]: https://github.com/oxidecomputer/sp-emu
 [Git worktrees]: https://git-scm.com/docs/git-worktree
+
+## SP-driven power (emulated fleets)
+
+With `--emu`, a sled's power follows its service processor the way a real
+gimlet's does. Each sp-emu serves a host power bridge (`SP_EMU_HOST_POWER`) on
+the port after its MGS pair, and `svc:/oxide/voxel-power:r<rack>`, installed
+by the launch, follows the fleet:
+
+- `power-state A2` through MGS stops the sled's propolis; `A0` starts a fresh
+  one replaying the instance captured at launch (`.falcon/<node>.ensure.json`).
+  `voxel sp cycle g1` does both, as `pilot sp cycle` does.
+- An SP reset power cycles its sled, as on a gimlet.
+- Ignition commands from the sidecar act on the whole sled: `power-off` takes
+  the sled's SP down with it, `power-on` brings the SP back and it powers the
+  host as it boots, `power-reset` does both.
+- When a sled's propolis goes away for any other reason the SP is told over
+  IPCC, so it reports A2 rather than an A0 host that is not there.
+
+The hypervisor-level operations are available by hand, with or without
+emulated SPs, and `voxel host ls` shows each node's propolis and SP view:
+
+```
+voxel host ls
+voxel host off g1
+voxel host on g1
+voxel host reset g1
+```

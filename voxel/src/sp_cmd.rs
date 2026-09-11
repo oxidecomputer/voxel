@@ -2,17 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `voxel sp` - manage and operate the rack's service processors.
-//!
-//! Two axes:
-//!  - **build/stage** the `sp-emu` artifacts (`ready`/`flash`/`build`) - voxel's
-//!    own emulator lifecycle; `pilot` has no equivalent.
-//!  - **operate** the live SPs over MGS, `pilot sp`-style (`ls`/`state`/`exec`),
-//!    by running `faux-mgs` (the same client `pilot` shells out to) inside the
-//!    switch zone against each SP's loopback MGS port. Needs a running `--emu`
-//!    rack. `exec` is the raw passthrough that unlocks the full faux-mgs surface
-//!    (`inventory`, `component-details`, `read-sensor-value`, `dump`,
-//!    `read-caboose`, `power-state`, `rot-boot-info`, ...).
+//! The sp command: stage the sp-emu artifacts, and operate the live SPs over
+//! MGS with faux-mgs, pilot style. Needs a running --emu rack to operate.
 
 use anyhow::{Context, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -54,10 +45,13 @@ pub(crate) async fn cmd_sp(
             );
             Ok(())
         }
+        SpCmd::Cycle { target, switch } => {
+            sp_cycle(cfg, name, switch, target).await
+        }
+        SpCmd::Watch { rack } => crate::power::watch(cfg, name, *rack).await,
         SpCmd::Exec { target, switch, command } => {
-            // `command` is the passthrough token(s) after `-e`. Split each on
-            // whitespace so a single quoted string (`-e "read-caboose 0"`) and
-            // separate args (`-e read-caboose 0`) both flatten to faux-mgs argv.
+            // Split each -e token on whitespace so a quoted string and separate
+            // arguments both flatten to the faux-mgs argv.
             let parts: Vec<&str> =
                 command.iter().flat_map(|s| s.split_whitespace()).collect();
             print!("{}", sp_faux(cfg, name, switch, target, &parts).await?);
@@ -78,11 +72,10 @@ pub(crate) async fn cmd_sp(
     }
 }
 
-// --- operator commands (faux-mgs in the switch zone) -----------------------
+// Operator commands, through faux-mgs.
 
-/// The MGS loopback port for an SP target. Accepts (in order): a node selector
-/// (`sidecar` | `g0` | `g1` ...), a board serial (e.g. `2FAKE001`), or a raw
-/// sim address (`[::1]:33310` | `33310`).
+/// The MGS port for an SP target: a node selector, a board serial, or a raw
+/// address or port, tried in that order.
 fn resolve_port(fleet: &SpFleet, target: &str) -> anyhow::Result<u16> {
     if let Some(sp) = fleet.sps.iter().find(|sp| sp.selector() == target) {
         return Ok(sp.base_port);
@@ -90,8 +83,11 @@ fn resolve_port(fleet: &SpFleet, target: &str) -> anyhow::Result<u16> {
     if let Some(sp) = fleet.sps.iter().find(|sp| sp_serial(sp) == target) {
         return Ok(sp.base_port);
     }
+    // A raw port must be one the fleet serves. A stray number fails here
+    // instead of retrying against a port nothing listens on.
     if let Some(p) =
         target.rsplit(':').next().and_then(|s| s.parse::<u16>().ok())
+        && fleet.sps.iter().any(|sp| p == sp.base_port || p == sp.base_port + 1)
     {
         return Ok(p);
     }
@@ -101,22 +97,13 @@ fn resolve_port(fleet: &SpFleet, target: &str) -> anyhow::Result<u16> {
     ))
 }
 
-/// The board serial an SP reports: the fleet's configured serial, which voxel
-/// feeds to the SP itself (sp-sim config / sp-emu SP_EMU_VPD_SERIAL).
+/// The board serial an SP reports, the fleet's configured serial.
 fn sp_serial(sp: &Sp) -> String {
     sp.serial.clone()
 }
 
-/// Run a faux-mgs command against one SP (by port) inside the switch zone over
-/// ssh, returning its combined output. The emulator can drop the first request
-/// under load, so retry (callers pick how hard). Uses [`ssh_output`] (not
-/// `ssh_capture`) so a non-zero faux-mgs exit returns the SP's OWN error text
-/// (e.g. "the image caboose does not contain 'GITC'", "code: Unconfigured") - a
-/// bad arg or an empty slot is the SP answering, not the rack being down. Only a
-/// genuine ssh transport failure (None) maps to "is the switch zone reachable".
-/// The rack, switch slot and SP fleet behind a `--switch` selector. The slot is
-/// the scrimlet's position among its rack's scrimlets, which is what mgs.rs
-/// numbers switch0/switch1 by and which view port the host fleet answers on.
+/// The rack, switch slot and SP fleet behind a --switch selector. The slot is
+/// the scrimlet's position among its rack's scrimlets, as mgs.rs numbers them.
 fn switch_target(
     cfg: &VoxelConfig,
     topo: &Topo,
@@ -129,13 +116,13 @@ fn switch_target(
         .filter(|(d, _)| d.scrimlet && d.rack == s.rack)
         .position(|(d, _)| d.name == s.name)
         .unwrap_or(0) as u16;
-    // Built the same way launch and the host fleet build it, so the operator
-    // commands cannot disagree with the SPs that are actually running.
+    // Built as launch and the host fleet build it, so the operator commands
+    // match the running SPs.
     Ok((crate::topo::emu_fleet(cfg, s.rack), s.rack, slot, s.name.clone()))
 }
 
-/// The faux-mgs to drive the fleet with: the copy staged beside the rack's
-/// fleet, else `[sp].faux_mgs`.
+/// The faux-mgs to drive the fleet with: the copy staged beside the fleet,
+/// else [sp].faux_mgs.
 fn faux_bin(cfg: &VoxelConfig, rack: usize) -> anyhow::Result<Utf8PathBuf> {
     let staged = crate::topo::sp_fleet_dir(rack).join("sp-emu/faux-mgs");
     if staged.exists() {
@@ -150,10 +137,8 @@ fn faux_bin(cfg: &VoxelConfig, rack: usize) -> anyhow::Result<Utf8PathBuf> {
     }
 }
 
-/// Run a faux-mgs verb against the rack's host fleet. The fleet runs here, so
-/// this is a plain local process: no switch zone, no ssh hop, no cached
-/// scrimlet IP to go stale. faux-mgs logs to stderr and answers on stdout, so
-/// combine them the way the in-zone `2>&1` did.
+/// Run a faux-mgs verb against the host fleet as a local process. faux-mgs
+/// logs to stderr and answers on stdout; both are returned.
 fn faux_run(
     bin: &Utf8Path,
     addr: &str,
@@ -183,8 +168,8 @@ fn faux_run(
     Ok(text)
 }
 
-/// `sp <verb...>` against a named target: resolve switch + port, stage faux-mgs,
-/// run it (generous retries - the caller wants the answer).
+/// Run faux-mgs verbs against a named target: resolve the switch and port,
+/// then run with generous retries.
 async fn sp_faux(
     cfg: &VoxelConfig,
     name: &str,
@@ -197,8 +182,8 @@ async fn sp_faux(
     // Each SP serves switch0 on its base port and switch1 on the next one.
     let port = resolve_port(&fleet, target)? + slot;
     let bin = faux_bin(cfg, rack)?;
-    // 30s per attempt: sprot-backed verbs (`state`, rot-*) take the emu gimlets
-    // ~20s under post-init MGS load; 15s timed out on every attempt.
+    // 30s per attempt: sprot backed verbs take an emulated gimlet about 20s
+    // under MGS load.
     faux_run(
         &bin,
         &voxel_config::config::sp_host_addr(rack),
@@ -209,14 +194,37 @@ async fn sp_faux(
     )
 }
 
-/// `voxel sp reflash <target> <image>` - re-flash a live SP (or the shared RoT)
-/// and restart its sp-emu service: the firmware counterpart to `voxel rack
-/// patch`. Flashes in-zone with the BAKED `sp-emu` (so it works on a
-/// self-contained image with no `[sp]` paths set), then verifies over MGS.
-/// Live + ephemeral - a clean relaunch reverts to the image; bake it via
-/// `build-cp.sh` to persist. `target == "rot"` swaps the shared raw
-/// `rot.flash` (every RoT bridge serves it) and restarts them all; otherwise
-/// it's a single SP.
+/// Power cycle a host through its SP, as pilot sp cycle does: A2 if the host
+/// is on, a pause, then A0.
+async fn sp_cycle(
+    cfg: &VoxelConfig,
+    name: &str,
+    switch: &str,
+    target: &str,
+) -> anyhow::Result<()> {
+    let out = sp_faux(cfg, name, switch, target, &["power-state"]).await?;
+    // faux-mgs prints the state on its own line among its log lines.
+    let state = out
+        .lines()
+        .map(str::trim)
+        .find(|l| matches!(*l, "A0" | "A1" | "A2"))
+        .unwrap_or_else(|| out.trim());
+    match state {
+        "A2" => println!("{target}: already A2"),
+        "A0" => {
+            sp_faux(cfg, name, switch, target, &["power-state", "A2"]).await?;
+            println!("{target}: A2");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        other => bail!("{target}: unexpected power state {other:?}"),
+    }
+    sp_faux(cfg, name, switch, target, &["power-state", "A0"]).await?;
+    println!("{target}: A0");
+    Ok(())
+}
+
+/// Re-flash a live SP, or the shared RoT with target rot, restart its service
+/// and verify over MGS. Ephemeral: a relaunch reverts to the image.
 async fn sp_reflash(
     cfg: &VoxelConfig,
     name: &str,
@@ -229,13 +237,12 @@ async fn sp_reflash(
     }
     let topo = build_topo(cfg, name)?;
     let (fleet, rack, _, _) = switch_target(cfg, &topo, switch)?;
-    // Fails loudly when this is not a running --emu rack: there is no flash
-    // file or voxel-sp-emu instance to swap on an sp-sim one.
+    // Fails loudly on an sp-sim rack: there is no flash file to swap.
     crate::sp_host::emu_bin(rack)?;
 
     if target == "rot" {
-        // Every SP runs oxide-rot-1 in-process from the fleet's shared RoT
-        // image, so replacing it and restarting the fleet reflashes them all.
+        // Every SP runs the RoT from the fleet's shared image. Replacing it
+        // and restarting the fleet reflashes them all.
         let rot = crate::sp_host::fleet_dir(rack).join("rot.image");
         eprintln!("[voxel] reflashing the shared RoT ({rot}) from {image}");
         std::fs::copy(image, &rot)
@@ -258,14 +265,13 @@ async fn sp_reflash(
         return Ok(());
     }
 
-    // The SMF instance is the SP process, one per base port; the switch slot
-    // only picks which view to talk to.
+    // The SMF instance is the SP process, one per base port. The switch slot
+    // only picks the view.
     let port = resolve_port(&fleet, target)?;
     eprintln!("[voxel] reflashing SP {target} (port {port}) from {image}");
     crate::sp_host::flash_sp(rack, port, image)?;
-    // The SP re-runs its ~340M-instruction preboot (~30s) before MGS answers;
-    // sp_faux retries generously, so this waits out the boot and returns fresh
-    // state.
+    // The SP reruns its 30s preboot before MGS answers. sp_faux retries
+    // through it and returns fresh state.
     eprintln!(
         "[voxel] SP {target} reflashed + restarting; waiting for it to boot \
          (~30s) ..."
@@ -280,17 +286,8 @@ async fn sp_reflash(
     Ok(())
 }
 
-/// `voxel sp debug <target> [--off]` - toggle the in-zone humility debug
-/// listeners for one SP by flipping `SP_EMU_NO_DEBUG` on its sp-emu service +
-/// restarting it. The SPs already run in `gdb` mode; that env var is the only
-/// thing suppressing the gdb/ocd listeners (`sp-emu` src/gdb.rs), so this is the
-/// on/off switch. On enable, prints the per-SP humility ports + attach command.
-/// Live + ephemeral (a clean relaunch reverts to baked production = debug off).
-///
-/// We edit the service's `start/environment` via an `svccfg -f` command file
-/// (scp'd into the zone) - preserving the rest of the env, toggling just the one
-/// var - then `svcadm refresh` + `restart`. Listeners bind after the SP's ~30s
-/// preboot.
+/// Toggle the humility debug listeners for one SP by flipping SP_EMU_NO_DEBUG
+/// on its service and restarting it. Ephemeral: a relaunch reverts to off.
 async fn sp_debug(
     cfg: &VoxelConfig,
     name: &str,
@@ -300,11 +297,10 @@ async fn sp_debug(
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let (fleet, rack, _, _) = switch_target(cfg, &topo, switch)?;
-    // The SMF instance is the SP process, one per base port; the switch slot
-    // only picks which view to TALK to, which is not what we are toggling.
+    // The SMF instance is the SP process, one per base port. The switch slot
+    // only picks the view.
     let port = resolve_port(&fleet, target)?;
-    // Keep everything else in the environment (board, state dir, bridge, RoT)
-    // and toggle only SP_EMU_NO_DEBUG.
+    // Keep the rest of the environment and toggle only SP_EMU_NO_DEBUG.
     let env = crate::sp_host::read_env(rack, port).ok_or_else(|| {
         anyhow!(
             "couldn't read the SMF environment for SP port {port} - is this a \
@@ -327,18 +323,15 @@ async fn sp_debug(
         );
         return Ok(());
     }
-    // Per-SP ports, offset by the bridge port so every SP in the fleet is
-    // debuggable at once (sp-emu gdb.rs: 33300 -> 0, 33310 -> 10, ...). sp-emu
-    // exposes a Glasgow SWD probe, which stock humility speaks directly: the SP
-    // at 4444 + off and its RoT at 4544 + off.
+    // sp-emu exposes a Glasgow SWD probe per SP, offset by base port minus
+    // 33300: the SP at 4444 plus offset, its RoT at 4544 plus offset.
     let off = port.wrapping_sub(SP_PORT_BASE);
     let (sp_swd, rot_swd) = (4444 + off, 4544 + off);
     eprintln!(
         "[voxel] {target} (port {port}) debug ENABLED; sp-emu restarting \
          (listeners ready in ~30s after preboot)"
     );
-    // The fleet runs here, so the listeners are on this host's loopback and
-    // humility runs here too - no zone to tunnel into.
+    // The fleet runs here, so the listeners are on this host's loopback.
     println!("humility attach (listeners on 127.0.0.1 of this host):");
     println!(
         "  SP   - humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{sp_swd} <cmd>"
@@ -349,15 +342,8 @@ async fn sp_debug(
     Ok(())
 }
 
-/// `voxel sp ipcc <target> [--cmd identity|bsu]` - drive one host<->SP exchange
-/// over the SP's control UART (RFD 316 / IPCC). sp-emu models UART7 and exposes
-/// it as `SP_EMU_HOST_UART` (a Unix socket it connects to). We stage the host
-/// sp-emu (which has the `ipcc` host-role subcommand) into the zone as the probe,
-/// start it listening, arm the SP with that socket + restart (so it connects at
-/// boot), then the probe sends a `HostToSp` request and decodes the `SpToHost`
-/// reply - proving the emulated SP speaks IPCC. Everything runs in-zone (the SP's
-/// UART socket is in-zone loopback). Live + ephemeral (the arming reverts on a
-/// clean relaunch). Emu-only.
+/// Drive one host to SP exchange over the SP's IPCC UART: start the sp-emu
+/// broker, arm the SP with its socket, send a request and decode the reply.
 async fn sp_ipcc(
     cfg: &VoxelConfig,
     name: &str,
@@ -375,16 +361,14 @@ async fn sp_ipcc(
     let topo = build_topo(cfg, name)?;
     let (fleet, rack, _, _) = switch_target(cfg, &topo, switch)?;
     let port = resolve_port(&fleet, target)?;
-    // sp-emu carries the ipcc subcommands, and it is the same binary already
-    // running the fleet.
+    // sp-emu carries the ipcc subcommands; it is the binary running the fleet.
     let bin = crate::sp_host::emu_bin(rack)?;
     let state = crate::sp_host::state_dir(rack, port);
     let sp_sock = state.join("ipcc.sock");
     let ctl_sock = state.join("ipcc-ctl.sock");
 
     eprintln!("[voxel] {target} (port {port}): ipcc {command}");
-    // Fast path: a broker is already up and holding the SP's UART, so repeats
-    // skip the reboot entirely.
+    // Fast path: a broker already holds the SP's UART, so no restart.
     let started_broker = match ipcc_req(&bin, &ctl_sock, command) {
         IpccReply::Reply(out) => {
             print!("{out}");
@@ -404,8 +388,7 @@ async fn sp_ipcc(
     if started_broker {
         let log = std::fs::File::create(state.join("ipcc-broker.log"))
             .with_context(|| format!("open the IPCC broker log in {state}"))?;
-        // Detached, so it outlives this command and later calls take the fast
-        // path above.
+        // Detached, so it outlives this command.
         std::process::Command::new(bin.as_str())
             .args(["ipcc-serve", sp_sock.as_str(), ctl_sock.as_str()])
             .stdin(std::process::Stdio::null())
@@ -418,9 +401,8 @@ async fn sp_ipcc(
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    // Point the SP's UART7 at the broker socket. The environment only takes
-    // effect on (re)start, and a brand new broker needs the SP to reconnect
-    // either way.
+    // Point the SP's UART7 at the broker socket. The environment takes effect
+    // on restart, and a new broker needs the SP to reconnect anyway.
     let env = crate::sp_host::read_env(rack, port).ok_or_else(|| {
         anyhow!(
             "couldn't read the SMF environment for SP port {port} - is this a \
@@ -442,7 +424,7 @@ async fn sp_ipcc(
         crate::sp_host::set_env(rack, port, &tokens)?;
     }
 
-    // Wait out the SP's ~30s preboot, then read the reply through the broker.
+    // Wait out the SP's 30s preboot, then read the reply through the broker.
     for _ in 0..70 {
         if let IpccReply::Reply(out) = ipcc_req(&bin, &ctl_sock, command) {
             print!("{out}");
@@ -463,12 +445,12 @@ async fn sp_ipcc(
 enum IpccReply {
     /// A decoded SpToHost reply.
     Reply(String),
-    /// No broker is listening (sp-emu exit 3).
+    /// No broker is listening, sp-emu exit 3.
     NoBroker,
-    /// The broker is up but the SP has not connected yet (sp-emu exit 4).
+    /// The broker is up but the SP has not connected yet, sp-emu exit 4.
     NotConnected,
-    /// This sp-emu has no ipcc broker at all. It prints its usage and exits 0,
-    /// which would otherwise read as an empty success.
+    /// This sp-emu has no ipcc broker: it prints usage and exits 0, which
+    /// would otherwise read as an empty success.
     Unsupported,
 }
 
@@ -480,8 +462,8 @@ fn ipcc_req(bin: &Utf8Path, ctl: &Utf8Path, command: &str) -> IpccReply {
     else {
         return IpccReply::NoBroker;
     };
-    // sp-emu answers on stdout but prints its usage (and its identity
-    // banner) on stderr, so judge the run on both.
+    // sp-emu answers on stdout and prints usage and its identity banner on
+    // stderr. Judge the run on both.
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     if !out.status.success() {
@@ -496,17 +478,8 @@ fn ipcc_req(bin: &Utf8Path, ctl: &Utf8Path, command: &str) -> IpccReply {
     IpccReply::Reply(text)
 }
 
-/// `voxel sp dump <target> [--ringbuf]` - force + decode a crash dump of one live
-/// emulated SP. sp-emu writes a humility-hydrate RAM snapshot on demand: when
-/// `<SP_EMU_DUMP_DIR>/.trigger` appears it dumps RAM (flash comes from the archive)
-/// and swaps in `.done` (src/mem.rs `write_hydrate_dump`). We arm the SP's service
-/// with that dir + its archive id (a one-time ~30s restart if not already armed),
-/// touch the trigger in-zone, pull the zip to the host, and run `humility
-/// hydrate` + `tasks`/`ringbuf` against the SP's hubris archive - all where
-/// humility + the archive live (the debug listeners are in-zone loopback, so a
-/// probe-based dump would need a tunnel; this needs none). Live + ephemeral:
-/// the arming reverts on a clean relaunch. Emu-only (sp-sim never faults / has
-/// no dump dir).
+/// Force and decode a crash dump of one emulated SP: arm its service with a
+/// dump dir, trigger the dump, and run humility hydrate against its archive.
 async fn sp_dump(
     cfg: &VoxelConfig,
     name: &str,
@@ -524,13 +497,11 @@ async fn sp_dump(
         .find(|s| s.base_port == port)
         .map(|s| s.selector())
         .unwrap_or_else(|| target.to_string());
-    // Fails loudly when this is not a running --emu rack: sp-sim has no dump
-    // directory to arm.
+    // Fails loudly on an sp-sim rack: there is no dump directory to arm.
     crate::sp_host::emu_bin(rack)?;
 
-    // The hubris archive for this SP: humility needs it to fill flash (the dump
-    // omits it) and its image id must match the dump's. Take the archive the
-    // fleet was flashed from, so it cannot drift from what is running.
+    // humility fills flash from the archive the fleet was flashed from, and
+    // its image id must match the dump's.
     let board = if selector == "sidecar" { "sidecar" } else { "gimlet" };
     let archive =
         crate::sp_host::fleet_dir(rack).join(format!("{board}.archive"));
@@ -542,8 +513,8 @@ async fn sp_dump(
     let humility = std::env::var("VOXEL_HUMILITY")
         .unwrap_or_else(|_| "humility".to_string());
 
-    // The dump's archive id must equal the archive's image id (humility hydrate
-    // rejects a mismatch), so read the SP's running archive id over MGS.
+    // The dump's archive id must equal the archive's image id. Read the
+    // running id over MGS.
     let state = sp_faux(cfg, name, switch, target, &["state"]).await?;
     let archive_id = state
         .lines()
@@ -560,9 +531,8 @@ async fn sp_dump(
     let want_dir = format!("SP_EMU_DUMP_DIR={dump_dir}");
     let want_id = format!("SP_EMU_DUMP_ARCHIVE_ID={archive_id}");
 
-    // Arm the instance with the dump dir + archive id if it isn't already. The
-    // environment only takes effect on (re)start, so a first-time arm costs one
-    // ~30s preboot; an already-armed SP triggers immediately.
+    // Arm the instance with the dump dir and archive id if needed. A first
+    // arm costs one 30s preboot.
     let env = crate::sp_host::read_env(rack, port).ok_or_else(|| {
         anyhow!(
             "couldn't read the SMF environment for SP port {port} - is this a \
@@ -587,7 +557,7 @@ async fn sp_dump(
             "[voxel] armed {target} (port {port}) for dumps; sp-emu \
              restarting, waiting for boot (~30s) ..."
         );
-        // Block until the SP answers MGS again (sp_faux retries out the preboot).
+        // Block until the SP answers MGS again. sp_faux retries out the preboot.
         let _ = sp_faux(cfg, name, switch, target, &["state"]).await?;
     }
 
@@ -620,8 +590,8 @@ async fn sp_dump(
         std::thread::sleep(std::time::Duration::from_millis(500));
         waited_ms += 500;
     }
-    // humility hydrate reads dump.json + 0x*.bin from the zip root. Local sh, so
-    // the glob is the shell's own with no nested quoting to survive.
+    // humility hydrate reads dump.json and the 0x*.bin files from the zip
+    // root. A local shell expands the glob.
     let zipped = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("cd {dump_dir} && zip -q dump.zip dump.json 0x*.bin"))
@@ -634,8 +604,7 @@ async fn sp_dump(
     }
 
     let hydrated = dump_dir.join("hydrated.dump");
-    // humility hydrate refuses to overwrite its `-o` target, so clear a stale
-    // one from a previous dump of this SP.
+    // humility hydrate refuses to overwrite its output. Clear a stale one.
     let _ = std::fs::remove_file(&hydrated);
     eprintln!("[voxel] hydrating with `{humility} -a {archive}` ...");
     let hy = std::process::Command::new(&humility)
@@ -658,7 +627,7 @@ async fn sp_dump(
             ));
         }
     }
-    // The hydrated dump is self-contained (humility `-d`); no archive needed.
+    // The hydrated dump is self contained; no archive needed.
     let cmd = if ringbuf { "ringbuf" } else { "tasks" };
     let dec = std::process::Command::new(&humility)
         .arg("-d")
@@ -676,7 +645,7 @@ async fn sp_dump(
     Ok(())
 }
 
-/// `voxel sp ls` - enumerate every SP via the switch zone, pilot-style table.
+/// List every SP over MGS as a pilot style table.
 async fn sp_ls(
     cfg: &VoxelConfig,
     name: &str,
@@ -691,11 +660,8 @@ async fn sp_ls(
         "{:<8}  {:<5}  {:<8}  {:<12}  {:<6}  ARCHIVE",
         "SP", "PORT", "TYPE", "SERIAL", "POWER"
     );
-    // The fleet runs here, so probe every SP concurrently as its own process.
-    // A warm SP answers in ~20ms, which makes the table one probe deep rather
-    // than the sum of them. `state` includes a sprot round trip to the RoT,
-    // which takes the emu gimlets ~20s under post-init MGS load, so each
-    // attempt needs headroom beyond that.
+    // Probe every SP concurrently. A state query includes a sprot round trip
+    // that takes an emulated gimlet about 20s under MGS load.
     let kids: Vec<_> = fleet
         .sps
         .iter()
@@ -728,8 +694,8 @@ async fn sp_ls(
             SpRole::Sidecar => "sidecar",
             SpRole::Gimlet(_) => "gimlet",
         };
-        // An SP that answered has a hubris archive / power even if its serial is
-        // blank, so key "answered" off that, not serial.
+        // An SP that answered has an archive and a power state even with a
+        // blank serial. Key answered off those.
         let archive = field(&out, "hubris archive:");
         let power = field(&out, "power state:");
         let responded = !archive.is_empty() || !power.is_empty();
@@ -764,7 +730,7 @@ async fn sp_ls(
     Ok(())
 }
 
-/// Pull `label: value` out of faux-mgs text output (first match), trimmed.
+/// Pull the first label: value line out of faux-mgs output, trimmed.
 fn field(out: &str, label: &str) -> String {
     out.lines()
         .find_map(|l| l.trim().strip_prefix(label))
@@ -772,7 +738,7 @@ fn field(out: &str, label: &str) -> String {
         .unwrap_or_default()
 }
 
-// --- artifact commands (was `Ls`, now `Ready`; flash/build unchanged) -------
+// Artifact commands.
 
 fn present(p: &str) -> bool {
     Utf8Path::new(p).exists()
@@ -795,8 +761,8 @@ fn ready(cfg: &VoxelConfig) {
     println!("sp-emu binaries ([sp] in voxel.toml):");
     show("emu_bin", sp.emu_bin.as_deref());
     show("faux_mgs", sp.faux_mgs.as_deref());
-    // Firmware is not listed: an image built with --from-tuf carries the
-    // release's own, and --sp-firmware overrides it for one launch.
+    // Firmware is not listed: a --from-tuf image carries the release's own,
+    // and --sp-firmware overrides it for one launch.
     println!(
         "\n`voxel launch --emu` ready: {}",
         if sp.emu_bin.as_deref().map(present).unwrap_or(false) {
@@ -849,7 +815,7 @@ fn build(commit: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Locate `voxel-image/build-sp.sh` (mirrors `image::build_cp_script`).
+/// Locate voxel-image/build-sp.sh, as image::build_cp_script does.
 fn build_sp_script() -> anyhow::Result<Utf8PathBuf> {
     crate::util::locate_script("VOXEL_BUILD_SP", "build-sp.sh")
 }

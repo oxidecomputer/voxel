@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Node access: run commands, attach serial, and pilot-style SSH into sled
-//! global zones (`host`) and switch zones (`tp`).
+//! Node access: commands, serial, and ssh into sled global zones and switch
+//! zones.
 
 use anyhow::{Context, bail};
 use libfalcon::{NodeRef, cli::console};
@@ -12,8 +12,7 @@ use voxel_config::{SledDesc, VoxelConfig};
 use crate::net::{ZLOGIN, resolve_external_ip, ssh_output, zlogin};
 use crate::topo::{Topo, build_topo};
 
-/// `voxel host exec -c "<cmd>" <sled>` - run a command in a sled's global zone
-/// over ssh (the non-interactive `host login`) and print its output.
+/// Run a command in a sled's global zone over ssh and print its output.
 pub(crate) async fn cmd_host_exec(
     cfg: &VoxelConfig,
     name: &str,
@@ -38,9 +37,7 @@ pub(crate) async fn cmd_host_exec(
     Ok(())
 }
 
-/// `voxel tp exec -c "<cmd>" <switch>` - run a command inside a switch zone
-/// (`oxz_switch`, where swadm/dpd/mgadm live) over ssh+zlogin and print its
-/// output. The non-interactive `tp login`.
+/// Run a command inside a switch zone over ssh and zlogin and print its output.
 pub(crate) async fn cmd_tp_exec(
     cfg: &VoxelConfig,
     name: &str,
@@ -74,8 +71,8 @@ pub(crate) async fn cmd_serial(
     console(node, camino::Utf8Path::new(&dir)).await.context("serial")
 }
 
-/// Hand the terminal to `ssh root@<ip>` (optionally running a remote command),
-/// replacing this process - the pilot/captain access pattern.
+/// Hand the terminal to ssh as root at ip, replacing this process. An optional
+/// remote command runs instead of a shell.
 fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut c = std::process::Command::new("ssh");
@@ -87,7 +84,7 @@ fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
     if let Some(r) = remote {
         c.arg(r);
     }
-    // exec() only returns if it failed to launch ssh.
+    // exec returns only when ssh failed to launch.
     bail!("could not exec ssh: {}", c.exec())
 }
 
@@ -96,13 +93,39 @@ pub(crate) async fn cmd_host_ls(
     name: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    println!("{:<6}  {:<16}  ROLE", "NODE", "IP");
-    for (s, n) in &topo.sleds {
-        let ip = resolve_external_ip(cfg, &topo.runner, &s.name, *n, false)
-            .await
-            .unwrap_or_else(|_| "(unknown)".into());
-        let role = if s.scrimlet { "scrimlet" } else { "gimlet" };
-        println!("{:<6}  {:<16}  {role}", s.name, ip);
+    println!(
+        "{:<6}  {:<16}  {:<8}  {:<8}  {:<10}  SP",
+        "NODE", "IP", "ROLE", "PID", "PROPOLIS"
+    );
+    let mut rows: Vec<(String, NodeRef, &str, Option<usize>)> = topo
+        .sleds
+        .iter()
+        .map(|(s, n)| {
+            let role = if s.scrimlet { "scrimlet" } else { "gimlet" };
+            (s.name.clone(), *n, role, Some(s.rack))
+        })
+        .collect();
+    rows.extend(
+        topo.routers.iter().map(|(r, n)| (r.clone(), *n, "router", None)),
+    );
+    for (node, n, role, rack) in rows {
+        let is_router = role == "router";
+        let pid =
+            crate::node::read_pidfile(&node).unwrap_or_else(|| "-".into());
+        let state = crate::node::propolis_state(&node).await;
+        // A powered off node has no console to ask. Do not wait on it.
+        let ip = if state == "down" {
+            "-".to_string()
+        } else {
+            resolve_external_ip(cfg, &topo.runner, &node, n, is_router)
+                .await
+                .unwrap_or_else(|_| "(unknown)".into())
+        };
+        // The SP's host power, where an emulated fleet serves this sled.
+        let sp = rack
+            .and_then(|rack| crate::power::sp_state(cfg, rack, &node))
+            .unwrap_or_else(|| "-".into());
+        println!("{node:<6}  {ip:<16}  {role:<8}  {pid:<8}  {state:<10}  {sp}");
     }
     Ok(())
 }
@@ -113,8 +136,7 @@ pub(crate) async fn cmd_host_login(
     node: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    // Routers accept the same root SSH login (the FRR image bakes in sshd with
-    // the operator key), so `host login` covers them too.
+    // Routers accept the same root ssh login; the FRR image bakes it in.
     let (n, is_router) = topo
         .sleds
         .iter()
@@ -139,11 +161,7 @@ pub(crate) async fn cmd_host_login(
     ssh_exec(&ip, None)
 }
 
-/// Resolve a switch argument to its scrimlet `(SledDesc, NodeRef)`. Accepts:
-/// a scrimlet **node name** (`g3`, always unambiguous); a **rack-qualified**
-/// switch `rackR/switchS` (R is 1-based, matching `tp ls` - the right form for a
-/// multi-rack deployment where each rack has its own switch0/switch1); or a bare
-/// **global** `switchN` (back-compat, the Nth scrimlet - fine for a single rack).
+/// Resolve a switch argument to its scrimlet.
 pub(crate) fn resolve_switch<'a>(
     topo: &'a Topo,
     switch: &str,
@@ -151,11 +169,11 @@ pub(crate) fn resolve_switch<'a>(
     let scrimlets: Vec<&(SledDesc, NodeRef)> =
         topo.sleds.iter().filter(|(s, _)| s.scrimlet).collect();
 
-    // Node name - always unambiguous.
+    // Node name, always unambiguous.
     if let Some(hit) = scrimlets.iter().find(|(s, _)| s.name == switch) {
         return Ok(hit);
     }
-    // Rack-qualified `rackR/switchS` (R 1-based).
+    // Rack qualified rackR/switchS, R 1-based.
     if let Some((r, sw)) = switch.split_once('/')
         && let (Some(rack), Some(slot)) = (
             r.strip_prefix("rack").and_then(|x| x.parse::<usize>().ok()),
@@ -172,7 +190,7 @@ pub(crate) fn resolve_switch<'a>(
         })?;
         return Ok(hit);
     }
-    // Bare `switchN` - global Nth scrimlet.
+    // Bare switchN: the global Nth scrimlet.
     if let Some(n) =
         switch.strip_prefix("switch").and_then(|x| x.parse::<usize>().ok())
     {
@@ -191,8 +209,8 @@ pub(crate) async fn cmd_tp_ls(
     name: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    // Each rack has its own switch0/switch1, so number the switch slot PER RACK
-    // and show which rack it's in (1-based, matching `voxel info`).
+    // Each rack has its own switch0 and switch1. Number the slot per rack and
+    // show the rack, 1-based as in voxel info.
     let multi = cfg.topology.racks() > 1;
     if multi {
         println!("{:<6}  {:<8}  {:<6}  IP", "RACK", "SWITCH", "NODE");
