@@ -30,7 +30,7 @@ platform itself.
 
 This guide walks through standing up a Voxel rack from bare metal and
 introduces the things you can do with it once it's running. Building the
-control-plane image takes 30-45 minutes; after that, launching a rack takes a
+control-plane image takes 30-45 minutes, after that, launching a rack takes a
 few minutes.
 
 == Hardware Requirements
@@ -46,7 +46,7 @@ fast storage is all that's needed.
 | Operating system | https://github.com/oxidecomputer/helios[Helios] (illumos)
 | Architecture     | x86_64
 | CPU              | AMD Ryzen 9 or Intel Core Ultra 9 series (each VM is a separate process, so a higher core count helps)
-| Memory           | 64 GB minimum; 128 GB or more for larger topologies (see <<scaling>> below)
+| Memory           | 64 GB minimum, 128 GB or more for larger topologies (see <<scaling>> below)
 | Storage          | 500 GiB or more on a flash device (NVMe or SSD)
 | Network          | At least one physical NIC with access to an IPv4 network
 |===
@@ -81,12 +81,10 @@ and 128 GB accommodates 8 sleds or a 2×4-sled multi-rack deployment.
 
 === Storage
 
-Voxel stores images and VM disks as ZFS datasets. Each sled is provisioned
-with seven NVMe-backed zvols (two M.2 and five U.2 devices) at
-`sled_disk_gb` (default 100 GB) per device, so a 4-sled topology allocates
-roughly 2.8 TB of zvol space. ZFS thin-provisions these; actual consumption
-depends on what the control plane writes, but the underlying pool needs
-enough free space and, more importantly, throughput.
+Voxel stores images and VM disks as ZFS datasets. Each sled gets a boot
+zvol at `sled_disk_gb` (default 100 GiB) plus seven NVMe-backed zvols
+(two M.2 at 32 GiB, five U.2 at 20 GiB), so a 4-sled topology allocates
+roughly 1 TiB of sparse zvol space.
 
 If your root NVMe is slow or small, point Voxel's dataset at a faster pool:
 
@@ -235,7 +233,7 @@ significantly faster.
 === Router Image
 
 The FRR router image only needs to be built once. The argument is an image
-label; it can be any name you choose:
+label, it can be any name you choose:
 
 [source,sh]
 ----
