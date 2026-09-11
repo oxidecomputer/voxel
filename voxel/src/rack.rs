@@ -22,9 +22,8 @@ use crate::topo::{
     Topo, build_topo, reset_node_cargo_bay, stage_config, stage_sprockets,
 };
 
-/// A per-rack progress/label tag: `rackN` (1-based) when the deployment has more
-/// than one rack, else the single-rack fallback the caller passes ("rack",
-/// "rack-init", ...).
+/// A per-rack label: rackN, 1-based, for a multi-rack deployment, else the
+/// single-rack fallback the caller passes.
 fn rack_label(racks: usize, rack: usize, single: &str) -> String {
     if racks > 1 { format!("rack{}", rack + 1) } else { single.to_string() }
 }
@@ -36,7 +35,7 @@ pub(crate) async fn cmd_route(
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
     let ce = topo.node_ref("ce").context("no ce router in topology")?;
-    // One host route per rack's external prefix - all racks egress via the shared ce.
+    // One host route per rack's external prefix. All racks egress via ce.
     let racks = cfg.topology.racks();
     for rack in 0..racks {
         let prefix = cfg.network.for_rack(rack).infra_prefix;
@@ -52,7 +51,7 @@ pub(crate) async fn cmd_route(
     Ok(())
 }
 
-/// Physical RAM in GiB via `prtconf -m` (illumos prints total memory in MB).
+/// Physical RAM in GiB via prtconf -m, which prints MB.
 fn physical_ram_gb() -> Option<u64> {
     let out = Command::new("prtconf").arg("-m").output().ok()?;
     if !out.status.success() {
@@ -65,12 +64,8 @@ fn physical_ram_gb() -> Option<u64> {
         .map(|mb| mb / 1024)
 }
 
-/// Refuse a launch that can't physically fit. Guest RAM shows up as `VMM Memory`
-/// (~1.2× the requested guest RAM, from bhyve overhead) and must leave room for
-/// the kernel + a minimal ZFS ARC, or the all-VMs-at-once boot thrashes - which
-/// is what makes falcon's cargo-bay mount time out on the serial console. Better
-/// a clear "won't fit" up front than a cryptic boot-spike timeout. Best-effort:
-/// if physical RAM can't be read we skip; `VOXEL_SKIP_MEM_PREFLIGHT=1` overrides.
+/// Refuse a launch whose guest RAM cannot fit beside the kernel and a minimal
+/// ARC. Skipped when RAM cannot be read; VOXEL_SKIP_MEM_PREFLIGHT=1 overrides.
 fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
     if std::env::var("VOXEL_SKIP_MEM_PREFLIGHT").is_ok() {
         return Ok(());
@@ -92,8 +87,7 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The host's default-route interface via `route -n get default`, or `None`
-/// when there is no default route (falcon reports that on its own).
+/// The host's default route interface, or None without a default route.
 fn default_route_iface() -> Option<String> {
     let out = Command::new(crate::net::ROUTE)
         .args(["-n", "get", "default"])
@@ -108,12 +102,8 @@ fn default_route_iface() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Refuse a `lan`-mode launch whose external link is jumbo. voxel-init classifies
-/// a sled NIC as underlay iff it accepts mtu=9000. Guest VNICs on a jumbo link
-/// all pass that probe, so the sleds' external NICs get misclassified as
-/// underlay and never come up. Anything below 9000 is fine. Best-effort: if
-/// the link or its MTU can't be read we skip and let falcon surface the
-/// problem.
+/// Refuse a lan mode launch on a jumbo external link: voxel-init classifies
+/// any NIC accepting MTU 9000 as underlay. Skipped when the MTU cannot be read.
 fn lan_mtu_preflight() -> anyhow::Result<()> {
     let link = match std::env::var("EXT_INTERFACE") {
         Ok(l) => l,
@@ -135,9 +125,8 @@ fn lan_mtu_preflight() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `/opt/oxide/voxel-init <role>` on each given node concurrently, surfacing
-/// each node's `[voxel-init]` milestone lines (the raw `+ cmd` echoes stay in the
-/// guest's `/tmp/launch.log`).
+/// Run voxel-init with a role on each node concurrently, surfacing the
+/// milestone lines. The command echoes stay in the guest's launch log.
 async fn run_voxel_init(
     d: &Runner,
     items: Vec<(NodeRef, &'static str, String)>,
@@ -157,13 +146,8 @@ async fn run_voxel_init(
     futures::future::join_all(handles).await;
 }
 
-/// Bring up the cross-rack interconnect front ports on a HELD (pre-RSS) rack.
-/// rack 0 gets these from early networking during RSS (config-rss carries them
-/// as AddrConf cluster ports); a rack > 0 never runs RSS, so its switch's front
-/// ports are never configured. Create each interconnect port + its link-local by
-/// hand in the switch zone, matching the 100G/no-FEC/AddrConf cluster port
-/// config-rss carries for rack 0, so the cross-rack DDM underlay has a live
-/// link on both ends. No-op for a single rack (`interconnect_ports` is empty).
+/// Bring up the cross-rack interconnect ports on a held rack, which never
+/// runs RSS. Matches the cluster port config-rss carries for rack 0.
 async fn bring_up_interconnect(
     d: &Runner,
     topo: &Topo,
@@ -174,7 +158,7 @@ async fn bring_up_interconnect(
     if ports.is_empty() {
         return;
     }
-    // This rack's scrimlets in slot order, matching `interconnect_ports`' `switch{slot}`.
+    // This rack's scrimlets in slot order, matching interconnect_ports.
     let scrimlets: Vec<(NodeRef, String)> = topo
         .sleds
         .iter()
@@ -201,10 +185,8 @@ async fn bring_up_interconnect(
                 continue;
             }
         };
-        // The held rack's switch zone may still be installing at this point.
-        // Poll until dendrite answers, then create + enable the link (the
-        // `voxel network link-up` path) and poll its link-local to DAD
-        // complete, all under one deadline. Logs only when the state changes.
+        // The switch zone may still be installing. Poll until dendrite answers,
+        // create and enable the link, then wait for its link-local under one deadline.
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(600);
         let mut up = false;
@@ -266,15 +248,14 @@ async fn bring_up_interconnect(
 pub(crate) async fn cmd_launch(
     cfg: &VoxelConfig,
     name: &str,
+    config_path: &Utf8Path,
     no_progress: bool,
     no_route: bool,
     emu: bool,
     sp_firmware: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
-    // Floor (per rack - each is an independent RSS domain): omicron's control
-    // plane can't form below 3 sleds (Crucible 3-way replication,
-    // CockroachDB/trust-quorum majority), and the RSS->Nexus handoff needs both
-    // switches, i.e. exactly 2 scrimlets.
+    // Per rack: the control plane needs 3 sleds for Crucible and CockroachDB,
+    // and the RSS to Nexus handoff needs both switches.
     let sleds = cfg.sleds();
     let racks = cfg.topology.racks();
     if cfg.topology.sleds < 3 {
@@ -292,9 +273,8 @@ pub(crate) async fn cmd_launch(
             );
         }
     }
-    // Each scrimlet's SoftNPU front ports = fabric uplinks + cross-rack
-    // interconnects. Guard against exceeding the sidecar's port budget (the full
-    // cross-rack mesh grows with racks*switches).
+    // SoftNPU front ports are the uplinks plus the cross-rack interconnects.
+    // Guard the sidecar's port budget.
     const MAX_FRONT_PORTS: usize = 128;
     let n_cr =
         cfg.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
@@ -308,14 +288,12 @@ pub(crate) async fn cmd_launch(
             );
         }
     }
-    // Fail fast if the configured images aren't built yet - a clear message
-    // beats the cryptic clone error falcon would throw partway through launch.
+    // Fail fast when the configured images are not built.
     crate::image::ensure_image(&cfg.image.cp_image())?;
     crate::image::ensure_image(&cfg.image.frr_image())?;
     memory_preflight(cfg)?;
-    // The isolated external segment must exist before any node boots, as the
-    // nodes' static addresses (staged into each cargo-bay) stay in use after
-    // bring-up (RSS watch, router NAT, host route to ce).
+    // The isolated segment must exist before any node boots; the staged
+    // static addresses stay in use after bring-up.
     if cfg.external.isolated() {
         external_up(&cfg.external, DryRun::No)
             .context("bringing up the isolated external segment")?;
@@ -325,9 +303,7 @@ pub(crate) async fn cmd_launch(
     reset_node_cargo_bay(cfg)?;
     stage_config(cfg, emu, sp_firmware)?;
     stage_sprockets(cfg)?;
-    // The SP fleet runs on this host, so it has to exist before any node boots:
-    // each switch zone's MGS dials it, and the scrimlets are staged to reach the
-    // address it binds.
+    // The SP fleet runs on this host and must exist before any node boots.
     if emu {
         crate::sp_host::up_all(cfg, emu)?;
     }
@@ -335,11 +311,8 @@ pub(crate) async fn cmd_launch(
     crate::disks::create_zvols(&crate::image::falcon_dataset(), name, &sleds)
         .context("creating sled disks")?;
     let mut topo = build_topo(cfg, name)?;
-    // The all-VMs-at-once boot grabs ~all the guest RAM in one spike; under that
-    // pressure falcon's cargo-bay mount over the serial console can transiently
-    // time out ("[sc] <node>: timeout waiting for data") and abort the whole
-    // boot. It's recoverable on a clean retry, so do that automatically: tear
-    // down the partial boot (releasing VNICs/zvols) and rebuild a fresh topology.
+    // The boot spike can time out falcon's cargo-bay mount over the console.
+    // A clean retry recovers it: tear down and rebuild the topology.
     const BOOT_ATTEMPTS: u32 = 3;
     let mut attempt = 1;
     loop {
@@ -359,6 +332,19 @@ pub(crate) async fn cmd_launch(
         }
     }
 
+    // Capture each node's instance so an SP can bring it back as launched,
+    // then start the loop that lets the SPs own the sleds' power.
+    let nodes: Vec<String> = topo
+        .sleds
+        .iter()
+        .map(|(s, _)| s.name.clone())
+        .chain(topo.routers.iter().map(|(r, _)| r.clone()))
+        .collect();
+    crate::node::capture_missing(&nodes).await;
+    if emu {
+        crate::power::up_all(cfg, name, config_path)?;
+    }
+
     // Run the in-guest agent, baked into the images at /opt/oxide/voxel-init.
     const GIMLET_LAUNCH: &str =
         "/opt/oxide/voxel-init gimlet 2>&1 | tee /tmp/launch.log";
@@ -366,8 +352,7 @@ pub(crate) async fn cmd_launch(
         "/opt/oxide/voxel-init router 2>&1 | tee /tmp/launch.log";
     let d = &topo.runner;
 
-    // Customer routers (the shared transit) first - quick, and must be up for
-    // the racks' uplink BGP.
+    // Customer routers first: quick, and the uplink BGP needs them.
     let routers: Vec<(NodeRef, &'static str, String)> = topo
         .routers
         .iter()
@@ -376,7 +361,7 @@ pub(crate) async fn cmd_launch(
     run_voxel_init(d, routers).await;
 
     if no_progress {
-        // No RSS watcher to use as a barrier, so bring every sled up at once.
+        // No RSS watcher as a barrier. Bring every sled up at once.
         let sleds: Vec<(NodeRef, &'static str, String)> = topo
             .sleds
             .iter()
@@ -385,13 +370,8 @@ pub(crate) async fn cmd_launch(
         run_voxel_init(d, sleds).await;
         info!(d.log, "launch complete (progress watch skipped)");
     } else {
-        // **Stagger by rack.** Bring up each rack's sleds and watch its RSS to
-        // completion before starting the next rack. Running two racks' heavy
-        // zone-init concurrently thrashes the box hard enough to knock a scrimlet
-        // over mid-bring-up - which loses its runtime switch-slot identity and
-        // wedges that rack's Nexus handoff (the switch1-reverts-to-switch0 bug).
-        // One rack at a time keeps the box within its I/O budget. A single rack
-        // behaves exactly as before.
+        // Stagger by rack: bring up a rack's sleds and watch its RSS to
+        // completion before the next. Concurrent zone init thrashes the box.
         for rack in 0..racks {
             let rack_sleds: Vec<(NodeRef, &'static str, String)> = topo
                 .sleds
@@ -408,15 +388,11 @@ pub(crate) async fn cmd_launch(
                 );
             }
             run_voxel_init(d, rack_sleds).await;
-            // Multirack: only rack 0 (the cluster) runs RSS. rack > 0 boots (sleds +
-            // the cross-rack interconnect wired) but is left PRE-RSS - the unclaimed
-            // state a future cluster-join (RFD 573) would start from. omicron can't
-            // join racks into one AZ yet, so we stage it and stop here.
+            // Only rack 0 runs RSS. Later racks boot and stay pre-RSS, the
+            // unclaimed state a cluster join would start from (RFD 573).
             if rack > 0 {
-                // RSS won't run here, so early networking never configures this
-                // rack's switch front ports; its interconnect ports are brought up
-                // at the end of launch (see below), after the switch zone has
-                // settled past its startup dendrite restart.
+                // Without RSS the switch front ports stay unconfigured. The
+                // interconnect ports come up at the end of launch.
                 info!(
                     d.log,
                     "rack{}: booted, left uninitialized (no multirack join yet)",
@@ -428,9 +404,8 @@ pub(crate) async fn cmd_launch(
                 topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
             {
                 let tag = rack_label(racks, rack, "rack-init");
-                // --wicket-setup: nothing auto-inited (no staged config-rss),
-                // so drive rack setup through the commission API; watch_rss
-                // then reports the wicketd-triggered bring-up as usual.
+                // No staged config-rss: drive rack setup through the commission
+                // API, then watch the bring-up as usual.
                 if emu
                     && let Err(e) = crate::commission::drive(
                         cfg, d, *n, &s.name, rack, &tag,
@@ -465,17 +440,11 @@ pub(crate) async fn cmd_launch(
         info!(d.log, "launch complete");
     }
 
-    // Point the host route at this launch's ce for each rack's external prefix
-    // (all racks egress via the shared ce; ce's DHCP IP changes every bring-up),
-    // then confirm the rack is actually reachable before declaring it usable - a
-    // route isn't reachability (the shared transit can briefly flap the first
-    // rack's path as the second rack joins).
+    // Route each rack's external prefix at this launch's ce, whose lease
+    // changes every bring-up, then confirm the rack is reachable.
     if let Some(ce) = topo.node_ref("ce") {
         for rack in 0..racks {
-            // Held racks (rack > 0) never run RSS, so they have no external
-            // services or DNS - there's nothing to route to or wait on, and the
-            // reachability probe would just burn its full timeout on a rack that
-            // never converges. Skip them (their interconnect comes up below).
+            // Held racks have no external services or DNS. Skip them.
             if rack > 0 {
                 continue;
             }
@@ -499,34 +468,21 @@ pub(crate) async fn cmd_launch(
         }
     }
 
-    // Held racks (rack > 0) never run RSS, so early networking never configures
-    // their switch front ports. Bring up their cross-rack interconnect ports here,
-    // at the end of launch: by now the switch zones are past their startup dendrite
-    // restart (which would otherwise wipe these runtime `swadm` links) and off the
-    // zone-init load, so the create/enable/addr stick.
+    // Bring up the held racks' interconnect ports last, after their switch
+    // zones are past the startup dendrite restart that would wipe the links.
     for rack in 1..racks {
         bring_up_interconnect(d, &topo, cfg, rack).await;
     }
 
-    // --emu-rot: nothing to attach here anymore. voxel-init stands up a shared
-    // `voxel-rot-emu` service per switch zone and points every SP at it via
-    // SP_EMU_ROT_SERVICE from boot, so each SP stays single-core and the RoT
-    // bridge is live through RSS -- MGS/Nexus pin the real RoT at rack-init.
+    // The RoT needs nothing here: voxel-init points every SP at the shared
+    // voxel-rot-emu service from boot.
     Ok(())
 }
 
-/// Kill propolis processes that belong to this deployment but that falcon won't
-/// reap itself. A node whose `.falcon/<node>.pid` went missing (a partially
-/// failed prior teardown) leaves an orphaned propolis holding that node's VNICs
-/// and zvol busy - which then wedges *this* destroy: link teardown aborts with
-/// "Device busy", and the follow-up zvol wipe can't proceed either. We identify
-/// orphans by the deployment-prefixed VNIC paths in their open files
-/// (`/dev/net/<name>_*`, e.g. `/dev/net/voxel_g3_sn_vnic0`), so this is scoped
-/// to this rack and never touches another deployment's propolis. Pids falcon
-/// already tracks via the workspace pid files are left for falcon to kill.
-/// Returns how many it reaped.
+/// Kill this deployment's propolis processes that falcon lost track of, found
+/// by the deployment's VNIC paths in their open files. Returns the count.
 fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
-    // Pids falcon tracks via the workspace pid files - leave those to falcon.
+    // Pids falcon tracks via the workspace pid files are left to falcon.
     let mut tracked: HashSet<i32> = HashSet::new();
     if let Ok(entries) = std::fs::read_dir(".falcon") {
         for e in entries.flatten() {
@@ -543,7 +499,7 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
     let out =
         match Command::new("pgrep").args(["-f", "propolis-server"]).output() {
             Ok(o) if o.status.success() => o.stdout,
-            // pgrep exits non-zero when there are no matches - nothing to reap.
+            // pgrep exits non-zero with no matches: nothing to reap.
             _ => return 0,
         };
     let needle = format!("/dev/net/{name}_");
@@ -556,7 +512,7 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
         if tracked.contains(&pid) {
             continue;
         }
-        // Does this propolis hold one of THIS deployment's VNICs?
+        // Whether this propolis holds one of this deployment's VNICs.
         let pf = match Command::new("pfiles").arg(pid.to_string()).output() {
             Ok(o) => o.stdout,
             Err(_) => continue,
@@ -574,19 +530,11 @@ fn reap_orphan_propolis(name: &str, log: &slog::Logger) -> usize {
     reaped
 }
 
-/// Tear down a deployment's falcon resources and guarantee a clean slate. Reap
-/// orphan propolis the workspace can't (a node whose `.falcon/<node>.pid` went
-/// missing leaves one holding VNICs/zvol busy, which would wedge the teardown),
-/// run falcon's own destroy, then unconditionally wipe the node disks - falcon's
-/// destroy tears down nodes -> links -> zvols -> workspace and bails on the first
-/// busy resource, which can leave the persistent `topo/<name>` datasets (and
-/// their stale crucible/trust-quorum ledger) behind, so the next launch boots
-/// dirty (RSS falsely reports an already-initialized rack). Ok if the rack is
-/// gone + disks clean, even when falcon's destroy erred but the wipe succeeded.
-/// Shared by `cmd_destroy` and the boot-retry path.
+/// Tear down a deployment: reap orphan propolis, run falcon's destroy, then
+/// wipe the node disks unconditionally so the next launch boots clean.
 fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
     if reap_orphan_propolis(name, &runner.log) > 0 {
-        // Give the kernel a moment to release the freed VNIC/zvol handles.
+        // Give the kernel a moment to release the VNIC and zvol handles.
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     let result = runner.destroy();
@@ -595,7 +543,7 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
         .args(["destroy", "-r", &topo_ds])
         .output();
     match (&result, wipe) {
-        // destroy errored but the disk wipe succeeded - the rack is gone + clean.
+        // destroy errored but the wipe succeeded: the rack is gone and clean.
         (Err(e), Ok(o)) if o.status.success() => {
             warn!(
                 runner.log,
@@ -608,14 +556,14 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
-    // Before teardown, so the fleet still goes away if falcon's own destroy
-    // errors. Scoped by rack, so a co-resident rack keeps its SPs.
+    // The power loop first so it does not act on the sleds vanishing, then
+    // the fleet, both before teardown. Scoped by rack.
+    crate::power::down_all(cfg);
     crate::sp_host::down_all(cfg);
     let topo = build_topo(cfg, name)?;
     teardown(&topo.runner, name)?;
-    // Isolated mode's segment stays up (per-host, reused by the next launch);
-    // node addresses are static and staged fresh at each launch, so there's
-    // nothing to reset on destroy.
+    // The isolated segment stays up for the next launch. Node addresses are
+    // staged fresh each launch.
     Ok(())
 }
 
@@ -646,10 +594,7 @@ pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// RSS watch budget: emulated SPs slow every MGS RPC and multi-rack racks
-/// converge under each other's load, so both get 60m vs the 30m a single sp-sim
-/// rack needs. (`cmd_status` watches a running rack with no emu_sp context, so it
-/// passes `false`.)
+/// RSS watch budget: 60m with emulated SPs or multiple racks, else 30m.
 fn rss_watch_cap(emu_sp: bool, racks: usize) -> std::time::Duration {
     std::time::Duration::from_secs(if emu_sp || racks > 1 {
         3600
@@ -669,8 +614,7 @@ pub(crate) async fn cmd_status(
         bail!("no RSS sled in topology");
     }
     let d = &topo.runner;
-    // Multi-rack racks converge under each other's load - watch longer (matches
-    // cmd_launch). Duration is Copy, so each watcher closure gets its own.
+    // Multiple racks converge under each other's load. Watch longer.
     let watch_cap = rss_watch_cap(false, racks);
     let ips = if cfg.external.isolated() {
         cfg.static_external_ips()
