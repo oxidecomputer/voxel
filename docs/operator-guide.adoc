@@ -36,8 +36,8 @@ few minutes.
 == Hardware Requirements
 
 Voxel runs on bare metal — not in a cloud VM, for the same reason it cannot
-nest its own hypervisor. A desktop-class AMD or Intel system with sufficient
-memory and fast storage is all that's needed.
+nest its own hypervisor. An AMD or Intel system with sufficient memory and
+fast storage is all that's needed.
 
 === Baseline
 
@@ -51,8 +51,8 @@ memory and fast storage is all that's needed.
 | Network          | At least one physical NIC with access to an IPv4 network
 |===
 
-For most users, a desktop-class AMD Ryzen 9 system with 128 GB of RAM and a
-2 TB NVMe drive is a good starting point.
+For most users, an AMD Ryzen 9 system with 128 GB of RAM and a 2 TB NVMe
+drive is a good starting point.
 
 [[scaling]]
 === Memory Scaling
@@ -77,8 +77,7 @@ it accounts for worst-case bhyve overhead (~1.2× guest RAM) and a ~22 GB
 kernel/ARC reserve. Actual peak usage is typically lower.
 
 As a rough guide: 64 GB is sufficient for the default 4-sled single rack,
-128 GB accommodates 8 sleds or a 2×4-sled multi-rack deployment, and 256 GB
-or more is appropriate for larger multi-rack topologies.
+and 128 GB accommodates 8 sleds or a 2×4-sled multi-rack deployment.
 
 === Storage
 
@@ -221,8 +220,9 @@ This clones Omicron at the given tag, compiles the control-plane packages, and
 bakes them into a bootable image named `voxel-cp-v21`. The process takes
 30–45 minutes depending on your hardware.
 
-Alternatively, if you have a release TUF repository archive, you can build
-without compiling Omicron from source:
+Alternatively, if you have a release
+https://github.com/oxidecomputer/omicron/blob/main/docs/releng.adoc[TUF repository]
+archive, you can build without compiling Omicron from source:
 
 [source,sh]
 ----
@@ -300,6 +300,26 @@ voxel info
 
 This shows the nodes, their roles (sled, scrimlet, router), and the network
 wiring between them.
+
+=== Connecting to Nodes
+
+To log into a sled's global zone directly:
+
+[source,sh]
+----
+pfexec voxel host login g0
+----
+
+To connect to a specific control-plane zone (e.g., a switch zone), use the
+technician port command:
+
+[source,sh]
+----
+pfexec voxel tp login switch0
+----
+
+These are useful for inspecting zone state, checking service logs, and
+debugging control-plane behavior on individual sleds.
 
 === Tearing Down
 
@@ -406,23 +426,6 @@ have a route to the rack's infrastructure prefix through the host. See
 <<Reaching the Rack from Another Device>> for the static route and DNS
 configuration needed to reach Nexus from a remote machine.
 
-=== The Web Console
-
-The Oxide web console is served by Nexus at the rack's external address. Once
-you have DNS or `/etc/hosts` configured (see <<Reaching the Rack from Another
-Device>>), open:
-
-----
-https://recovery.sys.rack1.oxide.test
-----
-
-Log in with the default recovery silo credentials (`recovery` / `oxide`).
-
-The console provides a graphical interface for the same operations available
-through the API: creating projects, managing networking, viewing sled
-inventory, and observing utilization metrics. It is the same console that runs
-on production Oxide racks.
-
 === The Oxide API
 
 The Oxide API is a RESTful interface served by Nexus. You can interact with it
@@ -510,6 +513,22 @@ pfexec usermod -K defaultpriv=basic,net_icmpaccess "$USER"
 
 Start a new login session afterward for the privilege to take effect.
 
+=== The Web Console
+
+The Oxide web console is served by Nexus at the rack's external address. Once
+you have DNS configured (see <<Reaching the Rack from Another Device>>), open:
+
+----
+https://recovery.sys.rack1.oxide.test
+----
+
+Log in with the default recovery silo credentials (`recovery` / `oxide`).
+
+The console provides a graphical interface for the same operations available
+through the API: creating projects, managing networking, viewing sled
+inventory, and observing utilization metrics. It is the same console that runs
+on production Oxide racks.
+
 == Multi-Rack Deployments
 
 Voxel can emulate multiple interconnected Oxide racks on a single host. This
@@ -518,7 +537,8 @@ is useful for exploring how the Oxide architecture scales beyond a single rack
 
 === Configuration
 
-Multi-rack is a single configuration change:
+Multi-rack is a single configuration change (up to 2 racks are currently
+supported):
 
 [source,sh]
 ----
@@ -559,9 +579,6 @@ the rack count.
 [[further-reading]]
 == Further Reading
 
-This guide covers the essential path from bare metal to a running rack. Voxel
-has additional capabilities documented in the repository:
-
 - **link:parameters.md[Configuration reference]** — the complete `voxel.toml`
   parameter reference, covering every topology, network, image, and falcon
   setting.
@@ -584,5 +601,4 @@ has additional capabilities documented in the repository:
 - **link:multirack-quicktest.md[Multi-rack DDM quick test]** — a walkthrough
   of DDM prefix propagation across interconnected racks.
 - **https://github.com/oxidecomputer/omicron[Omicron]** — the Oxide control
-  plane itself. For deeper exploration of Nexus, sled-agent, Oximeter,
-  CockroachDB, and the rest of the stack.
+  plane, including Nexus, sled-agent, Oximeter, and other systems.
