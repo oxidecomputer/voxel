@@ -6,8 +6,8 @@
 == Introduction
 
 Voxel (Virtual Oxide Emulation Lab) stands up a complete virtual Oxide rack on
-a single machine. It deploys the full Oxide control plane —
-https://github.com/oxidecomputer/omicron[Omicron] — across a set of
+a single machine. It deploys the full Oxide control plane,
+https://github.com/oxidecomputer/omicron[Omicron], across a set of
 interconnected virtual machines defined and launched by
 https://github.com/oxidecomputer/falcon[Falcon] (a Rust API for creating
 network topologies), with
@@ -30,13 +30,13 @@ platform itself.
 
 This guide walks through standing up a Voxel rack from bare metal and
 introduces the things you can do with it once it's running. Building the
-control-plane image takes 30–45 minutes; after that, launching a rack takes a
+control-plane image takes 30-45 minutes; after that, launching a rack takes a
 few minutes.
 
 == Hardware Requirements
 
-Voxel runs on bare metal — not in a cloud VM, for the same reason it cannot
-nest its own hypervisor. An AMD or Intel system with sufficient memory and
+Voxel runs on bare metal, not in a cloud VM, because it cannot nest its own
+hypervisor. An AMD or Intel system with sufficient memory and
 fast storage is all that's needed.
 
 === Baseline
@@ -45,7 +45,7 @@ fast storage is all that's needed.
 |===
 | Operating system | https://github.com/oxidecomputer/helios[Helios] (illumos)
 | Architecture     | x86_64
-| CPU              | AMD Ryzen 9 or Intel Core Ultra 9 series (many cores help — each VM is a separate process)
+| CPU              | AMD Ryzen 9 or Intel Core Ultra 9 series (each VM is a separate process, so a higher core count helps)
 | Memory           | 64 GB minimum; 128 GB or more for larger topologies (see <<scaling>> below)
 | Storage          | 500 GiB or more on a flash device (NVMe or SSD)
 | Network          | At least one physical NIC with access to an IPv4 network
@@ -72,7 +72,7 @@ voxel config set topology.sled_memory_gb 6
 ----
 
 Voxel runs a preflight memory check before launch and refuses to start if the
-host cannot accommodate the configured topology. The check is conservative —
+host cannot accommodate the configured topology. The check is conservative;
 it accounts for worst-case bhyve overhead (~1.2× guest RAM) and a ~22 GB
 kernel/ARC reserve. Actual peak usage is typically lower.
 
@@ -84,8 +84,8 @@ and 128 GB accommodates 8 sleds or a 2×4-sled multi-rack deployment.
 Voxel stores images and VM disks as ZFS datasets. Each sled is provisioned
 with seven NVMe-backed zvols (two M.2 and five U.2 devices) at
 `sled_disk_gb` (default 100 GB) per device, so a 4-sled topology allocates
-roughly 2.8 TB of zvol space. ZFS thin-provisions these — actual consumption
-depends on what the control plane writes — but the underlying pool needs
+roughly 2.8 TB of zvol space. ZFS thin-provisions these; actual consumption
+depends on what the control plane writes, but the underlying pool needs
 enough free space and, more importantly, throughput.
 
 If your root NVMe is slow or small, point Voxel's dataset at a faster pool:
@@ -138,15 +138,15 @@ pkg update
 The https://github.com/oxidecomputer/helios-engvm[helios-engvm README] walks
 through each of the following steps in detail:
 
-- **Networking** — configure at least one physical interface with a static
+- **Networking**: configure at least one physical interface with a static
   address or DHCP. This interface is what Voxel's `lan` mode attaches to.
-- **Accounts** — provision a user account. The helios-engvm setup script can
+- **Accounts**: provision a user account. The helios-engvm setup script can
   mirror your workstation's SSH keys and shell preferences onto the new host.
-- **Services** — enable `sshd` and any other services you need for remote
+- **Services**: enable `sshd` and any other services you need for remote
   administration.
-- **Swap device** — create a swap zvol. With the memory pressure Voxel places
+- **Swap device**: create a swap zvol. With the memory pressure Voxel places
   on the host, swap provides a safety margin.
-- **Dump device** — create a dump zvol for kernel crash dumps.
+- **Dump device**: create a dump zvol for kernel crash dumps.
 
 === Remote Access
 
@@ -157,7 +157,7 @@ run on the Helios host itself, either at the console or over SSH.
 == Installing Voxel
 
 Voxel is built from source using Cargo, the Rust toolchain's build system.
-You will need a working Rust toolchain installed on the Helios host — see
+You will need a working Rust toolchain installed on the Helios host. See
 https://rustup.rs[rustup.rs] for installation instructions.
 
 [source,sh]
@@ -173,7 +173,7 @@ invoke it directly.
 === Configuration
 
 Voxel reads its configuration from `~/.config/voxel/voxel.toml` (falling back
-to `/etc/voxel/voxel.toml`). Every field has a sensible default — an empty or
+to `/etc/voxel/voxel.toml`). Every field has a sensible default; an empty or
 absent file is valid. Override individual settings with `voxel config set`:
 
 [source,sh]
@@ -197,15 +197,15 @@ link:parameters.md[parameters.md].
 
 A Voxel rack boots from two pre-built images:
 
-- **`voxel-cp`** — a Helios image with the Oxide control plane
+- **`voxel-cp`**: a Helios image with the Oxide control plane
   (Nexus, sled-agent, CockroachDB, Crucible, the switch software, and more)
   baked in at a specific Omicron version.
-- **`voxel-frr`** — a Debian image running FRR for the customer-edge and
+- **`voxel-frr`**: a Debian image running FRR for the customer-edge and
   transit routers. This image is version-independent and can be reused across
   control-plane versions.
 
 Per-node configuration (RSS config, SMBIOS identity, network topology) is
-generated on the fly at launch — a single image pair serves any topology.
+generated on the fly at launch. A single image pair serves any topology.
 
 === Control-Plane Image
 
@@ -218,7 +218,7 @@ pfexec voxel image create v21
 
 This clones Omicron at the given tag, compiles the control-plane packages, and
 bakes them into a bootable image named `voxel-cp-v21`. The process takes
-30–45 minutes depending on your hardware.
+30-45 minutes depending on your hardware.
 
 Alternatively, if you have a release
 https://github.com/oxidecomputer/omicron/blob/main/docs/releng.adoc[TUF repository]
@@ -235,7 +235,7 @@ significantly faster.
 === Router Image
 
 The FRR router image only needs to be built once. The argument is an image
-label — it can be any name you choose:
+label; it can be any name you choose:
 
 [source,sh]
 ----
@@ -334,7 +334,7 @@ pfexec voxel destroy
 
 After launch, the rack's external services (the web console, the Oxide API,
 external DNS) are reachable at addresses in the configured service pool
-(default `198.51.100.20`–`198.51.100.29`).
+(default `198.51.100.20`-`198.51.100.29`).
 
 === Host Route
 
@@ -555,20 +555,6 @@ Everything else auto-derives. Each rack gets:
 - A per-rack DNS zone (`rack1.oxide.test`, `rack2.oxide.test`).
 - A per-rack BGP ASN (offset from the base `network.bgp_asn`).
 
-=== Interconnection
-
-The racks are connected in two ways:
-
-- **Fabric routers** — the customer routers (`cr1`, `cr2`) link every
-  scrimlet across all racks, providing the shared transit backbone.
-- **Sidecar interconnects** — each rack's sidecar switches are wired in a
-  full mesh of direct links, enabling DDM prefix propagation between racks
-  (per RFD 583).
-
-This means that from the perspective of the control plane, each rack is an
-independent domain, but the network fabric stitches them together — exactly as
-a multi-rack Oxide deployment works in production.
-
 === Resource Considerations
 
 Multi-rack topologies multiply the resource requirements. A 2-rack deployment
@@ -579,26 +565,26 @@ the rack count.
 [[further-reading]]
 == Further Reading
 
-- **link:parameters.md[Configuration reference]** — the complete `voxel.toml`
+- **link:parameters.md[Configuration reference]**: the complete `voxel.toml`
   parameter reference, covering every topology, network, image, and falcon
   setting.
-- **Isolated external networking** — for hosts without a LAN, Voxel can build
+- **Isolated external networking**: for hosts without a LAN, Voxel can build
   the entire external network segment on a host etherstub with NAT. See the
   "Isolated external network" section of the project README.
-- **Emulated SPs and RoTs** — `voxel launch --emu` runs real Hubris firmware
+- **Emulated SPs and RoTs**: `voxel launch --emu` runs real Hubris firmware
   on emulated SP and RoT cores via
   https://github.com/oxidecomputer/sp-emu[sp-emu], with rack setup driven
   through wicketd. See the "Emulated SPs and RoTs" section of the README and
   the `voxel sp` command family.
-- **Component patching** — `voxel rack patch` swaps individual control-plane
+- **Component patching**: `voxel rack patch` swaps individual control-plane
   components (propolis, dendrite, MGD, and others) on a running rack without
   rebuilding the image. `voxel image patch` bakes the change into the image
   for persistence across relaunches.
-- **Network validation** — `voxel network validate` checks link states, BGP
+- **Network validation**: `voxel network validate` checks link states, BGP
   sessions, and routes on a running rack.
-- **TUF repository seeding** — `voxel repo seed` populates sled artifact
+- **TUF repository seeding**: `voxel repo seed` populates sled artifact
   stores from a TUF repo, accelerating update convergence.
-- **link:multirack-quicktest.md[Multi-rack DDM quick test]** — a walkthrough
+- **link:multirack-quicktest.md[Multi-rack DDM quick test]**: a walkthrough
   of DDM prefix propagation across interconnected racks.
-- **https://github.com/oxidecomputer/omicron[Omicron]** — the Oxide control
+- **https://github.com/oxidecomputer/omicron[Omicron]**: the Oxide control
   plane, including Nexus, sled-agent, Oximeter, and other systems.
