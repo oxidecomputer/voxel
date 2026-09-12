@@ -320,6 +320,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "out/mgd",
         "out/transceiver-control",
         "out/console-assets",
+        "out/releng",
+        "out/versioned",
     ] {
         rsync.arg("--exclude").arg(ex);
     }

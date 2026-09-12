@@ -39,7 +39,7 @@ pub struct SledAgentConfig {
     /// (`softnpu_link` scrimlet->every fabric router).
     pub num_fabric_routers: usize,
     /// Switch-to-switch interconnects this scrimlet is on - extra FRONT ports
-    /// (`softnpu_links` sidecar<->sidecar), wired after the fabric uplinks, and 
+    /// (`softnpu_links` sidecar<->sidecar), wired after the fabric uplinks, and
     /// the front-port budget must include them or the link lands off the ASIC.
     pub num_interconnects: usize,
     /// Sled-agent `data_links` config shape (see [`crate::config::SledDataLinksSchema`]).
