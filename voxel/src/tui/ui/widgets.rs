@@ -295,10 +295,6 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
         ]
     };
     let contextual_navigation = if narrow { "Tab/⇧" } else { "Tab/S-Tab" };
-    let item_or_section = if narrow { "item/sect" } else { "item/section" };
-    let log_or_section = if narrow { "log/sec" } else { "log/section" };
-    let resource_or_section =
-        if narrow { "res/sect" } else { "resource/section" };
     if app.session.confirmation.is_some() {
         return vec![
             group("↑/↓", "move"),
@@ -316,8 +312,7 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
         ];
     }
     if app.session.help_open {
-        let mut groups =
-            vec![group("↑/↓/Pg", "scroll"), group("?/Esc", "close")];
+        let mut groups = vec![group("↑/↓", "scroll"), group("?/Esc", "close")];
         groups.extend(lifecycle());
         return groups;
     }
@@ -339,29 +334,30 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
             match pane {
                 crate::tui::event::MonitoringPane::RackSummary => {
                     groups.push(group("←/→", "rack"));
-                    groups.push(group("↑/↓", "section"));
                 }
                 crate::tui::event::MonitoringPane::Topology => {
-                    groups.push(group("↑/↓", resource_or_section));
+                    groups.push(group(
+                        "↑/↓",
+                        if narrow { "res" } else { "resource" },
+                    ));
                     groups.push(group("Pg", if narrow { "" } else { "page" }));
                     if app.session.selected_resource.is_some() {
                         groups.push(group("Enter", "open"));
                     }
                 }
                 crate::tui::event::MonitoringPane::TopZones => {
-                    groups.push(group("↑/↓", "zones/section"));
+                    groups.push(group("↑/↓", "zones"));
                     groups.push(group("Pg", if narrow { "" } else { "page" }));
                 }
             }
-        } else {
-            groups.push(group("↑/↓", "section"));
         }
         if app.session.selected_resource.is_some() {
             groups.push(group("Esc", if narrow { "" } else { "clear" }));
         }
         groups.extend([
             group(contextual_navigation, "section"),
-            group("1/2", "view"),
+            group("v", "view"),
+            group("x", if narrow { "" } else { "external monitoring" }),
         ]);
         groups.extend(lifecycle());
         groups.push(group("?", "help"));
@@ -389,28 +385,24 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     groups.push(group("Space", if expanded { "fold" } else { "expand" }));
     if expanded {
         match pane {
-            crate::tui::event::DeploymentPane::Phases
-            | crate::tui::event::DeploymentPane::CurrentPhase => {
-                groups.push(group("↑/↓", item_or_section));
+            crate::tui::event::DeploymentPane::Phases => {
+                groups.push(group("↑/↓", "item"));
+                groups.push(group("Pg", if narrow { "" } else { "page" }));
+            }
+            crate::tui::event::DeploymentPane::CurrentPhase => {
                 groups.push(group("Pg", if narrow { "" } else { "page" }));
             }
             crate::tui::event::DeploymentPane::Logs => {
                 groups.push(group("f", "filter"));
-                groups.push(group("↑/↓", log_or_section));
+                groups.push(group("↑/↓", "log"));
                 groups.push(group("Pg", if narrow { "" } else { "page" }));
             }
             crate::tui::event::DeploymentPane::OverallProgress
-            | crate::tui::event::DeploymentPane::Status => {
-                groups.push(group("↑/↓", "section"));
-            }
+            | crate::tui::event::DeploymentPane::Status => {}
         }
-    } else {
-        groups.push(group("↑/↓", "section"));
     }
-    groups.extend([
-        group(contextual_navigation, "section"),
-        group("1/2", "view"),
-    ]);
+    groups
+        .extend([group(contextual_navigation, "section"), group("v", "view")]);
     groups.extend(lifecycle());
     groups.push(group("?", "help"));
     groups
@@ -508,6 +500,33 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn group_text(app: &App) -> Vec<String> {
+        action_groups(app, false)
+            .into_iter()
+            .map(|group| format!("{} {}", group.key, group.description))
+            .collect()
+    }
+
+    #[test]
+    fn footer_keeps_view_and_section_navigation_distinct() {
+        let app = App::new(vec![], 8, 8);
+
+        let groups = group_text(&app);
+
+        assert!(groups.contains(&"v view".to_owned()));
+        assert!(groups.contains(&"Tab/S-Tab section".to_owned()));
+        assert!(!groups.iter().any(|group| group.starts_with("1/2 ")));
+        assert!(!groups.iter().any(|group| group.starts_with("↑/↓ ")));
+    }
+
+    #[test]
+    fn monitoring_footer_advertises_external_monitoring_contextually() {
+        let mut app = App::new(vec![], 8, 8);
+        app.session.view = View::Monitor;
+
+        assert!(group_text(&app).contains(&"x external monitoring".to_owned()));
     }
 
     #[test]

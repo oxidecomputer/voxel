@@ -15,7 +15,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::tui::event::{Action, AppEvent, View};
+use crate::tui::event::{Action, AppEvent};
 
 pub type TuiTerminal = Terminal<CrosstermBackend<io::BufWriter<std::fs::File>>>;
 
@@ -39,15 +39,14 @@ pub fn key_action(key: KeyEvent) -> Option<Action> {
         return None;
     }
     Some(match key.code {
-        KeyCode::Char('1') => Action::SwitchView(View::Deployment),
-        KeyCode::Char('2') => Action::SwitchView(View::Monitor),
-        KeyCode::Tab => Action::NextItem,
-        KeyCode::BackTab => Action::PreviousItem,
+        KeyCode::Char('v') => Action::ToggleView,
+        KeyCode::Tab => Action::NextSection,
+        KeyCode::BackTab => Action::PreviousSection,
         KeyCode::Left => Action::PreviousRack,
         KeyCode::Right => Action::NextRack,
         KeyCode::Enter => Action::Activate,
         KeyCode::Char(' ') => Action::ToggleSection,
-        KeyCode::Char('?') | KeyCode::F(1) => Action::ToggleHelp,
+        KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char('s') => Action::CopyExternalMonitoringSelected,
         KeyCode::Char('a') => Action::CopyExternalMonitoringAll,
         KeyCode::Char('u') => Action::CopyExternalMonitoringGuide,
@@ -322,16 +321,14 @@ mod tests {
     fn maps_all_documented_keys() {
         let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
         let cases = [
-            (KeyCode::Char('1'), Action::SwitchView(View::Deployment)),
-            (KeyCode::Char('2'), Action::SwitchView(View::Monitor)),
-            (KeyCode::Tab, Action::NextItem),
-            (KeyCode::BackTab, Action::PreviousItem),
+            (KeyCode::Char('v'), Action::ToggleView),
+            (KeyCode::Tab, Action::NextSection),
+            (KeyCode::BackTab, Action::PreviousSection),
             (KeyCode::Left, Action::PreviousRack),
             (KeyCode::Right, Action::NextRack),
             (KeyCode::Enter, Action::Activate),
             (KeyCode::Char(' '), Action::ToggleSection),
             (KeyCode::Char('?'), Action::ToggleHelp),
-            (KeyCode::F(1), Action::ToggleHelp),
             (KeyCode::Char('s'), Action::CopyExternalMonitoringSelected),
             (KeyCode::Char('a'), Action::CopyExternalMonitoringAll),
             (KeyCode::Char('u'), Action::CopyExternalMonitoringGuide),
@@ -348,9 +345,12 @@ mod tests {
         for (c, a) in cases {
             assert_eq!(key_action(k(c)), Some(a));
         }
+        assert_eq!(key_action(k(KeyCode::Char('1'))), None);
+        assert_eq!(key_action(k(KeyCode::Char('2'))), None);
         assert_eq!(key_action(k(KeyCode::Char('3'))), None);
         assert_eq!(key_action(k(KeyCode::Char('4'))), None);
         assert_eq!(key_action(k(KeyCode::Char('o'))), None);
+        assert_eq!(key_action(k(KeyCode::F(1))), None);
         assert_eq!(
             key_action(KeyEvent {
                 kind: KeyEventKind::Release,

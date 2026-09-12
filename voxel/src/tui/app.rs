@@ -312,7 +312,7 @@ impl App {
         let mut app = Self {
             session: SessionState {
                 view: View::Deployment,
-                deployment_pane: DeploymentPane::Phases,
+                deployment_pane: DeploymentPane::OverallProgress,
                 monitoring_pane: MonitoringPane::Topology,
                 collapsed_deployment: BTreeSet::new(),
                 collapsed_monitoring: BTreeSet::new(),
@@ -840,13 +840,10 @@ impl App {
             };
         }
         match action {
-            Action::SwitchView(view) => {
-                self.session.view = view;
-                if view == View::Deployment {
-                    self.session.detail_open = false;
-                }
-                self.repair_selection();
-            }
+            Action::ToggleView => self.switch_view(match self.session.view {
+                View::Deployment => View::Monitor,
+                View::Monitor => View::Deployment,
+            }),
             Action::NextRack
                 if self.session.view == View::Monitor
                     && self.session.monitoring_pane
@@ -867,8 +864,8 @@ impl App {
             {
                 self.move_rack(Direction::Previous)
             }
-            Action::NextItem => self.move_item(Direction::Next),
-            Action::PreviousItem => self.move_item(Direction::Previous),
+            Action::NextSection => self.move_section(Direction::Next),
+            Action::PreviousSection => self.move_section(Direction::Previous),
             Action::ToggleSection => match self.session.view {
                 View::Deployment => {
                     let pane = self.session.deployment_pane;
@@ -965,14 +962,8 @@ impl App {
                 self.logs_filter = self.logs_filter.next();
                 self.logs.scroll = 0;
             }
-            Action::Scroll { delta, page: false }
-                if !self.try_move_focused_content(delta) && delta != 0 =>
-            {
-                self.move_item(if delta > 0 {
-                    Direction::Next
-                } else {
-                    Direction::Previous
-                });
+            Action::Scroll { delta, page: false } => {
+                self.move_focused_content(delta);
             }
             Action::Scroll { delta, page: true } => match self.session.view {
                 View::Deployment
@@ -1306,9 +1297,9 @@ impl App {
             direction,
         );
     }
-    fn try_move_focused_content(&mut self, delta: isize) -> bool {
+    fn move_focused_content(&mut self, delta: isize) {
         if delta == 0 {
-            return false;
+            return;
         }
         match self.session.view {
             View::Deployment
@@ -1320,13 +1311,13 @@ impl App {
                     DeploymentPane::Phases => {
                         let Some(operation) = self.operation.active.as_ref()
                         else {
-                            return false;
+                            return;
                         };
                         let phases = crate::tui::ui::deployment::phase_order(
                             operation.kind,
                         );
                         if phases.is_empty() {
-                            return false;
+                            return;
                         }
                         let visible =
                             crate::tui::ui::deployment::phase_content_height(
@@ -1350,9 +1341,8 @@ impl App {
                                 active,
                             );
                         self.session.phase_scroll = candidate;
-                        candidate != current
                     }
-                    DeploymentPane::CurrentPhase => false,
+                    DeploymentPane::CurrentPhase => {}
                     DeploymentPane::Logs => {
                         let visible =
                             crate::tui::ui::deployment::log_content_height(
@@ -1360,7 +1350,7 @@ impl App {
                             );
                         let len = crate::tui::ui::logs::filtered_len(self);
                         if len == 0 {
-                            return false;
+                            return;
                         }
                         let current = crate::tui::ui::logs::effective_scroll(
                             self.logs.scroll,
@@ -1374,10 +1364,9 @@ impl App {
                             visible,
                         );
                         self.logs.scroll = candidate;
-                        candidate != current
                     }
                     DeploymentPane::OverallProgress
-                    | DeploymentPane::Status => false,
+                    | DeploymentPane::Status => {}
                 }
             }
             View::Monitor
@@ -1388,7 +1377,7 @@ impl App {
             {
                 let resources = self.resources();
                 if resources.is_empty() {
-                    return false;
+                    return;
                 }
                 let current = self.session.selected_resource.as_ref().and_then(
                     |selected| resources.iter().position(|id| id == selected),
@@ -1404,7 +1393,6 @@ impl App {
                 self.session.selected_resource =
                     resources.get(candidate).cloned();
                 self.session.monitor_scroll = candidate;
-                current != Some(candidate)
             }
             View::Monitor
                 if self.session.monitoring_pane == MonitoringPane::TopZones
@@ -1415,7 +1403,7 @@ impl App {
                 let capacity =
                     crate::tui::ui::monitor::top_zones_page_capacity(self);
                 if capacity == 0 {
-                    return false;
+                    return;
                 }
                 let maximum = crate::tui::ui::monitor::top_zones_len(
                     self,
@@ -1426,12 +1414,11 @@ impl App {
                 let candidate =
                     current.saturating_add_signed(delta).min(maximum);
                 self.session.top_zones_scroll = candidate;
-                candidate != current
             }
-            _ => false,
+            _ => {}
         }
     }
-    fn move_item(&mut self, direction: Direction) {
+    fn move_section(&mut self, direction: Direction) {
         match self.session.view {
             View::Deployment => {
                 self.session.deployment_pane = Self::moved(
@@ -1450,6 +1437,13 @@ impl App {
                 .unwrap();
             }
         }
+    }
+    fn switch_view(&mut self, view: View) {
+        self.session.view = view;
+        if view == View::Deployment {
+            self.session.detail_open = false;
+        }
+        self.repair_selection();
     }
     fn repair_selection(&mut self) {
         let racks = self.racks();
@@ -1730,9 +1724,50 @@ mod factual_outcome_tests {
         };
         let mut app = App::new(vec![descriptor.clone()], 8, 8);
 
-        app.update(AppEvent::Action(Action::SwitchView(View::Monitor)));
+        app.update(AppEvent::Action(Action::ToggleView));
 
         assert_eq!(app.session.selected_resource, Some(descriptor.id));
+    }
+
+    #[test]
+    fn toggle_view_moves_between_deployment_and_monitoring() {
+        let mut app = App::new(vec![], 8, 8);
+
+        app.update(AppEvent::Action(Action::ToggleView));
+        assert_eq!(app.session.view, View::Monitor);
+
+        app.update(AppEvent::Action(Action::ToggleView));
+        assert_eq!(app.session.view, View::Deployment);
+    }
+
+    #[test]
+    fn arrows_do_not_move_between_sections_without_nested_content() {
+        let mut app = App::new(vec![], 8, 8);
+        assert_eq!(
+            app.session.deployment_pane,
+            DeploymentPane::OverallProgress
+        );
+
+        app.update(AppEvent::Action(Action::Scroll { delta: 1, page: false }));
+
+        assert_eq!(
+            app.session.deployment_pane,
+            DeploymentPane::OverallProgress
+        );
+    }
+
+    #[test]
+    fn tab_actions_move_between_sections() {
+        let mut app = App::new(vec![], 8, 8);
+
+        app.update(AppEvent::Action(Action::NextSection));
+        assert_eq!(app.session.deployment_pane, DeploymentPane::Phases);
+
+        app.update(AppEvent::Action(Action::PreviousSection));
+        assert_eq!(
+            app.session.deployment_pane,
+            DeploymentPane::OverallProgress
+        );
     }
 
     #[test]
@@ -2078,10 +2113,7 @@ mod factual_outcome_tests {
         app.reattach_command = Some("pfexec voxel tui".into());
 
         app.open_confirmation(Confirmation::Detach);
-        app.update(AppEvent::Action(Action::Scroll {
-            delta: -1,
-            page: false,
-        }));
+        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
         assert_eq!(
             app.update(AppEvent::Action(Action::Activate)),
             vec![Effect::Cancel {
@@ -2104,10 +2136,7 @@ mod factual_outcome_tests {
 
         // Request detach — deferred because a launch is active.
         app.open_confirmation(Confirmation::Detach);
-        app.update(AppEvent::Action(Action::Scroll {
-            delta: -1,
-            page: false,
-        }));
+        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
         app.update(AppEvent::Action(Action::Activate));
         assert_eq!(
             app.session.post_operation_exit,

@@ -26,21 +26,20 @@ to select one.
 ## Views and actions
 
 The TUI has two alternate views, Deployment and Monitoring. Each view has a
-number of foldable sections stacked within it. `Up` and `Down` move within
-nested content and hand focus to the adjacent section at an effective edge;
-section traversal wraps. `Tab` and `Shift-Tab` always move section focus, and
-`Space` folds or expands the focused section.
+number of foldable sections stacked within it. `Up` and `Down` move within the
+focused section. `Tab` and `Shift-Tab` move section focus, `Space` folds or
+expands the focused section, and `v` toggles the active view.
 
 | Key | Action |
 |---|---|
-| `1` / `2` | Switch between views |
+| `v` | Toggle Deployment / Monitoring |
 | `Tab` / `Shift-Tab` | Next / previous top-level section |
 | `Space` | Fold / expand the focused section |
 | `Left` / `Right` | Previous / next rack in Rack Summary |
-| `Up` / `Down` | Navigate nested content, handing off at an edge |
+| `Up` / `Down` | Navigate within the focused section |
 | `PageUp` / `PageDown` | Page nested content without changing section focus |
 | `Enter` | Open the selected topology resource detail |
-| `?` / `F1` | Open or close Help |
+| `?` | Open or close Help |
 | `Esc` | Dismiss the topmost confirmation, Help, detail, or selection |
 | `f` | Cycle the level filter while Deployment Logs is focused |
 | `l` / `r` | Request launch / route |

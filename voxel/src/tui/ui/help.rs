@@ -8,32 +8,26 @@ use ratatui::{
 };
 
 const GLOBAL: &[(&str, &str)] = &[
-    ("1 / 2", "Deployment / Monitoring"),
+    ("v", "Toggle Deployment / Monitoring"),
     ("Tab / Shift-Tab", "Next / previous section"),
     ("Space", "Fold / expand section"),
-    ("? / F1", "Toggle help"),
+    ("?", "Toggle help"),
     ("Esc", "Close pane or selection"),
     ("d", "Detach (resume with `voxel tui resume`)"),
     ("q", "Quit and destroy deployment"),
 ];
 const DEPLOYMENT: &[(&str, &str)] = &[
-    ("Sections", "Overall Progress, Phases, Status, Current Phase, Logs"),
-    ("↑ / ↓", "Move item / section"),
+    ("↑ / ↓", "Move within section"),
     ("PgUp / PgDn", "Page content"),
     ("f", "Cycle log filter"),
     ("l / r", "Launch / route"),
     ("c / x", "Cancel / destroy resources"),
 ];
 const MONITORING: &[(&str, &str)] = &[
-    ("Sections", "Rack Summary, Topology, Top Zones by Traffic"),
     ("← / →", "Previous / next rack"),
-    ("↑ / ↓", "Move resource / section"),
+    ("↑ / ↓", "Move within section"),
     ("PgUp / PgDn", "Page resources"),
     ("Enter", "Open resource detail"),
-    ("Top Zones ↑ / ↓", "Browse traffic ranking"),
-    ("Detail ↑ / ↓", "Browse peers"),
-    ("Detail Enter/Esc", "Close detail"),
-    ("x", "External monitoring"),
 ];
 const DIALOGS: &[(&str, &str)] = &[
     ("↑ / ↓", "Select option"),
@@ -41,14 +35,8 @@ const DIALOGS: &[(&str, &str)] = &[
     ("y", "Copy fallback command"),
     ("n", "Reject"),
     ("Esc", "Close dialog"),
-    ("Help ↑/↓ / Pg", "Scroll line / page"),
 ];
-const TRAFFIC: &[(&str, &str)] =
-    &[("Rates", "normal ≤100 KB/s; elevated >100 KB/s–5 MB/s; high >5 MB/s")];
-const HEALTH: &[(&str, &str)] = &[
-    ("States", "● healthy; ◌ checking; ! degraded / failed"),
-    ("", "? / ◐ / × / ■ checking"),
-];
+const HELP: &[(&str, &str)] = &[("↑ / ↓", "Scroll")];
 
 fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
     Line::from(vec![
@@ -67,8 +55,7 @@ fn help_text() -> Text<'static> {
         ("Deployment", DEPLOYMENT),
         ("Monitoring", MONITORING),
         ("Dialogs", DIALOGS),
-        ("Traffic", TRAFFIC),
-        ("Health", HEALTH),
+        ("Help", HELP),
     ] {
         if !lines.is_empty() {
             lines.push(Line::default());
@@ -182,8 +169,7 @@ mod tests {
         ("Deployment", DEPLOYMENT),
         ("Monitoring", MONITORING),
         ("Dialogs", DIALOGS),
-        ("Traffic", TRAFFIC),
-        ("Health", HEALTH),
+        ("Help", HELP),
     ];
 
     fn rendered_help(app: &App, width: u16, height: u16) -> Buffer {
@@ -353,66 +339,35 @@ mod tests {
     }
 
     #[test]
-    fn help_contract_contains_every_exact_category_row_and_legend() {
+    fn help_contract_contains_only_the_approved_shortcuts() {
         let rows = HELP_SECTIONS;
         assert_eq!(
             rows.iter().map(|(category, _)| *category).collect::<Vec<_>>(),
-            [
-                "Global",
-                "Deployment",
-                "Monitoring",
-                "Dialogs",
-                "Traffic",
-                "Health"
-            ]
+            ["Global", "Deployment", "Monitoring", "Dialogs", "Help"]
         );
         let expected = [
-            ("1 / 2", "Deployment / Monitoring"),
-            (
-                "Tab / Shift-Tab",
-                "Next / previous top-level section unconditionally",
-            ),
-            ("Space", "Fold / expand focused section"),
-            ("? / F1", "Open / close Help"),
-            ("Esc", "Close the topmost non-confirmation pane or selection"),
-            ("d", "Detach and leave resources; resume with voxel tui resume"),
-            ("q", "Quit; destroy deployment first unless already stopped"),
-            (
-                "Sections",
-                "Overall Progress, Phases, Status, Current Phase, Logs",
-            ),
-            ("↑ / ↓", "Move nested; at edge/no vertical content, move section"),
-            ("PgUp / PgDn", "Page nested content only"),
+            ("v", "Toggle Deployment / Monitoring"),
+            ("Tab / Shift-Tab", "Next / previous section"),
+            ("Space", "Fold / expand section"),
+            ("?", "Toggle help"),
+            ("Esc", "Close pane or selection"),
+            ("d", "Detach (resume with `voxel tui resume`)"),
+            ("q", "Quit and destroy deployment"),
+            ("↑ / ↓", "Move within section"),
+            ("PgUp / PgDn", "Page content"),
             ("f", "Cycle log filter"),
             ("l / r", "Launch / route"),
-            ("c / x", "Cancel and leave / destroy resources"),
-            ("Sections", "Rack Summary, Topology, Top Zones by Traffic"),
-            ("← / →", "Previous / next rack in Rack Summary"),
-            (
-                "↑ / ↓",
-                "Move resource; at edge/no vertical content, move section",
-            ),
-            ("PgUp / PgDn", "Page Topology resources or Top Zones"),
-            ("Enter", "Open selected resource detail"),
-            ("Top Zones ↑ / ↓", "Browse the rack-wide traffic ranking"),
-            (
-                "Detail ↑ / ↓",
-                "Browse peers; detail stays open; section unchanged",
-            ),
-            ("Detail Enter/Esc", "Close resource detail"),
-            ("x", "External monitoring"),
-            ("↑ / ↓", "Choose a confirmation option"),
-            ("Enter", "Confirm selected safe-default option"),
-            ("y", "Copy full fallback command from Detach"),
-            ("n", "Reject confirmation"),
-            ("Esc", "Reject or close topmost dialog"),
-            ("Help ↑/↓ / Pg", "Scroll one wrapped line / page"),
-            (
-                "Rates",
-                "normal ≤100 KB/s; elevated >100 KB/s–5 MB/s; high >5 MB/s",
-            ),
-            ("States", "● healthy; ◌ checking status; ! degraded / failed"),
-            ("", "? / ◐ / × / ■ checking status"),
+            ("c / x", "Cancel / destroy resources"),
+            ("← / →", "Previous / next rack"),
+            ("↑ / ↓", "Move within section"),
+            ("PgUp / PgDn", "Page resources"),
+            ("Enter", "Open resource detail"),
+            ("↑ / ↓", "Select option"),
+            ("Enter", "Confirm selection"),
+            ("y", "Copy fallback command"),
+            ("n", "Reject"),
+            ("Esc", "Close dialog"),
+            ("↑ / ↓", "Scroll"),
         ];
         assert_eq!(
             rows.iter()
@@ -420,7 +375,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        assert!(!DEPLOYMENT.iter().any(|(key, _)| *key == "Enter"));
     }
 
     #[test]
@@ -443,7 +397,7 @@ mod tests {
         let area = help_area(overlay_area(Rect::new(0, 0, 48, 16)));
         let metrics = help_metrics(area);
         assert_eq!(metrics.capacity, page_capacity(&app));
-        assert!(metrics.total > metrics.capacity * 3);
+        assert!(metrics.total > metrics.capacity);
 
         for requested in [0, metrics.max_scroll / 2, usize::MAX] {
             app.session.help_scroll = requested;

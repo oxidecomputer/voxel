@@ -158,11 +158,11 @@ pub enum Effect {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
-    SwitchView(View),
+    ToggleView,
     NextRack,
     PreviousRack,
-    NextItem,
-    PreviousItem,
+    NextSection,
+    PreviousSection,
     Activate,
     ToggleSection,
     ToggleHelp,
