@@ -9,8 +9,7 @@ use super::{
     logging::DurableLog,
     operation::{
         CommandOutcome, DestroyPhase, LaunchPhase, LogLevel, OperationEvent,
-        OperationKind, OperationPhase, OperationWarning, OutputStream,
-        RoutePhase,
+        OperationKind, OperationPhase, OperationWarning, RoutePhase,
     },
     phase::{PhaseClassifier, PhaseHint},
     process::{
@@ -215,11 +214,7 @@ impl Effects {
         self.operation(
             active.request_id,
             OperationEvent::Log {
-                level: if line.stream == OutputStream::Stderr {
-                    LogLevel::Error
-                } else {
-                    LogLevel::Info
-                },
+                level: log_level(&line.text),
                 message: line.text.clone(),
             },
         )
@@ -391,12 +386,65 @@ fn force_outcome(result: ChildResult, kill: ForceStopResult) -> CommandOutcome {
     }
 }
 
+/// slog writes every level to stderr, so the stream alone says nothing about
+/// severity: treating stderr as Error tags ordinary `INFO` progress as a
+/// failure and makes the log filter useless. Read the level slog actually
+/// printed, scanning only the leading tokens so the word "WARN" inside a
+/// message cannot promote it.
+///
+/// An unrecognized line falls back to Info rather than Error: it is usually a
+/// continuation of a multi-line message, and a genuine failure still reaches
+/// the operator through the child's exit status and stderr summary.
+fn log_level(text: &str) -> LogLevel {
+    text.split_whitespace()
+        .take(5)
+        .find_map(|token| match token {
+            "CRIT" | "ERRO" => Some(LogLevel::Error),
+            "WARN" => Some(LogLevel::Warning),
+            "INFO" | "DEBG" | "TRCE" => Some(LogLevel::Info),
+            _ => None,
+        })
+        .unwrap_or(LogLevel::Info)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::operation::{
         DestroyPhase, LaunchPhase, OperationPhase, RoutePhase,
     };
+
+    #[test]
+    fn log_level_reads_the_level_slog_printed_not_the_stream() {
+        // Every one of these arrives on stderr; only severity should differ.
+        assert_eq!(
+            log_level(
+                "Sep 13 22:24:11.782 INFO rack-init [13/16]: waiting for database"
+            ),
+            LogLevel::Info
+        );
+        assert_eq!(
+            log_level("Sep 13 22:24:11.782 WARN serial retry"),
+            LogLevel::Warning
+        );
+        assert_eq!(
+            log_level("Sep 13 22:24:11.782 ERRO launch failed"),
+            LogLevel::Error
+        );
+        assert_eq!(
+            log_level("Sep 13 22:24:11.782 TRCE [sc] cr1: drained"),
+            LogLevel::Info
+        );
+        // A bare continuation line is not a failure.
+        assert_eq!(log_level("    at line 3"), LogLevel::Info);
+        // "WARN" deep inside a message must not promote it.
+        assert_eq!(
+            log_level(
+                "Sep 13 22:24:11.782 INFO rack-init: cleared the WARN state"
+            ),
+            LogLevel::Info
+        );
+    }
 
     #[test]
     fn every_operation_has_a_tui_owned_reconciliation_phase() {
