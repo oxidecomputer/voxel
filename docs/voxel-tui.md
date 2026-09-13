@@ -43,11 +43,11 @@ expands the focused section, and `v` toggles the active view.
 | `Esc` | Dismiss the topmost confirmation, Help, detail, or selection |
 | `f` | Cycle the level filter while Deployment Logs is focused |
 | `l` / `r` | Request launch / route |
-| `c` / `x` | Cancel and leave resources / cancel and destroy |
-| `d` | Detach and leave deployment resources in place |
+| `x` | Stop the operation and destroy the deployment; press again to force stop a command that will not settle |
+| `d` | Leave the TUI, keeping the deployment running; resume with `voxel tui resume` |
 | `y` | Copy the full fallback command from the detach dialog |
 | `n` | Reject a confirmation |
-| `q` | Quit, destroying resources first unless observed stopped |
+| `q` | Quit and destroy the deployment, unless it is already observed stopped |
 
 ### Deployment
 

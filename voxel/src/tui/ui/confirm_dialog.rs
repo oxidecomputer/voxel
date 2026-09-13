@@ -17,16 +17,13 @@ fn prompt(confirmation: &Confirmation) -> &'static str {
     match confirmation {
         Confirmation::Launch => "Launch deployment?",
         Confirmation::Route => "Apply routes?",
-        Confirmation::Detach => "Detach from Voxel TUI?",
+        Confirmation::Detach => "Leave the TUI, keep the deployment?",
         Confirmation::Quit => "Quit Voxel TUI?",
-        Confirmation::QuitAndDestroy => {
-            "Quit TUI and destroy Voxel deployment?"
-        }
-        Confirmation::CancelAndLeave => "Cancel operation and leave resources?",
+        Confirmation::QuitAndDestroy => "Quit and destroy the deployment?",
         Confirmation::CancelAndDestroy => {
-            "Cancel operation and DESTROY resources?"
+            "Stop the operation and destroy the deployment?"
         }
-        Confirmation::ForceStop => "Force stop the direct Voxel child?",
+        Confirmation::ForceStop => "Force stop the running command?",
     }
 }
 
@@ -39,9 +36,8 @@ fn body(app: &App, confirmation: &Confirmation) -> Text<'static> {
     let mut lines = vec![Line::from(prompt(confirmation))];
     if matches!(confirmation, Confirmation::Detach) {
         if app.operation.active.is_some() || app.operation.pending.is_some() {
-            lines.push(Line::from(
-                "The active operation will be cancelled; resources will be left in place.",
-            ));
+            lines.push(Line::from("The running operation stops."));
+            lines.push(Line::from("The deployment is left in place."));
         }
         lines.push(Line::from("Resume later with:"));
         lines.push(Line::from("voxel tui resume"));
@@ -49,17 +45,14 @@ fn body(app: &App, confirmation: &Confirmation) -> Text<'static> {
             lines.push(Line::from("Full fallback command copied."));
         }
     }
-    if matches!(
-        confirmation,
-        Confirmation::CancelAndLeave | Confirmation::CancelAndDestroy
-    ) {
+    if matches!(confirmation, Confirmation::CancelAndDestroy) {
         lines.push(Line::from(
-            "The Voxel command is still running; waiting for the Voxel command to settle without interrupting an opaque Falcon boundary.",
+            "The running command is allowed to finish safely first, so this can take a moment.",
         ));
     }
     if matches!(confirmation, Confirmation::ForceStop) {
         lines.push(Line::from(
-            "Force stop can leave partial deployment state. Only the direct child is terminated; reconciliation still follows.",
+            "This can leave the deployment half-built. Use it only when the command will not stop on its own.",
         ));
     }
     Text::from(lines)
@@ -205,12 +198,9 @@ mod tests {
     #[test]
     fn lifecycle_prompts_match_exactly() {
         for (confirmation, expected) in [
-            (Confirmation::Detach, "Detach from Voxel TUI?"),
+            (Confirmation::Detach, "Leave the TUI, keep the deployment?"),
             (Confirmation::Quit, "Quit Voxel TUI?"),
-            (
-                Confirmation::QuitAndDestroy,
-                "Quit TUI and destroy Voxel deployment?",
-            ),
+            (Confirmation::QuitAndDestroy, "Quit and destroy the deployment?"),
         ] {
             let text = rendered_dialog_text(&app_for(confirmation), 100, 22);
             assert!(text.contains(expected), "missing {expected:?}: {text}");
@@ -252,8 +242,8 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("The active operation will be cancelled;")
-                && text.contains("resources will be left in place."),
+            text.contains("The running operation stops.")
+                && text.contains("The deployment is left in place."),
             "{text}"
         );
     }
@@ -262,21 +252,16 @@ mod tests {
         for (confirmation, affirmative, selected_reject) in [
             (Confirmation::Launch, "Launch deployment", "▶ Cancel"),
             (Confirmation::Route, "Apply routes", "▶ Cancel"),
-            (Confirmation::Detach, "Detach and leave resources", "▶ Back"),
+            (Confirmation::Detach, "Leave and keep it running", "▶ Back"),
             (Confirmation::Quit, "Quit Voxel TUI", "▶ Back"),
             (
                 Confirmation::QuitAndDestroy,
-                "Destroy deployment and quit",
-                "▶ Back",
-            ),
-            (
-                Confirmation::CancelAndLeave,
-                "Cancel and leave resources",
+                "Destroy the deployment and quit",
                 "▶ Back",
             ),
             (
                 Confirmation::CancelAndDestroy,
-                "Cancel and destroy resources",
+                "Stop and destroy the deployment",
                 "▶ Back",
             ),
         ] {

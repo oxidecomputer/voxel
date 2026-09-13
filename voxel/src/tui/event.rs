@@ -59,7 +59,6 @@ pub enum Confirmation {
     Detach,
     Quit,
     QuitAndDestroy,
-    CancelAndLeave,
     CancelAndDestroy,
     ForceStop,
 }
@@ -86,7 +85,7 @@ const ROUTE_OPTIONS: &[ConfirmationOption] = &[
     ConfirmationOption { label: "Cancel", action: Reject },
 ];
 const DETACH_OPTIONS: &[ConfirmationOption] = &[
-    ConfirmationOption { label: "Detach and leave resources", action: Confirm },
+    ConfirmationOption { label: "Leave and keep it running", action: Confirm },
     ConfirmationOption { label: "Back", action: Reject },
 ];
 const QUIT_OPTIONS: &[ConfirmationOption] = &[
@@ -95,24 +94,20 @@ const QUIT_OPTIONS: &[ConfirmationOption] = &[
 ];
 const QUIT_AND_DESTROY_OPTIONS: &[ConfirmationOption] = &[
     ConfirmationOption {
-        label: "Destroy deployment and quit",
+        label: "Destroy the deployment and quit",
         action: Confirm,
     },
     ConfirmationOption { label: "Back", action: Reject },
 ];
-const LEAVE_OPTIONS: &[ConfirmationOption] = &[
-    ConfirmationOption { label: "Cancel and leave resources", action: Confirm },
-    ConfirmationOption { label: "Back", action: Reject },
-];
 const DESTROY_CANCEL_OPTIONS: &[ConfirmationOption] = &[
     ConfirmationOption {
-        label: "Cancel and destroy resources",
+        label: "Stop and destroy the deployment",
         action: Confirm,
     },
     ConfirmationOption { label: "Back", action: Reject },
 ];
 const FORCE_STOP_OPTIONS: &[ConfirmationOption] = &[
-    ConfirmationOption { label: "Force stop direct child", action: Confirm },
+    ConfirmationOption { label: "Force stop the command", action: Confirm },
     ConfirmationOption { label: "Back", action: Reject },
 ];
 impl Confirmation {
@@ -123,7 +118,6 @@ impl Confirmation {
             Self::Detach => DETACH_OPTIONS,
             Self::Quit => QUIT_OPTIONS,
             Self::QuitAndDestroy => QUIT_AND_DESTROY_OPTIONS,
-            Self::CancelAndLeave => LEAVE_OPTIONS,
             Self::CancelAndDestroy => DESTROY_CANCEL_OPTIONS,
             Self::ForceStop => FORCE_STOP_OPTIONS,
         }
@@ -174,7 +168,6 @@ pub enum Action {
     RequestRoute,
     RequestDetach,
     RequestQuit,
-    RequestCancelAndLeave,
     RequestCancelAndDestroy,
     CopyReattachCommand,
     Reject,

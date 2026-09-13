@@ -930,24 +930,21 @@ impl App {
             {
                 self.open_confirmation(Confirmation::Route)
             }
-            Action::RequestCancelAndLeave
-                if self.session.view == View::Deployment
-                    && self.can_cancel() =>
-            {
-                self.open_confirmation(Confirmation::CancelAndLeave)
-            }
-            Action::RequestCancelAndLeave
-                if self.session.view == View::Deployment
-                    && self.can_force_stop() =>
-            {
-                self.open_confirmation(Confirmation::ForceStop)
-            }
             Action::RequestCancelAndDestroy
                 if self.session.view == View::Deployment
                     && (self.can_cancel()
                         || self.can_upgrade_cancel_to_destroy()) =>
             {
                 self.open_confirmation(Confirmation::CancelAndDestroy)
+            }
+            // Escalation: once the stop is already in flight, the same key
+            // offers the only remaining lever against a child that will not
+            // settle.
+            Action::RequestCancelAndDestroy
+                if self.session.view == View::Deployment
+                    && self.can_force_stop() =>
+            {
+                self.open_confirmation(Confirmation::ForceStop)
             }
             Action::CycleLogFilter
                 if self.session.view == View::Deployment
@@ -1159,9 +1156,6 @@ impl App {
                 if !self.session.quitting && self.resources_may_exist() =>
             {
                 self.destroy_and_quit()
-            }
-            Confirmation::CancelAndLeave if self.can_cancel() => {
-                vec![self.cancel(CancelChoice::Leave)]
             }
             Confirmation::CancelAndDestroy
                 if self.can_cancel()
@@ -2091,6 +2085,26 @@ mod factual_outcome_tests {
             app.operation.active.unwrap().cancel_choice,
             Some(CancelChoice::Destroy)
         );
+    }
+
+    #[test]
+    fn stop_key_escalates_to_force_stop_once_cancelling() {
+        let mut app = active_app();
+        app.session.view = View::Deployment;
+
+        // First press stops and destroys.
+        app.update(AppEvent::Action(Action::RequestCancelAndDestroy));
+        assert_eq!(
+            app.session.confirmation,
+            Some(Confirmation::CancelAndDestroy)
+        );
+        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
+        app.update(AppEvent::Action(Action::Activate));
+
+        // With the stop already in flight, the same key is the only remaining
+        // lever against a child that will not settle.
+        app.update(AppEvent::Action(Action::RequestCancelAndDestroy));
+        assert_eq!(app.session.confirmation, Some(Confirmation::ForceStop));
     }
 
     #[test]

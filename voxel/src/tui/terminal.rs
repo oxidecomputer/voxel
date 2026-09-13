@@ -62,7 +62,6 @@ pub fn key_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('r') => Action::RequestRoute,
         KeyCode::Char('d') => Action::RequestDetach,
         KeyCode::Char('q') => Action::RequestQuit,
-        KeyCode::Char('c') => Action::RequestCancelAndLeave,
         KeyCode::Char('x') => Action::RequestCancelAndDestroy,
         _ => return None,
     })
@@ -337,7 +336,6 @@ mod tests {
             (KeyCode::Char('r'), Action::RequestRoute),
             (KeyCode::Char('d'), Action::RequestDetach),
             (KeyCode::Char('q'), Action::RequestQuit),
-            (KeyCode::Char('c'), Action::RequestCancelAndLeave),
             (KeyCode::Char('x'), Action::RequestCancelAndDestroy),
             (KeyCode::Char('y'), Action::CopyReattachCommand),
             (KeyCode::Char('n'), Action::Reject),
