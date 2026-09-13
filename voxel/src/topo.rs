@@ -463,6 +463,7 @@ pub(crate) fn omicron_src() -> Option<Utf8PathBuf> {
 pub(crate) fn stage_config(
     cfg: &VoxelConfig,
     emu: bool,
+    init_rss: bool,
     sp_firmware: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
     let sleds = cfg.sleds();
@@ -500,12 +501,13 @@ pub(crate) fn stage_config(
             .iter()
             .find(|s| s.rss && s.rack == rack)
             .ok_or_else(|| anyhow!("rack {rack} has no RSS sled"))?;
-        // For `--wicket-setup` we drive RSS through wicketd, so the config-rss
-        // must NOT be injected by voxel-init (sled-agent would otherwise auto-init
-        // from it). voxel-init only injects `<cargo-bay>/config-rss.toml`, so we
-        // simply generate it OUTSIDE the cargo-bay (in `wicket-setup/rackN/`) -
-        // `wicket_setup::drive` reads it from there to build the wicketd bodies.
-        let rss_dir = if emu {
+        // voxel-init injects `<cargo-bay>/config-rss.toml` into sled-agent,
+        // which then initializes the rack itself. That is the --init-rss
+        // path. By default rack setup goes through wicketd's commission API
+        // (commission::drive builds its request from the config directly),
+        // so the rendered config-rss is kept OUTSIDE the cargo-bay, under
+        // `wicket-setup/rackN/`, as a reference copy of what was requested.
+        let rss_dir = if !init_rss {
             let d = Utf8Path::new("wicket-setup").join(format!("rack{rack}"));
             fs::create_dir_all(&d)?;
             d
@@ -652,7 +654,7 @@ pub(crate) fn stage_config(
             }
         }
         // One fleet for the rack, staged on the host instead of in each zone.
-        stage_sp_emu(cfg, &fleet, &sp_fleet_dir(rack), emu, fw.as_deref())?;
+        stage_sp_emu(cfg, &fleet, &sp_fleet_dir(rack), fw.as_deref())?;
     }
     Ok(())
 }
@@ -667,7 +669,6 @@ fn stage_sp_emu(
     cfg: &VoxelConfig,
     fleet: &voxel_config::sp::SpFleet,
     dir: &Utf8Path,
-    emu_rot: bool,
     fw: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
     let emu = fleet.emu_sps();
@@ -704,17 +705,15 @@ fn stage_sp_emu(
              point --sp-firmware at a directory of SP/RoT images"
         );
     };
-    if emu_rot {
-        let rot = fw_dir.join("rot-a.zip");
-        fs::copy(&rot, out.join("rot.image"))
-            .with_context(|| format!("stage RoT image from {rot}"))?;
-        // Staged bootleby turns on sp-emu secure boot; rot_image must be
-        // self-signed.
-        let bootleby = fw_dir.join("bootleby.zip");
-        if bootleby.exists() {
-            fs::copy(&bootleby, out.join("bootleby.zip"))
-                .with_context(|| format!("stage bootleby from {bootleby}"))?;
-        }
+    let rot = fw_dir.join("rot-a.zip");
+    fs::copy(&rot, out.join("rot.image"))
+        .with_context(|| format!("stage RoT image from {rot}"))?;
+    // Staged bootleby turns on sp-emu secure boot; rot_image must be
+    // self-signed.
+    let bootleby = fw_dir.join("bootleby.zip");
+    if bootleby.exists() {
+        fs::copy(&bootleby, out.join("bootleby.zip"))
+            .with_context(|| format!("stage bootleby from {bootleby}"))?;
     }
     // Stage each role's hubris archive; voxel-init flashes a per-instance state
     // directory from it in the zone (sp-emu 1.x flashes from the archive, not a
