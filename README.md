@@ -20,7 +20,9 @@ generation.
 - **`voxel-image/`**: image build machinery (`voxel image create`) and the install
   scripts that bake a control-plane image from an omicron commit.
 
-See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference, there are a LOT of tuning knobs.
+See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference,
+there are a LOT of tuning knobs. Terminal-interface operators should also see
+the [`voxel tui` guide](docs/voxel-tui.md).
 
 ## Building
 

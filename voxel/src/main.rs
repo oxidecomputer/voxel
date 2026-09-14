@@ -43,6 +43,7 @@ mod sp_cmd;
 mod sp_host;
 mod topo;
 mod tufrepo;
+mod tui;
 mod util;
 mod wicket_setup;
 
@@ -79,6 +80,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open the terminal interface.
+    Tui {
+        #[command(subcommand)]
+        cmd: Option<TuiCmd>,
+    },
     /// Launch the rack and stream RSS bring-up progress.
     Launch {
         /// Don't watch RSS bring-up after launch.
@@ -214,6 +220,16 @@ enum Cmd {
         /// Arguments passed to Omicron commtest (place them after `--`).
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TuiCmd {
+    /// Resume a detached TUI session.
+    Resume {
+        /// Choose from all available sessions.
+        #[arg(long)]
+        choose: bool,
     },
 }
 
@@ -771,9 +787,55 @@ fn anchor_workdir(
     Ok(())
 }
 
+fn resolve_tui_context(
+    cli: &Cli,
+    config_path: &Utf8Path,
+    config: VoxelConfig,
+    invocation_dir: &Utf8Path,
+) -> anyhow::Result<tui::TuiContext> {
+    let make_absolute = |path: Utf8PathBuf| {
+        if path.is_absolute() { path } else { invocation_dir.join(path) }
+    };
+    let workdir = cli
+        .workdir
+        .clone()
+        .or_else(|| config.falcon.workdir.clone().map(Utf8PathBuf::from))
+        .or_else(|| config_path.parent().map(Utf8Path::to_path_buf))
+        .map(make_absolute)
+        .context("cannot resolve TUI workdir")?;
+    let dataset = std::env::var("FALCON_DATASET")
+        .unwrap_or_else(|_| "rpool/falcon".to_string());
+    let build_root = std::env::var("BUILD_ROOT")
+        .map(Utf8PathBuf::from)
+        .unwrap_or_else(|_| {
+            Utf8PathBuf::from(
+                std::env::var("HOME").unwrap_or_else(|_| "/root".into()),
+            )
+            .join("voxel-builds")
+        });
+
+    Ok(tui::TuiContext::new(
+        config_path.to_path_buf(),
+        workdir,
+        cli.name.clone(),
+        dataset,
+        make_absolute(build_root),
+        config,
+        std::env::current_exe().context("resolve current voxel executable")?,
+        std::env::vars_os().collect(),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
+    if let Cmd::Tui { cmd: Some(TuiCmd::Resume { choose }) } = &cli.cmd {
+        return tui::resume(*choose);
+    }
+    let invocation_dir = Utf8PathBuf::try_from(
+        std::env::current_dir().context("resolve invocation directory")?,
+    )
+    .context("invocation directory is not valid UTF-8")?;
     // Anchor to the project root before anything touches cargo-bay/.falcon.
     let config_path = discover_config(cli.config.as_deref());
     // A missing config means defaults; an existing one that fails to load or
@@ -786,6 +848,19 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
+        Cmd::Tui { cmd } => {
+            debug_assert!(
+                cmd.is_none(),
+                "resume dispatched before configuration"
+            );
+            let context = resolve_tui_context(
+                &cli,
+                &config_path,
+                load_config(&config_path)?,
+                &invocation_dir,
+            )?;
+            tui::run(context).await
+        }
         Cmd::Launch { no_progress, no_route, emu, sp_firmware } => {
             // One flag: emulated SPs, the RoT bridge on top of them, and
             // wicketd-driven setup are the same configuration in practice, and
@@ -1065,5 +1140,21 @@ mod tests {
         assert!(find("43bb5af99ec").ends_with("omicron-43bb5af"));
         // No match falls back to the exact (nonexistent) path.
         assert!(find("deadbeef").ends_with("omicron-deadbeef"));
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn parses_tui_commands_and_preserves_launch_parsing() {
+        assert!(Cli::try_parse_from(["voxel", "tui"]).is_ok());
+        assert!(Cli::try_parse_from(["voxel", "tui", "resume"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["voxel", "tui", "resume", "--choose"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["voxel", "launch", "--emu"]).is_ok());
     }
 }
