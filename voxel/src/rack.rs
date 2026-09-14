@@ -309,10 +309,24 @@ pub(crate) async fn cmd_launch(
             );
         }
     }
-    // Fail fast if the configured images aren't built yet - a clear message
-    // beats the cryptic clone error falcon would throw partway through launch.
+    // Fail fast if the configured images aren't built yet
     crate::image::ensure_image(&cfg.image.cp_image())?;
     crate::image::ensure_image(&cfg.image.frr_image())?;
+    // A --from-tuf image bakes no sp-sim (yet)
+    if !emu && crate::topo::is_tuf_image(&cfg.image.cp_image()) {
+        if !init_rss {
+            bail!(
+                "image {} was built with --from-tuf and carries no sp-sim; \
+                 launch with --emu, or use an image built from a commit or --src",
+                cfg.image.cp_image()
+            );
+        }
+        eprintln!(
+            "[voxel] warning: image {} was built with --from-tuf and carries \
+             no sp-sim; the rack will initialize with no SPs in its inventory",
+            cfg.image.cp_image()
+        );
+    }
     memory_preflight(cfg)?;
     // The isolated external segment must exist before any node boots, as the
     // nodes' static addresses (staged into each cargo-bay) stay in use after
