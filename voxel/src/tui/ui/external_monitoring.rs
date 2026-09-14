@@ -38,19 +38,7 @@ fn yaml_for<'a>(racks: impl IntoIterator<Item = (RackId, &'a str)>) -> String {
     yaml
 }
 
-pub(crate) fn selected_yaml(app: &App) -> String {
-    let selected = app
-        .session
-        .selected_rack
-        .or_else(|| app.external_monitoring_endpoints.keys().next().copied());
-    yaml_for(selected.into_iter().filter_map(|rack| {
-        app.external_monitoring_endpoints
-            .get(&rack)
-            .map(|host| (rack, host.as_str()))
-    }))
-}
-
-pub(crate) fn all_yaml(app: &App) -> String {
+pub(crate) fn receiver_yaml(app: &App) -> String {
     yaml_for(
         app.external_monitoring_endpoints
             .iter()
@@ -58,7 +46,7 @@ pub(crate) fn all_yaml(app: &App) -> String {
     )
 }
 
-pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+pub fn draw(frame: &mut ratatui::Frame<'_>) {
     let root = overlay_area(frame.area());
     let width = root.width.min(92);
     let height = root.height.min(26);
@@ -72,54 +60,26 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         return;
     }
     frame.render_widget(Clear, area);
-    let selected = app.session.selected_rack.map_or_else(
-        || "first configured rack".into(),
-        |rack| format!("rack {}", rack.0),
-    );
     let body = vec![
         Line::styled(
-            "The Voxel TUI is a deployment assistant, not a monitoring platform",
+            "Setting up External Monitoring",
             Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD),
         ),
         Line::default(),
         Line::from(
-            "Use the official Oxide receiver to ingest Oximeter metrics,",
+            "To monitor your Voxel deployment, copy the OpenTelemetry receiver",
         ),
-        Line::from("then connect your own observability stack."),
-        Line::default(),
-        Line::from(
-            "1. Create a least-privilege fleet-viewer token for each virtual rack.",
-        ),
-        Line::from(
-            "2. Copy the receiver fragment and set OXIDE_TOKEN_RACKN in the Collector environment.",
-        ),
-        Line::from(
-            "3. Add oxide/rack<N> to your list of receivers, and choose your exporters.",
-        ),
+        Line::from("YAML and follow the integration guide:"),
+        Line::from(GUIDE_URL),
         Line::default(),
         Line::from(vec![
             Span::styled("s", Style::default().fg(TUI_YELLOW)),
-            Span::raw(format!(" copy {selected} YAML   ")),
+            Span::raw(" copy receiver YAML   "),
             Span::styled("a", Style::default().fg(TUI_YELLOW)),
-            Span::raw(" copy all-rack YAML   "),
-            Span::styled("u", Style::default().fg(TUI_YELLOW)),
-            Span::raw(" copy official guide URL"),
+            Span::raw(" copy guide URL   "),
+            Span::styled("Esc", Style::default().fg(TUI_YELLOW)),
+            Span::raw(" close"),
         ]),
-        Line::from("Esc close this window"),
-        Line::default(),
-        Line::from("Documentation:"),
-        Line::from(format!("1. {GUIDE_URL}")),
-        Line::from(
-            "2. https://docs.oxide.computer/guides/metrics/oxql-tutorial",
-        ),
-        Line::from(
-            "3. https://docs.oxide.computer/guides/metrics/timeseries-schemas",
-        ),
-        Line::default(),
-        Line::styled(
-            "NOTE: insecure_skip_verify is included only because Voxel uses self-signed virtual-rack certificates.",
-            Style::default().fg(OX_RED),
-        ),
     ];
     let block = Block::bordered()
         .title(" External monitoring ")
@@ -175,12 +135,9 @@ mod tests {
         assert!(app.session.external_monitoring_open);
         app.update(Action::RequestCancelAndDestroy.into());
         assert!(app.session.external_monitoring_open);
+        // One fragment covers every rack; it just grows with the rack count.
         assert!(matches!(
-            app.update(Action::CopyExternalMonitoringSelected.into()).as_slice(),
-            [Effect::CopyToClipboard(yaml)] if yaml.contains("oxide/rack0:") && !yaml.contains("oxide/rack1:")
-        ));
-        assert!(matches!(
-            app.update(Action::CopyExternalMonitoringAll.into()).as_slice(),
+            app.update(Action::CopyExternalMonitoringYaml.into()).as_slice(),
             [Effect::CopyToClipboard(yaml)] if yaml.contains("oxide/rack0:") && yaml.contains("oxide/rack1:")
         ));
         assert_eq!(

@@ -116,7 +116,7 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         super::node_detail::draw(frame, app);
     }
     if app.session.external_monitoring_open {
-        super::external_monitoring::draw(frame, app);
+        super::external_monitoring::draw(frame);
     }
     if app.session.help_open {
         super::help::draw(frame, app, root.mode);

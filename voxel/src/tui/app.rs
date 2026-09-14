@@ -795,16 +795,11 @@ impl App {
                     self.session.external_monitoring_open = false;
                     vec![]
                 }
-                Action::CopyExternalMonitoringSelected => {
+                Action::CopyExternalMonitoringYaml => {
                     vec![Effect::CopyToClipboard(
-                        crate::tui::ui::external_monitoring::selected_yaml(
+                        crate::tui::ui::external_monitoring::receiver_yaml(
                             self,
                         ),
-                    )]
-                }
-                Action::CopyExternalMonitoringAll => {
-                    vec![Effect::CopyToClipboard(
-                        crate::tui::ui::external_monitoring::all_yaml(self),
                     )]
                 }
                 Action::CopyExternalMonitoringGuide => {
