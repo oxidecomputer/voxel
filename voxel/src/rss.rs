@@ -148,8 +148,8 @@ async fn discover_rss_ip(
             Err(e) if Instant::now() + RETRY_SPACING >= ip_deadline => {
                 warn!(
                     d.log,
-                    "{tag}: can't find the RSS node's IP to watch over SSH ({e}); \
-                    bring-up continues - check `voxel status` / the console"
+                    "{tag}: no RSS node IP to watch over ssh ({e}); bring-up \
+                    continues, see voxel status"
                 );
                 break None;
             }
@@ -178,9 +178,8 @@ async fn watch_rss_loop(
         if start.elapsed() > cap {
             warn!(
                 d.log,
-                "{tag}: stopped watching after {}m - the rack may still be \
-                 converging; check the console or re-run `voxel status`. Not failing \
-                 the launch.",
+                "{tag}: stopped watching after {}m; the rack may still be \
+                 converging, see voxel status",
                 cap.as_secs() / 60
             );
             break;
@@ -202,8 +201,8 @@ async fn watch_rss_loop(
                 {
                     warn!(
                         d.log,
-                        "{tag}: RSS will not start - a service on the RSS node is in \
-                         MAINTENANCE. `svcs -x`:\n{}",
+                        "{tag}: RSS will not start: a service on the RSS node is in \
+                        maintenance. svcs -x:\n{}",
                         x.trim()
                     );
                     if let Some(t) = crate::net::ssh_capture(
@@ -219,7 +218,7 @@ async fn watch_rss_loop(
                     }
                     warn!(
                         d.log,
-                        "{tag}: not waiting further - fix the service above, then relaunch."
+                        "{tag}: not waiting further; clear the service, then relaunch"
                     );
                     break;
                 }
@@ -234,7 +233,7 @@ async fn watch_rss_loop(
                     };
                     info!(
                         d.log,
-                        "{tag}: still watching, {mins}m elapsed - {where_}"
+                        "{tag}: still watching, {mins}m elapsed, {where_}"
                     );
                     last_emit = Instant::now();
                 }
@@ -286,7 +285,7 @@ async fn watch_rss_loop(
                 } else {
                     info!(
                         d.log,
-                        "{tag}: complete - rack initialized (RSS run {init_id})"
+                        "{tag}: complete, rack initialized (RSS run {init_id})"
                     );
                 }
                 break;

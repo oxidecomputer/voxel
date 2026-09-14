@@ -113,8 +113,7 @@ async fn serial_bounded_caps<T>(
     }
     if hard > soft {
         eprintln!(
-            "[voxel] {what}: no answer from the serial console after {}s. Waiting up to {}s \
-             rather than cancelling, since a cancelled exec wedges the console.",
+            "[voxel] {what}: no serial console answer after {}s; waiting up to {}s",
             soft.as_secs(),
             hard.as_secs()
         );
@@ -361,8 +360,8 @@ pub(crate) fn wait_external_reachable(
     }
     warn!(
         log,
-        "{label}: external network not reachable after ~{}s (dns {dns_ip}) - the rack is up but \
-         its external path may still be converging; retry `voxel route` or `dig {dns_zone} SOA @{dns_ip}`",
+        "{label}: external network not reachable after {}s (dns {dns_ip}); \
+             it may still be converging: voxel route, or dig {dns_zone} SOA @{dns_ip}",
         ATTEMPTS * SPACING.as_secs() as u32
     );
 }
@@ -482,7 +481,7 @@ pub(crate) async fn set_external_route(
     } else {
         warn!(
             d.log,
-            "route {} -> {} not confirmed: {}{} - run: route add {} {}",
+            "route {} -> {} not confirmed: {}{}; run: route add {} {}",
             prefix,
             ip,
             String::from_utf8_lossy(&add.stdout).trim(),

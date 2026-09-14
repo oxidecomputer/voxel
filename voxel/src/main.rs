@@ -260,10 +260,9 @@ enum ImageCmd {
         /// phase 2 payload, switch zone recomposed for softnpu.
         #[arg(long, value_name = "REPO_ZIP")]
         from_tuf: Option<Utf8PathBuf>,
-        /// With --from-tuf: an omicron-sled-agent package tar built with
-        /// switch-softnpu, staged in place of the phase 2 sled-agent. The
-        /// standard-image binary hardwires scrimlet = tofino ASIC, so softnpu
-        /// scrimlets need this build.
+        /// With --from-tuf: an omicron-sled-agent package tar staged in place
+        /// of the phase 2 sled-agent, for trying a sled-agent build. The
+        /// phase 2 one detects softnpu scrimlets at runtime.
         #[arg(long, value_name = "PKG_TAR", requires = "from_tuf")]
         sled_agent: Option<Utf8PathBuf>,
     },
