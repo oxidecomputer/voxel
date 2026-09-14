@@ -92,7 +92,7 @@ pub(crate) fn draw(
     for tier in &scene.tiers {
         let (label, empty) = match tier.tier {
             TopologyTier::Routers => ("Routers", "No routers"),
-            TopologyTier::SwitchZones => ("Switch zones", "No switch zones"),
+            TopologyTier::SwitchZones => ("Sidecars", "No sidecars"),
             TopologyTier::Sleds => ("Sleds", "No sleds"),
         };
         if tier.label_area.area() > 0 {
@@ -129,14 +129,6 @@ pub(crate) fn draw(
                 .style(structural),
             bus.area,
         );
-        let label = " Switch fabric ";
-        let label_width = terminal_width(label);
-        if usize::from(bus.area.width) >= label_width + 2 {
-            frame.render_widget(
-                Paragraph::new(label).style(structural),
-                Rect::new(bus.area.x + 2, bus.area.y, label_width as u16, 1),
-            );
-        }
     }
     for connector in &scene.connectors {
         frame.render_widget(
@@ -180,7 +172,7 @@ fn draw_switch_zone_node(
     app: &App,
     descriptor: &ResourceDescriptor,
 ) {
-    draw_node_primitive(frame, area, app, descriptor, "SWZ");
+    draw_node_primitive(frame, area, app, descriptor, "SC");
 }
 
 fn draw_sled_node(
