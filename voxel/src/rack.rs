@@ -269,6 +269,7 @@ pub(crate) async fn cmd_launch(
     no_progress: bool,
     no_route: bool,
     emu: bool,
+    init_rss: bool,
     sp_firmware: Option<&Utf8Path>,
 ) -> anyhow::Result<()> {
     // Floor (per rack - each is an independent RSS domain): omicron's control
@@ -308,10 +309,24 @@ pub(crate) async fn cmd_launch(
             );
         }
     }
-    // Fail fast if the configured images aren't built yet - a clear message
-    // beats the cryptic clone error falcon would throw partway through launch.
+    // Fail fast if the configured images aren't built yet
     crate::image::ensure_image(&cfg.image.cp_image())?;
     crate::image::ensure_image(&cfg.image.frr_image())?;
+    // A --from-tuf image bakes no sp-sim (yet)
+    if !emu && crate::topo::is_tuf_image(&cfg.image.cp_image()) {
+        if !init_rss {
+            bail!(
+                "image {} was built with --from-tuf and carries no sp-sim; \
+                 launch with --emu, or use an image built from a commit or --src",
+                cfg.image.cp_image()
+            );
+        }
+        eprintln!(
+            "[voxel] warning: image {} was built with --from-tuf and carries \
+             no sp-sim; the rack will initialize with no SPs in its inventory",
+            cfg.image.cp_image()
+        );
+    }
     memory_preflight(cfg)?;
     // The isolated external segment must exist before any node boots, as the
     // nodes' static addresses (staged into each cargo-bay) stay in use after
@@ -323,7 +338,7 @@ pub(crate) async fn cmd_launch(
         lan_mtu_preflight()?;
     }
     reset_node_cargo_bay(cfg)?;
-    stage_config(cfg, emu, sp_firmware)?;
+    stage_config(cfg, emu, init_rss, sp_firmware)?;
     stage_sprockets(cfg)?;
     // The SP fleet runs on this host, so it has to exist before any node boots:
     // each switch zone's MGS dials it, and the scrimlets are staged to reach the
@@ -428,10 +443,11 @@ pub(crate) async fn cmd_launch(
                 topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
             {
                 let tag = rack_label(racks, rack, "rack-init");
-                // --wicket-setup: nothing auto-inited (no staged config-rss),
-                // so drive rack setup through the commission API; watch_rss
-                // then reports the wicketd-triggered bring-up as usual.
-                if emu
+                // Default: no config-rss was staged for sled-agent, so drive
+                // rack setup through wicketd's commission API; watch_rss then
+                // reports the bring-up as usual. --init-rss staged one and
+                // sled-agent initializes the rack on its own.
+                if !init_rss
                     && let Err(e) = crate::commission::drive(
                         cfg, d, *n, &s.name, rack, &tag,
                     )
@@ -508,10 +524,6 @@ pub(crate) async fn cmd_launch(
         bring_up_interconnect(d, &topo, cfg, rack).await;
     }
 
-    // --emu-rot: nothing to attach here anymore. voxel-init stands up a shared
-    // `voxel-rot-emu` service per switch zone and points every SP at it via
-    // SP_EMU_ROT_SERVICE from boot, so each SP stays single-core and the RoT
-    // bridge is live through RSS -- MGS/Nexus pin the real RoT at rack-init.
     Ok(())
 }
 
@@ -648,14 +660,10 @@ pub(crate) fn cmd_info(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
 
 /// RSS watch budget: emulated SPs slow every MGS RPC and multi-rack racks
 /// converge under each other's load, so both get 60m vs the 30m a single sp-sim
-/// rack needs. (`cmd_status` watches a running rack with no emu_sp context, so it
-/// passes `false`.)
-fn rss_watch_cap(emu_sp: bool, racks: usize) -> std::time::Duration {
-    std::time::Duration::from_secs(if emu_sp || racks > 1 {
-        3600
-    } else {
-        1800
-    })
+/// rack needs. (`cmd_status` watches a running rack without knowing whether it
+/// is --emu, so it passes `false`.)
+fn rss_watch_cap(emu: bool, racks: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(if emu || racks > 1 { 3600 } else { 1800 })
 }
 
 pub(crate) async fn cmd_status(
