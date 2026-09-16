@@ -48,14 +48,21 @@ voxel config set image.frr voxel-frr-proto
 
 5. `pfexec voxel launch`
 
-A few notes: by default, this will all happen under $HOME. If you don't like that or need
-to improve performance by using a separate disk, there are some knobs set via `voxel config set`:
+A few notes: by default, this will all happen under $HOME. If you don't like
+that or need to improve performance by using a separate disk, there are some
+knobs set via `voxel config set`:
 
 * falcon.dataset: Location for built control plane snapshots, exported as
   `FALCON_DATASET`, with images and topo zvols under `<ds>/img/...`
-* falcon.build_root: Location where omicron will clone and compile for new images,
-  exported as `BUILD_ROOT`, holding the omicron checkout
-* falcon.workdir: Location where voxel will do its configuration and setup for new launches
+* falcon.build_root: Location where omicron will clone and compile for new
+  images, exported as `BUILD_ROOT`, holding the omicron checkout
+* falcon.workdir: Location where voxel will do its configuration and setup for
+  new launches
+* falcon.ssh_pubkey: SSH public key staged into every node, allowing
+  `ssh root@<node>` to authenticate by key rather than the empty root password.
+  This defaults to the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`,
+  `id_rsa.pub`. When the key has a non-standard name, set it directly:
+  `voxel config set falcon.ssh_pubkey ~/.ssh/github_ed25519.pub`
 
 ## Privileges
 

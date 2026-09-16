@@ -669,7 +669,128 @@ pub(crate) fn stage_config(
         // One fleet for the rack, staged on the host instead of in each zone.
         stage_sp_emu(cfg, &fleet, &sp_fleet_dir(rack), fw.as_deref())?;
     }
+
+    stage_ssh_pubkey(cfg)?;
     Ok(())
+}
+
+const SSH_PUBKEY_CANDIDATES: &[&str] =
+    &["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"];
+
+fn stage_ssh_pubkey(cfg: &VoxelConfig) -> anyhow::Result<()> {
+    let ssh_dir = std::env::var("HOME")
+        .ok()
+        .map(|dir| Utf8PathBuf::from(dir).join(".ssh"));
+    stage_ssh_pubkey_in(cfg, Utf8Path::new(CARGO_BAY), ssh_dir.as_deref())
+}
+
+fn stage_ssh_pubkey_in(
+    cfg: &VoxelConfig,
+    cargo_root: &Utf8Path,
+    ssh_dir: Option<&Utf8Path>,
+) -> anyhow::Result<()> {
+    let body = if cfg.falcon.ssh_pubkey_disabled {
+        eprintln!(
+            "[voxel] staging empty root authorized keys into the cargo-bays"
+        );
+        Some(String::new())
+    } else {
+        let path = match &cfg.falcon.ssh_pubkey {
+            Some(p) => {
+                let p = Utf8PathBuf::from(p);
+                if !p.is_file() {
+                    bail!("[falcon].ssh_pubkey '{p}' does not exist");
+                }
+                Some(p)
+            }
+            None => ssh_dir.and_then(|ssh| {
+                SSH_PUBKEY_CANDIDATES
+                    .iter()
+                    .map(|file| ssh.join(file))
+                    .find(|path| path.is_file())
+            }),
+        };
+        path.map(|path| -> anyhow::Result<String> {
+            let body = read_ssh_pubkey(&path)
+                .with_context(|| format!("ssh public key {path}"))?;
+            eprintln!(
+                "[voxel] staging ssh public key {path} into the cargo-bays"
+            );
+            Ok(body)
+        })
+        .transpose()?
+    };
+
+    cfg.sleds()
+        .into_iter()
+        .map(|s| s.name)
+        .chain(cfg.topology.routers.iter().cloned())
+        .try_for_each(|node| {
+            let dir = cargo_root.join(&node);
+            let path = dir.join("root_authorized_keys");
+            match &body {
+                Some(body) => {
+                    fs::create_dir_all(&dir)
+                        .with_context(|| format!("create {dir}"))?;
+                    fs::write(&path, body)
+                        .with_context(|| format!("write {path}"))
+                }
+                None => match fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(())
+                    }
+                    Err(e) => Err(e).with_context(|| format!("remove {path}")),
+                },
+            }
+        })
+}
+
+/// Read and validate a public-key file.
+///
+/// Validation is by content, not filename. With cargo-bay mounting into
+/// every guest, an `ssh_pubkey` somehow pointing at a private key
+/// would share the secret with the whole rack! Every non-empty
+/// line in the file must carry a recognized public-key algorithm prefix.
+///
+/// Returns the key file normalized.
+fn read_ssh_pubkey(path: &Utf8Path) -> anyhow::Result<String> {
+    validate_ssh_pubkey(&fs::read_to_string(path)?)
+}
+
+const SSH_PUBKEY_PREFIXES: &[&str] = &[
+    "ssh-ed25519 ",
+    "ssh-rsa ",
+    "ssh-dss ",
+    "ecdsa-sha2-",
+    "sk-ssh-ed25519@",
+    "sk-ecdsa-",
+];
+
+/// The content check behind `read_ssh_pubkey`, split out for testing.
+fn validate_ssh_pubkey(raw: &str) -> anyhow::Result<String> {
+    if raw.contains("PRIVATE KEY") {
+        bail!("this is a private key; refusing to stage it into the guests");
+    }
+    let mut body = String::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if !SSH_PUBKEY_PREFIXES.iter().any(|p| line.starts_with(p)) {
+            bail!(
+                "line does not match an OpenSSH public key: '{}...'",
+                line.chars().take(24).collect::<String>()
+            );
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if body.is_empty() {
+        bail!("no keys found");
+    }
+    Ok(body)
 }
 
 /// Stage the `sp-emu` binary + each emulated SP's flashed hubris image into the
@@ -857,6 +978,130 @@ pub(crate) fn stage_sprockets(cfg: &VoxelConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn staged_ssh_paths(
+        root: &Utf8Path,
+    ) -> impl Iterator<Item = Utf8PathBuf> + '_ {
+        ["g0", "g1", "g2", "g3", "ce", "cr1", "cr2"]
+            .into_iter()
+            .map(|node| root.join(node).join("root_authorized_keys"))
+    }
+
+    #[test]
+    fn stage_ssh_pubkey_disable_overrides_discovery_and_explicit_path()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let cargo = root.join("cargo-bay");
+        let ssh = root.join("ssh");
+        fs::create_dir(&ssh)?;
+        fs::write(
+            ssh.join("id_ed25519.pub"),
+            "ssh-ed25519 AAA discovered\r\n",
+        )?;
+        let mut cfg = VoxelConfig::default();
+
+        stage_ssh_pubkey_in(&cfg, &cargo, Some(&ssh))?;
+        for path in staged_ssh_paths(&cargo) {
+            assert_eq!(
+                fs::read_to_string(path)?,
+                "ssh-ed25519 AAA discovered\n"
+            );
+        }
+
+        cfg.falcon.ssh_pubkey_disabled = true;
+        for explicit in [None, Some(root.join("missing.pub").into_string())] {
+            cfg.falcon.ssh_pubkey = explicit;
+            stage_ssh_pubkey_in(&cfg, &cargo, Some(&ssh))?;
+            for path in staged_ssh_paths(&cargo) {
+                assert!(fs::read(path)?.is_empty());
+            }
+        }
+
+        cfg.falcon.ssh_pubkey_disabled = false;
+        cfg.falcon.ssh_pubkey = None;
+        stage_ssh_pubkey_in(&cfg, &cargo, Some(&ssh))?;
+        for path in staged_ssh_paths(&cargo) {
+            assert_eq!(
+                fs::read_to_string(path)?,
+                "ssh-ed25519 AAA discovered\n"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stage_ssh_pubkey_no_key_removes_staged_files() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let cargo = root.join("cargo-bay");
+        for path in staged_ssh_paths(&cargo) {
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, "ssh-ed25519 AAA previous\n")?;
+        }
+        let cfg = VoxelConfig::default();
+
+        for ssh_dir in [Some(root), None] {
+            stage_ssh_pubkey_in(&cfg, &cargo, ssh_dir)?;
+            for path in staged_ssh_paths(&cargo) {
+                assert!(!path.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stage_ssh_pubkey_explicit_path_is_validated_before_staging()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(temp.path()).unwrap();
+        let cargo = root.join("cargo-bay");
+        let selected = root.join("selected.pub");
+        fs::write(&selected, "ssh-ed25519 AAA selected\n")?;
+        fs::write(root.join("id_ed25519.pub"), "ssh-ed25519 AAA discovered\n")?;
+        let mut cfg = VoxelConfig::default();
+        cfg.falcon.ssh_pubkey = Some(selected.into_string());
+
+        stage_ssh_pubkey_in(&cfg, &cargo, Some(root))?;
+        for path in staged_ssh_paths(&cargo) {
+            assert_eq!(fs::read_to_string(path)?, "ssh-ed25519 AAA selected\n");
+        }
+
+        cfg.falcon.ssh_pubkey = Some(root.join("missing.pub").into_string());
+        assert!(stage_ssh_pubkey_in(&cfg, &cargo, Some(root)).is_err());
+        for path in staged_ssh_paths(&cargo) {
+            assert_eq!(fs::read_to_string(path)?, "ssh-ed25519 AAA selected\n");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_and_normalizes_public_keys() {
+        let out = validate_ssh_pubkey(
+            "ssh-ed25519 AAAC3Nza me@host\r\n\nssh-rsa AAAAB3Nza me@host",
+        )
+        .unwrap();
+
+        assert_eq!(
+            out,
+            "ssh-ed25519 AAAC3Nza me@host\nssh-rsa AAAAB3Nza me@host\n"
+        );
+    }
+
+    /// The cargo-bay is mounted into every guest. A `[falcon].ssh_pubkey`
+    /// pointing at the private half must fail outright.
+    #[test]
+    fn rejects_private_keys_and_non_keys() {
+        let openssh = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk...\n\
+             -----END OPENSSH PRIVATE KEY-----\n";
+        assert!(validate_ssh_pubkey(openssh).is_err());
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n\
+                   -----END RSA PRIVATE KEY-----\n";
+        assert!(validate_ssh_pubkey(pem).is_err());
+        assert!(validate_ssh_pubkey("not a key at all\n").is_err());
+        assert!(validate_ssh_pubkey("\n\n").is_err());
+        assert!(validate_ssh_pubkey("").is_err());
+    }
 
     /// A stand-in checkout carrying the two files the sled-schema detection
     /// reads: the sled-agent config field and the sled-hardware enum variants.

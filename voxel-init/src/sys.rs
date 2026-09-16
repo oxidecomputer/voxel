@@ -7,6 +7,9 @@
 //! every step is visible and best-effort steps log a warning instead of
 //! aborting. Mirror that—`run`/`run_quiet` never panic and return success.
 
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Parsed `/opt/cargo-bay/external-net` (voxel-managed isolated segment). All
@@ -68,6 +71,55 @@ pub fn note(msg: impl AsRef<str>) {
 /// A non-fatal warning (mirrors the scripts' `echo WARN: ...`).
 pub fn warn(msg: impl AsRef<str>) {
     println!("[voxel-init] WARN: {}", msg.as_ref());
+}
+
+pub fn sync_authorized_keys(staged: &str) {
+    sync_authorized_keys_in(Path::new(staged), Path::new("/root/.ssh"));
+}
+
+fn sync_authorized_keys_in(staged: &Path, dir: &Path) {
+    let keys = match fs::read_to_string(staged) {
+        Ok(k) => k,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn(format!("authorized_keys: read {}: {e}", staged.display()));
+            return;
+        }
+    };
+
+    if let Err(e) =
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    {
+        warn(format!("authorized_keys: {}: {e}", dir.display()));
+        return;
+    }
+
+    let out = keys
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .fold(String::new(), |mut out, line| {
+            out.push_str(line);
+            out.push('\n');
+            out
+        });
+
+    let path = dir.join("authorized_keys");
+    if let Err(e) = fs::write(&path, &out) {
+        warn(format!("authorized_keys: write: {e}"));
+        return;
+    }
+
+    if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    {
+        warn(format!("authorized_keys: chmod {}: {e}", dir.display()));
+    }
+
+    if let Err(e) =
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+    {
+        warn(format!("authorized_keys: chmod {}: {e}", path.display()));
+    }
 }
 
 /// Apply literal `(from, to)` substitutions to `path` in one rewrite. Both role
@@ -134,5 +186,96 @@ pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_staged_keys_preserve_existing_file() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join(".ssh");
+        fs::create_dir(&dir)?;
+        let path = dir.join("authorized_keys");
+        let keys = b"ssh-ed25519 AAA existing\n";
+        fs::write(&path, keys)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
+
+        sync_authorized_keys_in(&temp.path().join("missing"), &dir);
+
+        assert_eq!(fs::read(&path)?, keys);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_staged_keys_do_not_create_directory() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join(".ssh");
+
+        sync_authorized_keys_in(&temp.path().join("missing"), &dir);
+
+        assert!(!dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_staged_keys_preserve_existing_file() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join(".ssh");
+        fs::create_dir(&dir)?;
+        let path = dir.join("authorized_keys");
+        let keys = b"ssh-ed25519 AAA existing\n";
+        fs::write(&path, keys)?;
+        let staged = temp.path().join("staged");
+        fs::write(&staged, b"\xff")?;
+
+        sync_authorized_keys_in(&staged, &dir);
+
+        assert_eq!(fs::read(&path)?, keys);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_keys_replace_existing_file() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join(".ssh");
+        fs::create_dir(&dir)?;
+        let path = dir.join("authorized_keys");
+        fs::write(&path, b"ssh-ed25519 AAA existing\n")?;
+        let staged = temp.path().join("staged");
+        fs::write(&staged, b"ssh-ed25519 AAA staged\r\n\r\n")?;
+
+        for _ in 0..2 {
+            sync_authorized_keys_in(&staged, &dir);
+
+            assert_eq!(fs::read(&path)?, b"ssh-ed25519 AAA staged\n");
+            assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                fs::metadata(&path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_staged_keys_clear_installed_keys() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join(".ssh");
+        let staged = temp.path().join("staged");
+        let path = dir.join("authorized_keys");
+
+        fs::write(&staged, b"ssh-ed25519 AAA staged\n")?;
+        sync_authorized_keys_in(&staged, &dir);
+        assert_eq!(fs::read(&path)?, b"ssh-ed25519 AAA staged\n");
+
+        fs::write(&staged, b"")?;
+        sync_authorized_keys_in(&staged, &dir);
+        assert_eq!(fs::read(&path)?, b"");
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
     }
 }
