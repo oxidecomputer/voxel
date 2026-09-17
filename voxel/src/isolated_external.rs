@@ -75,7 +75,7 @@ fn probe(cmd: &str, args: &[&str]) -> bool {
 
 /// Capture a read-only probe's stdout (`None` on spawn failure or non-zero
 /// exit).
-fn probe_out(cmd: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn probe_out(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {
         return None;
