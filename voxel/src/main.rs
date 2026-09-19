@@ -794,16 +794,14 @@ async fn main() -> Result<(), Error> {
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
         Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
-            rack::cmd_launch(
-                &load_config(&config_path)?,
-                &cli.name,
-                *no_progress,
-                *no_route,
-                *emu,
-                *init_rss,
-                sp_firmware.as_deref(),
-            )
-            .await
+            let opts = rack::LaunchOpts {
+                no_progress: *no_progress,
+                no_route: *no_route,
+                emu: *emu,
+                init_rss: *init_rss,
+                sp_firmware: sp_firmware.as_deref(),
+            };
+            rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
         }
         Cmd::WicketDryrun { config_rss, sleds } => {
             wicket_setup::dryrun(config_rss, *sleds)
