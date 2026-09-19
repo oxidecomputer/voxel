@@ -88,12 +88,18 @@ enum Cmd {
         #[arg(long)]
         no_route: bool,
         /// Run the rack on emulated hardware: real-firmware SPs and RoTs on
-        /// `sp-emu` instead of `sp-sim`, with rack setup driven through wicketd.
+        /// `sp-emu` instead of `sp-sim`. Rack setup goes through wicketd's
+        /// commission API as on every launch.
         ///
         /// Firmware comes from the image's own TUF repo (`image create
         /// --from-tuf`), so an --emu rack runs the release it reports.
         #[arg(long)]
         emu: bool,
+        /// Let sled-agent initialize the rack itself from a staged
+        /// config-rss.toml instead of driving setup through wicketd's
+        /// commission API. sp-sim only.
+        #[arg(long, conflicts_with = "emu")]
+        init_rss: bool,
         /// Run the emulated fleet on the firmware in DIR instead of the
         /// image's own: sp-gimlet-c.zip, sp-sidecar-c.zip, rot-a.zip and
         /// bootleby.zip, laid out as `image create --from-tuf` extracts them.
@@ -103,8 +109,9 @@ enum Cmd {
         #[arg(long, value_name = "DIR", value_parser = abs_path)]
         sp_firmware: Option<Utf8PathBuf>,
     },
-    /// (debug) Print the wicketd RSS config body that `--wicket-setup` would PUT,
-    /// reshaped from a generated config-rss.toml (validates the mapping offline).
+    /// (debug) Print the wicketd RSS config body the legacy wicketd path would
+    /// PUT, reshaped from a generated config-rss.toml (validates the mapping
+    /// offline). Launch drives setup through the commission API instead.
     #[command(hide = true)]
     WicketDryrun {
         /// Path to a generated config-rss.toml.
@@ -818,19 +825,15 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route, emu, sp_firmware } => {
-            // One flag: emulated SPs, the RoT bridge on top of them, and
-            // wicketd-driven setup are the same configuration in practice, and
-            // the combinations that split them apart are not worth carrying.
-            rack::cmd_launch(
-                &load_config(&config_path)?,
-                &cli.name,
-                *no_progress,
-                *no_route,
-                *emu,
-                sp_firmware.as_deref(),
-            )
-            .await
+        Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
+            let opts = rack::LaunchOpts {
+                no_progress: *no_progress,
+                no_route: *no_route,
+                emu: *emu,
+                init_rss: *init_rss,
+                sp_firmware: sp_firmware.as_deref(),
+            };
+            rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
         }
         Cmd::WicketDryrun { config_rss, sleds } => {
             wicket_setup::dryrun(config_rss, *sleds)

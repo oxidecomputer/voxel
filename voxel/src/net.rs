@@ -147,12 +147,21 @@ pub(crate) async fn resolve_external_ip(
     is_router: bool,
 ) -> anyhow::Result<String> {
     if cfg.external.isolated()
-        && let Some((_, ip)) =
-            cfg.static_external_ips().into_iter().find(|(name, _)| name == node)
+        && let Some(ip) = static_external_ip(cfg, node)
     {
         return Ok(ip);
     }
     node_external_ip(d, n, is_router).await
+}
+
+/// A node's address in isolated mode's static numbering, None if it has none.
+pub(crate) fn static_external_ip(
+    cfg: &voxel_config::VoxelConfig,
+    node: &str,
+) -> Option<String> {
+    cfg.static_external_ips()
+        .into_iter()
+        .find_map(|(name, ip)| (name == node).then_some(ip))
 }
 
 /// ce's stable nexthop, when one is known without touching the guest. An
@@ -165,9 +174,7 @@ pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
     if !cfg.external.isolated() {
         return None;
     }
-    cfg.static_external_ips()
-        .into_iter()
-        .find_map(|(name, ip)| (name == "ce").then_some(ip))
+    static_external_ip(cfg, "ce")
 }
 
 /// A node's external (host-LAN) IPv4 - the address `voxel route` points at and

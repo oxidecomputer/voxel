@@ -318,9 +318,9 @@ fn sleep2() {
 ///
 /// Deliberately NOT baked, kept ephemeral or per-launch: `xtask
 /// virtual-hardware create` (per-node emulated U.2/M.2), `scadm propolis
-/// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet - flashing
-/// hubris images is a runtime concern, so `voxel launch --emu-sp` stages and
-/// flashes it per-scrimlet from the `[sp]` config instead.
+/// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet. Flashing
+/// hubris images is a runtime concern, so `voxel launch --emu` stages the fleet
+/// on the host per launch from the image's firmware (or `--sp-firmware`).
 pub fn build_control_plane_image() -> Result<()> {
     let version =
         std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());

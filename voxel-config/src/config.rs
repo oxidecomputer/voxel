@@ -843,7 +843,7 @@ impl Default for RecoverySiloCfg {
 
 impl VoxelConfig {
     /// Routers other than ce.
-    fn fabric_router_count(&self) -> usize {
+    pub fn fabric_router_count(&self) -> usize {
         self.topology.routers.iter().filter(|r| r.as_str() != "ce").count()
     }
 

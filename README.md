@@ -214,8 +214,7 @@ Notes:
 
 By default voxel backs each SP with omicron's `sp-sim`. To run real SP and RoT
 firmware, voxel uses [sp-emu], which boots unmodified Hubris on emulated
-STM32H7 and LPC55 cores. sp-emu is a separate binary
-run inside the switch zone, not a Cargo dependency, so build it and point voxel at it.
+STM32H7 and LPC55 cores.
 
 1. Build sp-emu:
 
@@ -239,9 +238,11 @@ run inside the switch zone, not a Cargo dependency, so build it and point voxel 
    voxel launch --emu
    ```
 
-   `--emu` runs real SP and RoT firmware behind MGS and drives rack setup
-   through wicketd (the real operator flow) rather than the file-based
-   sled-agent auto-init.
+   `--emu` runs stock SP and RoT firmware behind MGS. Rack setup goes
+   through wicketd's commission API on every
+   launch, `--emu` or not; `launch --init-rss` is the sp-sim-only shortcut
+   that stages a config-rss.toml for sled-agent to initialize the rack
+   itself.
 
 The firmware itself comes from the image's own TUF repo: `image create
 --from-tuf` extracts the gimlet and sidecar SP archives, the RoT slot A image
@@ -249,7 +250,7 @@ and the RoT bootloader, and stamps their location on the image, so a rack
 cannot boot firmware that disagrees with the release it reports.
 
 To boot *different* firmware - which is how you give a firmware update
-something to do, or test a hubris change - name the images in `[sp]` and they
+something to do, or test a hubris change, name the images in `[sp]` and they
 win over the image's own:
 
 ```toml

@@ -611,8 +611,9 @@ fn apply_helios_build_env(cmd: &mut Command) {
 /// the service pool at RSS time and can move between pool members, so probe
 /// the candidates for a live HTTP listener.
 ///
-/// TLS-only racks (`--wicket-setup` uploads a self-signed certificate with
-/// DNS-only SANs) are refused rather than guessed at. Therefore, commtest's
+/// TLS-only racks (commission-driven setup, the launch default, uploads a
+/// self-signed certificate with DNS-only SANs) are refused rather than guessed
+/// at. Therefore, commtest's
 /// oxide client has no way to trust that certificate on a raw-IP URL, so
 /// handing it a `https://` base would spin its API wait until the 60 minute
 /// timeout.
@@ -638,9 +639,10 @@ fn derive_api(network: &Network) -> anyhow::Result<String> {
     }
     if let Some(host) = live_on(443) {
         bail!(
-            "the rack API at {host} answers on 443 only (a `--wicket-setup` rack's \
-             self-signed certificate); commtest cannot validate that certificate, \
-             so pass --api with an endpoint it can reach"
+            "the rack API at {host} answers on 443 only (the self-signed \
+             certificate a commission-driven launch uploads); commtest cannot \
+             validate that certificate, so pass --api with an endpoint it can \
+             reach, or launch with --init-rss for a plain-HTTP rack"
         );
     }
     Ok(match candidates.first() {
