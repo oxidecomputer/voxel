@@ -4,22 +4,25 @@
 
 //! Read a TUF repo zip as an image source: the control plane zones, the
 //! measurement corpus, the host OS phase 2 payload, and the omicron commit
-//! the repo was built from. Targets are streamed out with `unzip -p`; only
-//! the index is held in memory. Composites are GNU tar format, which illumos
-//! tar rejects, so streams are unpacked in process.
+//! the repo was built from. Members are streamed out of the zip in process
+//! (no unzip binary on the host); only the index is held in memory.
+//! Composites are GNU tar format, which illumos tar rejects, so those streams
+//! are unpacked in process too.
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use zip::ZipArchive;
+use zip::read::ZipFile;
 
 /// `BootImageHeader` magic + fixed size (nexus_sled_agent_shared); the phase 2
 /// artifact is this header followed by a raw ZFS pool image.
 const BOOT_IMAGE_MAGIC: u32 = 0x1deb0075;
 const BOOT_IMAGE_HEADER_SIZE: usize = 4096;
 
-type MemberArchive = tar::Archive<flate2::read::GzDecoder<ChildStdout>>;
+type MemberArchive<'a> =
+    tar::Archive<flate2::read::GzDecoder<ZipFile<'a, File>>>;
 
 /// A parsed TUF repo zip (`tufaceous` v1 layout: `repo/targets/<sha>.<name>`).
 pub(crate) struct TufRepoSource {
@@ -72,7 +75,9 @@ impl TufRepoSource {
         if !path.exists() {
             bail!("TUF repo {path} not found");
         }
-        let members = zip_members(path)?;
+        let mut zip = open_zip(path)?;
+        let members: Vec<String> =
+            zip.file_names().map(str::to_string).collect();
         // Prefer the v1 index; every repo that carries v2 carries v1 too.
         let index = members
             .iter()
@@ -83,7 +88,10 @@ impl TufRepoSource {
             .with_context(|| {
                 format!("{path} has no artifacts index under repo/targets/")
             })?;
-        let raw = zip_read(path, index)?;
+        let mut raw = Vec::new();
+        member(&mut zip, index)?
+            .read_to_end(&mut raw)
+            .with_context(|| format!("read {index}"))?;
         let json: serde_json::Value = serde_json::from_slice(&raw)
             .with_context(|| format!("parse {index}"))?;
         let system_version = json
@@ -162,7 +170,8 @@ impl TufRepoSource {
         dir: &Utf8Path,
     ) -> Result<Vec<String>> {
         fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
-        let (mut child, mut archive) = self.member_tar(&self.control_plane)?;
+        let mut zip = self.open()?;
+        let mut archive = member_tar(&mut zip, &self.control_plane)?;
         let mut names = Vec::new();
         for entry in
             archive.entries().context("read control plane composite entries")?
@@ -183,7 +192,6 @@ impl TufRepoSource {
                 .with_context(|| format!("unpack {name} into {dir}"))?;
             names.push(name);
         }
-        wait_ok(&mut child, &self.control_plane)?;
         if names.is_empty() {
             bail!("control plane composite in {} carried no zones", self.path);
         }
@@ -199,10 +207,9 @@ impl TufRepoSource {
             bail!("{} has no measurement_corpus targets", self.path);
         }
         fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
-        for (member, target) in &self.corpus {
-            let bytes = zip_read(&self.path, member)?;
-            fs::write(dir.join(target), bytes)
-                .with_context(|| format!("write corpus {target}"))?;
+        let mut zip = self.open()?;
+        for (m, target) in &self.corpus {
+            extract_member(&mut zip, m, &dir.join(target))?;
         }
         Ok(self.corpus.len())
     }
@@ -216,7 +223,8 @@ impl TufRepoSource {
         boot_image_dest: &Utf8Path,
         phase1_dest: &Utf8Path,
     ) -> Result<(u64, u64)> {
-        let (mut child, mut archive) = self.member_tar(&self.host)?;
+        let mut zip = self.open()?;
+        let mut archive = member_tar(&mut zip, &self.host)?;
         let mut boot_image = None;
         let mut phase1 = None;
         for entry in archive.entries().context("read host composite entries")? {
@@ -261,10 +269,6 @@ impl TufRepoSource {
                 break;
             }
         }
-        // Entries can follow; drop the reader so unzip sees EPIPE instead of
-        // blocking on a full pipe under wait().
-        drop(archive);
-        wait_ok(&mut child, &self.host)?;
         let need = |v: Option<u64>, what: &str| {
             v.with_context(|| {
                 format!("host artifact in {} carries no {what}", self.path)
@@ -293,23 +297,24 @@ impl TufRepoSource {
                 })
         };
 
+        let mut zip = self.open()?;
         let gimlet = dir.join(format!("sp-{GIMLET_BOARD}.zip"));
-        zip_extract(&self.path, find("gimlet_sp", GIMLET_BOARD)?, &gimlet)?;
+        extract_member(&mut zip, find("gimlet_sp", GIMLET_BOARD)?, &gimlet)?;
         let sidecar = dir.join(format!("sp-{SIDECAR_BOARD}.zip"));
-        zip_extract(&self.path, find("switch_sp", SIDECAR_BOARD)?, &sidecar)?;
+        extract_member(&mut zip, find("switch_sp", SIDECAR_BOARD)?, &sidecar)?;
 
         let bootleby = dir.join("bootleby.zip");
         let boot_name = format!("gimlet_rot_bootloader-{BOOTLOADER_VARIANT}");
-        zip_extract(
-            &self.path,
+        extract_member(
+            &mut zip,
             find("gimlet_rot_bootloader", &boot_name)?,
             &bootleby,
         )?;
 
         // The RoT composite holds archive-a.zip and archive-b.zip; slot A is
         // what launch flashes, and bootleby verifies it.
-        let rot_member = find("gimlet_rot", ROT_VARIANT)?.to_string();
-        let (mut child, mut archive) = self.member_tar(&rot_member)?;
+        let rot_member = find("gimlet_rot", ROT_VARIANT)?;
+        let mut archive = member_tar(&mut zip, rot_member)?;
         let mut rot_a = None;
         for entry in archive.entries().context("read RoT composite entries")? {
             let mut entry = entry?;
@@ -325,8 +330,6 @@ impl TufRepoSource {
             rot_a = Some(dest);
             break;
         }
-        drop(archive);
-        wait_ok(&mut child, &rot_member)?;
         let rot_a = rot_a.with_context(|| {
             format!("{ROT_VARIANT} in {} carries no archive-a.zip", self.path)
         })?;
@@ -348,29 +351,67 @@ impl TufRepoSource {
     /// Every `repo/targets/<sha256>.<name>` member with its sha.
     pub(crate) fn target_members(&self) -> Result<Vec<(String, String)>> {
         let mut v = Vec::new();
-        for m in zip_members(&self.path)? {
+        for m in self.open()?.file_names() {
             let Some(base) = m.strip_prefix("repo/targets/") else {
                 continue;
             };
             let Some((sha, _)) = base.split_once('.') else { continue };
             if sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
-                v.push((sha.to_string(), m));
+                v.push((sha.to_string(), m.to_string()));
             }
         }
         Ok(v)
     }
 
-    /// Stream one composite member as a tar archive.
-    fn member_tar(&self, member: &str) -> Result<(Child, MemberArchive)> {
-        let mut child = Command::new("unzip")
-            .args(["-p", self.path.as_str(), member])
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("spawn unzip -p")?;
-        let stdout = child.stdout.take().context("unzip stdout")?;
-        let archive = tar::Archive::new(flate2::read::GzDecoder::new(stdout));
-        Ok((child, archive))
+    fn open(&self) -> Result<ZipArchive<File>> {
+        open_zip(&self.path)
     }
+}
+
+/// Open a repo zip; the central directory is parsed here, members are read
+/// on demand.
+fn open_zip(path: &Utf8Path) -> Result<ZipArchive<File>> {
+    let file = File::open(path).with_context(|| format!("open {path}"))?;
+    ZipArchive::new(file).with_context(|| format!("read {path} (not a zip?)"))
+}
+
+/// A streaming reader over one member.
+fn member<'a>(
+    zip: &'a mut ZipArchive<File>,
+    name: &str,
+) -> Result<ZipFile<'a, File>> {
+    zip.by_name(name).with_context(|| format!("zip member {name}"))
+}
+
+/// Stream one composite member as a tar archive.
+fn member_tar<'a>(
+    zip: &'a mut ZipArchive<File>,
+    name: &str,
+) -> Result<MemberArchive<'a>> {
+    let file = member(zip, name)?;
+    Ok(tar::Archive::new(flate2::read::GzDecoder::new(file)))
+}
+
+/// Stream one member to `dest`, as is, returning its size.
+fn extract_member(
+    zip: &mut ZipArchive<File>,
+    name: &str,
+    dest: &Utf8Path,
+) -> Result<u64> {
+    let mut src = member(zip, name)?;
+    let mut out =
+        File::create(dest).with_context(|| format!("create {dest}"))?;
+    std::io::copy(&mut src, &mut out)
+        .with_context(|| format!("write {name} to {dest}"))
+}
+
+/// Copy one member of the repo zip at `path` to `dest`, returning its size.
+pub(crate) fn extract_from(
+    path: &Utf8Path,
+    name: &str,
+    dest: &Utf8Path,
+) -> Result<u64> {
+    extract_member(&mut open_zip(path)?, name, dest)
 }
 
 /// Copy `boot_image` minus its 4096 byte header to `dest`: the raw ZFS pool
@@ -387,58 +428,6 @@ pub(crate) fn strip_boot_image_header(
         fs::File::create(dest).with_context(|| format!("create {dest}"))?;
     std::io::copy(&mut src, &mut out)
         .with_context(|| format!("write phase 2 payload to {dest}"))
-}
-
-fn wait_ok(child: &mut Child, member: &str) -> Result<()> {
-    let status = child.wait().context("wait for unzip")?;
-    // The tar reader stops at the archive's logical end; unzip may still be
-    // writing zip padding and exit on EPIPE, which is not a failure here.
-    if !status.success() && status.code().is_some_and(|c| c != 141) {
-        bail!("unzip -p {member} exited with {status}");
-    }
-    Ok(())
-}
-
-/// `unzip -Z1`: one member path per line.
-fn zip_members(path: &Utf8Path) -> Result<Vec<String>> {
-    let out = Command::new("unzip")
-        .args(["-Z1", path.as_str()])
-        .output()
-        .context("run unzip -Z1")?;
-    if !out.status.success() {
-        bail!("unzip -Z1 {path} failed (not a zip?)");
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect())
-}
-
-/// Stream one zip member to `dest`, as is.
-fn zip_extract(path: &Utf8Path, member: &str, dest: &Utf8Path) -> Result<()> {
-    let mut child = Command::new("unzip")
-        .args(["-p", path.as_str(), member])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("spawn unzip -p")?;
-    let mut out = child.stdout.take().context("unzip stdout")?;
-    let mut file =
-        fs::File::create(dest).with_context(|| format!("create {dest}"))?;
-    std::io::copy(&mut out, &mut file)
-        .with_context(|| format!("write {member} to {dest}"))?;
-    wait_ok(&mut child, member)
-}
-
-/// `unzip -p`: stream one member.
-fn zip_read(path: &Utf8Path, member: &str) -> Result<Vec<u8>> {
-    let out = Command::new("unzip")
-        .args(["-p", path.as_str(), member])
-        .output()
-        .with_context(|| format!("unzip -p {member}"))?;
-    if !out.status.success() {
-        bail!("unzip -p {path} {member} failed");
-    }
-    Ok(out.stdout)
 }
 
 /// Parse the short omicron sha out of `<semver>+git<sha>`.

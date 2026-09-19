@@ -215,30 +215,16 @@ fn discover_stores(name: &str, ip: &str) -> Result<Sled> {
     Ok(Sled { name: name.to_string(), ip: ip.to_string(), pools, have })
 }
 
-/// Stream one zip member into the staging dir under its sha name,
-/// returning its size.
+/// Copy one repo member into the staging dir under its sha name, returning
+/// its size.
 fn stage_member(
     repo: &Utf8Path,
     member: &str,
     staging: &Utf8Path,
     sha: &str,
 ) -> Result<u64> {
-    let mut unzip = Command::new("unzip")
-        .args(["-p", repo.as_str(), member])
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("spawn unzip -p")?;
-    let mut out = unzip.stdout.take().context("unzip stdout")?;
-    let dest = staging.join(sha);
-    let mut file =
-        fs::File::create(&dest).with_context(|| format!("create {dest}"))?;
-    let n = std::io::copy(&mut out, &mut file)
-        .with_context(|| format!("stage {member}"))?;
-    let status = unzip.wait().context("wait for unzip")?;
-    if !status.success() {
-        bail!("unzip -p {member} exited with {status}");
-    }
-    Ok(n)
+    crate::tufrepo::extract_from(repo, member, &staging.join(sha))
+        .with_context(|| format!("stage {member}"))
 }
 
 /// An ssh command with voxel's usual empty-root-password access.
