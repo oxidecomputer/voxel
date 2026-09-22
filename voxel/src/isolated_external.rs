@@ -34,23 +34,18 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use voxel_config::External;
 
-/// Etherstub carrying the isolated segment. Distinct from the how-to-run
-/// `fake_external_stub0` name so a manually plumbed fake network can coexist.
+/// Etherstub carrying the isolated segment; distinct from the how-to-run name.
 pub(crate) const STUB: &str = "voxel_ext_stub0";
 /// Host VNIC on the stub; owns the gateway address.
 pub(crate) const VNIC: &str = "voxel_ext0";
 /// ipadm address object on the VNIC.
 const ADDROBJ: &str = "voxel_ext0/external";
 
-/// MTU threshold for voxel-init's underlay classification. A sled NIC is
-/// underlay iff it accepts jumbo frames (mtu=9000). An etherstub comes up at
-/// 9000, so without a cap below this, the sleds' external NICs pass the jumbo
-/// probe, get misclassified as underlay, and never come up. The cap itself
-/// comes from `external.mtu` (default 1500).
+/// voxel-init classifies a sled NIC as underlay iff it accepts this MTU, so the
+/// external segment must stay below it.
 const JUMBO_MTU: u32 = 9000;
 
-/// Refuse an `external.mtu` the jumbo probe can't distinguish from the
-/// underlay.
+/// Refuse an external.mtu the jumbo probe cannot tell from the underlay.
 fn assert_mtu_classifiable(mtu: u32) -> anyhow::Result<()> {
     if mtu >= JUMBO_MTU {
         bail!(
@@ -62,7 +57,7 @@ fn assert_mtu_classifiable(mtu: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run a read-only probe (true when it exits 0).
+/// Run a read-only probe, true when it exits 0.
 fn probe(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
         .args(args)
@@ -73,8 +68,7 @@ fn probe(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Capture a read-only probe's stdout (`None` on spawn failure or non-zero
-/// exit).
+/// A read-only probe's stdout, None on spawn failure or non-zero exit.
 pub(crate) fn probe_out(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {
@@ -83,12 +77,10 @@ pub(crate) fn probe_out(cmd: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Run a mutating host command under pfexec, or print it under `--dry-run`.
-/// Whether `up`/`down` apply their host changes or only print them. A bare
-/// `bool` at these call sites reads as an unexplained `false`.
+/// Whether up and down apply their host changes or only print them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DryRun {
-    /// Print the `pfexec` commands without running them.
+    /// Print the pfexec commands without running them.
     Yes,
     /// Apply the changes.
     No,
@@ -120,7 +112,7 @@ fn run(dry_run: bool, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create a temporary static address `addr` on `addrobj` via `ipadm`.
+/// Create a temporary static address addr on addrobj via ipadm.
 fn create_addr(dry_run: bool, addrobj: &str, addr: &str) -> anyhow::Result<()> {
     run(
         dry_run,
@@ -137,15 +129,13 @@ fn create_addr(dry_run: bool, addrobj: &str, addr: &str) -> anyhow::Result<()> {
     )
 }
 
-/// The uplink's `dladm show-phys` state, or `None` when the link is absent.
+/// The uplink's dladm show-phys state, None when the link is absent.
 fn uplink_state(link: &str) -> Option<String> {
     probe_out("dladm", &["show-phys", "-p", "-o", "state", link])
         .map(|s| s.trim().to_string())
 }
 
-/// A link's current MTU.
-///
-/// Returns `None` when the link is absent.
+/// A link's current MTU, None when the link is absent.
 pub(crate) fn link_mtu(link: &str) -> Option<String> {
     probe_out(
         "dladm",
@@ -154,10 +144,8 @@ pub(crate) fn link_mtu(link: &str) -> Option<String> {
     .map(|s| s.trim().to_string())
 }
 
-/// Every host IPv4 address currently plumbed, minus the segment's own VNIC
-/// (so `up` stays idempotent), loopback, and link-local. `ipadm show-addr -p
-/// -o addrobj,addr` prints one entry per line, e.g. `igb0/dhcp:172.20.0.5/24`,
-/// or `tun0/v4:100.121.38.79->100.121.38.79` for point-to-point interfaces.
+/// Every plumbed host IPv4 address except the segment's own VNIC, loopback and
+/// link-local.
 fn host_v4_addrs() -> Vec<Ipv4Net> {
     let Some(out) =
         probe_out("ipadm", &["show-addr", "-p", "-o", "addrobj,addr"])
@@ -173,10 +161,8 @@ fn host_v4_addrs() -> Vec<Ipv4Net> {
         .collect()
 }
 
-/// Parse one `ipadm` address column entry. Point-to-point entries (VPN and
-/// tunnel interfaces) print as `local->peer` with no prefix length and would
-/// otherwise fail the CIDR parse and silently vanish from the overlap check.
-/// The local side is what the host owns, so treat it as a /32.
+/// Parse one ipadm address entry. Point-to-point entries print as local->peer
+/// with no prefix; the local side is taken as a /32.
 fn parse_host_addr(addr: &str) -> Option<Ipv4Net> {
     match addr.split_once("->") {
         Some((local, _)) => {
@@ -187,10 +173,7 @@ fn parse_host_addr(addr: &str) -> Option<Ipv4Net> {
     }
 }
 
-/// Refuse an `external.subnet` that overlaps an address the host already owns.
-/// A collision would either steal traffic from an existing network or make
-/// the segment unreachable via the wrong route. Either way, no automatic
-/// recovery.
+/// Refuse an external.subnet that overlaps an address the host already owns.
 fn assert_subnet_disjoint(subnet: &str) -> anyhow::Result<()> {
     let cfg: Ipv4Net = subnet.parse().with_context(|| {
         format!("external.subnet '{subnet}' must be CIDR (a.b.c.d/len)")
@@ -206,9 +189,7 @@ fn assert_subnet_disjoint(subnet: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refuse to NAT out a link that isn't up.
-// A typo'd uplink would otherwise wire the segment to a dead link and fail
-// silently.
+/// Refuse to NAT out a link that is not up.
 fn assert_uplink_up(link: &str) -> anyhow::Result<()> {
     match uplink_state(link).as_deref() {
         Some("up") => Ok(()),
@@ -220,7 +201,7 @@ fn assert_uplink_up(link: &str) -> anyhow::Result<()> {
     }
 }
 
-/// The two how-to-run NAT rules (portmap for tcp/udp, bare map for the rest).
+/// The two how-to-run NAT rules: portmap for tcp/udp, bare map for the rest.
 fn nat_rules(uplink: &str, subnet: &str) -> [String; 2] {
     [
         format!("map {uplink} {subnet} -> 0/32 portmap tcp/udp auto"),
@@ -228,28 +209,26 @@ fn nat_rules(uplink: &str, subnet: &str) -> [String; 2] {
     ]
 }
 
-/// Whether the subnet's map rules are already loaded (`ipnat -l` needs privs).
+/// Whether the subnet's map rules are already loaded; ipnat -l needs privs.
 fn nat_loaded(uplink: &str, subnet: &str) -> bool {
-    // Match on the rule prefix only. `ipnat -l` prints the target normalized
-    // (`0/32` becomes `0.0.0.0/32`), so the full rule text would never match.
+    // ipnat -l prints the target normalized (0/32 as 0.0.0.0/32), so match the
+    // rule prefix only.
     probe_out("pfexec", &["ipnat", "-l"])
         .is_some_and(|l| l.contains(&format!("map {uplink} {subnet}")))
 }
 
-/// Append the NAT rules via `ipnat -f -`. This is append-only and never
-/// flushes, so unrelated rules survive.
+/// Append the NAT rules via ipnat -f -, which never flushes other rules.
 fn load_nat(uplink: &str, subnet: &str, dry_run: bool) -> anyhow::Result<()> {
     pipe_nat(uplink, subnet, &["ipnat", "-f", "-"], dry_run)
 }
 
-/// Remove the NAT rules via `ipnat -r -f -`. The `-r` flag deletes exactly
-/// the rules matching the piped text, so unrelated rules survive. Removing
-/// an absent rule prints a warning but exits 0, which keeps this idempotent.
+/// Remove the NAT rules via ipnat -r -f -, which deletes only the rules
+/// matching the piped text. Removing an absent rule exits 0.
 fn unload_nat(uplink: &str, subnet: &str, dry_run: bool) -> anyhow::Result<()> {
     pipe_nat(uplink, subnet, &["ipnat", "-r", "-f", "-"], dry_run)
 }
 
-/// Pipe the subnet's rule text into `pfexec <args>` on stdin.
+/// Pipe the subnet's rule text into pfexec <args> on stdin.
 fn pipe_nat(
     uplink: &str,
     subnet: &str,
@@ -283,15 +262,8 @@ fn pipe_nat(
     Ok(())
 }
 
-/// Stand the isolated segment up. This is safe to call on every launch,
-/// as each step is guarded by its `show-*` probe and skipped once satisfied.
-///
-/// # Errors
-///
-/// Fails when `uplink` is unset or not up, when `mtu` reaches the jumbo
-/// threshold, when `subnet` is not CIDR or overlaps a host-owned address, or
-/// when one of the underlying `dladm`/`ipadm`/`routeadm`/`ipnat` commands
-/// fails.
+/// Stand the isolated segment up. Each step is guarded by its show probe, so
+/// this is safe on every launch.
 pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
     let dry_run = dry_run.applies();
     let uplink = x.uplink.as_deref().context(
@@ -342,9 +314,8 @@ pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
     match live_addr.as_deref() {
         Some(a) if a == desired_addr => {}
         Some(_) => {
-            // Same addrobj, different address. Falls out when `host_ip` or the
-            // subnet prefix changes across `up` invocations. Delete and
-            // re-create so nodes staged with the new gateway can reach us.
+            // The addrobj holds a different address after a host_ip or prefix
+            // change; re-create it so nodes staged with the new gateway reach us.
             run(dry_run, &["ipadm", "delete-addr", ADDROBJ])?;
             create_addr(dry_run, ADDROBJ, &desired_addr)?;
         }
@@ -378,13 +349,8 @@ pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Tear the segment down, including address, interface, VNIC, etherstub, and
-/// the NAT rules. IPv4 forwarding stays enabled (see module doc).
-///
-/// # Errors
-///
-/// Fails when a delete command fails, e.g. the etherstub still carries node
-/// VNICs from a running rack.
+/// Tear the segment down: address, interface, VNIC, etherstub and NAT rules.
+/// IPv4 forwarding stays enabled, being host-global.
 pub(crate) fn down(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
     let dry_run = dry_run.applies();
     eprintln!("[voxel] external: taking down isolated segment");
@@ -415,11 +381,8 @@ pub(crate) fn down(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assert the whole path is live, printing one PASS/FAIL line per item.
-///
-/// # Errors
-///
-/// Fails when any item is missing, so the CLI exit code reflects the result.
+/// Assert the whole path is live, one ok/MISSING line per item; fails when any
+/// item is missing so the exit code reflects it.
 pub(crate) fn check(x: &External) -> anyhow::Result<()> {
     let mut ok = true;
     let mut item = |good: bool, what: &str| {
@@ -449,8 +412,8 @@ pub(crate) fn check(x: &External) -> anyhow::Result<()> {
         ),
     );
     item(probe("dladm", &["show-vnic", VNIC]), &format!("vnic {VNIC}"));
-    // Match on the exact address, not just addrobj existence: a stale addr
-    // from a prior host_ip / subnet-prefix config would otherwise pass.
+    // Match the exact address: a stale one from a prior host_ip or prefix
+    // would otherwise pass.
     let expected = x
         .prefix_length()
         .map(|p| format!("{}/{p}", x.host_ip))

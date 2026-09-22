@@ -13,55 +13,31 @@ use std::time::{Duration, Instant};
 
 use crate::rss::strip_ansi;
 
-/// The switch zone's root as seen from the sled global zone - prepend it to an
-/// in-zone path to reach the same file from the GZ (e.g. `{SWITCH_ZONE_ROOT}{p}`).
-/// Single source for the handful of GZ-rooted switch-zone paths voxel touches.
+/// The switch zone's root as seen from the sled global zone.
 pub(crate) const SWITCH_ZONE_ROOT: &str = "/zone/oxz_switch/root";
 
-/// Absolute path to `route`. Not all invoking shells carry /usr/sbin on PATH
-/// (commtest re-executes voxel under a fresh login), so spawn it absolutely.
+/// Absolute path to route: commtest re-executes voxel under a login shell
+/// that lacks /usr/sbin on PATH.
 pub(crate) const ROUTE: &str = "/usr/sbin/route";
 
-/// The `zlogin` invocation prefix for the switch zone. Use [`zlogin`] to build a
-/// full command; this bare form is for the interactive login (no command).
+/// Bare zlogin prefix for the switch zone, for the interactive login.
 pub(crate) const ZLOGIN: &str = "zlogin oxz_switch";
 
-/// Wrap `cmd` to run inside the switch zone: `zlogin oxz_switch <cmd>`. Single
-/// source for the ~dozen switch-zone command sites (each still adds its own
-/// redirections / quoting around the result).
+/// Wrap cmd to run inside the switch zone.
 pub(crate) fn zlogin(cmd: &str) -> String {
     format!("{ZLOGIN} {cmd}")
 }
 
-/// Soft bound on a serial-console resolution. The exec itself completes in a
-/// few seconds, so blowing this means the console is slow or wedged.
-/// [`serial_bounded`] warns here and keeps waiting rather than cancelling,
-/// because cancelling the exec is what wedges the console.
+/// Soft bound on a serial-console exec: serial_bounded warns here and keeps
+/// waiting, since cancelling the exec is what wedges the console.
 pub(crate) const SERIAL_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Hard bound on a serial-console resolution. Giving up here abandons the exec
-/// mid-flight, which can wedge the console, but a console this far past the
-/// few-second norm is already unusable.
+/// Hard bound on a serial-console exec, past which it is abandoned.
 pub(crate) const SERIAL_RESOLVE_HARD_TIMEOUT: Duration =
     Duration::from_secs(60);
 
-/// Run a serial-console exec under the two-stage deadline. Cancelling an
-/// in-flight falcon exec leaves the console wedged for every later exec (see
-/// [`resolve_external_ip`]), so a slow exec is not cancelled at
-/// [`SERIAL_RESOLVE_TIMEOUT`]. It gets a warning and keeps running to
-/// [`SERIAL_RESOLVE_HARD_TIMEOUT`], where only a console that is already
-/// unusable is abandoned. `what` names the operation in both messages.
-///
-/// The hard deadline is a deliberate trade-off: it still drops the exec
-/// mid-flight, and truly never cancelling would need a detached exec that
-/// falcon's serial API does not offer. These execs answer in a few seconds
-/// on a healthy console, so 60s of silence means the console is already
-/// wedged and there is nothing left for cancellation to break.
-///
-/// # Errors
-///
-/// Fails when the exec itself fails, or with a timeout error past the hard
-/// deadline.
+/// Run a serial-console exec under the two-stage deadline: warn at the soft
+/// bound, abandon at the hard bound. what names the operation in messages.
 pub(crate) async fn serial_bounded<T>(
     what: &str,
     fut: impl Future<Output = anyhow::Result<T>>,
@@ -75,16 +51,8 @@ pub(crate) async fn serial_bounded<T>(
     .await
 }
 
-/// Like [`serial_bounded`], but never waits past `deadline`. Retry loops use
-/// this so one slow attempt cannot stretch their overall window: the hard
-/// deadline shrinks to the window's remainder. Abandoning at the window's
-/// edge carries the same wedge risk as the hard deadline, and these callers
-/// stop using the console once the window closes anyway.
-///
-/// # Errors
-///
-/// As [`serial_bounded`], with the timeout landing at `deadline` when that
-/// comes first.
+/// Like serial_bounded, but never waits past deadline, so one slow attempt
+/// cannot stretch a retry loop's window.
 pub(crate) async fn serial_bounded_within<T>(
     what: &str,
     deadline: Instant,
@@ -100,7 +68,7 @@ pub(crate) async fn serial_bounded_within<T>(
     .await
 }
 
-/// Shared two-stage implementation: warn at `soft`, abandon at `hard`.
+/// Shared two-stage implementation: warn at soft, abandon at hard.
 async fn serial_bounded_caps<T>(
     what: &str,
     soft: Duration,
@@ -130,15 +98,8 @@ async fn serial_bounded_caps<T>(
     )
 }
 
-/// Resolve a node's external IPv4 without entering the guest when possible.
-/// Isolated mode numbers every node deterministically
-/// ([`VoxelConfig::static_external_ips`]), so we return the staged address
-/// directly. The fallback, [`node_external_ip`], execs over the falcon serial
-/// console, which wedges permanently if a prior exec was cancelled mid-flight
-/// (see [`ssh_output`]). Prefer this resolver wherever the config and node
-/// name are in hand.
-///
-/// [`VoxelConfig::static_external_ips`]: voxel_config::VoxelConfig::static_external_ips
+/// A node's external IPv4: the staged static address in isolated mode, else
+/// node_external_ip over the serial console.
 pub(crate) async fn resolve_external_ip(
     cfg: &voxel_config::VoxelConfig,
     d: &Runner,
@@ -164,9 +125,8 @@ pub(crate) fn static_external_ip(
         .find_map(|(name, ip)| (name == node).then_some(ip))
 }
 
-/// ce's stable nexthop, when one is known without touching the guest. An
-/// explicit `[topology].ce_external_ip` wins, otherwise isolated mode's static
-/// numbering supplies it.
+/// ce's nexthop when known without entering the guest: ce_external_ip, else
+/// isolated mode's static address.
 pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
     if let Some(ip) = &cfg.topology.ce_external_ip {
         return Some(ip.clone());
@@ -177,10 +137,8 @@ pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
     static_external_ip(cfg, "ce")
 }
 
-/// A node's external (host-LAN) IPv4 - the address `voxel route` points at and
-/// `voxel host`/`tp` SSH to. Every node's only non-loopback IPv4 is its host-LAN
-/// DHCP lease (the underlay/cr links are IPv6), so we just take the first one.
-/// Routers (Debian) report addresses via `ip`; sleds (Helios) via `ipadm`.
+/// A node's host-LAN IPv4, its only non-loopback IPv4 address. Routers report
+/// via ip, sleds via ipadm.
 pub(crate) async fn node_external_ip(
     d: &Runner,
     n: NodeRef,
@@ -204,17 +162,8 @@ pub(crate) async fn node_external_ip(
         .with_context(|| format!("no external IPv4 found (got {out:?})"))
 }
 
-/// Run `ssh root@<ip> <remote>` non-interactively and capture stdout, using the
-/// rack's empty root password (`setup_ssh` enables `PermitEmptyPasswords`). This
-/// is how [`crate::rss::watch_rss`] polls the bootstrap-agent: the serial console
-/// wedges under RSS load - a stalled/cancelled exec leaves a shell on the
-/// single-user console and poisons every later poll - but SSH to the node's LAN
-/// IP is unaffected. Returns None on any failure (ssh error / non-zero exit); the
-/// caller just retries. Bounded by ssh's own connect + keepalive timeouts so a
-/// poll can't hang.
-/// The ssh options shared by every voxel ssh invocation. The rack is re-created
-/// constantly, so host-key checking is off and known-hosts is ephemeral; this is
-/// the pilot/captain access pattern.
+/// ssh options for a rack that is re-created constantly: no host-key checking,
+/// ephemeral known-hosts.
 pub(crate) const EPHEMERAL_HOST_OPTS: &[&str] = &[
     "-o",
     "StrictHostKeyChecking=no",
@@ -224,8 +173,7 @@ pub(crate) const EPHEMERAL_HOST_OPTS: &[&str] = &[
     "LogLevel=ERROR",
 ];
 
-/// The empty-root-password auth options shared by every voxel ssh/scp invocation
-/// (force password auth, one prompt, fail fast). ssh adds keepalive options on top.
+/// Empty-root-password auth options shared by every ssh and scp invocation.
 pub(crate) const PASSWORD_AUTH_OPTS: &[&str] = &[
     "-o",
     "PreferredAuthentications=password",
@@ -237,9 +185,8 @@ pub(crate) const PASSWORD_AUTH_OPTS: &[&str] = &[
     "ConnectTimeout=8",
 ];
 
-/// Materialize the SSH_ASKPASS helper that supplies the rack's empty root password
-/// (a script that prints a blank line), returning its path. `None` if it can't be
-/// written / made executable. Shared by `ssh_exec` and `scp_to`.
+/// Write the SSH_ASKPASS helper that supplies the empty root password and
+/// return its path, None if it cannot be written or made executable.
 pub(crate) fn ensure_askpass() -> Option<camino::Utf8PathBuf> {
     let askpass = crate::util::temp_dir().join("voxel-empty-askpass.sh");
     if !askpass.exists() {
@@ -257,6 +204,8 @@ pub(crate) fn ensure_askpass() -> Option<camino::Utf8PathBuf> {
     Some(askpass)
 }
 
+/// Run ssh root@<ip> <remote> with the rack's empty root password and return
+/// stdout, None on any failure. Unlike the serial console, ssh survives RSS load.
 pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
     let out = ssh_exec(ip, remote)?;
     out.status
@@ -264,29 +213,22 @@ pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Like [`ssh_capture`], but returns the remote command's combined output even
-/// when it exits non-zero - for callers (e.g. `sp exec`) that want the remote
-/// tool's OWN error text (faux-mgs prints `Error: ...`, which the caller folds
-/// into stdout via `2>&1`) instead of a generic "is the rack up?". Returns None
-/// only when ssh itself couldn't run or couldn't connect/authenticate (exit 255),
-/// i.e. the node really is unreachable - a non-255 exit means the command ran and
-/// its output (success or error) is meaningful.
+/// Like ssh_capture, but returns combined output even on a non-zero exit, so
+/// the remote tool's own error text comes through. None only on ssh exit 255.
 pub(crate) fn ssh_output(ip: &str, remote: &str) -> Option<String> {
     let out = ssh_exec(ip, remote)?;
     if out.status.code() == Some(255) {
-        return None; // ssh transport failure (connect/auth), not a remote error
+        return None; // exit 255 is an ssh transport failure, not a remote error
     }
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     s.push_str(&String::from_utf8_lossy(&out.stderr));
     Some(s)
 }
 
-/// Run a non-interactive ssh command (empty root password via a forced
-/// SSH_ASKPASS) and return its raw `Output`. Shared by `ssh_capture` (gates
-/// on exit status) and `ssh_output` (keeps output regardless of status).
+/// Run a non-interactive ssh command with the empty root password and return
+/// its raw Output.
 fn ssh_exec(ip: &str, remote: &str) -> Option<std::process::Output> {
-    // ssh needs a non-interactive way to supply the (empty) password: point
-    // SSH_ASKPASS at a script that prints an empty line, and force its use.
+    // SSH_ASKPASS supplies the empty password; force its use.
     let askpass = ensure_askpass()?;
     std::process::Command::new("ssh")
         .env("SSH_ASKPASS", &askpass)
@@ -301,9 +243,7 @@ fn ssh_exec(ip: &str, remote: &str) -> Option<std::process::Output> {
         .ok()
 }
 
-/// `scp <local> root@<ip>:<remote>` non-interactively (empty root password, same
-/// pattern as [`ssh_capture`]). Returns whether it succeeded. Used to deliver
-/// `faux-mgs` into a switch zone for the `sp` operator commands.
+/// scp local to root@<ip>:<remote> non-interactively; whether it succeeded.
 pub(crate) fn scp_to(ip: &str, local: &str, remote: &str) -> bool {
     let askpass = match ensure_askpass() {
         Some(p) => p,
@@ -323,14 +263,8 @@ pub(crate) fn scp_to(ip: &str, local: &str, remote: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Confirm a rack's external network is actually reachable end-to-end after the
-/// host route is set - a route in the table isn't the same as a converged
-/// transit. Probes the rack's external DNS (a `dig` SOA query, UDP/53) from the
-/// host and waits, bounded, until it answers. With the shared transit, the second
-/// rack joining can briefly flap the first rack's path while BGP reconverges; this
-/// waits that out *here* instead of letting it surface to the operator as a dead
-/// DNS. Best-effort: logs the outcome, never fails the launch. No-op (with a note)
-/// if `dig` isn't installed.
+/// Wait, bounded, until the rack's external DNS answers a SOA query from the
+/// host. Best effort: logs the outcome, never fails the launch.
 pub(crate) fn wait_external_reachable(
     log: &slog::Logger,
     dns_ip: &str,
@@ -368,16 +302,14 @@ pub(crate) fn wait_external_reachable(
     }
     warn!(
         log,
-        "{label}: external network not reachable after ~{}s (dns {dns_ip}) - the rack is up but \
+        "{label}: external network not reachable after ~{}s (dns {dns_ip}); the rack is up but \
          its external path may still be converging; retry `voxel route` or `dig {dns_zone} SOA @{dns_ip}`",
         ATTEMPTS * SPACING.as_secs() as u32
     );
 }
 
-/// `dig <zone> SOA @<dns_ip>`: `Some(true)` if the server answered, `Some(false)`
-/// if it didn't (unreachable / timeout), `None` if `dig` isn't installed. The SOA
-/// of the external zone is authoritative, so a positive answer needs no silo
-/// knowledge - it just proves the rack's external DNS is reachable.
+/// dig <zone> SOA @<dns_ip>: Some(true) on an answer, Some(false) on none,
+/// None if dig is not installed.
 fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
     match std::process::Command::new("dig")
         .args([
@@ -397,15 +329,7 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
     }
 }
 
-/// (Re)point the host route for the rack's external network (`prefix`) at ce's
-/// current external IP. ce's host-facing NIC gets a fresh random MAC - and thus
-/// a fresh DHCP IP - every launch, so any static route goes stale; discovering
-/// it here keeps the external services reachable without a manual hunt. The
-/// route is keyed by `prefix`, so racks with distinct external prefixes don't
-/// collide. With `apply == false` it just prints the command.
-/// The gateways currently routing `dest` (an IPv4 network address like
-/// `198.51.100.0`), read from `netstat -rn -f inet`. Used to purge every stale
-/// route for a prefix - dead-ce gateways from prior launches pile up otherwise.
+/// Gateways currently routing dest, from netstat -rn -f inet.
 pub(crate) fn route_gateways(dest: &str) -> Vec<String> {
     let out = match std::process::Command::new("netstat")
         .args(["-rn", "-f", "inet"])
@@ -424,6 +348,8 @@ pub(crate) fn route_gateways(dest: &str) -> Vec<String> {
         .collect()
 }
 
+/// Point the host route for prefix at ce's current external IP, which changes
+/// every launch. With apply false, only print the command.
 pub(crate) async fn set_external_route(
     d: &Runner,
     ce: NodeRef,
@@ -431,9 +357,7 @@ pub(crate) async fn set_external_route(
     apply: bool,
     static_ip: Option<&str>,
 ) -> anyhow::Result<()> {
-    // A configured static ce address (`[topology].ce_external_ip`) is a stable
-    // nexthop: use it directly and skip the slow, volatile serial-console lease
-    // lookup. Otherwise read ce's DHCP lease as before.
+    // A static ce address is a stable nexthop; otherwise read ce's DHCP lease.
     let ip = match static_ip {
         Some(s) => s.to_string(),
         None => serial_bounded(
@@ -448,14 +372,8 @@ pub(crate) async fn set_external_route(
         info!(d.log, "external route (dry-run): route add {} {}", prefix, ip);
         return Ok(());
     }
-    // Drop ALL stale routes for this prefix, then point it at the live ce.
-    // Dead-ce gateways from prior launches accumulate, and a bare
-    // `route delete <prefix>` doesn't reliably clear multiple same-prefix routes -
-    // so first enumerate the live gateways for this prefix from the routing table
-    // and delete each explicitly, then a few unqualified deletes to catch any
-    // remainder. illumos `route`'s exit code is unreliable (non-zero even on a
-    // successful add), so we key off printed output and re-read the table to
-    // confirm the final state.
+    // Delete each stale gateway for the prefix explicitly, then sweep with bare
+    // deletes; illumos route's exit code is unreliable, so re-read the table.
     let dest = prefix.split('/').next().unwrap_or(prefix);
     for gw in route_gateways(dest) {
         let _ = std::process::Command::new(ROUTE)
@@ -489,7 +407,7 @@ pub(crate) async fn set_external_route(
     } else {
         warn!(
             d.log,
-            "route {} -> {} not confirmed: {}{} - run: route add {} {}",
+            "route {} -> {} not confirmed: {}{}; run: route add {} {}",
             prefix,
             ip,
             String::from_utf8_lossy(&add.stdout).trim(),
