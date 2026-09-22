@@ -2,7 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Falcon topology construction and the per-launch cargo-bay staging.
+//! Falcon topology construction (driven by [`VoxelConfig`]) and the per-launch
+//! cargo-bay staging that feeds it (generated sled/RSS/FRR/switch1 config +
+//! sprockets keys).
 
 use anyhow::{Context, anyhow, bail};
 use attest_mock::MockData;
