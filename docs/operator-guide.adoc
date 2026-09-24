@@ -70,8 +70,8 @@ adjustable:
 
 [source,sh]
 ----
-voxel config set topology.sleds 7
-voxel config set topology.sled_memory_gb 6
+voxel config set topology.sleds 8
+voxel config set topology.sled_memory_gb 7
 ----
 
 Voxel runs a preflight memory check before launch and refuses to start if the
@@ -80,7 +80,7 @@ it accounts for worst-case bhyve overhead (~1.2× guest RAM) and a ~22 GB
 kernel/ARC reserve. Actual peak usage is typically lower.
 
 As a rough guide: 64 GB is sufficient for the default 4-sled single rack,
-and 128 GB accommodates 7 sleds or a 2×3-sled multi-rack deployment.
+and 128 GB accommodates 8 sleds or a 2×4-sled multi-rack deployment.
 
 === Storage
 
