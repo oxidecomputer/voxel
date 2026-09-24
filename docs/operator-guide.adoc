@@ -35,7 +35,7 @@ few minutes.
 
 == Hardware Requirements
 
-Voxel runs on bare metal, not in a cloud VM, because it cannot nest its own
+Voxel runs on bare metal, not in a VM, because it cannot nest its own
 hypervisor. An AMD or Intel system with sufficient memory and
 fast storage is all that's needed.
 
@@ -52,7 +52,9 @@ fast storage is all that's needed.
 |===
 
 For most users, an AMD Ryzen 9 system with 128 GB of RAM and a 2 TB NVMe
-drive is a good starting point.
+drive is a good starting point. NVMe drives with onboard DRAM and TLC
+NAND (e.g. Samsung 990 Pro, WD SN850X, Crucial T500) offer the best
+image-build and launch performance.
 
 [[scaling]]
 === Memory Scaling
@@ -60,14 +62,15 @@ drive is a good starting point.
 The default topology runs 4 sleds (each allocated 8 GB of guest RAM) and 3
 routers (each allocated 4 GB), for 44 GB of total guest memory. With bhyve
 overhead and kernel/ARC reserves, the default 4-sled configuration fits
-comfortably within 64 GB of physical RAM.
+comfortably within 64 GB of physical RAM. The minimum is 3 sleds (the
+trust-quorum floor).
 
 Larger topologies need more memory. The sled count and per-sled memory are both
 adjustable:
 
 [source,sh]
 ----
-voxel config set topology.sleds 8
+voxel config set topology.sleds 7
 voxel config set topology.sled_memory_gb 6
 ----
 
@@ -77,7 +80,7 @@ it accounts for worst-case bhyve overhead (~1.2× guest RAM) and a ~22 GB
 kernel/ARC reserve. Actual peak usage is typically lower.
 
 As a rough guide: 64 GB is sufficient for the default 4-sled single rack,
-and 128 GB accommodates 8 sleds or a 2×4-sled multi-rack deployment.
+and 128 GB accommodates 7 sleds or a 2×3-sled multi-rack deployment.
 
 === Storage
 
@@ -166,7 +169,9 @@ cargo build --release
 ----
 
 The resulting binary is `target/release/voxel`. Add it to your `PATH` or
-invoke it directly.
+invoke it directly. CI also produces pre-built binaries (including `sp-emu`
+and `voxel-init`) via buildomat on each merge to `main`, though no official
+release cadence exists yet.
 
 === Configuration
 
@@ -228,7 +233,22 @@ pfexec voxel image create --from-tuf /path/to/repo.zip
 ----
 
 This extracts the pre-built zones directly from the release artifacts and is
-significantly faster.
+significantly faster. To find a TUF repo for a specific release, go to the
+https://github.com/oxidecomputer/omicron[Omicron repository], switch to the
+release branch or tag (e.g. `rel/v20.2/rc0`), click the green CI checkmark
+next to the last commit, and look for the `helios / build TUF repo` job. The
+artifact is `/work/repo.zip`.
+
+For developers working on Omicron itself, you can build an image directly
+from a local checkout:
+
+[source,sh]
+----
+pfexec voxel image create --src /path/to/omicron
+----
+
+This skips the clone and checkout steps and builds your working-tree edits
+as-is, which is useful for testing control-plane changes on a running rack.
 
 === Router Image
 
@@ -376,11 +396,21 @@ Replace `<helios-host-ip>` with the Helios host's address on your shared
 network, and adjust the prefix if you changed `network.infra_prefix` in your
 configuration.
 
-With the route in place, the rack's external services are reachable. The
-rack runs its own external DNS servers (at the `external_dns_ips` addresses
-in the service pool), which are authoritative for the configured DNS zone.
-Configure your workstation's resolver to forward queries for the zone to
-those addresses, or navigate directly by IP to the Nexus service address.
+With the route in place, the rack's external services are reachable by IP.
+The rack runs its own external DNS servers (at the `external_dns_ips`
+addresses in the service pool), which are authoritative for the configured
+DNS zone (`oxide.test` is the default). To resolve rack hostnames from your
+workstation, either forward that zone to the rack's DNS servers in your
+resolver configuration, or add entries to `/etc/hosts`:
+
+[source]
+----
+198.51.100.23  recovery.sys.rack1.oxide.test
+----
+
+The Nexus IP (`198.51.100.23` is the default) is visible in `voxel status`
+output. Without DNS or `/etc/hosts` configuration, you can
+navigate directly by IP (e.g. `https://198.51.100.23`).
 
 At default settings, the web console is at:
 
