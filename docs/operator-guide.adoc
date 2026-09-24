@@ -169,9 +169,13 @@ cargo build --release
 ----
 
 The resulting binary is `target/release/voxel`. Add it to your `PATH` or
-invoke it directly. CI also produces pre-built binaries (including `sp-emu`
-and `voxel-init`) via buildomat on each merge to `main`, though no official
-release cadence exists yet.
+invoke it directly. CI also produces pre-built binaries via buildomat on
+each merge to `main`, though no official release cadence exists yet. To
+fetch them, go to the
+https://github.com/oxidecomputer/voxel[voxel repository], click the green
+CI checkmark next to the last commit on `main`, find the buildomat job
+named `build`, and click **Details**. The build artifacts include `voxel`,
+`voxel-init`, and `sp-emu`.
 
 === Configuration
 
