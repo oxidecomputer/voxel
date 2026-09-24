@@ -2,20 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Voxel - a first-class CLI for launching and operating an image-backed
-//! virtual Oxide rack.
-//!
-//! Sleds boot the `voxel-cp` image, routers boot `voxel-frr`, and every
-//! per-node config is generated on the fly from a [`VoxelConfig`] (`voxel.toml`)
-//! by the `voxel-config` crate - no static a4x2 files. libfalcon is used as a
-//! library (`Runner`), so `voxel` owns its own command tree rather than wrapping
-//! falcon's CLI.
-//!
-//! libfalcon -> Helios only. Run after building voxel-cp / voxel-frr images.
-//!
-//! This file holds the CLI surface (clap), config discovery/loading, and the
-//! startup that anchors voxel to its project root; the commands themselves live
-//! in the topic modules below.
+//! The voxel CLI: launch and operate an image backed virtual Oxide rack. This
+//! file holds the command tree, config discovery, and the workdir anchoring.
 
 use anyhow::{Context, Error};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -34,7 +22,9 @@ mod imagebuild;
 mod isolated_external;
 mod net;
 mod network;
+mod node;
 mod patch;
+mod power;
 mod rack;
 mod repocmd;
 mod rss;
@@ -53,7 +43,7 @@ mod wicket_setup;
     about = "Launch and operate an image-backed virtual Oxide rack"
 )]
 struct Cli {
-    /// voxel.toml to use (default: ~/.config/voxel/voxel.toml, then /etc/voxel/voxel.toml).
+    /// voxel.toml to use. Default: ~/.config/voxel/voxel.toml, then /etc/voxel.
     #[arg(long, global = true, env = "VOXEL_CONFIG")]
     config: Option<Utf8PathBuf>,
 
@@ -61,15 +51,15 @@ struct Cli {
     #[arg(long, global = true, env = "VOXEL_WORKDIR")]
     workdir: Option<Utf8PathBuf>,
 
-    /// Topology (falcon deployment) name.
+    /// Topology name, the falcon deployment.
     #[arg(long, global = true, default_value = "voxel", env = "VOXEL_NAME")]
     name: String,
 
-    /// zfs dataset falcon uses (default: `rpool/falcon`).
+    /// zfs dataset falcon uses. Default: rpool/falcon.
     #[arg(long, global = true)]
     dataset: Option<String>,
 
-    /// Build root for `image create` (default: `$HOME/voxel-builds`).
+    /// Build root for image create. Default: $HOME/voxel-builds.
     #[arg(long, global = true)]
     build_root: Option<Utf8PathBuf>,
 
@@ -84,15 +74,11 @@ enum Cmd {
         /// Don't watch RSS bring-up after launch.
         #[arg(long)]
         no_progress: bool,
-        /// Don't set the host route to the rack's external network after launch.
+        /// Do not set the host route to the rack's external network.
         #[arg(long)]
         no_route: bool,
-        /// Run the rack on emulated hardware: real-firmware SPs and RoTs on
-        /// `sp-emu` instead of `sp-sim`. Rack setup goes through wicketd's
-        /// commission API as on every launch.
-        ///
-        /// Firmware comes from the image's own TUF repo (`image create
-        /// --from-tuf`), so an --emu rack runs the release it reports.
+        /// Run real firmware SPs and RoTs on sp-emu instead of sp-sim, with
+        /// rack setup through wicketd. Firmware comes from the image's repo.
         #[arg(long)]
         emu: bool,
         /// Let sled-agent initialize the rack itself from a staged
@@ -101,33 +87,28 @@ enum Cmd {
         #[arg(long, conflicts_with = "emu")]
         init_rss: bool,
         /// Run the emulated fleet on the firmware in DIR instead of the
-        /// image's own: sp-gimlet-c.zip, sp-sidecar-c.zip, rot-a.zip and
-        /// bootleby.zip, laid out as `image create --from-tuf` extracts them.
-        ///
-        /// For trying a hubris build before it ships. The rack then reports a
-        /// release it is not running, so say so wherever that is claimed.
+        /// image's own, laid out as image create --from-tuf extracts it.
         #[arg(long, value_name = "DIR")]
         sp_firmware: Option<Utf8PathBuf>,
     },
-    /// (debug) Print the wicketd RSS config body the legacy wicketd path would
-    /// PUT, reshaped from a generated config-rss.toml (validates the mapping
-    /// offline). Launch drives setup through the commission API instead.
+    /// Debug: print the wicketd RSS config body reshaped from a generated
+    /// config-rss.toml.
     #[command(hide = true)]
     WicketDryrun {
         /// Path to a generated config-rss.toml.
         config_rss: Utf8PathBuf,
-        /// Per-rack sled count (the bootstrap slot set).
+        /// Per-rack sled count, the bootstrap slot set.
         #[arg(default_value_t = 4)]
         sleds: usize,
     },
-    /// (debug) Print the typed commission rack-setup config body as JSON.
+    /// Debug: print the typed commission rack setup config body as JSON.
     #[command(hide = true)]
     CommissionDryrun {
-        /// Rack index (0-based).
+        /// Rack index, 0-based.
         #[arg(default_value_t = 0)]
         rack: usize,
     },
-    /// (Re)point the host route for the rack's external net at ce's current IP.
+    /// Point the host route for the rack's external network at ce's current IP.
     Route {
         /// Print the route command instead of applying it.
         #[arg(long)]
@@ -135,7 +116,7 @@ enum Cmd {
     },
     /// Destroy the rack.
     Destroy,
-    /// Open a serial console to a node (^q to exit).
+    /// Open a serial console to a node. ^q exits.
     Serial { node: String },
     /// Print topology information.
     Info,
@@ -151,7 +132,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImageCmd,
     },
-    /// Operate on a running rack (surgical component patching).
+    /// Operate on a running rack: component patching.
     Rack {
         #[command(subcommand)]
         cmd: RackCmd,
@@ -161,17 +142,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NetworkCmd,
     },
-    /// Operate and manage the emulated SPs (`sp-emu`) of an `--emu` rack.
+    /// Operate and manage the emulated SPs of an --emu rack.
     Sp {
         #[command(subcommand)]
         cmd: SpCmd,
     },
-    /// Access a sled's global zone (ls / login / exec).
+    /// Access a sled's global zone: ls, login, exec.
     Host {
         #[command(subcommand)]
         cmd: HostCmd,
     },
-    /// Access a switch zone / technician port (ls / login / exec).
+    /// Access a switch zone, the technician port: ls, login, exec.
     Tp {
         #[command(subcommand)]
         cmd: TpCmd,
@@ -181,14 +162,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RepoCmd,
     },
-    /// Build and run Omicron's commit-matched end-to-end connectivity test.
-    ///
-    /// Arguments after `--` are passed directly to commtest. If no command is
-    /// supplied, defaults to `run`; voxel supplies the rack API and a test IP
-    /// pool unless those are explicitly overridden.
+    /// Build and run omicron's commit matched connectivity test. Arguments
+    /// after -- go to commtest; voxel supplies the rack API and an IP pool.
     Commtest {
-        /// Omicron commit/tag to test, or `main` for the latest upstream.
-        /// Omit to use the commit encoded in the configured control-plane image.
+        /// Omicron commit or tag to test, or main. Default: the commit of the
+        /// configured control plane image.
         #[arg(value_name = "COMMIT")]
         reference: Option<String>,
 
@@ -196,7 +174,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH", conflicts_with = "reference")]
         source: Option<Utf8PathBuf>,
 
-        /// Rack to target (1-based).
+        /// Rack to target, 1-based.
         #[arg(long, default_value_t = 1)]
         rack: usize,
 
@@ -204,7 +182,7 @@ enum Cmd {
         #[arg(long, value_name = "URL")]
         api: Option<String>,
 
-        /// Connectivity phase to run (`uni` and `multi` are accepted aliases).
+        /// Connectivity phase to run. uni and multi are accepted aliases.
         #[arg(long, value_enum, default_value_t = commtest::Traffic::Unicast)]
         traffic: commtest::Traffic,
 
@@ -212,13 +190,12 @@ enum Cmd {
         #[arg(long)]
         no_build: bool,
 
-        /// Permit running with effective uid 0. Build artifacts and reports
-        /// under the build root become root-owned, which later unprivileged
-        /// runs may trip over.
+        /// Permit running as root. Artifacts under the build root then become
+        /// root owned.
         #[arg(long)]
         allow_root: bool,
 
-        /// Arguments passed to Omicron commtest (place them after `--`).
+        /// Arguments passed to commtest, after --.
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -228,9 +205,9 @@ enum Cmd {
 enum ConfigCmd {
     /// Print the effective configuration.
     Show,
-    /// Read a dotted key, e.g. `network.bgp_asn`.
+    /// Read a dotted key such as network.bgp_asn.
     Get { key: String },
-    /// Set a dotted scalar key, e.g. `topology.sleds 3`.
+    /// Set a dotted scalar key such as topology.sleds 3.
     Set { key: String, value: String },
     /// Validate and install a prepared voxel.toml.
     Load { file: Utf8PathBuf },
@@ -241,23 +218,18 @@ enum ImageCmd {
     /// List image bundles on disk.
     #[command(visible_alias = "list")]
     Ls,
-    /// Build a `voxel-cp` image for an omicron commit (from source).
-    ///
-    /// `--src <path>` instead builds an existing omicron checkout/worktree AS-IS
-    /// (the dev loop: your working-tree edits, warm target).
+    /// Build a voxel-cp image for an omicron commit from source, or from an
+    /// existing checkout as is with --src.
     Create {
-        /// omicron git commit (or tag) to build and pin the image to (default:
-        /// the omicron rev voxel itself is pinned to, or the rev a `--from-tuf`
-        /// repo was built from). With `--src` this is an optional image label
-        /// (default: the checkout's HEAD).
+        /// omicron commit or tag to build and pin the image to. Default: the
+        /// rev voxel pins, or the repo's with --from-tuf. A label with --src.
         commit: Option<String>,
-        /// Build from an existing omicron checkout/worktree AS-IS (host build,
-        /// for dev): skips clone + checkout so your working-tree edits are built.
+        /// Build an existing omicron checkout as is, skipping clone and
+        /// checkout.
         #[arg(long)]
         src: Option<Utf8PathBuf>,
         /// Build the image from this TUF repo's artifacts with no omicron
-        /// compile: zones + corpus byte exact, GZ software from the host OS
-        /// phase 2 payload, switch zone recomposed for softnpu.
+        /// compile. The switch zone is recomposed for softnpu.
         #[arg(long, value_name = "REPO_ZIP")]
         from_tuf: Option<Utf8PathBuf>,
         /// With --from-tuf: an omicron-sled-agent package tar staged in place
@@ -266,25 +238,23 @@ enum ImageCmd {
         #[arg(long, value_name = "PKG_TAR", requires = "from_tuf")]
         sled_agent: Option<Utf8PathBuf>,
     },
-    /// Export an image bundle to a file for distribution.
-    ///
-    /// Default: a `zfs send | zstd` stream (`<name>.zfs.zst`); `--raw` makes a
-    /// portable `<name>.raw.xz` disk image instead.
+    /// Export an image bundle: a zstd compressed zfs stream, or a raw xz disk
+    /// image with --raw.
     Export {
-        /// Image name (e.g. `voxel-cp-a3fee0ec`).
+        /// Image name.
         name: String,
-        /// Output file (default `<name>.zfs.zst`, or `<name>.raw.xz` with --raw).
+        /// Output file. Default: <name>.zfs.zst, or <name>.raw.xz with --raw.
         out: Option<Utf8PathBuf>,
-        /// Portable raw disk image (`dd | xz`) instead of a zfs stream.
+        /// Portable raw disk image instead of a zfs stream.
         #[arg(long)]
         raw: bool,
     },
-    /// Import an image bundle (`.zfs.zst` or `.raw.xz`) from `image export`.
+    /// Import an image bundle from image export, .zfs.zst or .raw.xz.
     Import {
-        /// File to import (name is derived from it).
+        /// File to import. The image name derives from it.
         file: Utf8PathBuf,
     },
-    /// Remove an image bundle (`zfs destroy <dataset>/img/<name>`).
+    /// Remove an image bundle.
     Rm {
         /// Image name to remove.
         name: String,
@@ -292,47 +262,43 @@ enum ImageCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Fold a component patch into the image's @base so it survives relaunches.
-    ///
-    /// Boot-modify-capture: boots the source image, places the artifact in-guest,
-    /// re-captures. The durable counterpart to `rack patch` (slower, ~minutes).
-    /// propolis + ddm-gz only for now (switch-zone services need a repack).
+    /// Fold a component patch into the image so it survives relaunches: boot,
+    /// place the artifact, recapture. propolis and ddm-gz only for now.
     Patch {
-        /// Component to patch (e.g. propolis, ddm-gz).
+        /// Component to patch, propolis or ddm-gz.
         component: String,
-        /// Git ref (commit) to patch to.
+        /// Git commit to patch to.
         reference: String,
-        /// Source image to patch (default: the configured image.cp).
+        /// Source image to patch. Default: the configured image.cp.
         #[arg(long)]
         image: Option<String>,
-        /// New image name (default: <src>-<component>-<shortref>).
+        /// New image name. Default: <src>-<component>-<shortref>.
         #[arg(long)]
         out: Option<String>,
     },
-    /// Build a `voxel-frr` customer-router image.
+    /// Build a voxel-frr customer router image.
     CreateFrr {
-        /// Image label; the image is named `voxel-frr-<version>`.
+        /// Image label. The image is named voxel-frr-<version>.
         #[arg(default_value = "proto")]
         version: String,
     },
-    /// (build helper) Bake an image: boot a one-node builder, run the in-guest
-    /// agent's install role, capture the disk.
+    /// Build helper: boot a one node builder, run the agent's install role,
+    /// capture the disk.
     #[command(hide = true)]
     Bake {
-        /// Registered image name (captured to `<dataset>/img/<name>@base`).
+        /// Registered image name, captured to <dataset>/img/<name>@base.
         name: String,
         /// Base image the builder boots.
         #[arg(long, default_value = "helios-3.0")]
         base: String,
-        /// Agent install role (`cp` | `frr`).
+        /// Agent install role, cp or frr.
         #[arg(long)]
         role: Option<String>,
-        /// An in-guest command to run instead of an agent role
-        /// (boot-modify-capture, used by `image patch`). With neither, the
-        /// builder just boots, smoke-testing that the image comes up.
+        /// An in-guest command to run instead of an agent role. With neither,
+        /// the builder only boots.
         #[arg(long, conflicts_with = "role")]
         exec: Option<String>,
-        /// Host dir mounted at `/opt/cargo-bay` in the guest.
+        /// Host dir mounted at /opt/cargo-bay in the guest.
         #[arg(long, default_value = "./cargo-bay/vbuild")]
         cargo_bay: Utf8PathBuf,
         #[arg(long, default_value_t = 8)]
@@ -344,18 +310,18 @@ enum ImageCmd {
         /// falcon deployment name for the builder topology.
         #[arg(long, default_value = "voxel_build")]
         deploy: String,
-        /// Host link the builder reaches the package repos through (default:
-        /// falcon's default external interface).
+        /// Host link the builder reaches the package repos through. Default:
+        /// falcon's external interface.
         #[arg(long)]
         ext_interface: Option<String>,
     },
-    /// (build helper) Render the build-time smf configs (mgs-sim, sp-sim,
-    /// sled-agent) into an omicron checkout.
+    /// Build helper: render the build time smf configs into an omicron
+    /// checkout.
     #[command(hide = true)]
     RenderSmf {
         /// Path to the omicron checkout root.
         omicron_root: Utf8PathBuf,
-        /// Number of gimlet SPs to simulate (sp-sim).
+        /// Number of gimlet SPs to simulate.
         #[arg(long, default_value_t = 4)]
         gimlets: usize,
     },
@@ -363,35 +329,32 @@ enum ImageCmd {
 
 #[derive(Subcommand)]
 enum NetworkCmd {
-    /// Show the per-rack network projection, switches, and the auto cross-rack
-    /// sidecar interconnect mesh.
+    /// Show the per-rack network projection, switches, and the cross-rack
+    /// interconnect mesh.
     Show,
-    /// Bring up a switch port's link on a running rack (transient).
-    ///
-    /// Creates (if needed) + enables the link via `swadm`; run on both ends. ⚠
-    /// Nexus reaps manual swadm links in ~30s - persistent config must use the API.
+    /// Bring up a switch port's link on a running rack. Transient: Nexus reaps
+    /// manual swadm links; persistent config goes through the API.
     LinkUp {
-        /// Switch: `switch0` | `switch1` | `switchN` | `rackR/switchS` | node `gN`.
+        /// Switch: switchN, rackR/switchS, or a scrimlet node gN.
         switch: String,
-        /// Switch port (e.g. `qsfp2`); the link is created as `<port>/0`.
+        /// Switch port such as qsfp2. The link is created as <port>/0.
         port: String,
-        /// Link speed (default 40G, matching the qsfp uplinks).
+        /// Link speed. Default 40G, matching the qsfp uplinks.
         #[arg(long, default_value = "40G")]
         speed: String,
-        /// Forward error correction (default none).
+        /// Forward error correction. Default none.
         #[arg(long, default_value = "none")]
         fec: String,
     },
-    /// Take down a switch port's link (disable + delete) on a running rack,
-    /// e.g. `voxel network link-down switch0 qsfp2`.
+    /// Take down a switch port's link on a running rack: disable and delete.
     LinkDown { switch: String, port: String },
-    /// Validate live networking: link states, BGP sessions, routes, host routes.
+    /// Validate live networking: links, BGP sessions, routes, host routes.
     Validate {
-        /// Full `swadm`/`mgadm` output instead of summary counts.
+        /// Full swadm and mgadm output instead of summary counts.
         #[arg(long)]
         detail: bool,
     },
-    /// Manage the isolated ("fake") external segment (`[external] mode = "isolated"`).
+    /// Manage the isolated external segment, [external] mode = isolated.
     External {
         #[command(subcommand)]
         cmd: ExternalCmd,
@@ -400,40 +363,35 @@ enum NetworkCmd {
 
 #[derive(Subcommand)]
 enum ExternalCmd {
-    /// Stand the segment up (the same path `launch` uses).
+    /// Stand the segment up, as launch does.
     Up {
         /// Print the host commands instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Tear the segment down (VNIC + etherstub + NAT rules ~ ipv4-forwarding
-    /// stays).
+    /// Tear the segment down: VNIC, etherstub, NAT. ipv4-forwarding stays.
     Down {
         /// Print the host commands instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Assert the whole path is live (uplink, links, NAT); PASS/FAIL per item.
+    /// Assert the whole path is live: uplink, links, NAT. PASS or FAIL each.
     Check,
 }
 
 #[derive(Subcommand)]
 enum RackCmd {
-    /// Swap a single component on the running rack at a ref, then restart it.
-    ///
-    /// Fetches the prebuilt artifact from buildomat, sha-verifies it, and places
-    /// it on the relevant nodes. Live + ephemeral (a clean relaunch reverts; see
-    /// `image patch` to persist). `--list` shows the patchable components.
+    /// Swap one component on the running rack at a ref, from buildomat, and
+    /// restart it. Ephemeral: a relaunch reverts. --list shows the components.
     Patch {
-        /// Component to patch (e.g. propolis, mgd, dendrite, lldp). Omit with
-        /// `--list` to see them all.
+        /// Component to patch, such as propolis or mgd. Omit with --list.
         component: Option<String>,
-        /// Git ref (commit) to patch to - the buildomat image revision.
+        /// Git commit to patch to, the buildomat image revision.
         reference: Option<String>,
         /// List the patchable components and exit.
         #[arg(long)]
         list: bool,
-        /// Print the plan (component, ref, target nodes) without applying it.
+        /// Print the plan without applying it.
         #[arg(long)]
         dry_run: bool,
     },
@@ -441,20 +399,18 @@ enum RackCmd {
 
 #[derive(Subcommand)]
 enum SpCmd {
-    /// List the live SPs over MGS: type, serial, power, archive id.
-    ///
-    /// Via faux-mgs in the switch zone; needs a running `--emu` rack.
+    /// List the live SPs over MGS: type, serial, power, archive id. Needs a
+    /// running --emu rack.
     #[command(visible_alias = "list")]
     Ls {
-        /// Which switch zone to query (`switch0`|`switch1`|`<scrimlet>`).
+        /// Which switch view to query: switch0, switch1, or a scrimlet.
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
     /// Show one SP's state: serial, power, RoT, archive.
     #[command(visible_alias = "state")]
     Info {
-        /// Target SP: serial (e.g. BRM44220001), node (sidecar | g0 | g1 ...),
-        /// or sim addr ([::1]:33310 | 33310).
+        /// Target SP: a serial, a node such as sidecar or g0, or a port.
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
@@ -462,141 +418,147 @@ enum SpCmd {
     /// Show an SP's power state.
     #[command(visible_alias = "st")]
     Status {
-        /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
+        /// Target SP: a serial, a node such as sidecar or g0, or a port.
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
     /// Inject an NMI into the host via the SP.
     Nmi {
-        /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
+        /// Target SP: a serial, a node such as sidecar or g0, or a port.
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Pass a raw faux-mgs command to an SP.
-    ///
-    /// The command's own args follow after `-e`, e.g. `-e inventory`,
-    /// `-e read-caboose 0`, `-e dump count`, `-e dump read --index 0`. Everything
-    /// after `-e` is passed through (a quoted string works too).
-    Exec {
-        /// Target SP: serial, node (sidecar | g0 ...), or sim addr.
+    /// Power cycle a host through its SP, as pilot sp cycle does: A2 if it is
+    /// on, then A0. The sled VM follows the SP.
+    Cycle {
+        /// Target SP: a serial, a node such as g0, or a port.
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
-        /// The faux-mgs command + its args (`-e read-caboose 0`).
+    },
+    /// Follow the emulated SPs and keep the sleds in step with their host
+    /// power. launch --emu runs this as svc:/oxide/voxel-power.
+    #[command(hide = true)]
+    Watch {
+        /// Rack to follow, 0-based. Default: every rack.
+        #[arg(long)]
+        rack: Option<usize>,
+    },
+    /// Pass a raw faux-mgs command to an SP. Everything after -e is passed
+    /// through, quoted or not.
+    Exec {
+        /// Target SP: a serial, a node such as sidecar or g0, or a port.
+        target: String,
+        #[arg(long, default_value = "switch0")]
+        switch: String,
+        /// The faux-mgs command and its arguments.
         #[arg(short = 'e', long = "exec", num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Check whether `launch --emu` is ready (artifacts present; no rack needed).
+    /// Check whether launch --emu has its artifacts. No rack needed.
     Ready,
-    /// Flash a hubris `.zip` into an sp-emu slot-A flash file (offline).
+    /// Flash a hubris archive into an sp-emu slot A flash file, offline.
     Flash {
-        /// Hubris image archive (e.g. build-gimlet-c-image-default.zip).
+        /// Hubris image archive.
         image: Utf8PathBuf,
         /// Output flash file.
         out: Utf8PathBuf,
     },
-    /// Re-flash a live SP (or the shared RoT) and restart its sp-emu service.
-    ///
-    /// The firmware counterpart to `rack patch`. `<image>` is a hubris `.zip`
-    /// for an SP, or a raw oxide-rot-1 image for target `rot` (restarts every RoT
-    /// bridge). Live + ephemeral (reverts on relaunch; bake via `image create`).
+    /// Re-flash a live SP, or the shared RoT with target rot, and restart its
+    /// service. Ephemeral: a relaunch reverts.
     Reflash {
-        /// Target: `sidecar` | `gN` | a port | `rot`.
+        /// Target: sidecar, gN, a port, or rot.
         target: String,
-        /// Hubris `.zip` (SP) or raw oxide-rot-1 flash image (target `rot`).
+        /// Hubris archive for an SP, or a raw oxide-rot-1 image for rot.
         image: Utf8PathBuf,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Enable (or `--off`) the humility SWD debug listeners for one SP.
-    ///
-    /// Toggles `SP_EMU_NO_DEBUG` + restarts the SP (~30s preboot). On enable,
-    /// prints the humility ports + attach command. Live + ephemeral.
+    /// Enable, or with --off disable, the humility SWD debug listeners for one
+    /// SP. Restarts the SP. Ephemeral.
     Debug {
-        /// Target SP: `sidecar` | `gN` | a port.
+        /// Target SP: sidecar, gN, or a port.
         target: String,
-        /// Disable debug (re-suppress the listeners) instead of enabling.
+        /// Disable debug instead of enabling it.
         #[arg(long)]
         off: bool,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Force + decode a crash dump of one live emulated SP.
-    ///
-    /// Arms the SP for dumps (a one-time ~30s restart if needed), triggers a
-    /// humility RAM snapshot in-zone, pulls it to the host, and runs `humility
-    /// hydrate` + `tasks`/`ringbuf`. Needs `humility` on PATH (or `$VOXEL_HUMILITY`).
+    /// Force and decode a crash dump of one emulated SP with humility hydrate.
+    /// Needs humility on PATH or in $VOXEL_HUMILITY.
     Dump {
-        /// Target SP: `sidecar` | `gN` | a port.
+        /// Target SP: sidecar, gN, or a port.
         target: String,
-        /// Run humility `ringbuf` instead of `tasks` on the hydrated dump.
+        /// Run humility ringbuf instead of tasks on the hydrated dump.
         #[arg(long)]
         ringbuf: bool,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Drive one host<->SP IPCC exchange over the SP's control UART (RFD 316).
-    ///
-    /// Arms the SP's UART7 with a socket (`SP_EMU_HOST_UART`, a one-time ~30s
-    /// restart), plays the host from in-zone, sends a `HostToSp` request, and
-    /// decodes the `SpToHost` reply - proving the emulated SP speaks IPCC.
+    /// Drive one host to SP IPCC exchange over the SP's control UART (RFD 316)
+    /// and decode the reply.
     Ipcc {
-        /// Target SP: `sidecar` | `gN` | a port.
+        /// Target SP: sidecar, gN, or a port.
         target: String,
-        /// Request to send: identity (VPD) | bsu (boot storage unit) | macs |
-        /// status (host boot options) | inventory.
+        /// Request to send: identity, bsu, macs, status, or inventory.
         #[arg(long, default_value = "identity")]
         cmd: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Build the gimlet-c + sidecar-c-emu images from a hubris commit.
+    /// Build the gimlet-c and sidecar-c-emu images from a hubris commit.
     Build {
-        /// hubris git commit to build (v1 builds from the configured checkout).
+        /// hubris commit to build. v1 builds from the configured checkout.
         commit: String,
     },
 }
 
 #[derive(Subcommand)]
 enum HostCmd {
-    /// List sleds and their external IPs.
+    /// List nodes: external IP, role, propolis pid and state, SP host power.
     Ls,
-    /// SSH into a sled's global zone or a router: `voxel host login g1`.
+    /// SSH into a sled's global zone or a router.
     Login {
         #[arg(default_value = "g0")]
         node: String,
     },
-    /// Run a command in a sled's global zone: `voxel host exec -c "svcs -x" g1`.
+    /// Run a command in a sled's global zone.
     Exec {
-        /// Command to run (quote multi-word commands).
+        /// Command to run. Quote multi-word commands.
         #[arg(short = 'c', long = "command")]
         command: String,
-        /// Target sled (g0, g1, ...).
+        /// Target sled, such as g1.
         #[arg(default_value = "g0")]
         sled: String,
     },
+    /// Power a node off: stop its propolis and destroy the VM. An emulated
+    /// SP is told its host went away and reports A2.
+    Off { node: String },
+    /// Power a node on: a fresh propolis replaying the instance it launched
+    /// with. With an emulated SP, sp cycle is the SP's way to do it.
+    On { node: String },
+    /// Reset a node: a propolis reboot. The VM keeps its process.
+    Reset { node: String },
 }
 
 #[derive(Subcommand)]
 enum TpCmd {
-    /// List switch zones (scrimlets) and their external IPs.
+    /// List switch zones and their external IPs.
     Ls,
-    /// SSH into a switch zone (technician port): `voxel tp login switch0`.
-    ///
-    /// Drops you in oxz_switch, where the dendrite/maghemite tools live
-    /// (`swadm`, `dpd`, `mgadm`).
+    /// SSH into a switch zone, where swadm, dpd and mgadm live.
     Login {
         #[arg(default_value = "switch0")]
         switch: String,
     },
-    /// Run a command in a switch zone: `voxel tp exec -c "swadm link ls" switch0`.
+    /// Run a command in a switch zone.
     Exec {
-        /// Command to run in oxz_switch (quote multi-word commands).
+        /// Command to run in oxz_switch. Quote multi-word commands.
         #[arg(short = 'c', long = "command")]
         command: String,
-        /// Target switch (`switch0` | `switchN` | `rackR/switchS` | scrimlet node).
+        /// Target switch: switchN, rackR/switchS, or a scrimlet node.
         #[arg(default_value = "switch0")]
         switch: String,
     },
@@ -604,18 +566,15 @@ enum TpCmd {
 
 #[derive(Subcommand)]
 enum RepoCmd {
-    /// Seed every sled's artifact stores with a repo's targets and cross-sync
-    /// Nexus-derived artifacts, so a just-set target release converges without
-    /// waiting out TUF replication. Run after the repo upload.
+    /// Seed every sled's artifact store with a repo's targets so a new target
+    /// release converges without waiting out TUF replication.
     Seed {
         /// The TUF repo zip that was uploaded.
         repo: Utf8PathBuf,
     },
 }
 
-// ---------------------------------------------------------------------------
-// Config loading + project-root resolution
-// ---------------------------------------------------------------------------
+// Config loading and project root resolution.
 
 fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
     if path.exists() {
@@ -647,13 +606,8 @@ fn absolutize(p: Utf8PathBuf) -> Utf8PathBuf {
     }
 }
 
-/// Discover the `voxel.toml` to use, as an absolute path. Order: explicit
-/// `--config`/`$VOXEL_CONFIG` -> the user config `~/.config/voxel/voxel.toml` ->
-/// `/etc/voxel/voxel.toml`. The user config is the default *and* where a fresh
-/// `config set` writes, so edits and launches always hit the same file no matter
-/// the CWD - no implicit project-local `./voxel.toml` to silently diverge from
-/// (use `--config` / `config load` for a one-off). Falls back to `./voxel.toml`
-/// only if `$HOME` is unset.
+/// The voxel.toml to use, absolute: --config, then ~/.config/voxel/voxel.toml,
+/// then /etc/voxel/voxel.toml. Falls back to ./voxel.toml without $HOME.
 fn discover_config(explicit: Option<&Utf8Path>) -> Utf8PathBuf {
     if let Some(p) = explicit {
         return absolutize(p.to_path_buf());
@@ -670,19 +624,13 @@ fn discover_config(explicit: Option<&Utf8Path>) -> Utf8PathBuf {
     if etc.is_file() {
         return etc;
     }
-    // Nothing exists yet: default to the user config so a fresh `config set`
-    // creates it there (only fall back to ./voxel.toml if $HOME is unset).
+    // Nothing exists yet: default to the user config so config set creates
+    // it there.
     user.unwrap_or_else(|| absolutize(Utf8PathBuf::from("voxel.toml")))
 }
 
-/// Resolve falcon settings (flag > voxel.toml `[falcon]` > existing env) and
-/// export them as `FALCON_DATASET` / `VOXEL_OMICRON_SRC`, so falcon's `Runner`,
-/// the sled-schema detection, the `image` commands, and any subprocess all see
-/// one consistent value. An unset var falls back to its built-in default
-/// (falcon's `rpool/falcon`).
-/// Locate `<build_root>/omicron-<commit>`, matching a short image label
-/// against full-sha checkout dirs (and vice versa) when the exact directory
-/// is absent. Ambiguous matches fall back to the exact path.
+/// Locate <build_root>/omicron-<commit>, matching a short label against full
+/// sha checkout dirs and vice versa. Ambiguous matches use the exact path.
 fn find_omicron_checkout(build_root: &str, commit: &str) -> String {
     let exact = format!("{build_root}/omicron-{commit}");
     if Utf8PathBuf::from(&exact).is_dir() {
@@ -702,6 +650,8 @@ fn find_omicron_checkout(build_root: &str, commit: &str) -> String {
     if candidates.len() == 1 { candidates.pop().unwrap() } else { exact }
 }
 
+/// Resolve the falcon settings, flag over config over environment, and export
+/// them as FALCON_DATASET and VOXEL_OMICRON_SRC for every subprocess.
 fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     let dataset = cli
         .dataset
@@ -709,16 +659,14 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .or_else(|| cfg.and_then(|c| c.falcon.dataset.clone()))
         .or_else(|| std::env::var("FALCON_DATASET").ok());
     if let Some(d) = dataset {
-        // SAFETY: runs before the tokio runtime spawns any worker, while the
-        // process is still single-threaded, so no concurrent getenv (from
-        // Rust or C) can race the write.
+        // SAFETY: runs before the tokio runtime spawns any worker, so no
+        // concurrent getenv can race the write.
         unsafe {
             std::env::set_var("FALCON_DATASET", d);
         }
     }
-    // Resolve the build root first (cli > config > env), since the omicron source
-    // path is derived from it below. Export it as-is; apply the default only for
-    // our derive.
+    // Resolve the build root first; the omicron source path derives from it.
+    // Export it as is and apply the default only to the derivation.
     let build_root = cli
         .build_root
         .as_ref()
@@ -737,9 +685,8 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
             std::env::var("HOME").unwrap_or_else(|_| "/root".into())
         )
     });
-    // The omicron checkout the CP image was built from. Only the sled-agent
-    // schema detection reads it. Derived from the image's commit so it can't
-    // drift from `image.cp`; $VOXEL_OMICRON_SRC overrides.
+    // The omicron checkout the CP image was built from, derived from the
+    // image's commit. $VOXEL_OMICRON_SRC overrides.
     let omicron_src = std::env::var("VOXEL_OMICRON_SRC").ok().or_else(|| {
         cfg.and_then(|c| c.image.cp_commit())
             .map(|commit| find_omicron_checkout(&build_root_eff, &commit))
@@ -752,10 +699,8 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     }
 }
 
-/// `chdir` to the project root so the CWD-relative `cargo-bay/` and `.falcon/`
-/// resolve correctly no matter where voxel was invoked from (e.g. `/usr/bin`).
-/// Root: `--workdir`/`$VOXEL_WORKDIR` > `[falcon].workdir` > the discovered
-/// `voxel.toml`'s directory. No-op if the chosen root isn't a directory.
+/// chdir to the project root so cargo-bay and .falcon resolve: --workdir,
+/// then [falcon].workdir, then the config's directory. No-op if not a dir.
 fn anchor_workdir(
     cli: &Cli,
     cfg: Option<&VoxelConfig>,
@@ -780,10 +725,10 @@ fn anchor_workdir(
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
-    // Anchor to the project root before anything touches cargo-bay/.falcon.
+    // Anchor to the project root before anything touches cargo-bay or .falcon.
     let config_path = discover_config(cli.config.as_deref());
-    // A missing config means defaults; an existing one that fails to load or
-    // parse must not (it silently dropped settings like falcon.dataset).
+    // A missing config means defaults. An existing one that fails to parse
+    // is an error.
     let cfg = match load_config(&config_path) {
         Ok(c) => Some(c),
         Err(e) if config_path.is_file() => return Err(e),
@@ -796,6 +741,7 @@ async fn main() -> Result<(), Error> {
             rack::cmd_launch(
                 &load_config(&config_path)?,
                 &cli.name,
+                &config_path,
                 *no_progress,
                 *no_route,
                 *emu,
@@ -837,7 +783,7 @@ async fn main() -> Result<(), Error> {
         } => commtest::run(
             &load_config(&config_path)?,
             commtest::Options {
-                // clap rejects <COMMIT> together with --source (conflicts_with).
+                // clap rejects COMMIT together with --source.
                 source: match (source.as_deref(), reference.as_deref()) {
                     (Some(path), _) => commtest::Source::Local(path),
                     (None, Some(r)) => commtest::Source::Reference(r),
@@ -1013,6 +959,33 @@ async fn main() -> Result<(), Error> {
                 )
                 .await
             }
+            HostCmd::Off { node } => {
+                node::cmd_host_power(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    node,
+                    node::Power::Off,
+                )
+                .await
+            }
+            HostCmd::On { node } => {
+                node::cmd_host_power(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    node,
+                    node::Power::On,
+                )
+                .await
+            }
+            HostCmd::Reset { node } => {
+                node::cmd_host_power(
+                    &load_config(&config_path)?,
+                    &cli.name,
+                    node,
+                    node::Power::Reset,
+                )
+                .await
+            }
         },
         Cmd::Tp { cmd } => match cmd {
             TpCmd::Ls => {
@@ -1067,7 +1040,7 @@ mod tests {
         assert!(find("21dae8a64").ends_with("omicron-21dae8a64f00baa5"));
         // Full sha resolves to a short-named checkout dir.
         assert!(find("43bb5af99ec").ends_with("omicron-43bb5af"));
-        // No match falls back to the exact (nonexistent) path.
+        // No match falls back to the exact, nonexistent path.
         assert!(find("deadbeef").ends_with("omicron-deadbeef"));
     }
 }
