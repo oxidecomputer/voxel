@@ -10,8 +10,10 @@
 
 use anyhow::{Context, bail, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
-use std::net::Ipv4Addr;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Ipv4Addr, TcpStream};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::Duration;
 use voxel_config::{Network, VoxelConfig};
 
 use crate::multicast;
@@ -613,10 +615,8 @@ fn apply_helios_build_env(cmd: &mut Command) {
 ///
 /// TLS-only racks (commission-driven setup, the launch default, uploads a
 /// self-signed certificate with DNS-only SANs) are refused rather than guessed
-/// at. Therefore, commtest's
-/// oxide client has no way to trust that certificate on a raw-IP URL, so
-/// handing it a `https://` base would spin its API wait until the 60 minute
-/// timeout.
+/// at because commtest's oxide client has no way to trust that certificate on a
+/// raw-IP URL.
 ///
 /// # Errors
 ///
@@ -634,7 +634,7 @@ fn derive_api(network: &Network) -> anyhow::Result<String> {
             .is_ok()
         })
     };
-    if let Some(host) = live_on(80) {
+    if let Some(host) = candidates.iter().copied().find(http_api_is_available) {
         return Ok(format!("http://{host}"));
     }
     if let Some(host) = live_on(443) {
@@ -649,6 +649,30 @@ fn derive_api(network: &Network) -> anyhow::Result<String> {
         Some(host) => format!("http://{host}"),
         None => format!("http://{}", network.service_pool_first),
     })
+}
+
+fn http_api_is_available(host: &Ipv4Addr) -> bool {
+    let mut stream = match TcpStream::connect_timeout(
+        &(*host, 80).into(),
+        Duration::from_millis(250),
+    ) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    if stream.set_read_timeout(Some(Duration::from_millis(250))).is_err()
+        || stream.set_write_timeout(Some(Duration::from_millis(250))).is_err()
+    {
+        return false;
+    }
+    let request = format!(
+        "GET /v1/ping HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut status = String::new();
+    BufReader::new(stream).read_line(&mut status).is_ok()
+        && (status.starts_with("HTTP/1.1 ") || status.starts_with("HTTP/1.0 "))
 }
 
 /// Service-pool addresses in probe order.
