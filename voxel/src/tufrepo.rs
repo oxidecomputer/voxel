@@ -8,9 +8,14 @@
 //! (no unzip binary on the host); only the index is held in memory.
 //! Composites are GNU tar format, which illumos tar rejects, so those streams
 //! are unpacked in process too.
+//!
+//! releng emits two layouts of the same build. v1 wraps the zones, the host
+//! OS and each RoT's slots in composite tarballs; v2 carries each as its own
+//! target.
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use zip::ZipArchive;
@@ -24,22 +29,38 @@ const BOOT_IMAGE_HEADER_SIZE: usize = 4096;
 type MemberArchive<'a> =
     tar::Archive<flate2::read::GzDecoder<ZipFile<'a, File>>>;
 
-/// A parsed TUF repo zip (`tufaceous` v1 layout: `repo/targets/<sha>.<name>`).
+/// A parsed TUF repo zip, either layout.
 pub(crate) struct TufRepoSource {
     pub path: Utf8PathBuf,
     /// Repo system version, e.g. `23.0.0-0.ci+git2e55f4ddac2`.
     pub system_version: String,
     /// Short omicron sha from the system version's `+git` suffix.
     pub commit: String,
-    /// Zip member holding the composite control plane tarball.
-    control_plane: String,
-    /// Zip member holding the composite host OS tarball.
-    host: String,
+    /// The members that differ between the two layouts.
+    layout: Layout,
+    /// sha256 of every target, by zip member. v1 encodes it in the member
+    /// name, v2 carries it in the TUF metadata.
+    hashes: BTreeMap<String, String>,
     /// Zip members holding measurement corpus artifacts, with their target
     /// names (member basename minus the sha prefix).
     corpus: Vec<(String, String)>,
     /// SP, RoT and RoT bootloader artifacts, by kind and name.
     firmware: Vec<Firmware>,
+}
+
+/// The members whose packaging differs by layout. The SPs, the bootloader
+/// and the measurement corpus are plain targets in both.
+enum Layout {
+    /// Composite tarballs, addressed as `repo/targets/<sha>.<name>`.
+    V1 { control_plane: String, host: String },
+    /// Individual targets, addressed by their path under `repo/targets/`.
+    V2 {
+        /// Zone member and the file name to write it as.
+        zones: Vec<(String, String)>,
+        phase1: String,
+        phase2: String,
+        rot_a: String,
+    },
 }
 
 /// One firmware artifact in the repo. A repo carries every board and keyset
@@ -61,6 +82,15 @@ const SIDECAR_BOARD: &str = "sidecar-c";
 const ROT_VARIANT: &str = "oxide-rot-1-selfsigned-bart";
 /// The RoT bootloader (bootleby) variant, matching [`ROT_VARIANT`]'s keyset.
 const BOOTLOADER_VARIANT: &str = "bart";
+/// The bart keyset's root key table hash, which the emulated RoTs enforce
+/// from their CMPA. v2 tags each RoT artifact with its keyset, so the image is
+/// selected by this hash.
+const BART_RKTH: &str =
+    "84332ef8279df87fbb759dc3866cbc50cd246fbb5a64705a7e60ba86bf01c27d";
+/// The host OS board and variant voxel takes from a v2 repo. v1 carries one
+/// host composite holding both pieces.
+const HOST_BOARD: &str = "gimlet";
+const HOST_VARIANT: &str = "host";
 
 /// Firmware extracted from a repo, as the paths `[sp]` wants.
 pub(crate) struct FirmwareSet {
@@ -78,22 +108,14 @@ impl TufRepoSource {
         let mut zip = open_zip(path)?;
         let members: Vec<String> =
             zip.file_names().map(str::to_string).collect();
-        // Prefer the v1 index; every repo that carries v2 carries v1 too.
-        let index = members
-            .iter()
-            .find(|m| m.ends_with(".artifacts.json"))
-            .or_else(|| {
-                members.iter().find(|m| m.ends_with("artifacts-v2.json"))
-            })
-            .with_context(|| {
-                format!("{path} has no artifacts index under repo/targets/")
-            })?;
-        let mut raw = Vec::new();
-        member(&mut zip, index)?
-            .read_to_end(&mut raw)
-            .with_context(|| format!("read {index}"))?;
-        let json: serde_json::Value = serde_json::from_slice(&raw)
-            .with_context(|| format!("parse {index}"))?;
+        // A repo carries one index or the other; releng emits each layout
+        // as its own zip.
+        let Some(index) =
+            members.iter().find(|m| m.ends_with(".artifacts.json")).cloned()
+        else {
+            return Self::load_v2(path, zip, members);
+        };
+        let json = read_json(&mut zip, &index)?;
         let system_version = json
             .get("system_version")
             .and_then(|v| v.as_str())
@@ -156,8 +178,122 @@ impl TufRepoSource {
             path: path.to_owned(),
             system_version,
             commit,
-            control_plane: need(control_plane, "control_plane")?,
-            host: need(host, "host")?,
+            layout: Layout::V1 {
+                control_plane: need(control_plane, "control_plane")?,
+                host: need(host, "host")?,
+            },
+            hashes: sha_keyed_members(&members),
+            corpus,
+            firmware,
+        })
+    }
+
+    /// Parse a v2 index: entries carry their kind and board in `tags`, and
+    /// name their target by path rather than by sha.
+    fn load_v2(
+        path: &Utf8Path,
+        mut zip: ZipArchive<File>,
+        members: Vec<String>,
+    ) -> Result<Self> {
+        let index = members
+            .iter()
+            .find(|m| m.ends_with("artifacts-v2.json"))
+            .cloned()
+            .with_context(|| {
+                format!("{path} has no artifacts index under repo/targets/")
+            })?;
+        let json = read_json(&mut zip, &index)?;
+        let system_version = json
+            .get("system_version")
+            .and_then(|v| v.as_str())
+            .context("artifacts index has no system_version")?
+            .to_string();
+        let commit = commit_of_version(&system_version)?;
+        let artifacts = json
+            .get("artifacts")
+            .and_then(|v| v.as_array())
+            .context("artifacts index has no artifacts array")?;
+
+        let mut zones = Vec::new();
+        let mut phase1 = None;
+        let mut phase2 = None;
+        let mut rot_a = None;
+        let mut corpus = Vec::new();
+        let mut firmware = Vec::new();
+        for a in artifacts {
+            let Some(target) = a.get("target_name").and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let tags = a.get("tags");
+            let tag =
+                |k: &str| tags.and_then(|t| t.get(k)).and_then(|v| v.as_str());
+            let member = format!("repo/targets/{target}");
+            if !members.contains(&member) {
+                bail!("target {target} listed but absent from {path}");
+            }
+            let base = target.rsplit('/').next().unwrap_or(target);
+            // A repo carries every board and keyset, so the tags that narrow
+            // an artifact to this fleet are part of the match.
+            match tag("kind").unwrap_or("") {
+                "zone" => zones.push((member, base.to_string())),
+                "measurement_corpus" => corpus.push((member, base.to_string())),
+                "os_phase1" if tag("os_board") == Some(HOST_BOARD) => {
+                    phase1 = Some(member);
+                }
+                "os_phase2" if tag("os_variant") == Some(HOST_VARIANT) => {
+                    phase2 = Some(member);
+                }
+                "rot"
+                    if tag("rot_rkth") == Some(BART_RKTH)
+                        && tag("rot_slot") == Some("a") =>
+                {
+                    rot_a = Some(member);
+                }
+                "rot_bootloader" if tag("rot_rkth") == Some(BART_RKTH) => {
+                    firmware.push(Firmware {
+                        kind: "gimlet_rot_bootloader".to_string(),
+                        name: format!(
+                            "gimlet_rot_bootloader-{BOOTLOADER_VARIANT}"
+                        ),
+                        member,
+                    });
+                }
+                "sp" => {
+                    let board = tag("sp_board").unwrap_or("");
+                    let kind = if board == GIMLET_BOARD {
+                        "gimlet_sp"
+                    } else if board == SIDECAR_BOARD {
+                        "switch_sp"
+                    } else {
+                        continue;
+                    };
+                    firmware.push(Firmware {
+                        kind: kind.to_string(),
+                        name: board.to_string(),
+                        member,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let need = |slot: Option<String>, what: &str| {
+            slot.with_context(|| format!("{path} has no {what} target"))
+        };
+        if zones.is_empty() {
+            bail!("{path} has no zone targets");
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            system_version,
+            commit,
+            layout: Layout::V2 {
+                zones,
+                phase1: need(phase1, "os_phase1")?,
+                phase2: need(phase2, "os_phase2")?,
+                rot_a: need(rot_a, "slot A RoT for the bart keyset")?,
+            },
+            hashes: v2_target_hashes(&mut zip)?,
             corpus,
             firmware,
         })
@@ -171,29 +307,43 @@ impl TufRepoSource {
     ) -> Result<Vec<String>> {
         fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
         let mut zip = self.open()?;
-        let mut archive = member_tar(&mut zip, &self.control_plane)?;
         let mut names = Vec::new();
-        for entry in
-            archive.entries().context("read control plane composite entries")?
-        {
-            let mut entry = entry?;
-            let path = entry.path()?.into_owned();
-            let Some(name) = path
-                .strip_prefix("zones")
-                .ok()
-                .and_then(|p| p.to_str())
-                .filter(|n| n.ends_with(".tar.gz"))
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            entry
-                .unpack(dir.join(&name))
-                .with_context(|| format!("unpack {name} into {dir}"))?;
-            names.push(name);
-        }
-        if names.is_empty() {
-            bail!("control plane composite in {} carried no zones", self.path);
+        match &self.layout {
+            Layout::V1 { control_plane, .. } => {
+                let mut archive = member_tar(&mut zip, control_plane)?;
+                for entry in archive
+                    .entries()
+                    .context("read control plane composite entries")?
+                {
+                    let mut entry = entry?;
+                    let path = entry.path()?.into_owned();
+                    let Some(name) = path
+                        .strip_prefix("zones")
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .filter(|n| n.ends_with(".tar.gz"))
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    entry
+                        .unpack(dir.join(&name))
+                        .with_context(|| format!("unpack {name} into {dir}"))?;
+                    names.push(name);
+                }
+                if names.is_empty() {
+                    bail!(
+                        "control plane composite in {} carried no zones",
+                        self.path
+                    );
+                }
+            }
+            Layout::V2 { zones, .. } => {
+                for (member, name) in zones {
+                    extract_member(&mut zip, member, &dir.join(name))?;
+                    names.push(name.clone());
+                }
+            }
         }
         names.sort();
         Ok(names)
@@ -224,7 +374,16 @@ impl TufRepoSource {
         phase1_dest: &Utf8Path,
     ) -> Result<(u64, u64)> {
         let mut zip = self.open()?;
-        let mut archive = member_tar(&mut zip, &self.host)?;
+        let host = match &self.layout {
+            Layout::V1 { host, .. } => host,
+            Layout::V2 { phase1, phase2, .. } => {
+                let rom = extract_member(&mut zip, phase1, phase1_dest)?;
+                let boot = extract_member(&mut zip, phase2, boot_image_dest)?;
+                check_boot_image(boot_image_dest)?;
+                return Ok((boot, rom));
+            }
+        };
+        let mut archive = member_tar(&mut zip, host)?;
         let mut boot_image = None;
         let mut phase1 = None;
         for entry in archive.entries().context("read host composite entries")? {
@@ -312,7 +471,13 @@ impl TufRepoSource {
         )?;
 
         // The RoT composite holds archive-a.zip and archive-b.zip; slot A is
-        // what launch flashes, and bootleby verifies it.
+        // what launch flashes, and bootleby verifies it. v2 tags the slots
+        // apart, so load already picked slot A.
+        if let Layout::V2 { rot_a, .. } = &self.layout {
+            let dest = dir.join("rot-a.zip");
+            extract_member(&mut zip, rot_a, &dest)?;
+            return Ok(FirmwareSet { gimlet, sidecar, rot_a: dest, bootleby });
+        }
         let rot_member = find("gimlet_rot", ROT_VARIANT)?;
         let mut archive = member_tar(&mut zip, rot_member)?;
         let mut rot_a = None;
@@ -341,31 +506,80 @@ impl TufRepoSource {
     /// keys use it rather than the commit: releng rebuilds of the same commit
     /// produce different artifacts.
     pub(crate) fn host_sha(&self) -> &str {
-        self.host
-            .strip_prefix("repo/targets/")
-            .and_then(|b| b.split_once('.'))
-            .map(|(sha, _)| sha)
-            .unwrap_or(&self.commit)
+        let member = match &self.layout {
+            Layout::V1 { host, .. } => host,
+            Layout::V2 { phase2, .. } => phase2,
+        };
+        self.hashes.get(member).map(String::as_str).unwrap_or(&self.commit)
     }
 
-    /// Every `repo/targets/<sha256>.<name>` member with its sha.
-    pub(crate) fn target_members(&self) -> Result<Vec<(String, String)>> {
-        let mut v = Vec::new();
-        for m in self.open()?.file_names() {
-            let Some(base) = m.strip_prefix("repo/targets/") else {
-                continue;
-            };
-            let Some((sha, _)) = base.split_once('.') else { continue };
-            if sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
-                v.push((sha.to_string(), m.to_string()));
-            }
-        }
-        Ok(v)
+    /// Every target member with its sha.
+    pub(crate) fn target_members(&self) -> Vec<(String, String)> {
+        self.hashes.iter().map(|(m, sha)| (sha.clone(), m.clone())).collect()
     }
 
     fn open(&self) -> Result<ZipArchive<File>> {
         open_zip(&self.path)
     }
+}
+
+/// Confirm a phase 2 artifact carries the boot image header.
+fn check_boot_image(path: &Utf8Path) -> Result<()> {
+    let mut f = File::open(path).with_context(|| format!("open {path}"))?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)
+        .with_context(|| format!("read boot image header from {path}"))?;
+    let magic = u32::from_le_bytes(magic);
+    if magic != BOOT_IMAGE_MAGIC {
+        bail!(
+            "{path} has boot image magic {magic:#x}, \
+             expected {BOOT_IMAGE_MAGIC:#x}"
+        );
+    }
+    Ok(())
+}
+
+/// Read and parse a zip member as JSON.
+fn read_json(
+    zip: &mut ZipArchive<File>,
+    name: &str,
+) -> Result<serde_json::Value> {
+    serde_json::from_reader(member(zip, name)?)
+        .with_context(|| format!("parse {name}"))
+}
+
+/// v1 members are `repo/targets/<sha256>.<name>`, so their sha is in the path.
+fn sha_keyed_members(members: &[String]) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for m in members {
+        let Some(base) = m.strip_prefix("repo/targets/") else { continue };
+        let Some((sha, _)) = base.split_once('.') else { continue };
+        if sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            map.insert(m.clone(), sha.to_string());
+        }
+    }
+    map
+}
+
+/// v2 members are named by path, so their hashes come from the TUF metadata.
+fn v2_target_hashes(
+    zip: &mut ZipArchive<File>,
+) -> Result<BTreeMap<String, String>> {
+    let json = read_json(zip, "repo/metadata/targets.json")?;
+    let targets = json
+        .get("signed")
+        .and_then(|s| s.get("targets"))
+        .and_then(|t| t.as_object())
+        .context("targets.json has no signed.targets")?;
+    let mut map = BTreeMap::new();
+    for (target, meta) in targets {
+        let Some(sha) = meta.pointer("/hashes/sha256").and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        map.insert(format!("repo/targets/{target}"), sha.to_string());
+    }
+    Ok(map)
 }
 
 /// Open a repo zip; the central directory is parsed here, members are read
