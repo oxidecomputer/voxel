@@ -27,7 +27,7 @@ use crate::topo::{
     Topo, build_topo, is_tuf_image, reset_node_cargo_bay, stage_config,
     stage_sprockets,
 };
-use crate::{commission, disks, image, sp_host};
+use crate::{commission, disks, image, node, power, sp_host};
 
 #[derive(Clone, Copy)]
 pub(crate) struct LaunchOpts<'a> {
@@ -37,6 +37,8 @@ pub(crate) struct LaunchOpts<'a> {
     pub(crate) init_rss: bool,
     /// Firmware directory for the emulated fleet, overriding the image's own.
     pub(crate) sp_firmware: Option<&'a Utf8Path>,
+    /// Config the power loop service inherits.
+    pub(crate) config_path: &'a Utf8Path,
 }
 
 /// Progress tag for a rack: rackN (1-based) with several racks, else single.
@@ -389,6 +391,19 @@ pub(crate) async fn cmd_launch(
             Err(e) => bail!("launch failed after {attempt} attempts: {e}"),
         }
     };
+
+    // Capture each node's instance so an SP can bring it back as launched,
+    // then start the loop that lets the SPs own the sleds' power.
+    let nodes: Vec<String> = topo
+        .sleds
+        .iter()
+        .map(|(s, _)| s.name.clone())
+        .chain(topo.routers.iter().map(|(r, _)| r.clone()))
+        .collect();
+    node::capture_missing(&nodes).await;
+    if opts.emu {
+        power::up_all(cfg, name, opts.config_path)?;
+    }
     let d = &topo.runner;
 
     // Routers first: the racks' uplink BGP needs the transit up.
@@ -541,7 +556,9 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
-    // Before teardown, so the fleet still goes away if falcon's destroy errors.
+    // The power loop first so it does not act on the sleds vanishing, then the
+    // fleet, both before teardown so they go away if falcon's destroy errors.
+    power::down_all(cfg);
     sp_host::down_all(cfg);
     let topo = build_topo(cfg, name)?;
     teardown(&topo.runner, name)
