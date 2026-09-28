@@ -276,10 +276,17 @@ artifact is `/work/repo.zip`. The corresponding SoftNPU sled-agent package is
 not contained in `repo.zip`; obtain the matching package from Oxide release
 engineering. A TUF repo by itself is not a complete Voxel image input.
 
-Omicron release engineering creates `repo.zip` with `cargo xtask download all`
-followed by `CI=1 cargo xtask releng`. That workflow currently downloads
-private release inputs and is not reproducible by an external customer; use
-the published CI artifact rather than trying to regenerate it locally.
+Oxide employees can build a TUF repository from an Omicron checkout with:
+
+[source,sh]
+----
+cargo xtask download all
+CI=1 cargo xtask releng
+----
+
+This produces `out/releng/repo.zip`. The workflow downloads private release
+inputs and is not reproducible by an external customer; external users should
+use the published CI artifact instead.
 
 For developers working on Omicron itself, you can build an image directly
 from a local checkout:
