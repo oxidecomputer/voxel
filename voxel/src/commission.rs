@@ -445,7 +445,13 @@ impl Tunnel {
             .chain(PASSWORD_AUTH_OPTS)
             .copied()
             .collect();
-        let proxy = format!("ssh {} -W [%h]:%p root@{gz_ip}", opts.join(" "));
+        // Note, the quoting below is important: even though `Command::arg`
+        // doesn't pass args through the shell, ssh will execute the command for
+        // ProxyCommand in the local shell, and zsh will try to do a glob with
+        // the square brackets (which in turn are needed to allow ssh to
+        // properly split the host/port pair on the color character) so this
+        // will error out without the single quotes for zsh users:
+        let proxy = format!("ssh {} -W '[%h]:%p' root@{gz_ip}", opts.join(" "));
         let child = Command::new("ssh")
             .env("SSH_ASKPASS", &askpass)
             .env("SSH_ASKPASS_REQUIRE", "force")
