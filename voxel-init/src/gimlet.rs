@@ -396,13 +396,18 @@ fn crash_dump() {
     run("dumpadm", &["-d", "/dev/zvol/dsk/rpool/dump"]);
 }
 
+/// Whether this sled is a scrimlet, from the role marker voxel-config writes
+/// into the sled config.
+fn is_scrimlet() -> bool {
+    fs::read_to_string(SLED_CFG)
+        .map(|s| s.contains("# voxel role: scrimlet"))
+        .unwrap_or(false)
+}
+
 /// Scrimlets load the baked SoftNPU P4 program. Gimlets have no softnpu
 /// device.
 fn maybe_load_sidecar() {
-    let scrimlet = fs::read_to_string(SLED_CFG)
-        .map(|s| s.contains("# voxel role: scrimlet"))
-        .unwrap_or(false);
-    if scrimlet {
+    if is_scrimlet() {
         run(
             "/opt/oxide/sidecar/scadm",
             &[
@@ -975,10 +980,7 @@ fn sidecar_programmed() -> bool {
 /// A restarted propolis has an empty SoftNPU. Load the P4 program when it is
 /// missing, and recover the dataplane if the switch zone is already up.
 fn ensure_sidecar_program() {
-    let scrimlet = fs::read_to_string(SLED_CFG)
-        .map(|s| s.contains(r#"sled_mode = "scrimlet""#))
-        .unwrap_or(false);
-    if !scrimlet || sidecar_programmed() {
+    if !is_scrimlet() || sidecar_programmed() {
         return;
     }
     note("switch-enforcer-svc: SoftNPU has no program; loading sidecar_lite");
