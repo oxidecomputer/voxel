@@ -34,6 +34,10 @@ drift surfaces at voxel compile time.
 
 ## Quickstart
 
+For a complete walkthrough, from preparing a Helios host through launching,
+accessing, and tearing down a rack, see the
+[operator guide](docs/operator-guide.adoc).
+
 1. `cargo build` builds voxel.
 2. `voxel image create 43bb5af` builds omicron (v21) and bakes `voxel-cp-43bb5af`
    (30-45 min).
