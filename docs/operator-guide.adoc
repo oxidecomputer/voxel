@@ -110,6 +110,9 @@ segment entirely on the host using an etherstub and NAT. This requires a
 physical NIC to NAT outbound traffic through but does not depend on an
 existing LAN. See <<further-reading>> for details.
 
+WARNING: A Voxel deployment running in `lan` mode is not a secure environment
+and should not be attached to an untrusted or public network.
+
 == Preparing the Host
 
 === Installing Helios
