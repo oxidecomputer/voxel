@@ -17,6 +17,7 @@ use rack_init_config::{
     ServiceIpPoolConfig, SwitchSlot, UplinkAddress, UplinkAddressConfig,
     UplinkPorts,
 };
+use sled_agent_types::early_networking::UnnumberedRouter;
 use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
 
 // Well-known service pool identity, matching omicron's v1-to-v2 conversion.
@@ -86,12 +87,12 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
             vec![BgpPeerConfig {
                 asn: p.peer_asn,
                 port: p.port.clone(),
-                addr: RouterPeerType::Unnumbered {
+                addr: RouterPeerType::Unnumbered(UnnumberedRouter {
                     router_lifetime: RouterLifetimeConfig::new(
                         p.router_lifetime,
                     )
                     .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
-                },
+                }),
                 hold_time: None,
                 idle_hold_time: None,
                 delay_open: None,
@@ -136,6 +137,7 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
         autoneg: false,
         lldp: Some(lldp(&p.switch, &p.lldp)),
         tx_eq: None,
+        allow_ddm_traffic: false,
     })
 }
 
@@ -156,6 +158,7 @@ fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
         autoneg: false,
         lldp: Some(lldp(switch, &format!("interconnect-{port}"))),
         tx_eq: None,
+        allow_ddm_traffic: false,
     })
 }
 
@@ -358,7 +361,7 @@ mod tests {
         assert_eq!(port.addresses[0].address, UplinkAddress::AddrConf);
         assert!(matches!(
             port.bgp_peers[0].addr,
-            RouterPeerType::Unnumbered { .. }
+            RouterPeerType::Unnumbered(..)
         ));
         assert_eq!(net.infra_ip_first, "::".parse::<IpAddr>().unwrap());
     }

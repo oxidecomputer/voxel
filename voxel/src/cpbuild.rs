@@ -320,6 +320,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "out/mgd",
         "out/transceiver-control",
         "out/console-assets",
+        "out/releng",
+        "out/versioned",
     ] {
         rsync.arg("--exclude").arg(ex);
     }
@@ -483,9 +485,8 @@ async fn create_cp_tuf(
     std::fs::copy(&phase1, host_dir.join("phase1-gimlet.rom"))
         .context("stage host phase 1 rom")?;
 
-    // The standard-image sled-agent hardwires scrimlet = tofino ASIC at
-    // compile time (bootstrap/pre_server.rs sled_mode_from_config); softnpu
-    // scrimlets need a switch-softnpu build staged over the phase 2 one.
+    // The phase 2 sled-agent detects softnpu scrimlets at runtime, so this is
+    // an override: a sled-agent package staged over the phase 2 one.
     if let Some(pkg) = sled_agent {
         let dir = cargo_bay.join("gz/sled-agent");
         std::fs::remove_dir_all(&dir)
@@ -505,12 +506,7 @@ async fn create_cp_tuf(
             cargo_bay.join("gz/sled-agent.xml"),
         )
         .context("stage the softnpu sled-agent SMF manifest")?;
-        eprintln!("[voxel] staged softnpu sled-agent from {pkg}");
-    } else {
-        eprintln!(
-            "[voxel] WARN: no --sled-agent; the phase 2 sled-agent cannot \
-             run softnpu scrimlets"
-        );
+        eprintln!("[voxel] staged sled-agent from {pkg}");
     }
 
     // --- 3. pinned single files from the omicron repo ------------------------
