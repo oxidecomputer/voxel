@@ -11,19 +11,19 @@ members = [
 anyhow = "1.0.102"
 # The omicron commit voxel is pinned to. Bumping this rev is the new-omicron
 # motion; build.rs surfaces it to voxel image create. Keep both revs identical.
-rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "c6b42fc64ad6b4ed2c14f2932b97b7b8234f9e78" }
-wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "c6b42fc64ad6b4ed2c14f2932b97b7b8234f9e78" }
-wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "c6b42fc64ad6b4ed2c14f2932b97b7b8234f9e78" }
+rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "d20018aa77dec97c27615d0d8c558bad2fa4782a" }
+wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "d20018aa77dec97c27615d0d8c558bad2fa4782a" }
+wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "d20018aa77dec97c27615d0d8c558bad2fa4782a" }
 # Unnumbered BGP peer type rack-init-config does not re-export yet.
-sled-agent-types = { git = "https://github.com/oxidecomputer/omicron", rev = "c6b42fc64ad6b4ed2c14f2932b97b7b8234f9e78" }
+sled-agent-types = { git = "https://github.com/oxidecomputer/omicron", rev = "d20018aa77dec97c27615d0d8c558bad2fa4782a" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
 # tokio features (they're additive), so we don't need "full".
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
-libfalcon = { git = "https://github.com/oxidecomputer/falcon", branch = "main" }
+libfalcon = { git = "https://github.com/oxidecomputer/falcon", rev = "6b1494b831bc18b588b0b591341f099e8f299533" }
 # Must be the rev libfalcon pins, so instance-spec component types unify.
-propolis-client = { git = "https://github.com/oxidecomputer/propolis", rev = "36f20be9bb4c3b362029237f5feb6377c982395f" }
+propolis-client = { git = "https://github.com/oxidecomputer/propolis", rev = "5e201ec4185ccb9182cc6ffcb09fadd9deee24ca" }
 futures = "0.3"
 oxnet = "0.1"
 slog = "2.7"
