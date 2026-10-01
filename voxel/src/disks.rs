@@ -2,16 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Real NVMe disks for sled nodes, backed by host zvols.
+//! NVMe disks for sled nodes, backed by host zvols.
 //!
 //! Each sled gets the gimlet complement (2 M.2, 5 U.2) as propolis `NvmeDisk`
 //! devices instead of file-backed vdevs in the guest. omicron then treats them
 //! as `RawDisk::Real`: it partitions the U.2s itself, reads the M.2 boot image
 //! from a real slice, and none of the `SyntheticDisk` code path runs.
-//!
-//! Nothing here needs an omicron change. sled-agent's `ExternalDisks::Hardcoded`
-//! carries a `disks: Vec<UnparsedDisk>` list that `poll_device_tree` injects on
-//! the `NotAnOxideSled` path, which is the path a voxel sled already takes.
 //!
 //! The disk's identity rides in its NVMe serial number, which the guest reads
 //! back via `nvmeadm`. That keeps voxel-init free of any shared layout table:
@@ -20,7 +16,7 @@
 use anyhow::{Context, Result, bail};
 use libfalcon::{NodeRef, Runner};
 use propolis_client::instance_spec::{
-    ComponentV0, FileStorageBackend, NvmeDisk, PciPath, SpecKey,
+    Component, FileStorageBackend, NvmeDisk, PciPath, SpecKey,
 };
 use voxel_config::SledDesc;
 
@@ -165,7 +161,7 @@ pub(crate) fn attach(
         let backend = SpecKey::Name(format!("{vol}_backing"));
         node.components.insert(
             backend.clone(),
-            ComponentV0::FileStorageBackend(FileStorageBackend {
+            Component::FileStorageBackend(FileStorageBackend {
                 // The raw (character) device, as falcon uses for boot disks.
                 path: format!(
                     "/dev/zvol/rdsk/{dataset}/topo/{deployment}/{vol}"
@@ -177,11 +173,12 @@ pub(crate) fn attach(
         );
         node.components.insert(
             SpecKey::Name(vol),
-            ComponentV0::NvmeDisk(NvmeDisk {
+            Component::NvmeDisk(NvmeDisk {
                 backend_id: backend,
                 pci_path: PciPath::new(0, disk.pci_dev, 0)
                     .context("PCI path for sled disk")?,
                 serial_number: serial_bytes(&disk.serial(sled))?,
+                has_write_cache: true,
             }),
         );
     }

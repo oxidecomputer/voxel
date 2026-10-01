@@ -380,7 +380,7 @@ pub(crate) async fn cmd_launch(
             Err(e) if attempt < BOOT_ATTEMPTS => {
                 warn!(
                     topo.runner.log,
-                    "boot attempt {attempt}/{BOOT_ATTEMPTS} failed ({e}); tearing down + retrying"
+                    "boot attempt {attempt}/{BOOT_ATTEMPTS} failed ({e}); retrying"
                 );
                 let _ = teardown(&topo.runner, name);
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -414,7 +414,7 @@ pub(crate) async fn cmd_launch(
             if rack > 0 {
                 info!(
                     d.log,
-                    "rack{}: booted, left pre-RSS (unclaimed - multirack join not yet supported)",
+                    "rack{}: booted, left uninitialized (no multirack join yet)",
                     rack + 1
                 );
                 continue;
