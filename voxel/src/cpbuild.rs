@@ -302,6 +302,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "-a",
         "--no-owner",
         "--no-group",
+        "-L",
         "tools",
         "out",
         "smf",
@@ -310,8 +311,6 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "target/release/xtask",
         "target/release/xtask-downloader",
     ]);
-    // out/ holds host-side downloads the image doesn't need; the zones are
-    // already unpacked in-guest from the tarballs we do keep.
     for ex in [
         "out/downloads",
         "out/clickhouse",
@@ -320,6 +319,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "out/mgd",
         "out/transceiver-control",
         "out/console-assets",
+        "out/releng",
+        "out/versioned",
     ] {
         rsync.arg("--exclude").arg(ex);
     }

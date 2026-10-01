@@ -11,9 +11,11 @@ members = [
 anyhow = "1.0.102"
 # The omicron commit voxel is pinned to. Bumping this rev is the new-omicron
 # motion; build.rs surfaces it to voxel image create. Keep both revs identical.
-rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
-wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
-wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
+rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "95d02dd9a62ca53cbce5a123d42286c810559b5f" }
+wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "95d02dd9a62ca53cbce5a123d42286c810559b5f" }
+wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "95d02dd9a62ca53cbce5a123d42286c810559b5f" }
+# Unnumbered BGP peer type rack-init-config does not re-export yet.
+sled-agent-types = { git = "https://github.com/oxidecomputer/omicron", rev = "95d02dd9a62ca53cbce5a123d42286c810559b5f" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
