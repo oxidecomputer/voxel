@@ -1,6 +1,6 @@
 [package]
 name = "voxel-init"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
 
 # The in-guest bring-up agent baked into voxel images. Deliberately depends on
