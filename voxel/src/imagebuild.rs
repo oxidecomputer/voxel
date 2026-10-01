@@ -138,6 +138,18 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     // An agent role, or an arbitrary command, or neither (boot-only smoke test).
     // The cargo-bay arrives without the exec bit, so the agent is copied to
     // local disk before running.
+    if o.role.is_some() {
+        let bay = d
+            .exec(node, "ls /opt/cargo-bay")
+            .await
+            .map_err(|e| anyhow::anyhow!("list cargo-bay in guest: {e}"))?;
+        if !bay.contains("voxel-init") {
+            bail!(
+                "cargo-bay copy incomplete in the builder; guest sees: {bay:?}"
+            );
+        }
+    }
+
     let step = match (o.role, o.exec) {
         (Some(role), _) => Some((
             format!("install --role {role}"),
