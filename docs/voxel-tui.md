@@ -23,6 +23,26 @@ and its session can attach to or detach from new or existing deployments. Use
 `voxel tui resume` to resume the most recent detached session, or add `--choose`
 to select one.
 
+### External network
+
+Before a fresh deployment, the TUI defaults the external network to Voxel's
+isolated segment (see [Isolated external
+network](../README.md#isolated-external-network-optional)). If the config sets
+no `external.mode`, the TUI writes `external.mode = "isolated"` to it, takes an
+unset `external.uplink` from the host's default-route link, and records the
+decision in `voxel-tui.log`. In LAN mode, each node leases addresses from the
+LAN's DHCP server. When that subnet is not on-link for the host, the host route
+to the rack cannot be installed, and Nexus and its Oximeter telemetry are
+unreachable. The isolated segment puts `ce` on a host-attached subnet, so the
+route always installs.
+
+An explicit `external.mode`, including `"lan"`, is left alone, and a running or
+resumed deployment keeps the mode it was launched with. To keep LAN behavior:
+
+```console
+$ voxel config set external.mode lan
+```
+
 ## Views and actions
 
 The TUI has two alternate views, Deployment and Monitoring. Each view has a

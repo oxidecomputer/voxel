@@ -1,7 +1,10 @@
+use anyhow::Context;
 use camino::Utf8PathBuf;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use voxel_config::VoxelConfig;
+use voxel_config::{VoxelConfig, config as vcfg};
+
+use super::operation::LogLevel;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublicCommand {
@@ -56,6 +59,62 @@ impl TuiContext {
             executable,
             effective_env,
         }
+    }
+
+    /// Moves an unconfigured external network to isolated mode. LAN mode
+    /// reaches the rack only when the LAN's DHCP subnet is on-link for the
+    /// host; otherwise the host route to the rack, and Nexus with it, cannot
+    /// be installed. The choice is written to the config so launch, route,
+    /// and destroy all agree on the segment. An operator's explicit mode is
+    /// left alone. Returns a log message describing any decision made.
+    pub(crate) fn default_isolated_external(
+        &mut self,
+        default_link: Option<String>,
+    ) -> anyhow::Result<Option<(LogLevel, String)>> {
+        let text = if self.config_path.exists() {
+            std::fs::read_to_string(&self.config_path)
+                .with_context(|| format!("read {}", self.config_path))?
+        } else {
+            VoxelConfig::default().to_toml()
+        };
+        let get = |key| vcfg::get(&text, key).map_err(anyhow::Error::msg);
+        if get("external.mode")?.is_some() {
+            return Ok(None);
+        }
+        let (text, uplink) = match (get("external.uplink")?, default_link) {
+            (Some(uplink), _) => (text.clone(), uplink),
+            (None, Some(link)) => (
+                vcfg::set(&text, "external.uplink", &link)
+                    .map_err(anyhow::Error::msg)?,
+                link,
+            ),
+            (None, None) => {
+                return Ok(Some((
+                    LogLevel::Warning,
+                    "external network: no default route to NAT an isolated \
+                     segment out of; staying in lan mode"
+                        .into(),
+                )));
+            }
+        };
+        let text = vcfg::set(&text, "external.mode", "isolated")
+            .map_err(anyhow::Error::msg)?;
+        if let Some(parent) = self.config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {parent}"))?;
+        }
+        std::fs::write(&self.config_path, &text)
+            .with_context(|| format!("write {}", self.config_path))?;
+        self.config = VoxelConfig::from_toml(&text)
+            .with_context(|| format!("parse {}", self.config_path))?;
+        Ok(Some((
+            LogLevel::Info,
+            format!(
+                "external network: {} now uses isolated mode out of {uplink}; \
+                 set external.mode = \"lan\" to opt out",
+                self.config_path
+            ),
+        )))
     }
 
     pub(crate) fn command_spec(&self, command: PublicCommand) -> CommandSpec {
@@ -154,6 +213,66 @@ mod tests {
             assert_eq!(spec.current_dir, PathBuf::from("/work/voxel"));
             assert_eq!(spec.env, context.effective_env);
         }
+    }
+
+    fn context_with_config(name: &str, text: Option<&str>) -> TuiContext {
+        let dir = std::env::temp_dir()
+            .join(format!("voxel-tui-external-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = Utf8PathBuf::try_from(dir.join("voxel.toml")).unwrap();
+        if let Some(text) = text {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        TuiContext { config_path: path, ..context() }
+    }
+
+    #[test]
+    fn unconfigured_external_network_defaults_to_isolated() {
+        let mut context = context_with_config("default", None);
+        let (_, note) = context
+            .default_isolated_external(Some("ixgbe0".into()))
+            .unwrap()
+            .unwrap();
+        assert!(note.contains("isolated mode out of ixgbe0"), "{note}");
+        assert!(context.config.external.isolated());
+        assert_eq!(context.config.external.uplink.as_deref(), Some("ixgbe0"));
+        let written = VoxelConfig::from_toml(
+            &std::fs::read_to_string(&context.config_path).unwrap(),
+        )
+        .unwrap();
+        assert!(written.external.isolated());
+        // Once written, the mode is explicit and is not revisited.
+        assert_eq!(
+            context.default_isolated_external(Some("igb0".into())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_external_choices_are_kept() {
+        let mut lan =
+            context_with_config("lan", Some("[external]\nmode = \"lan\"\n"));
+        assert_eq!(
+            lan.default_isolated_external(Some("ixgbe0".into())).unwrap(),
+            None
+        );
+        assert!(!lan.config.external.isolated());
+
+        let mut uplink = context_with_config(
+            "uplink",
+            Some("[external]\nuplink = \"igb1\"\n"),
+        );
+        uplink.default_isolated_external(Some("ixgbe0".into())).unwrap();
+        assert_eq!(uplink.config.external.uplink.as_deref(), Some("igb1"));
+        assert!(uplink.config.external.isolated());
+
+        let mut no_route = context_with_config("no-route", Some(""));
+        let (level, note) =
+            no_route.default_isolated_external(None).unwrap().unwrap();
+        assert_eq!(level, super::LogLevel::Warning);
+        assert!(note.contains("staying in lan mode"), "{note}");
+        assert!(!no_route.config.external.isolated());
     }
 
     #[test]

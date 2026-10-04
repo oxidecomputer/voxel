@@ -56,7 +56,16 @@ async fn reserve_initial_reconciliation(
         .context("reserve initial TUI reconciliation")
 }
 
-pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
+/// Whether this deployment already has storage, and so a fixed external mode.
+fn deployment_storage_present(context: &TuiContext) -> bool {
+    std::process::Command::new("zfs")
+        .args(["list", "-H", "-o", "name"])
+        .arg(format!("{}/topo/{}", context.dataset, context.name))
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     let resumed_claim = session::claim_from_environment()?;
 
     // Everything that must survive terminal setup failure is created first.
@@ -65,6 +74,23 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
         context.workdir.join("voxel-tui.log").as_std_path(),
     )
     .context("open durable TUI log")?;
+    // A running deployment keeps the external mode it was launched with.
+    let external_note = if resumed_claim.is_none()
+        && !deployment_storage_present(&context)
+    {
+        context.default_isolated_external(crate::rack::default_route_iface())?
+    } else {
+        None
+    };
+    if let Some((level, message)) = &external_note {
+        let tag = match level {
+            operation::LogLevel::Warning => "WARN",
+            _ => "INFO",
+        };
+        durable
+            .write_line(&format!("{tag} {message}"))
+            .context("write durable TUI log")?;
+    }
     let (mut detached, reattach) = session::prepare_direct(&context)?;
     let topology = telemetry::resource_descriptors(&context.config);
     prepare_probe_mounts(&context.workdir, &context.config)?;
@@ -110,6 +136,9 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
     let mut terminal = terminal::TerminalSession::enter(terminal_writer)
         .context("enter terminal UI")?;
     let mut app = App::new(topology, 500, 120);
+    if let Some((level, message)) = external_note {
+        app.logs.push(app::LogEntry::application(level, message));
+    }
     app.reattach_command = Some(reattach);
     app.external_monitoring_endpoints = (0..context.config.topology.racks())
         .filter_map(|rack| {

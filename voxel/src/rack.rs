@@ -94,7 +94,7 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
 
 /// The host's default-route interface via `route -n get default`, or `None`
 /// when there is no default route (falcon reports that on its own).
-fn default_route_iface() -> Option<String> {
+pub(crate) fn default_route_iface() -> Option<String> {
     let out = Command::new(crate::net::ROUTE)
         .args(["-n", "get", "default"])
         .output()
