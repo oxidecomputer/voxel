@@ -252,7 +252,7 @@ pub struct ObservabilityState {
     pub health: BTreeMap<ResourceId, LatestSample<HealthDiagnostic>>,
     pub addresses: BTreeMap<ResourceId, LatestSample<NodeAddresses>>,
     pub traffic_failures: BTreeMap<ResourceId, LatestSample<()>>,
-    direct_traffic: BTreeMap<ResourceId, LatestSample<TrafficSample>>,
+    pub direct_traffic: BTreeMap<ResourceId, LatestSample<TrafficSample>>,
     pub zone_cpu: BTreeMap<RackId, LatestSample<Vec<ZoneCpu>>>,
     pub zfs_headroom: BTreeMap<RackId, LatestSample<Vec<ZfsHeadroom>>>,
     pub oximeter_exceptions: BTreeMap<RackId, LatestSample<OximeterExceptions>>,

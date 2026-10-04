@@ -139,13 +139,26 @@ pub(crate) fn detail_area(app: &App) -> Option<Rect> {
 pub(crate) fn resource_health_state(app: &App, id: &ResourceId) -> HealthState {
     let kind = resource_kind(app, id);
     if kind != Some(ResourceKind::Sled) {
-        return app
-            .observability
-            .traffic_failures
-            .get(id)
-            .map_or(HealthState::Unavailable, |sample| {
-                collection_health_state(app, sample)
-            });
+        // A slow Oximeter cycle must not mark a node down while its direct
+        // probe still answers, so the fresher of the two decides.
+        let shown = app.observability.traffic_failures.get(id);
+        let direct = app.observability.direct_traffic.get(id);
+        // A source that has never reported says nothing, so it ranks below
+        // one that has reported a failure.
+        let rank = |state: HealthState| match state {
+            HealthState::Healthy => 3,
+            HealthState::Stale => 2,
+            HealthState::Unavailable => 1,
+            _ => 0,
+        };
+        return [
+            shown.map(|sample| collection_health_state(app, sample)),
+            direct.map(|sample| collection_health_state(app, sample)),
+        ]
+        .into_iter()
+        .flatten()
+        .max_by_key(|state| rank(*state))
+        .unwrap_or(HealthState::Unavailable);
     }
     let Some(sample) = app.observability.health.get(id) else {
         return HealthState::Unavailable;
@@ -211,10 +224,15 @@ fn resource_last_success(
             sample.good.as_ref().map(|good| good.captured_at)
         })
     } else {
-        app.observability.traffic_failures.get(id).and_then(|sample| {
-            sample.good.as_ref().map(|good| good.captured_at)
-        })
+        last_good(app.observability.traffic_failures.get(id))
+            .max(last_good(app.observability.direct_traffic.get(id)))
     }
+}
+
+fn last_good<T>(
+    sample: Option<&LatestSample<T>>,
+) -> Option<std::time::Instant> {
+    sample.and_then(|sample| sample.good.as_ref().map(|good| good.captured_at))
 }
 
 pub(crate) fn health_status_label(state: HealthState) -> &'static str {
@@ -766,6 +784,49 @@ mod height_tests {
                 HealthState::Healthy
             );
         }
+    }
+
+    #[test]
+    fn direct_probes_keep_a_switch_healthy_through_oximeter_gaps() {
+        let id = ResourceId::rack(RackId(0), ResourceKind::SwitchZone, "g0");
+        let mut app = App::new(
+            vec![ResourceDescriptor {
+                id: id.clone(),
+                rack: Some(RackId(0)),
+                kind: ResourceKind::SwitchZone,
+                name: "switch0".into(),
+                host: Some("g0".into()),
+                slot: Some(0),
+            }],
+            4,
+            4,
+        );
+        let start = Instant::now();
+        app.deployment.observed = ObservedDeploymentState::Running;
+        app.update(AppEvent::OximeterTraffic {
+            id: id.clone(),
+            at: start,
+            samples: vec![(
+                start,
+                TrafficSample {
+                    source: crate::tui::telemetry::TrafficSource::Oximeter,
+                    ..Default::default()
+                },
+            )],
+        });
+        // Oximeter goes quiet for five minutes; the direct probe does not.
+        let later = start + Duration::from_secs(300);
+        app.update(AppEvent::Tick { now: later });
+        assert_eq!(resource_health_state(&app, &id), HealthState::Unavailable);
+        app.update(AppEvent::Traffic {
+            id: id.clone(),
+            at: later,
+            sample: TrafficSample::default(),
+        });
+        assert_eq!(resource_health_state(&app, &id), HealthState::Healthy);
+        assert!(
+            resource_health_summary(&app, &id).contains("last success 0s ago")
+        );
     }
 
     #[test]
