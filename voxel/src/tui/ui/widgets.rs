@@ -39,6 +39,11 @@ pub(crate) fn fit_terminal_width(text: &str, width: usize) -> String {
 }
 
 pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+    if let Some(splash) = &app.splash
+        && super::splash::draw(frame, splash, app.now)
+    {
+        return;
+    }
     let area = frame.area();
     let root = root_layout(area);
     if root.mode == LayoutMode::Minimum {

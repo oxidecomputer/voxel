@@ -273,6 +273,7 @@ pub struct App {
     pub external_monitoring_endpoints: BTreeMap<RackId, String>,
     pub clipboard_copied: bool,
     pub now: Option<Instant>,
+    pub splash: Option<crate::tui::ui::splash::Splash>,
     next_operation_request_id: Option<OperationRequestId>,
 }
 
@@ -382,6 +383,7 @@ impl App {
             external_monitoring_endpoints: BTreeMap::new(),
             clipboard_copied: false,
             now: None,
+            splash: None,
             next_operation_request_id: Some(OperationRequestId::FIRST),
         };
         app.repair_selection();
@@ -391,8 +393,20 @@ impl App {
     pub fn update(&mut self, event: AppEvent) -> Vec<Effect> {
         let mut effects = vec![];
         match event {
-            AppEvent::Action(action) => return self.action(action),
-            AppEvent::Tick { now } => self.now = Some(now),
+            AppEvent::Action(action) => {
+                // Any key skips the launch animation, as in wicket.
+                if self.splash.take().is_some() {
+                    return effects;
+                }
+                return self.action(action);
+            }
+            AppEvent::Tick { now } => {
+                self.now = Some(now);
+                if self.splash.as_mut().is_some_and(|splash| !splash.tick(now))
+                {
+                    self.splash = None;
+                }
+            }
             AppEvent::Resize { width, height } => {
                 self.session.terminal = TerminalSize { width, height }
             }
@@ -1716,6 +1730,24 @@ mod factual_outcome_tests {
         app.update(AppEvent::Action(Action::ToggleView));
 
         assert_eq!(app.session.selected_resource, Some(descriptor.id));
+    }
+
+    #[test]
+    fn splash_swallows_the_first_key_and_expires_on_ticks() {
+        let mut app = App::new(vec![], 8, 8);
+        app.splash = Some(crate::tui::ui::splash::Splash::default());
+        app.update(AppEvent::Action(Action::ToggleView));
+        assert!(app.splash.is_none());
+        assert_eq!(app.session.view, View::Deployment);
+
+        let start = Instant::now();
+        app.splash = Some(crate::tui::ui::splash::Splash::default());
+        app.update(AppEvent::Tick { now: start });
+        assert!(app.splash.is_some());
+        app.update(AppEvent::Tick {
+            now: start + crate::tui::ui::splash::DURATION,
+        });
+        assert!(app.splash.is_none());
     }
 
     #[test]

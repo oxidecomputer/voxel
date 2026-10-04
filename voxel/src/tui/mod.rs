@@ -127,6 +127,19 @@ pub(crate) async fn run(context: TuiContext) -> anyhow::Result<()> {
         shutdown.clone(),
         Duration::from_millis(250),
     )?;
+    // The launch animation needs wicket's 30 ms cadence; run a dedicated
+    // ticker for its duration rather than speeding up the steady-state tick.
+    app.splash = Some(ui::splash::Splash::default());
+    let splash_ticks = shutdown.child_token();
+    terminal::spawn_ticks(
+        events_tx.clone(),
+        splash_ticks.clone(),
+        ui::splash::FRAME,
+    )?;
+    tokio::spawn(async move {
+        tokio::time::sleep(ui::splash::DURATION + ui::splash::FRAME).await;
+        splash_ticks.cancel();
+    });
     let mut collection = tokio::spawn(collector.run_gated(
         schedule,
         events_tx.clone(),
