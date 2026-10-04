@@ -514,7 +514,16 @@ fn detail_text(
     }
     if !errors.is_empty() {
         lines.push(Line::default());
-        lines.push(heading("Errors"));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Errors",
+                Style::default().fg(OX_OFF_WHITE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · logged to {}", app.durable_log_path),
+                Style::default().fg(TUI_GREY),
+            ),
+        ]));
         for (label, message) in errors {
             lines.push(item(label, bad(message)));
         }
@@ -659,8 +668,13 @@ mod tests {
             at: now,
             message: "ZFS response omitted a pool".into(),
         });
+        app.durable_log_path = "/work/voxel-tui.log".into();
         let text = render(&app, false);
         assert!(text.contains("no successful health sample"), "{text}");
+        assert!(
+            text.contains("Errors · logged to /work/voxel-tui.log"),
+            "{text}"
+        );
         assert!(
             text.contains("Zone CPU unavailable: CPU query timed out"),
             "{text}"

@@ -206,6 +206,28 @@ impl Effects {
                 }
                 child.forced = Some(result);
             }
+            Effect::RecordMonitoring { level, message } => {
+                let tag = match level {
+                    LogLevel::Info => "INFO",
+                    LogLevel::Warning => "WARN",
+                    LogLevel::Error => "ERRO",
+                };
+                // Match the timestamps on the launch child's own log lines.
+                let at = chrono::Local::now().format("%b %d %H:%M:%S%.3f");
+                if let Err(error) = self
+                    .durable
+                    .write_line(&format!("{at} {tag} monitor: {message}"))
+                {
+                    let _ = self
+                        .events
+                        .send(AppEvent::DurableLogFailed {
+                            message: format!(
+                                "durable TUI log write failed: {error}"
+                            ),
+                        })
+                        .await;
+                }
+            }
             Effect::CopyToClipboard(_) | Effect::Quit => {}
         }
     }

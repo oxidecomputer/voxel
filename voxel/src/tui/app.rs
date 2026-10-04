@@ -272,6 +272,9 @@ pub struct App {
     pub reattach_command: Option<String>,
     pub external_monitoring_endpoints: BTreeMap<RackId, String>,
     pub clipboard_copied: bool,
+    /// The last error logged per monitoring source, so a persistent failure
+    /// is logged once and its recovery is logged when it clears.
+    logged_monitoring_errors: BTreeMap<String, String>,
     pub now: Option<Instant>,
     pub splash: Option<crate::tui::ui::splash::Splash>,
     next_operation_request_id: Option<OperationRequestId>,
@@ -382,6 +385,7 @@ impl App {
             reattach_command: None,
             external_monitoring_endpoints: BTreeMap::new(),
             clipboard_copied: false,
+            logged_monitoring_errors: BTreeMap::new(),
             now: None,
             splash: None,
             next_operation_request_id: Some(OperationRequestId::FIRST),
@@ -392,6 +396,7 @@ impl App {
 
     pub fn update(&mut self, event: AppEvent) -> Vec<Effect> {
         let mut effects = vec![];
+        self.log_monitoring_outcome(&event, &mut effects);
         match event {
             AppEvent::Action(action) => {
                 // Any key skips the launch animation, as in wicket.
@@ -706,6 +711,99 @@ impl App {
         }
         self.clamp_log_scroll();
         effects
+    }
+
+    fn resource_label(&self, id: &ResourceId) -> String {
+        let name = self
+            .deployment
+            .topology
+            .iter()
+            .find(|descriptor| &descriptor.id == id)
+            .map_or(id.name.as_str(), |descriptor| descriptor.name.as_str());
+        format!("{name} {:?}", id.kind).to_lowercase()
+    }
+
+    /// Records monitoring failures in the TUI log as they appear or change,
+    /// and their recovery, so the Monitor view's errors have a durable trail.
+    fn log_monitoring_outcome(
+        &mut self,
+        event: &AppEvent,
+        effects: &mut Vec<Effect>,
+    ) {
+        let rack =
+            |rack: &RackId, what: &str| format!("rack {} {what}", rack.0);
+        let (source, error) = match event {
+            AppEvent::NexusUnavailable { rack: r, message, .. } => {
+                (rack(r, "Nexus"), Some(message))
+            }
+            AppEvent::NexusAvailable { rack: r, .. } => {
+                (rack(r, "Nexus"), None)
+            }
+            AppEvent::OximeterTrafficFailed { rack: r, message, .. } => {
+                (rack(r, "Oximeter traffic"), Some(message))
+            }
+            AppEvent::OximeterTraffic { id, .. } => match &id.scope {
+                ResourceScope::Rack(r) => (rack(r, "Oximeter traffic"), None),
+                ResourceScope::Fleet => return,
+            },
+            AppEvent::TrafficFailed { id, message, .. } => {
+                (format!("{} traffic", self.resource_label(id)), Some(message))
+            }
+            AppEvent::Traffic { id, .. } => {
+                (format!("{} traffic", self.resource_label(id)), None)
+            }
+            AppEvent::HealthFailed { id, message, .. } => {
+                (format!("{} health", self.resource_label(id)), Some(message))
+            }
+            AppEvent::Health { id, .. } => {
+                (format!("{} health", self.resource_label(id)), None)
+            }
+            AppEvent::AddressesFailed { id, message, .. } => (
+                format!("{} addresses", self.resource_label(id)),
+                Some(message),
+            ),
+            AppEvent::Addresses { id, .. } => {
+                (format!("{} addresses", self.resource_label(id)), None)
+            }
+            AppEvent::ZoneCpuFailed { rack: r, message, .. } => {
+                (rack(r, "zone CPU"), Some(message))
+            }
+            AppEvent::ZoneCpu { rack: r, .. } => (rack(r, "zone CPU"), None),
+            AppEvent::ZfsHeadroomFailed { rack: r, message, .. } => {
+                (rack(r, "ZFS"), Some(message))
+            }
+            AppEvent::ZfsHeadroom { rack: r, .. } => (rack(r, "ZFS"), None),
+            AppEvent::OximeterExceptionsFailed { rack: r, message, .. } => {
+                (rack(r, "Oximeter collector health"), Some(message))
+            }
+            AppEvent::OximeterExceptions { rack: r, .. } => {
+                (rack(r, "Oximeter collector health"), None)
+            }
+            AppEvent::RssFailed { rack: r, message, .. } => {
+                (rack(r, "RSS"), Some(message))
+            }
+            AppEvent::Rss { rack: r, .. } => (rack(r, "RSS"), None),
+            _ => return,
+        };
+        let (level, message) = match error {
+            Some(message)
+                if self.logged_monitoring_errors.get(&source)
+                    != Some(message) =>
+            {
+                self.logged_monitoring_errors
+                    .insert(source.clone(), message.clone());
+                (LogLevel::Warning, format!("{source}: {message}"))
+            }
+            None if self.logged_monitoring_errors.remove(&source).is_some() => {
+                (LogLevel::Info, format!("{source}: recovered"))
+            }
+            _ => return,
+        };
+        self.logs.push_filtered(
+            LogEntry::application(level, format!("monitor: {message}")),
+            self.logs_filter,
+        );
+        effects.push(Effect::RecordMonitoring { level, message });
     }
 
     fn action(&mut self, action: Action) -> Vec<Effect> {
@@ -1815,6 +1913,55 @@ mod factual_outcome_tests {
         app.update(AppEvent::Action(Action::Close));
         assert!(!app.session.detail_open);
         assert_eq!(app.session.selected_resource, Some(sled(1).id));
+    }
+
+    #[test]
+    fn monitoring_errors_are_logged_once_and_on_recovery() {
+        let rack = RackId(0);
+        let mut app = App::new(vec![], 8, 8);
+        let now = Instant::now();
+        let unavailable = |message: &str| AppEvent::NexusUnavailable {
+            rack,
+            at: now,
+            message: message.into(),
+        };
+        let recorded = |effects: Vec<Effect>| {
+            effects
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::RecordMonitoring { level, message } => {
+                        Some((level, message))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            recorded(app.update(unavailable("connect refused"))),
+            [(LogLevel::Warning, "rack 0 Nexus: connect refused".to_owned())]
+        );
+        assert!(
+            recorded(app.update(unavailable("connect refused"))).is_empty()
+        );
+        assert_eq!(
+            recorded(app.update(unavailable("timed out"))),
+            [(LogLevel::Warning, "rack 0 Nexus: timed out".to_owned())]
+        );
+        assert_eq!(
+            recorded(app.update(AppEvent::NexusAvailable { rack, at: now })),
+            [(LogLevel::Info, "rack 0 Nexus: recovered".to_owned())]
+        );
+        assert!(
+            recorded(app.update(AppEvent::NexusAvailable { rack, at: now }))
+                .is_empty()
+        );
+        // The Deployment view's log pane carries the same trail.
+        assert!(
+            app.logs.entries.iter().any(
+                |entry| entry.message == "monitor: rack 0 Nexus: timed out"
+            )
+        );
     }
 
     #[test]

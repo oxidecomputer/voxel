@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::tui::operation::{OperationEvent, OperationKind};
+use crate::tui::operation::{LogLevel, OperationEvent, OperationKind};
 use crate::tui::reconcile::{
     ReconciliationResult, RouteEvidence, RssObservation,
 };
@@ -143,10 +143,23 @@ impl OperationRequestId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
-    Start { request_id: OperationRequestId, kind: OperationKind },
-    Cancel { request_id: OperationRequestId, choice: CancelChoice },
-    ForceStop { request_id: OperationRequestId },
+    Start {
+        request_id: OperationRequestId,
+        kind: OperationKind,
+    },
+    Cancel {
+        request_id: OperationRequestId,
+        choice: CancelChoice,
+    },
+    ForceStop {
+        request_id: OperationRequestId,
+    },
     CopyToClipboard(String),
+    /// Append a monitoring outcome to the durable TUI log.
+    RecordMonitoring {
+        level: LogLevel,
+        message: String,
+    },
     Quit,
 }
 

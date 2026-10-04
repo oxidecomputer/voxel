@@ -136,6 +136,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     let mut terminal = terminal::TerminalSession::enter(terminal_writer)
         .context("enter terminal UI")?;
     let mut app = App::new(topology, 500, 120);
+    app.durable_log_path = context.workdir.join("voxel-tui.log").to_string();
     if let Some((level, message)) = external_note {
         app.logs.push(app::LogEntry::application(level, message));
     }

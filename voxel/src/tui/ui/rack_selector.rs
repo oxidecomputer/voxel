@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     tui::reconcile::ObservedDeploymentState,
-    tui::reconcile::RssObservation,
+    tui::reconcile::{RouteEvidence, RssObservation},
     tui::{
         App,
         telemetry::{Freshness, HealthState, LatestSample, TrafficSeverity},
@@ -141,15 +141,24 @@ pub fn draw(
         .get(&rack)
         .and_then(|sample| sample.latest_error.as_ref())
     {
+        // A missing host route is the usual reason this host cannot reach
+        // Nexus, and the raw connect error does not say so.
+        let cause = if matches!(
+            app.deployment.routes,
+            RouteEvidence::Applied | RouteEvidence::NotRequired
+        ) {
+            "Oximeter traffic, CPU, ZFS, collector health may be stale"
+        } else {
+            "No host route to the rack's external network is confirmed \
+             (r in Deployment applies it)"
+        };
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(
-                    "Nexus/control plane unavailable · direct-probe fallback enabled",
-                ),
                 Line::from(format!(
-                    "Oximeter traffic, CPU, ZFS, collector health may be stale · {}",
-                    error.message
+                    "Nexus/control plane unavailable · direct-probe fallback enabled · log: {}",
+                    app.durable_log_path
                 )),
+                Line::from(format!("{cause} · {}", error.message)),
             ])
             .style(Style::default().fg(OX_RED).add_modifier(Modifier::BOLD)),
             Rect::new(
@@ -336,8 +345,17 @@ mod tests {
             message: "Nexus is unavailable".into(),
         });
 
+        app.durable_log_path = "/work/voxel-tui.log".into();
+        let unrouted = rendered(&app);
+        assert!(unrouted.contains("Nexus/control plane unavailable"));
+        assert!(unrouted.contains("log: /work/voxel-tui.log"), "{unrouted}");
+        assert!(
+            unrouted.contains("No host route to the rack's external network"),
+            "{unrouted}"
+        );
+
+        app.deployment.routes = RouteEvidence::Applied;
         let outage = rendered(&app);
-        assert!(outage.contains("Nexus/control plane unavailable"));
         assert!(
             outage.contains("traffic, CPU, ZFS, collector health may be stale")
         );
