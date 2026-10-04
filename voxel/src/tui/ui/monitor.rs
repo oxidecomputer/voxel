@@ -1,12 +1,11 @@
 use super::{
     colors::{
-        OX_GREEN_LIGHT, OX_RED, TUI_GREEN, TUI_GREY, TUI_GREY_DARK, TUI_PURPLE,
-        TUI_YELLOW,
+        OX_GREEN_LIGHT, OX_RED, TUI_GREEN, TUI_GREY, TUI_GREY_DARK, TUI_YELLOW,
     },
     renderer::LayoutMode,
     widgets::{
-        fit_terminal_width, format_rate, section_block, section_heights,
-        section_rects, terminal_width, traffic_style,
+        format_rate, section_block, section_heights, section_rects,
+        traffic_style,
     },
 };
 use crate::{
@@ -25,7 +24,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Cell, Paragraph, Row, Sparkline, Table},
+    widgets::{Block, Cell, Paragraph, Row, Table},
 };
 use std::time::Duration;
 
@@ -91,51 +90,48 @@ pub(crate) fn monitor_rows(
 #[derive(Clone, Copy)]
 pub(crate) struct MiddleLayout {
     pub(crate) topology: Rect,
-    pub(crate) inspector: Rect,
+    pub(crate) detail: Rect,
     pub(crate) divider: Rect,
 }
 
+/// Wide layouts show the rack and the selected node's details side by
+/// side; compact ones show one at a time, as wicket does.
 pub(crate) fn middle_layout(area: Rect, mode: LayoutMode) -> MiddleLayout {
     let inner = Block::bordered().inner(area);
-    if mode == LayoutMode::Wide {
-        let topology_width =
-            super::topology::column_width(inner.height).min(inner.width / 2);
-        let divider = Rect::new(
-            inner.x.saturating_add(topology_width),
-            inner.y,
-            1,
-            inner.height,
-        );
+    if mode != LayoutMode::Wide {
         return MiddleLayout {
-            topology: Rect::new(inner.x, inner.y, topology_width, inner.height),
-            inspector: Rect::new(
-                divider.x.saturating_add(1),
-                inner.y,
-                inner.right().saturating_sub(divider.x.saturating_add(1)),
-                inner.height,
-            ),
-            divider,
+            topology: inner,
+            detail: inner,
+            divider: Rect::default(),
         };
     }
-    let inspector_height: u16 = if inner.height <= 4 { 2 } else { 3 };
-    let topology_height =
-        inner.height.saturating_sub(inspector_height.saturating_add(1));
-    let divider_y = inner.y.saturating_add(topology_height);
+    let topology_width =
+        super::topology::column_width(inner.height).min(inner.width / 2);
+    let divider = Rect::new(
+        inner.x.saturating_add(topology_width),
+        inner.y,
+        1,
+        inner.height,
+    );
     MiddleLayout {
-        topology: Rect::new(inner.x, inner.y, inner.width, topology_height),
-        divider: Rect::new(
-            inner.x,
-            divider_y,
-            inner.width,
-            u16::from(inner.height > topology_height),
+        topology: Rect::new(inner.x, inner.y, topology_width, inner.height),
+        detail: Rect::new(
+            divider.x.saturating_add(1),
+            inner.y,
+            inner.right().saturating_sub(divider.x.saturating_add(1)),
+            inner.height,
         ),
-        inspector: Rect::new(
-            inner.x,
-            divider_y.saturating_add(1),
-            inner.width,
-            inner.bottom().saturating_sub(divider_y.saturating_add(1)),
-        ),
+        divider,
     }
+}
+
+/// Where the details pane is drawn, if the Topology section shows it.
+pub(crate) fn detail_area(app: &App) -> Option<Rect> {
+    let (area, mode) = super::widgets::content_area(app);
+    let rows = monitor_rows(area, app, mode);
+    let visible = app.session.monitoring_expanded(MonitoringPane::Topology)
+        && (mode == LayoutMode::Wide || app.session.detail_open);
+    visible.then(|| middle_layout(rows[1], mode).detail)
 }
 
 pub(crate) fn resource_health_state(app: &App, id: &ResourceId) -> HealthState {
@@ -265,7 +261,7 @@ pub(crate) fn visible_traffic_error<'a>(
     collection_error_is_visible(app, id, error).then_some(error)
 }
 
-fn collection_error_is_visible(
+pub(crate) fn collection_error_is_visible(
     app: &App,
     id: &ResourceId,
     error: &crate::tui::telemetry::CollectionError,
@@ -322,372 +318,33 @@ fn draw_topology(
         return;
     }
     let layout = middle_layout(area, mode);
-    let scoped = scoped_descriptors(app, rack);
-    super::topology::draw(frame, layout.topology, app, &scoped);
+    let detail_focused = app.session.detail_open;
+    if mode == LayoutMode::Wide || !detail_focused {
+        let scoped = scoped_descriptors(app, rack);
+        super::topology::draw(frame, layout.topology, app, &scoped);
+    }
+    if mode == LayoutMode::Wide || detail_focused {
+        super::node_detail::draw(frame, layout.detail, app, detail_focused);
+    }
+    if layout.divider.area() == 0 {
+        return;
+    }
     let edge =
         Style::default().fg(if focused { TUI_YELLOW } else { OX_GREEN_LIGHT });
     for y in layout.divider.y..layout.divider.bottom() {
-        let line = if mode == LayoutMode::Wide {
-            "│".to_string()
-        } else {
-            "─".repeat(layout.divider.width.into())
-        };
         frame.render_widget(
-            Paragraph::new(line).style(edge),
-            Rect::new(layout.divider.x, y, layout.divider.width, 1),
+            Paragraph::new("│").style(edge),
+            Rect::new(layout.divider.x, y, 1, 1),
         );
     }
-    if mode == LayoutMode::Wide && area.height >= 2 {
-        frame.render_widget(
-            Paragraph::new("┬").style(edge),
-            Rect::new(layout.divider.x, area.y, 1, 1),
-        );
-        frame.render_widget(
-            Paragraph::new("┴").style(edge),
-            Rect::new(layout.divider.x, area.bottom() - 1, 1, 1),
-        );
-    } else if layout.divider.height > 0 {
-        frame.render_widget(
-            Paragraph::new("├").style(edge),
-            Rect::new(area.x, layout.divider.y, 1, 1),
-        );
-        frame.render_widget(
-            Paragraph::new("┤").style(edge),
-            Rect::new(area.right() - 1, layout.divider.y, 1, 1),
-        );
-    }
-    if layout.inspector.width > 0 {
-        let title = fit_terminal_width(
-            " Selected Resource ",
-            layout.inspector.width.into(),
-        );
-        frame.render_widget(
-            Paragraph::new(title.clone()).style(
-                Style::default().fg(TUI_PURPLE).add_modifier(Modifier::BOLD),
-            ),
-            Rect::new(
-                layout.inspector.x,
-                if mode == LayoutMode::Wide {
-                    area.y
-                } else {
-                    layout.divider.y
-                },
-                terminal_width(&title) as u16,
-                1,
-            ),
-        );
-        draw_selected_resource_inspector(frame, layout.inspector, app);
-    }
-}
-
-fn draw_selected_resource_inspector(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    app: &App,
-) {
-    let Some(id) = app.session.selected_resource.as_ref() else {
-        frame.render_widget(Paragraph::new("No resource selected"), area);
-        return;
-    };
-    let Some(descriptor) =
-        app.deployment.topology.iter().find(|descriptor| &descriptor.id == id)
-    else {
-        frame.render_widget(Paragraph::new("No resource selected"), area);
-        return;
-    };
-    if area.height <= 7 {
-        let traffic = app.observability.telemetry.resources.get(id);
-        let sampled = traffic.and_then(|value| value.current_at).is_some();
-        let mut lines = Vec::new();
-        if area.height >= 3 {
-            lines.push(Line::from(vec![
-                Span::raw(format!(
-                    "{:?} {} · ",
-                    descriptor.kind, descriptor.name
-                )),
-                Span::styled(
-                    health_status_label(resource_health_state(app, id)),
-                    health_style(resource_health_state(app, id)),
-                ),
-            ]));
-        }
-        lines.push(if sampled {
-            let traffic = traffic.expect("sampled traffic exists");
-            Line::from(format!(
-                "{} · source: {}",
-                rate_line(traffic.current_rate),
-                traffic.current_sample.source.label()
-            ))
-        } else {
-            Line::from("RX — TX — Total — · collecting")
-        });
-        let data = sparkline_data(
-            traffic.into_iter().flat_map(|value| {
-                value
-                    .history
-                    .points()
-                    .iter()
-                    .map(|point| point.rate.total_bytes_sec())
-            }),
-            area.width.saturating_sub(9),
-        );
-        if data.is_empty() {
-            lines.push(Line::from("History: collecting (no samples)"));
-            frame.render_widget(Paragraph::new(lines), area);
-        } else {
-            lines.push(Line::from("History "));
-            let history_y =
-                area.y.saturating_add(lines.len().saturating_sub(1) as u16);
-            frame.render_widget(Paragraph::new(lines), area);
-            let label_width = terminal_width("History ") as u16;
-            frame.render_widget(
-                Sparkline::default()
-                    .data(&data)
-                    .style(health_style(resource_health_state(app, id))),
-                Rect::new(
-                    area.x.saturating_add(label_width),
-                    history_y,
-                    area.width.saturating_sub(label_width),
-                    1,
-                ),
-            );
-        }
-        return;
-    }
-    let age = resource_last_success(app, id)
-        .and_then(|captured_at| {
-            app.now
-                .map(|now| now.saturating_duration_since(captured_at).as_secs())
-        })
-        .map(|age| format!("{age}s ago"))
-        .unwrap_or_else(|| "never".into());
-    let rack = descriptor
-        .rack
-        .map(|rack| format!("Rack {}", rack.0))
-        .unwrap_or_else(|| "Fleet".into());
-    let host = descriptor
-        .host
-        .as_ref()
-        .map(|host| format!(" · host {host}"))
-        .unwrap_or_default();
-    let mut lines = vec![
-        Line::from(format!("{:?} {}", descriptor.kind, descriptor.name)),
-        Line::from(format!("{rack}{host}")),
-        Line::from(Span::styled(
-            health_status_label(resource_health_state(app, id)),
-            health_style(resource_health_state(app, id)),
-        )),
-        Line::from(format!("Last success {age}")),
-    ];
-    let traffic = app.observability.telemetry.resources.get(id);
-    let sampled = traffic.and_then(|traffic| traffic.current_at).is_some();
-    if let Some(traffic) = traffic.filter(|_| sampled) {
-        lines.push(rate_line(traffic.current_rate));
-        lines.push(Line::from(format!(
-            "Packets RX {:.0}/s · TX {:.0}/s",
-            traffic.current_rate.rx_packets_sec,
-            traffic.current_rate.tx_packets_sec
-        )));
-        lines.push(Line::from(format!(
-            "Link errors RX {:.2}/s · TX {:.2}/s · source: {}",
-            traffic.current_sample.errors.rx_sec,
-            traffic.current_sample.errors.tx_sec,
-            traffic.current_sample.source.label()
-        )));
-    } else {
-        lines.push(Line::from("Traffic: collecting/unavailable"));
-    }
-    if let Some(error) = latest_collection_error(app, id) {
-        lines.push(Line::from(format!("Latest error: {}", error.message)));
-    }
-    if let Some(rack) = descriptor.rack {
-        if let Some(zfs) = app
-            .observability
-            .zfs_headroom
-            .get(&rack)
-            .and_then(|sample| sample.good.as_ref())
-        {
-            let pools = zfs.value.iter().filter(|pool| pool.id == *id);
-            let (available, total, count) = pools.fold(
-                (0_u64, 0_u64, 0_usize),
-                |(available, total, count), pool| {
-                    (
-                        available.saturating_add(pool.available_bytes()),
-                        total.saturating_add(pool.total_bytes),
-                        count + 1,
-                    )
-                },
-            );
-            if count > 0 {
-                lines.push(Line::from(format!(
-                    "ZFS {:.1}/{:.1} GiB free · {count} pools",
-                    available as f64 / 1024.0_f64.powi(3),
-                    total as f64 / 1024.0_f64.powi(3)
-                )));
-            }
-        }
-        if let Some(error) = app
-            .observability
-            .zone_cpu
-            .get(&rack)
-            .and_then(|sample| sample.latest_error.as_ref())
-        {
-            lines.push(Line::from(format!(
-                "Zone CPU unavailable: {}",
-                error.message
-            )));
-        }
-        if let Some(error) = app
-            .observability
-            .zfs_headroom
-            .get(&rack)
-            .and_then(|sample| sample.latest_error.as_ref())
-        {
-            lines.push(Line::from(format!(
-                "ZFS unavailable: {}",
-                error.message
-            )));
-        }
-    }
-    lines.push(Line::from("History (60s)"));
-    let guidance_y = area.bottom().saturating_sub(1);
-    let text_height =
-        lines.len().min(area.height.saturating_sub(1) as usize) as u16;
     frame.render_widget(
-        Paragraph::new(lines),
-        Rect::new(area.x, area.y, area.width, text_height),
+        Paragraph::new("┬").style(edge),
+        Rect::new(layout.divider.x, area.y, 1, 1),
     );
-    let mut y = area.y.saturating_add(text_height);
-    if y < guidance_y {
-        let data = sparkline_data(
-            traffic.into_iter().flat_map(|traffic| {
-                traffic
-                    .history
-                    .points()
-                    .iter()
-                    .map(|point| point.rate.total_bytes_sec())
-            }),
-            area.width,
-        );
-        if data.is_empty() {
-            frame.render_widget(
-                Paragraph::new("History: collecting (no samples)"),
-                Rect::new(area.x, y, area.width, 1),
-            );
-        } else {
-            frame.render_widget(
-                Sparkline::default()
-                    .data(&data)
-                    .style(health_style(resource_health_state(app, id))),
-                Rect::new(area.x, y, area.width, 1),
-            );
-        }
-        y += 1;
-    }
-    let mut zones = traffic
-        .into_iter()
-        .flat_map(|traffic| traffic.current_sample.zones.iter())
-        .collect::<Vec<_>>();
-    zones.sort_by(|a, b| {
-        b.rate
-            .total_bytes_sec()
-            .total_cmp(&a.rate.total_bytes_sec())
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    if y < guidance_y {
-        frame.render_widget(
-            Paragraph::new("Zones for selected resource")
-                .style(Style::default().add_modifier(Modifier::BOLD)),
-            Rect::new(area.x, y, area.width, 1),
-        );
-        y += 1;
-    }
-    if let Some(rack) = descriptor.rack
-        && let Some(cpu) = app
-            .observability
-            .zone_cpu
-            .get(&rack)
-            .and_then(|sample| sample.good.as_ref())
-    {
-        for zone in cpu
-            .value
-            .iter()
-            .filter(|zone| zone.id == *id)
-            .take(guidance_y.saturating_sub(y) as usize)
-        {
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "CPU {} {:.1}% wait {:.1}%",
-                    zone.name,
-                    zone.total_percent(),
-                    zone.wait_percent
-                )),
-                Rect::new(area.x, y, area.width, 1),
-            );
-            y += 1;
-        }
-    }
-    if zones.is_empty() && y < guidance_y {
-        frame.render_widget(
-            Paragraph::new("No zone samples"),
-            Rect::new(area.x, y, area.width, 1),
-        );
-        y += 1;
-    }
-    let capacity = guidance_y.saturating_sub(y) as usize;
-    let shown = if zones.len() > capacity {
-        capacity.saturating_sub(1)
-    } else {
-        capacity
-    };
-    for zone in zones.iter().take(shown) {
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{} {}",
-                zone.short_name,
-                format_rate(zone.rate.total_bytes_sec())
-            ))
-            .style(traffic_style(
-                TrafficSeverity::for_bytes_per_sec(zone.rate.total_bytes_sec()),
-            )),
-            Rect::new(area.x, y, area.width, 1),
-        );
-        y += 1;
-    }
-    if zones.len() > shown && y < guidance_y {
-        frame.render_widget(
-            Paragraph::new(format!("+{} more", zones.len() - shown)),
-            Rect::new(area.x, y, area.width, 1),
-        );
-    }
-    if area.height > 0 {
-        frame.render_widget(
-            Paragraph::new("Enter opens full detail")
-                .style(Style::default().fg(TUI_GREY)),
-            Rect::new(area.x, guidance_y, area.width, 1),
-        );
-    }
-}
-
-fn latest_collection_error<'a>(
-    app: &'a App,
-    id: &ResourceId,
-) -> Option<&'a crate::tui::telemetry::CollectionError> {
-    [
-        app.observability
-            .health
-            .get(id)
-            .and_then(|sample| sample.latest_error.as_ref()),
-        app.observability
-            .addresses
-            .get(id)
-            .and_then(|sample| sample.latest_error.as_ref())
-            .filter(|error| collection_error_is_visible(app, id, error)),
-        visible_traffic_error(app, id),
-    ]
-    .into_iter()
-    .flatten()
-    .max_by_key(|error| error.attempted_at)
+    frame.render_widget(
+        Paragraph::new("┴").style(edge),
+        Rect::new(layout.divider.x, area.bottom() - 1, 1, 1),
+    );
 }
 
 pub(crate) fn scoped_descriptors(
@@ -731,7 +388,7 @@ fn monitor_scope_contains(
         || app.session.selected_resource.as_ref() == Some(&descriptor.id)
 }
 
-fn rate_line(rate: BidirectionalRate) -> Line<'static> {
+pub(crate) fn rate_line(rate: BidirectionalRate) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("RX {} ", format_rate(rate.rx_bytes_sec)),
@@ -1002,29 +659,46 @@ mod height_tests {
     }
 
     #[test]
-    fn topology_divider_follows_focus_without_recoloring_selection() {
+    fn wide_topology_shows_details_beside_a_focus_coloured_divider() {
         let area = Rect::new(0, 0, 160, 20);
         let layout = middle_layout(area, LayoutMode::Wide);
-        let render = |app: &App| {
+        let render = |app: &App, mode| {
             let mut terminal =
                 Terminal::new(TestBackend::new(160, 20)).unwrap();
             terminal
-                .draw(|frame| draw_topology(frame, area, app, LayoutMode::Wide))
+                .draw(|frame| draw_topology(frame, area, app, mode))
                 .unwrap();
             terminal.backend().buffer().clone()
         };
+        let text = |buffer: &ratatui::buffer::Buffer| {
+            buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
 
-        let focused = render(&app());
+        let focused = render(&app(), LayoutMode::Wide);
         assert_eq!(focused[(layout.divider.x, area.y)].fg, TUI_YELLOW);
         assert_eq!(focused[(layout.divider.x, area.y + 1)].fg, TUI_YELLOW);
-        assert_eq!(focused[(layout.inspector.x + 1, area.y)].fg, TUI_PURPLE);
+        assert!(text(&focused).contains("RACK 0 / SLED seeded"));
 
         let mut inactive_app = app();
         inactive_app.session.monitoring_pane = MonitoringPane::TopZones;
-        let inactive = render(&inactive_app);
+        let inactive = render(&inactive_app, LayoutMode::Wide);
         assert_eq!(inactive[(layout.divider.x, area.y)].fg, OX_GREEN_LIGHT);
         assert_eq!(inactive[(layout.divider.x, area.y + 1)].fg, OX_GREEN_LIGHT);
-        assert_eq!(inactive[(layout.inspector.x + 1, area.y)].fg, TUI_PURPLE);
+
+        // Compact layouts show the rack, or the details once focused.
+        let mut compact = app();
+        assert!(
+            !text(&render(&compact, LayoutMode::Compact)).contains("RACK 0 /")
+        );
+        compact.session.detail_open = true;
+        assert!(
+            text(&render(&compact, LayoutMode::Compact))
+                .contains("RACK 0 / SLED seeded")
+        );
     }
 
     #[test]
@@ -1109,142 +783,6 @@ mod height_tests {
         assert_eq!(
             resource_health_state(&app, &descriptor.id),
             HealthState::Healthy
-        );
-    }
-
-    #[test]
-    fn non_sled_inspector_uses_simple_health_status() {
-        let descriptor = ResourceDescriptor {
-            id: ResourceId::fleet(ResourceKind::Router, "ce"),
-            rack: None,
-            kind: ResourceKind::Router,
-            name: "ce".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(vec![descriptor.clone()], 4, 4);
-        let now = Instant::now();
-        app.deployment.observed = ObservedDeploymentState::Running;
-        app.session.selected_resource = Some(descriptor.id.clone());
-        app.update(AppEvent::Tick { now });
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw_selected_resource_inspector(frame, frame.area(), &app)
-            })
-            .unwrap();
-        let checking = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(checking.contains("Checking Status"), "{checking}");
-
-        app.update(AppEvent::Traffic {
-            id: descriptor.id,
-            at: now,
-            sample: TrafficSample::default(),
-        });
-
-        terminal
-            .draw(|frame| {
-                draw_selected_resource_inspector(frame, frame.area(), &app)
-            })
-            .unwrap();
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("Healthy"), "{text}");
-        assert!(!text.contains("Freshness"), "{text}");
-        assert!(text.contains("Last success 0s ago"), "{text}");
-        assert!(text.contains("source: direct probe"), "{text}");
-    }
-
-    #[test]
-    fn compact_inspector_hides_router_errors_before_running_reconciliation() {
-        let id = ResourceId::fleet(ResourceKind::Router, "ce");
-        let descriptor = ResourceDescriptor {
-            id: id.clone(),
-            rack: None,
-            kind: ResourceKind::Router,
-            name: "ce".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(vec![descriptor], 4, 4);
-        app.session.selected_resource = Some(id.clone());
-        let before_reconciliation = Instant::now();
-        app.update(AppEvent::TrafficFailed {
-            id,
-            at: before_reconciliation,
-            message: "propolis uuid for ce: No such file".into(),
-        });
-        app.deployment.observed = ObservedDeploymentState::Stopped;
-        app.deployment.last_reconciliation_at =
-            Some(before_reconciliation + Duration::from_secs(1));
-        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
-
-        terminal
-            .draw(|frame| {
-                draw_selected_resource_inspector(frame, frame.area(), &app)
-            })
-            .unwrap();
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!text.contains("propolis uuid"), "{text}");
-    }
-
-    #[test]
-    fn sled_inspector_explains_unavailable_oximeter_diagnostics() {
-        let mut app = app();
-        let id = app.deployment.topology[0].id.clone();
-        app.session.selected_resource = Some(id);
-        let now = Instant::now();
-        app.update(AppEvent::ZoneCpuFailed {
-            rack: RackId(0),
-            at: now,
-            message: "CPU query timed out".into(),
-        });
-        app.update(AppEvent::ZfsHeadroomFailed {
-            rack: RackId(0),
-            at: now,
-            message: "ZFS response omitted a pool".into(),
-        });
-        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
-
-        terminal
-            .draw(|frame| {
-                draw_selected_resource_inspector(frame, frame.area(), &app)
-            })
-            .unwrap();
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(
-            text.contains("Zone CPU unavailable: CPU query timed out"),
-            "{text}"
-        );
-        assert!(
-            text.contains("ZFS unavailable: ZFS response omitted a pool"),
-            "{text}"
         );
     }
 

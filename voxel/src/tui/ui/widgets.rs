@@ -117,9 +117,6 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         Paragraph::new(guidance_lines(app, root.footer.width)),
         root.footer,
     );
-    if app.session.view == View::Monitor && app.session.detail_open {
-        super::node_detail::draw(frame, app);
-    }
     if app.session.external_monitoring_open {
         super::external_monitoring::draw(frame);
     }
@@ -323,8 +320,9 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     }
     if app.session.detail_open {
         let mut groups = vec![
-            group("↑/↓", "resource"),
-            group("Enter/Esc", "close"),
+            group("↑/↓", "scroll"),
+            group("←/→", "node"),
+            group("Esc", "rack"),
             group("?", "help"),
         ];
         groups.extend(lifecycle());
@@ -343,7 +341,7 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
                 crate::tui::event::MonitoringPane::Topology => {
                     groups.push(group("↑↓←→", "node"));
                     if app.session.selected_resource.is_some() {
-                        groups.push(group("Enter", "open"));
+                        groups.push(group("Enter", "details"));
                     }
                 }
                 crate::tui::event::MonitoringPane::TopZones => {
@@ -468,21 +466,6 @@ pub(crate) fn active_tab_style() -> Style {
     Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD)
 }
 
-pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(vertical[1])[1]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_detail_title_omits_redundant_close_instruction() {
+    fn focused_details_replace_rack_keys_in_the_footer() {
         let descriptor = ResourceDescriptor {
             id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
             rack: Some(RackId(0)),
@@ -547,9 +530,9 @@ mod tests {
 
         let text = screen_text(&app);
 
-        assert!(text.contains("Resource detail"));
-        assert!(!text.contains("Enter/Esc closes"));
-        assert!(text.contains("Enter/Esc"));
-        assert!(text.contains("close"));
+        assert!(text.contains("RACK 0 / SLED g0"), "{text}");
+        assert!(text.contains("Rack <Esc>"), "{text}");
+        assert!(group_text(&app).contains(&"Esc rack".to_owned()));
+        assert!(group_text(&app).contains(&"←/→ node".to_owned()));
     }
 }

@@ -55,6 +55,7 @@ pub struct SessionState {
     pub selected_resource: Option<ResourceId>,
     pub terminal: TerminalSize,
     pub detail_open: bool,
+    pub detail_scroll: usize,
     pub confirmation: Option<Confirmation>,
     pub confirmation_selection: usize,
     pub post_operation_exit: Option<PostOperationExit>,
@@ -326,6 +327,7 @@ impl App {
                 selected_resource: None,
                 terminal: TerminalSize { width: 0, height: 0 },
                 detail_open: false,
+                detail_scroll: 0,
                 confirmation: None,
                 confirmation_selection: 0,
                 post_operation_exit: None,
@@ -833,14 +835,26 @@ impl App {
                     self.session.help_scroll = 0;
                     vec![]
                 }
-                Action::Scroll { delta, page: false } => {
-                    if delta != 0 {
-                        self.move_resource(if delta > 0 {
-                            Direction::Next
-                        } else {
-                            Direction::Previous
-                        });
-                    }
+                Action::Left | Action::Right => {
+                    self.move_resource(if matches!(action, Action::Right) {
+                        Direction::Next
+                    } else {
+                        Direction::Previous
+                    });
+                    self.session.detail_scroll = 0;
+                    vec![]
+                }
+                Action::Scroll { delta, page } => {
+                    let (viewport, limit) =
+                        crate::tui::ui::node_detail::scroll_limits(self);
+                    let amount =
+                        if page { viewport.max(1) } else { 1 } as isize;
+                    self.session.detail_scroll = self
+                        .session
+                        .detail_scroll
+                        .min(limit)
+                        .saturating_add_signed(delta.saturating_mul(amount))
+                        .min(limit);
                     vec![]
                 }
                 _ => vec![],
@@ -910,7 +924,8 @@ impl App {
                     && !self.session.help_open
                     && self.session.confirmation.is_none() =>
             {
-                self.session.detail_open = !self.session.detail_open
+                self.session.detail_open = true;
+                self.session.detail_scroll = 0;
             }
             Action::ToggleHelp if self.session.confirmation.is_none() => {
                 self.session.help_open = !self.session.help_open;
@@ -1760,6 +1775,46 @@ mod factual_outcome_tests {
         assert_eq!(app.session.selected_resource, Some(sled(1).id));
         app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
         assert_eq!(app.session.selected_resource, Some(sled(2).id));
+    }
+
+    #[test]
+    fn details_scroll_within_bounds_and_cycle_nodes() {
+        let sled = |cubby: u8| ResourceDescriptor {
+            id: ResourceId::rack(
+                RackId(0),
+                ResourceKind::Sled,
+                format!("g{cubby}"),
+            ),
+            rack: Some(RackId(0)),
+            kind: ResourceKind::Sled,
+            name: format!("g{cubby}"),
+            host: None,
+            slot: Some(cubby),
+        };
+        let mut app = App::new(vec![sled(0), sled(1)], 8, 8);
+        app.update(AppEvent::Resize { width: 120, height: 24 });
+        app.update(AppEvent::Action(Action::ToggleView));
+        app.update(AppEvent::Action(Action::Activate));
+        assert!(app.session.detail_open);
+
+        let (_, limit) = crate::tui::ui::node_detail::scroll_limits(&app);
+        assert!(limit > 0);
+        for _ in 0..4 {
+            app.update(AppEvent::Action(Action::Scroll {
+                delta: 1,
+                page: true,
+            }));
+        }
+        assert_eq!(app.session.detail_scroll, limit);
+        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
+        assert_eq!(app.session.detail_scroll, limit - 1);
+
+        app.update(AppEvent::Action(Action::Right));
+        assert_eq!(app.session.selected_resource, Some(sled(1).id));
+        assert_eq!(app.session.detail_scroll, 0);
+        app.update(AppEvent::Action(Action::Close));
+        assert!(!app.session.detail_open);
+        assert_eq!(app.session.selected_resource, Some(sled(1).id));
     }
 
     #[test]

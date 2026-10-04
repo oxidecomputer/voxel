@@ -27,7 +27,7 @@ const MONITORING: &[(&str, &str)] = &[
     ("← / →", "Previous / next rack; sibling node in the rack"),
     ("↑ / ↓", "Move within section"),
     ("PgUp / PgDn", "Page top zones"),
-    ("Enter", "Open resource detail"),
+    ("Enter / Esc", "Focus node details / back to the rack"),
 ];
 const DIALOGS: &[(&str, &str)] = &[
     ("↑ / ↓", "Select option"),
@@ -361,7 +361,7 @@ mod tests {
             ("← / →", "Previous / next rack; sibling node in the rack"),
             ("↑ / ↓", "Move within section"),
             ("PgUp / PgDn", "Page top zones"),
-            ("Enter", "Open resource detail"),
+            ("Enter / Esc", "Focus node details / back to the rack"),
             ("↑ / ↓", "Select option"),
             ("Enter", "Confirm selection"),
             ("y", "Copy fallback command"),
