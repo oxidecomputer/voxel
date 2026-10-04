@@ -123,6 +123,7 @@ mod tests {
             kind: ResourceKind::Sled,
             name: "g0".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor], 4, 4);
         app.session.view = View::Monitor;

@@ -47,7 +47,6 @@ pub struct SessionState {
     pub collapsed_monitoring: BTreeSet<MonitoringPane>,
     pub phase_scroll: usize,
     pub subtask_scroll: usize,
-    pub monitor_scroll: usize,
     pub top_zones_scroll: usize,
     pub help_scroll: usize,
     pub help_open: bool,
@@ -319,7 +318,6 @@ impl App {
                 collapsed_monitoring: BTreeSet::new(),
                 phase_scroll: 0,
                 subtask_scroll: 0,
-                monitor_scroll: 0,
                 top_zones_scroll: 0,
                 help_scroll: 0,
                 help_open: false,
@@ -853,25 +851,37 @@ impl App {
                 View::Deployment => View::Monitor,
                 View::Monitor => View::Deployment,
             }),
-            Action::NextRack
+            Action::Left | Action::Right
                 if self.session.view == View::Monitor
-                    && self.session.monitoring_pane
-                        == MonitoringPane::RackSummary
                     && self
                         .session
-                        .monitoring_expanded(MonitoringPane::RackSummary) =>
+                        .monitoring_expanded(self.session.monitoring_pane) =>
             {
-                self.move_rack(Direction::Next)
-            }
-            Action::PreviousRack
-                if self.session.view == View::Monitor
-                    && self.session.monitoring_pane
-                        == MonitoringPane::RackSummary
-                    && self
-                        .session
-                        .monitoring_expanded(MonitoringPane::RackSummary) =>
-            {
-                self.move_rack(Direction::Previous)
+                let right = matches!(action, Action::Right);
+                match self.session.monitoring_pane {
+                    MonitoringPane::RackSummary => self.move_rack(if right {
+                        Direction::Next
+                    } else {
+                        Direction::Previous
+                    }),
+                    MonitoringPane::Topology => {
+                        let next = self
+                            .session
+                            .selected_resource
+                            .as_ref()
+                            .and_then(|current| {
+                                crate::tui::ui::topology::horizontal_neighbor(
+                                    &self.scoped_topology(),
+                                    current,
+                                    right,
+                                )
+                            });
+                        if next.is_some() {
+                            self.session.selected_resource = next;
+                        }
+                    }
+                    MonitoringPane::TopZones => {}
+                }
             }
             Action::NextSection => self.move_section(Direction::Next),
             Action::PreviousSection => self.move_section(Direction::Previous),
@@ -1012,42 +1022,6 @@ impl App {
                     }
                 }
                 View::Deployment => {}
-                View::Monitor
-                    if self.session.monitoring_pane
-                        == MonitoringPane::Topology
-                        && self
-                            .session
-                            .monitoring_expanded(MonitoringPane::Topology) =>
-                {
-                    let amount = crate::tui::ui::monitor::page_capacity(self)
-                        .max(1) as isize;
-                    let resources = self.resources();
-                    let current =
-                        self.session.selected_resource.as_ref().and_then(
-                            |selected| {
-                                resources.iter().position(|id| id == selected)
-                            },
-                        );
-                    let index = current.map_or_else(
-                        || {
-                            if delta < 0 {
-                                resources.len().saturating_sub(1)
-                            } else {
-                                0
-                            }
-                        },
-                        |current| {
-                            current
-                                .saturating_add_signed(
-                                    delta.saturating_mul(amount),
-                                )
-                                .min(resources.len().saturating_sub(1))
-                        },
-                    );
-                    self.session.selected_resource =
-                        resources.get(index).cloned();
-                    self.session.monitor_scroll = index;
-                }
                 View::Monitor
                     if self.session.monitoring_pane
                         == MonitoringPane::TopZones
@@ -1241,9 +1215,8 @@ impl App {
             .into_iter()
             .collect()
     }
-    fn resources(&self) -> Vec<ResourceId> {
-        let descriptors = self
-            .deployment
+    fn scoped_topology(&self) -> Vec<ResourceDescriptor> {
+        self.deployment
             .topology
             .iter()
             .filter(|d| {
@@ -1252,9 +1225,12 @@ impl App {
                     || d.kind == crate::tui::telemetry::ResourceKind::Router
             })
             .cloned()
-            .collect::<Vec<_>>();
+            .collect()
+    }
+    fn resources(&self) -> Vec<ResourceId> {
+        let descriptors = self.scoped_topology();
         if self.session.view == View::Monitor {
-            crate::tui::ui::topology::semantic_order(&descriptors)
+            crate::tui::ui::topology::navigation_order(&descriptors)
         } else {
             descriptors.into_iter().map(|descriptor| descriptor.id).collect()
         }
@@ -1289,7 +1265,6 @@ impl App {
             self.session.selected_rack.as_ref(),
             direction,
         );
-        self.session.monitor_scroll = 0;
         self.session.top_zones_scroll = 0;
         self.repair_resource();
     }
@@ -1378,24 +1353,26 @@ impl App {
                         .session
                         .monitoring_expanded(MonitoringPane::Topology) =>
             {
-                let resources = self.resources();
-                if resources.is_empty() {
-                    return;
+                let next = match self.session.selected_resource.as_ref() {
+                    Some(current) => {
+                        crate::tui::ui::topology::vertical_neighbor(
+                            &self.scoped_topology(),
+                            current,
+                            delta > 0,
+                        )
+                    }
+                    None => {
+                        let resources = self.resources();
+                        if delta < 0 {
+                            resources.last().cloned()
+                        } else {
+                            resources.first().cloned()
+                        }
+                    }
+                };
+                if next.is_some() {
+                    self.session.selected_resource = next;
                 }
-                let current = self.session.selected_resource.as_ref().and_then(
-                    |selected| resources.iter().position(|id| id == selected),
-                );
-                let candidate = current.map_or_else(
-                    || if delta < 0 { resources.len() - 1 } else { 0 },
-                    |index| {
-                        index
-                            .saturating_add_signed(delta)
-                            .min(resources.len().saturating_sub(1))
-                    },
-                );
-                self.session.selected_resource =
-                    resources.get(candidate).cloned();
-                self.session.monitor_scroll = candidate;
             }
             View::Monitor
                 if self.session.monitoring_pane == MonitoringPane::TopZones
@@ -1724,6 +1701,7 @@ mod factual_outcome_tests {
             kind: ResourceKind::Sled,
             name: "g0".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor.clone()], 8, 8);
 
@@ -1748,6 +1726,40 @@ mod factual_outcome_tests {
             now: start + crate::tui::ui::splash::DURATION,
         });
         assert!(app.splash.is_none());
+    }
+
+    #[test]
+    fn topology_arrows_walk_the_rack_elevation() {
+        let sled = |cubby: u8| ResourceDescriptor {
+            id: ResourceId::rack(
+                RackId(0),
+                ResourceKind::Sled,
+                format!("g{cubby}"),
+            ),
+            rack: Some(RackId(0)),
+            kind: ResourceKind::Sled,
+            name: format!("g{cubby}"),
+            host: None,
+            slot: Some(cubby),
+        };
+        let mut app = App::new(vec![sled(0), sled(1), sled(2)], 8, 8);
+        app.update(AppEvent::Action(Action::ToggleView));
+        assert_eq!(app.session.monitoring_pane, MonitoringPane::Topology);
+        assert_eq!(app.session.selected_resource, Some(sled(0).id));
+
+        // Cubby 2 sits above cubby 0 in the elevation.
+        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
+        assert_eq!(app.session.selected_resource, Some(sled(2).id));
+        app.update(AppEvent::Action(Action::Scroll { delta: 1, page: false }));
+        assert_eq!(app.session.selected_resource, Some(sled(0).id));
+        app.update(AppEvent::Action(Action::Right));
+        assert_eq!(app.session.selected_resource, Some(sled(1).id));
+        // There is no sled to the right of cubby 1 or below it.
+        app.update(AppEvent::Action(Action::Right));
+        app.update(AppEvent::Action(Action::Scroll { delta: 1, page: false }));
+        assert_eq!(app.session.selected_resource, Some(sled(1).id));
+        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
+        assert_eq!(app.session.selected_resource, Some(sled(2).id));
     }
 
     #[test]
@@ -1815,6 +1827,7 @@ mod factual_outcome_tests {
                 kind: ResourceKind::Sled,
                 name: format!("g{rack}"),
                 host: None,
+                slot: None,
             })
             .collect();
         let mut app = App::new(descriptors, 8, 8);
@@ -1853,6 +1866,7 @@ mod factual_outcome_tests {
             kind: ResourceKind::Sled,
             name: "g0".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor], 8, 8);
         let started = Instant::now();

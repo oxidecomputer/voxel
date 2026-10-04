@@ -9,8 +9,6 @@ pub mod node_detail;
 pub mod rack_selector;
 pub mod renderer;
 pub mod splash;
-#[allow(dead_code)]
-// Consumed by the topology renderer and reducer in subsequent tasks.
 pub(crate) mod topology;
 pub mod widgets;
 

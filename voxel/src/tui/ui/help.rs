@@ -24,9 +24,9 @@ const DEPLOYMENT: &[(&str, &str)] = &[
     ("x", "Stop the operation and destroy the deployment"),
 ];
 const MONITORING: &[(&str, &str)] = &[
-    ("← / →", "Previous / next rack"),
+    ("← / →", "Previous / next rack; sibling node in the rack"),
     ("↑ / ↓", "Move within section"),
-    ("PgUp / PgDn", "Page resources"),
+    ("PgUp / PgDn", "Page top zones"),
     ("Enter", "Open resource detail"),
 ];
 const DIALOGS: &[(&str, &str)] = &[
@@ -358,9 +358,9 @@ mod tests {
             ("f", "Cycle log filter"),
             ("l / r", "Launch / route"),
             ("x", "Stop the operation and destroy the deployment"),
-            ("← / →", "Previous / next rack"),
+            ("← / →", "Previous / next rack; sibling node in the rack"),
             ("↑ / ↓", "Move within section"),
-            ("PgUp / PgDn", "Page resources"),
+            ("PgUp / PgDn", "Page top zones"),
             ("Enter", "Open resource detail"),
             ("↑ / ↓", "Select option"),
             ("Enter", "Confirm selection"),

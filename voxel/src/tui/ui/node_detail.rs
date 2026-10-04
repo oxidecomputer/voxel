@@ -270,6 +270,7 @@ mod tests {
             kind: ResourceKind::Router,
             name: "ce".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor], 4, 4);
         app.session.selected_resource = Some(id.clone());

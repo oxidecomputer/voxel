@@ -341,11 +341,7 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
                     groups.push(group("←/→", "rack"));
                 }
                 crate::tui::event::MonitoringPane::Topology => {
-                    groups.push(group(
-                        "↑/↓",
-                        if narrow { "res" } else { "resource" },
-                    ));
-                    groups.push(group("Pg", if narrow { "" } else { "page" }));
+                    groups.push(group("↑↓←→", "node"));
                     if app.session.selected_resource.is_some() {
                         groups.push(group("Enter", "open"));
                     }
@@ -542,6 +538,7 @@ mod tests {
             kind: ResourceKind::Sled,
             name: "g0".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor.clone()], 8, 8);
         app.session.view = View::Monitor;

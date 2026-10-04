@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use voxel_config::VoxelConfig;
 
 const HISTORY_WINDOW: Duration = Duration::from_secs(60);
+pub const SLED_CUBBIES: u8 = 32;
+pub const SWITCH_SLOTS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RackId(pub usize);
@@ -53,6 +55,10 @@ pub struct ResourceDescriptor {
     pub name: String,
     /// Hosting sled for a switch zone.
     pub host: Option<String>,
+    /// Physical position in the rack elevation: a sled's cubby or a switch
+    /// zone's switch slot. None for routers and for anything a real rack has
+    /// no room for.
+    pub slot: Option<u8>,
 }
 
 pub fn resource_descriptors(config: &VoxelConfig) -> Vec<ResourceDescriptor> {
@@ -67,10 +73,17 @@ pub fn resource_descriptors(config: &VoxelConfig) -> Vec<ResourceDescriptor> {
             kind: ResourceKind::Sled,
             name: sled.name.clone(),
             host: None,
+            // The SP location MGS reports is the global sled index, so a
+            // second rack's sleds sit where the control plane says they do.
+            slot: u8::try_from(sled.index)
+                .ok()
+                .filter(|cubby| *cubby < SLED_CUBBIES),
         });
         if sled.scrimlet {
             let slot = switch_slots.entry(sled.rack).or_default();
             let name = format!("switch{slot}");
+            let switch_slot =
+                u8::try_from(*slot).ok().filter(|slot| *slot < SWITCH_SLOTS);
             *slot += 1;
             result.push(ResourceDescriptor {
                 // The rack-local slot is presentation/targeting data; the hosting
@@ -84,6 +97,7 @@ pub fn resource_descriptors(config: &VoxelConfig) -> Vec<ResourceDescriptor> {
                 kind: ResourceKind::SwitchZone,
                 name,
                 host: Some(sled.name),
+                slot: switch_slot,
             });
         }
     }
@@ -94,6 +108,7 @@ pub fn resource_descriptors(config: &VoxelConfig) -> Vec<ResourceDescriptor> {
             kind: ResourceKind::Router,
             name: name.clone(),
             host: None,
+            slot: None,
         });
     }
     result.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1031,13 +1046,29 @@ mod tests {
         assert_eq!(
             switches
                 .iter()
-                .map(|r| (r.rack, r.name.as_str(), r.host.as_deref()))
+                .map(|r| (r.rack, r.name.as_str(), r.host.as_deref(), r.slot))
                 .collect::<Vec<_>>(),
             vec![
-                (Some(RackId(0)), "switch0", Some("g0")),
-                (Some(RackId(0)), "switch1", Some("g2")),
-                (Some(RackId(1)), "switch0", Some("g3")),
-                (Some(RackId(1)), "switch1", Some("g5")),
+                (Some(RackId(0)), "switch0", Some("g0"), Some(0)),
+                (Some(RackId(0)), "switch1", Some("g2"), Some(1)),
+                (Some(RackId(1)), "switch0", Some("g3"), Some(0)),
+                (Some(RackId(1)), "switch1", Some("g5"), Some(1)),
+            ]
+        );
+        // Cubbies follow the global SP slot, so rack 1 starts at cubby 3.
+        assert_eq!(
+            resources
+                .iter()
+                .filter(|r| r.kind == ResourceKind::Sled)
+                .map(|r| (r.rack, r.slot))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(RackId(0)), Some(0)),
+                (Some(RackId(0)), Some(1)),
+                (Some(RackId(0)), Some(2)),
+                (Some(RackId(1)), Some(3)),
+                (Some(RackId(1)), Some(4)),
+                (Some(RackId(1)), Some(5)),
             ]
         );
         assert!(

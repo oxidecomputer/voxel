@@ -59,13 +59,18 @@ pub(crate) fn monitor_rows(
     app: &App,
     mode: LayoutMode,
 ) -> Vec<Rect> {
-    let preferred = match (mode, area.height) {
+    let mut preferred = match (mode, area.height) {
         (LayoutMode::Wide, 0..=17) => [4, 3, 3],
         (LayoutMode::Wide, _) => [5, 12, 7],
         (LayoutMode::Compact, 0..=11) => [3, 3, 2],
         (LayoutMode::Compact, _) => [4, 8, 3],
         (LayoutMode::Minimum, _) => [1, 1, 1],
     };
+    // The rack elevation needs far more rows than a summary does, so the
+    // Topology section claims them while it has focus.
+    if app.session.monitoring_pane == MonitoringPane::Topology {
+        preferred[1] = super::topology::PREFERRED_HEIGHT + 2;
+    }
     let expanded =
         MonitoringPane::ORDER.map(|pane| app.session.monitoring_expanded(pane));
     let focused = MonitoringPane::ORDER
@@ -93,9 +98,8 @@ pub(crate) struct MiddleLayout {
 pub(crate) fn middle_layout(area: Rect, mode: LayoutMode) -> MiddleLayout {
     let inner = Block::bordered().inner(area);
     if mode == LayoutMode::Wide {
-        let topology_width = ((u32::from(inner.width) * 3 / 5) as u16)
-            .max(1)
-            .min(inner.width.saturating_sub(1));
+        let topology_width =
+            super::topology::column_width(inner.height).min(inner.width / 2);
         let divider = Rect::new(
             inner.x.saturating_add(topology_width),
             inner.y,
@@ -115,7 +119,7 @@ pub(crate) fn middle_layout(area: Rect, mode: LayoutMode) -> MiddleLayout {
     }
     let inspector_height: u16 = if inner.height <= 4 { 2 } else { 3 };
     let topology_height =
-        inner.height.saturating_sub(inspector_height.saturating_add(1)).min(9);
+        inner.height.saturating_sub(inspector_height.saturating_add(1));
     let divider_y = inner.y.saturating_add(topology_height);
     MiddleLayout {
         topology: Rect::new(inner.x, inner.y, inner.width, topology_height),
@@ -132,35 +136,6 @@ pub(crate) fn middle_layout(area: Rect, mode: LayoutMode) -> MiddleLayout {
             inner.bottom().saturating_sub(divider_y.saturating_add(1)),
         ),
     }
-}
-
-pub(crate) fn page_capacity(app: &App) -> usize {
-    let (area, mode) = super::widgets::content_area(app);
-    if !app.session.monitoring_expanded(MonitoringPane::Topology) {
-        return 1;
-    }
-    let rows = monitor_rows(area, app, mode);
-    if rows[1].height <= 2 {
-        return 1;
-    }
-    let scoped = scoped_descriptors(app, app.session.selected_rack);
-    let scene = super::topology::layout_scene(
-        middle_layout(rows[1], mode).topology,
-        mode,
-        &scoped,
-        app.session.selected_resource.as_ref(),
-        app.session.monitor_scroll,
-    );
-    scene
-        .tiers
-        .iter()
-        .find(|tier| {
-            tier.visible_ids
-                .iter()
-                .any(|id| Some(id) == app.session.selected_resource.as_ref())
-        })
-        .map_or(1, |tier| tier.visible_ids.len())
-        .max(1)
 }
 
 pub(crate) fn resource_health_state(app: &App, id: &ResourceId) -> HealthState {
@@ -348,14 +323,7 @@ fn draw_topology(
     }
     let layout = middle_layout(area, mode);
     let scoped = scoped_descriptors(app, rack);
-    let scene = super::topology::layout_scene(
-        layout.topology,
-        mode,
-        &scoped,
-        app.session.selected_resource.as_ref(),
-        app.session.monitor_scroll,
-    );
-    super::topology::draw(frame, &scene, app);
+    super::topology::draw(frame, layout.topology, app, &scoped);
     let edge =
         Style::default().fg(if focused { TUI_YELLOW } else { OX_GREEN_LIGHT });
     for y in layout.divider.y..layout.divider.bottom() {
@@ -942,6 +910,7 @@ mod height_tests {
             kind: ResourceKind::Sled,
             name: "seeded".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(
             vec![ResourceDescriptor {
@@ -1083,6 +1052,7 @@ mod height_tests {
             kind,
             name: name.into(),
             host: None,
+            slot: None,
         })
         .collect::<Vec<_>>();
         let mut app = App::new(descriptors.clone(), 4, 4);
@@ -1115,6 +1085,7 @@ mod height_tests {
             kind: ResourceKind::Sled,
             name: "g0".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor.clone()], 4, 4);
         let sampled_at = Instant::now();
@@ -1149,6 +1120,7 @@ mod height_tests {
             kind: ResourceKind::Router,
             name: "ce".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor.clone()], 4, 4);
         let now = Instant::now();
@@ -1204,6 +1176,7 @@ mod height_tests {
             kind: ResourceKind::Router,
             name: "ce".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor], 4, 4);
         app.session.selected_resource = Some(id.clone());
@@ -1310,6 +1283,7 @@ mod height_tests {
             kind: ResourceKind::Sled,
             name: "g0".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor.clone()], 4, 4);
         app.session.top_zones_scroll = 1;
@@ -1405,6 +1379,7 @@ mod tests {
             kind: ResourceKind::Router,
             name: "ce".into(),
             host: None,
+            slot: None,
         };
         let mut app = App::new(vec![descriptor], 4, 4);
         let before_reconciliation = Instant::now();

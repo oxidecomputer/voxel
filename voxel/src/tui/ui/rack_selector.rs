@@ -324,6 +324,7 @@ mod tests {
                 kind: ResourceKind::Sled,
                 name: "g0".into(),
                 host: None,
+                slot: None,
             }],
             4,
             4,

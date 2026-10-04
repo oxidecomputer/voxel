@@ -6,17 +6,14 @@ pub const OX_GREEN_LIGHT: Color = Color::Rgb(0x48, 0xD5, 0x97);
 #[cfg(test)]
 pub const OX_GREEN_DARK: Color = Color::Rgb(0x11, 0x27, 0x25);
 pub const OX_GREEN_DARKEST: Color = Color::Rgb(0x0B, 0x14, 0x18);
-#[cfg(test)]
 pub const OX_GRAY: Color = Color::Rgb(0x9C, 0x9F, 0xA0);
 #[cfg(test)]
 pub const OX_GRAY_DARK: Color = Color::Rgb(0x62, 0x66, 0x68);
-#[cfg(test)]
 pub const OX_WHITE: Color = Color::Rgb(0xE7, 0xE7, 0xE8);
 #[cfg(test)]
 pub const OX_PINK: Color = Color::Rgb(0xE6, 0x68, 0x86);
 #[cfg(test)]
 pub const OX_YELLOW_DIM: Color = Color::Rgb(0xAE, 0x96, 0x4E);
-#[cfg(test)]
 pub const TUI_BLACK: Color = Color::Rgb(0x1E, 0x1E, 0x22);
 pub const TUI_YELLOW: Color = Color::Rgb(0xF1, 0xD7, 0x8F);
 pub const TUI_GREEN: Color = Color::Rgb(0x8F, 0xEF, 0xBF);
