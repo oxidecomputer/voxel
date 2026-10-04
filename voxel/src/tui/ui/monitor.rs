@@ -66,9 +66,11 @@ pub(crate) fn monitor_rows(
         (LayoutMode::Minimum, _) => [1, 1, 1],
     };
     // The rack elevation needs far more rows than a summary does, so the
-    // Topology section claims them while it has focus.
+    // Topology section claims them while it has focus, short of the rack
+    // summary's rows: those carry the rack's control-plane error banner.
     if app.session.monitoring_pane == MonitoringPane::Topology {
-        preferred[1] = super::topology::PREFERRED_HEIGHT + 2;
+        preferred[1] = (super::topology::PREFERRED_HEIGHT + 2)
+            .min(area.height.saturating_sub(preferred[0] + 1));
     }
     let expanded =
         MonitoringPane::ORDER.map(|pane| app.session.monitoring_expanded(pane));
@@ -699,6 +701,21 @@ mod height_tests {
             text(&render(&compact, LayoutMode::Compact))
                 .contains("RACK 0 / SLED seeded")
         );
+    }
+
+    #[test]
+    fn focused_topology_leaves_the_rack_summary_its_rows() {
+        let app = app();
+        assert_eq!(app.session.monitoring_pane, MonitoringPane::Topology);
+        for height in [30, 51, 80] {
+            let rows = monitor_rows(
+                Rect::new(0, 0, 160, height),
+                &app,
+                LayoutMode::Wide,
+            );
+            assert_eq!(rows[0].height, 5, "height {height}");
+            assert!(rows[1].height > rows[2].height, "height {height}");
+        }
     }
 
     #[test]
