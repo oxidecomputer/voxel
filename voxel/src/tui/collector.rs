@@ -2248,13 +2248,22 @@ impl<E: NodeExecutor> Collector<E> {
         } else if let Some(login) = login {
             (0..config.topology.racks())
                 .map(|rack| {
+                    let network = config.network.for_rack(rack);
                     Ok((
                         RackId(rack),
-                        Arc::new(NexusClient::new(
-                            crate::tui::nexus::rack_endpoints(config, rack)?,
-                            login.clone(),
-                            Duration::from_secs(60),
-                        )?),
+                        Arc::new(
+                            NexusClient::new(
+                                crate::tui::nexus::rack_endpoints(
+                                    config, rack,
+                                )?,
+                                login.clone(),
+                                Duration::from_secs(60),
+                            )?
+                            .with_dns(
+                                network.external_dns_ips,
+                                &network.dns_zone,
+                            ),
+                        ),
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?

@@ -219,14 +219,54 @@ struct QueryRequest<'a> {
     include_summaries: bool,
 }
 
+/// Bounds the TCP connect separately from the request timeout. Most
+/// service-pool addresses are not Nexus and silently drop connections, and a
+/// probe round can only conclude once its slowest probe has.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+// Kept short: the lookup runs inside the 10 s Nexus readiness budget.
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Where a rack publishes its Nexus addresses once rack setup has completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NexusDns {
+    servers: Vec<String>,
+    name: String,
+}
+
 pub(crate) struct NexusClient {
     http: reqwest::Client,
     endpoints: Vec<Url>,
+    dns: Option<NexusDns>,
     endpoint: Mutex<Option<Url>>,
     authenticated: Mutex<Option<Url>>,
     operation: Mutex<()>,
     login: RecoveryLogin,
     timeout: Duration,
+}
+
+/// The A records in `dig +short` output; CNAME targets and noise are skipped.
+fn parse_dig_addresses(output: &str) -> Vec<Ipv4Addr> {
+    output.lines().filter_map(|line| line.trim().parse().ok()).collect()
+}
+
+/// Narrows the configured candidates to the addresses DNS names, keeping
+/// their scheme order. Addresses outside the configured pool are still
+/// trusted, since DNS is authoritative once it answers.
+fn dns_endpoints(configured: &[Url], resolved: &[Ipv4Addr]) -> Vec<Url> {
+    let mut schemes = Vec::<&str>::new();
+    for endpoint in configured {
+        if !schemes.contains(&endpoint.scheme()) {
+            schemes.push(endpoint.scheme());
+        }
+    }
+    schemes
+        .into_iter()
+        .flat_map(|scheme| {
+            resolved.iter().filter_map(move |address| {
+                Url::parse(&format!("{scheme}://{address}/")).ok()
+            })
+        })
+        .collect()
 }
 
 impl NexusClient {
@@ -243,17 +283,61 @@ impl NexusClient {
             // development certificate. This client is private to virtual racks.
             .danger_accept_invalid_certs(true)
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT.min(timeout))
             .build()
             .context("build Voxel Nexus client")?;
         Ok(Self {
             http,
             endpoints,
+            dns: None,
             endpoint: Mutex::new(None),
             authenticated: Mutex::new(None),
             operation: Mutex::new(()),
             login,
             timeout,
         })
+    }
+
+    /// Prefers the Nexus addresses `servers` publish for the recovery silo in
+    /// `zone` over the configured candidates whenever they answer.
+    pub(crate) fn with_dns(mut self, servers: Vec<String>, zone: &str) -> Self {
+        self.dns = Some(NexusDns {
+            servers,
+            name: format!("{}.sys.{zone}", self.login.silo),
+        });
+        self
+    }
+
+    /// Nexus addresses from the rack's external DNS, or none when DNS is not
+    /// serving yet (before rack setup) or `dig` is unavailable.
+    async fn resolve(&self, cancel: &CancellationToken) -> Vec<Ipv4Addr> {
+        let Some(dns) = &self.dns else {
+            return Vec::new();
+        };
+        for server in &dns.servers {
+            let mut command = tokio::process::Command::new("dig");
+            command
+                .args(["+short", "+time=1", "+tries=1"])
+                .arg(format!("@{server}"))
+                .args([dns.name.as_str(), "A"])
+                .kill_on_drop(true);
+            let output = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Vec::new(),
+                output = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, command.output()) => output,
+            };
+            if let Ok(Ok(output)) = output
+                && output.status.success()
+            {
+                let addresses = parse_dig_addresses(&String::from_utf8_lossy(
+                    &output.stdout,
+                ));
+                if !addresses.is_empty() {
+                    return addresses;
+                }
+            }
+        }
+        Vec::new()
     }
 
     async fn send(
@@ -282,11 +366,15 @@ impl NexusClient {
         {
             return Ok(endpoint);
         }
+        let resolved = self.resolve(cancel).await;
+        let candidates = if resolved.is_empty() {
+            self.endpoints.clone()
+        } else {
+            dns_endpoints(&self.endpoints, &resolved)
+        };
         let mut probes = FuturesUnordered::new();
-        for endpoint in self
-            .endpoints
-            .iter()
-            .filter(|endpoint| !excluded.contains(endpoint))
+        for endpoint in
+            candidates.iter().filter(|endpoint| !excluded.contains(endpoint))
         {
             let endpoint = endpoint.clone();
             probes.push(async move {
@@ -542,6 +630,52 @@ mod tests {
         assert_eq!(endpoints[0].as_str(), "http://198.51.100.22/");
         assert_eq!(endpoints[8].as_str(), "http://198.51.100.20/");
         assert_eq!(endpoints[10].as_str(), "https://198.51.100.22/");
+    }
+
+    #[test]
+    fn dns_answers_narrow_the_candidates_and_keep_scheme_order() {
+        let configured = rack_endpoints(&VoxelConfig::default(), 0).unwrap();
+        let resolved = parse_dig_addresses(
+            "198.51.100.22\nnexus.alias.example.\n198.51.100.24\n\n",
+        );
+        let narrowed = dns_endpoints(&configured, &resolved)
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            narrowed,
+            [
+                "http://198.51.100.22/",
+                "http://198.51.100.24/",
+                "https://198.51.100.22/",
+                "https://198.51.100.24/",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unanswering_addresses_fail_at_the_connect_timeout() {
+        // TEST-NET-1 is never routed, so the connect either fails at once or
+        // hangs; either way the long request timeout must not apply.
+        let client = NexusClient::new(
+            vec![Url::parse("http://192.0.2.1/").unwrap()],
+            RecoveryLogin {
+                silo: "recovery".into(),
+                username: "recovery".into(),
+                password: "oxide".into(),
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .with_dns(vec![], "rack1.oxide.test");
+        let started = std::time::Instant::now();
+        let error = client.ready(&CancellationToken::new()).await.unwrap_err();
+        assert!(
+            started.elapsed() < CONNECT_TIMEOUT + Duration::from_secs(2),
+            "{:?}: {error:#}",
+            started.elapsed()
+        );
+        assert!(format!("{error:#}").contains("Nexus is unavailable"));
     }
 
     #[test]
