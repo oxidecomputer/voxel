@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Tabs},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Tabs},
 };
 
 pub(crate) fn terminal_width(text: &str) -> usize {
@@ -39,6 +39,8 @@ pub(crate) fn fit_terminal_width(text: &str, width: usize) -> String {
 }
 
 pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+    // Like wicket, paint the theme's background rather than the terminal's.
+    frame.render_widget(Block::default().style(background()), frame.area());
     if let Some(splash) = &app.splash
         && super::splash::draw(frame, splash, app.now)
     {
@@ -60,7 +62,7 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let tabs = Tabs::new(titles)
         .select(usize::from(app.session.view == View::Monitor))
         .style(Style::default().fg(TUI_GREY))
-        .highlight_style(active_tab_style())
+        .highlight_style(header_style(true))
         .divider(Span::styled(" │ ", Style::default().fg(TUI_GREY_DARK)));
     let state = format!("{:?} │ alerts {alerts}", app.deployment.observed);
     if area.width < 80 {
@@ -69,14 +71,14 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .split(root.header);
         frame.render_widget(
             Paragraph::new(format!(" VOXEL · {state}"))
-                .style(Style::default().fg(OX_YELLOW)),
+                .style(Style::default().fg(OX_OFF_WHITE)),
             header[0],
         );
         frame.render_widget(
             tabs.block(
                 Block::default()
                     .borders(Borders::BOTTOM)
-                    .border_style(primary_edge_style()),
+                    .border_style(line_style(true)),
             ),
             header[1],
         );
@@ -89,18 +91,18 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                 Block::default()
                     .borders(Borders::BOTTOM)
                     .title(" VOXEL ")
-                    .border_style(primary_edge_style()),
+                    .border_style(line_style(true)),
             ),
             header[0],
         );
         frame.render_widget(
             Paragraph::new(state)
-                .style(Style::default().fg(OX_YELLOW))
+                .style(Style::default().fg(OX_OFF_WHITE))
                 .right_aligned()
                 .block(
                     Block::default()
                         .borders(Borders::BOTTOM)
-                        .border_style(primary_edge_style()),
+                        .border_style(line_style(true)),
                 ),
             header[1],
         );
@@ -269,18 +271,15 @@ fn styled_groups(groups: Vec<ActionGroup>) -> Line<'static> {
     let mut spans = Vec::new();
     for (index, group) in groups.into_iter().enumerate() {
         if index > 0 {
-            spans.push(Span::raw(" "));
+            spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(
-            format!("[{}]", group.key),
-            Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD),
-        ));
         if !group.description.is_empty() {
             spans.push(Span::styled(
-                format!(" {}", group.description),
-                Style::default().fg(OX_OFF_WHITE),
+                format!("{} ", group.description),
+                help_function_style(),
             ));
         }
+        spans.push(Span::styled(format!("<{}>", group.key), help_key_style()));
     }
     Line::from(spans)
 }
@@ -436,16 +435,66 @@ pub(crate) fn traffic_style(severity: TrafficSeverity) -> Style {
     })
 }
 
-pub(crate) fn selection_style() -> Style {
-    Style::default().fg(TUI_PURPLE).add_modifier(Modifier::BOLD)
+// The styles below follow wicket's ui/defaults/style.rs.
+
+/// The theme background painted under every frame.
+pub(crate) fn background() -> Style {
+    Style::default().bg(TUI_BLACK)
 }
 
-pub(crate) fn primary_edge_style() -> Style {
-    Style::default().fg(OX_GREEN_LIGHT)
+/// A highlighted item: the selected node, rack, or option.
+pub(crate) fn selection_style() -> Style {
+    Style::default().bg(TUI_PURPLE).fg(TUI_BLACK)
+}
+
+/// Border lines: dark green where focus is, grey elsewhere.
+pub(crate) fn line_style(focused: bool) -> Style {
+    Style::default().fg(if focused { TUI_GREEN_DARK } else { TUI_GREY })
+}
+
+/// Titles and active tabs: bright green where focus is, grey elsewhere.
+pub(crate) fn header_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(TUI_GREEN).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TUI_GREY)
+    }
+}
+
+pub(crate) fn help_function_style() -> Style {
+    Style::default().fg(TUI_GREEN)
+}
+
+pub(crate) fn help_key_style() -> Style {
+    Style::default().fg(TUI_GREEN_DARK)
+}
+
+pub(crate) fn rounded_block<'a>() -> Block<'a> {
+    Block::bordered().border_type(BorderType::Rounded)
+}
+
+/// Prepares a pop-up: fades the screen behind it, as wicket does, and
+/// clears the pop-up's own area to the theme background.
+pub(crate) fn popup_backdrop(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let screen = frame.area();
+    frame
+        .buffer_mut()
+        .set_style(screen, Style::default().bg(TUI_BLACK).fg(TUI_GREY));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(background()), area);
+}
+
+/// A pop-up's frame: rounded, dark green, with a bright green title.
+pub(crate) fn popup_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    rounded_block()
+        .title(title)
+        .border_style(line_style(true))
+        .title_style(header_style(true))
+        .style(background().fg(OX_OFF_WHITE))
 }
 
 pub(crate) fn primary_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
-    Block::bordered().title(title).border_style(primary_edge_style())
+    rounded_block().title(title).border_style(line_style(true))
 }
 
 pub(crate) fn section_block<'a>(
@@ -455,15 +504,10 @@ pub(crate) fn section_block<'a>(
 ) -> Block<'a> {
     let mut spans = vec![Span::raw(if expanded { " ▾ " } else { " ▸ " })];
     spans.extend(title.into().spans);
-    let style = if focused { active_tab_style() } else { primary_edge_style() };
-    Block::bordered()
+    rounded_block()
         .title(Line::from(spans))
-        .border_style(style)
-        .title_style(style)
-}
-
-pub(crate) fn active_tab_style() -> Style {
-    Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD)
+        .border_style(line_style(focused))
+        .title_style(header_style(focused))
 }
 
 #[cfg(test)]
@@ -491,6 +535,32 @@ mod tests {
             .into_iter()
             .map(|group| format!("{} {}", group.key, group.description))
             .collect()
+    }
+
+    #[test]
+    fn theme_background_and_popup_fade_follow_wicket() {
+        let mut app = App::new(vec![], 8, 8);
+        let render = |app: &App| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let plain = render(&app);
+        assert_eq!(plain[(119, 20)].bg, TUI_BLACK);
+        // The focused section's frame is rounded and dark green.
+        let corner = plain
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "╭")
+            .expect("sections are rounded");
+        assert_eq!(corner.fg, TUI_GREEN_DARK);
+
+        app.session.help_open = true;
+        let faded = render(&app);
+        // Behind the pop-up, the header's coloured text is greyed out.
+        assert_eq!(faded[(1, 0)].fg, TUI_GREY);
+        assert_eq!(faded[(1, 0)].bg, TUI_BLACK);
     }
 
     #[test]

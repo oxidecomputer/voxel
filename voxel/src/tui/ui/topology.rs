@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
 
 use super::{
@@ -17,7 +17,7 @@ use super::{
         TUI_GREY, TUI_GREY_DARK, TUI_PURPLE, TUI_YELLOW,
     },
     monitor::{health_style, resource_health_state},
-    widgets::{fit_terminal_width, selection_style},
+    widgets::{fit_terminal_width, line_style, rounded_block, selection_style},
 };
 use crate::tui::{
     App,
@@ -227,6 +227,11 @@ pub(crate) fn horizontal_neighbor(
     .map(|(_, id)| id.clone())
 }
 
+fn rack_focused(app: &App) -> bool {
+    app.session.monitoring_pane == crate::tui::event::MonitoringPane::Topology
+        && !app.session.detail_open
+}
+
 pub(crate) fn draw(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -291,7 +296,7 @@ fn draw_uplink(
         let label = Span::raw(format!(" {} ", router.name));
         spans.push(Span::styled(health_glyph(state), health_style(state)));
         spans.push(if selected {
-            label.style(selection_style().add_modifier(Modifier::REVERSED))
+            label.style(selection_style())
         } else {
             label
         });
@@ -299,9 +304,8 @@ fn draw_uplink(
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(OX_GREEN_LIGHT))
+            rounded_block()
+                .border_style(line_style(rack_focused(app)))
                 .title(" Uplink "),
         ),
         area,
@@ -371,7 +375,7 @@ fn draw_bay(
     let border = if selected {
         Style::default().fg(TUI_BLACK).bg(TUI_PURPLE)
     } else if fill.is_some() {
-        Style::default().fg(OX_GRAY).bg(Color::Reset)
+        Style::default().fg(OX_GRAY).bg(TUI_BLACK)
     } else {
         Style::default().fg(TUI_GREY_DARK)
     };

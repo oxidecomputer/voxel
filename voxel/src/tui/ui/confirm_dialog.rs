@@ -1,16 +1,13 @@
 use super::{
-    colors::{OX_GREEN_DARKEST, OX_OFF_WHITE, OX_YELLOW, TUI_PURPLE},
-    widgets::{overlay_area, terminal_width},
+    colors::TUI_PURPLE,
+    widgets::{overlay_area, popup_backdrop, popup_block, terminal_width},
 };
 use crate::tui::{App, event::Confirmation};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Text},
-    widgets::{
-        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState,
-        Paragraph, Wrap,
-    },
+    widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 fn prompt(confirmation: &Confirmation) -> &'static str {
@@ -119,12 +116,8 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let options = confirmation.options(app.can_cancel());
     let dialog_body = body(app, confirmation);
     let area = dialog_area(app, overlay_area(frame.area()));
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Confirmation ")
-        .border_style(Style::default().fg(OX_YELLOW))
-        .style(Style::default().bg(OX_GREEN_DARKEST).fg(OX_OFF_WHITE));
+    popup_backdrop(frame, area);
+    let block = popup_block(" Confirmation ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let body_height = Paragraph::new(dialog_body.clone())
@@ -321,6 +314,10 @@ mod tests {
             .unwrap();
         assert_eq!(buffer[back].fg, TUI_PURPLE);
         assert!(buffer[back].modifier.contains(Modifier::BOLD));
-        assert_eq!(buffer[(area.x, area.y)].fg, OX_YELLOW);
+        assert_eq!(buffer[(area.x, area.y)].symbol(), "╭");
+        assert_eq!(
+            buffer[(area.x, area.y)].fg,
+            crate::tui::ui::colors::TUI_GREEN_DARK
+        );
     }
 }

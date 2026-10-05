@@ -17,7 +17,6 @@ pub const OX_YELLOW_DIM: Color = Color::Rgb(0xAE, 0x96, 0x4E);
 pub const TUI_BLACK: Color = Color::Rgb(0x1E, 0x1E, 0x22);
 pub const TUI_YELLOW: Color = Color::Rgb(0xF1, 0xD7, 0x8F);
 pub const TUI_GREEN: Color = Color::Rgb(0x8F, 0xEF, 0xBF);
-#[cfg(test)]
 pub const TUI_GREEN_DARK: Color = Color::Rgb(0x2E, 0x81, 0x60);
 pub const TUI_GREY: Color = Color::Rgb(0x78, 0x78, 0x7A);
 pub const TUI_PURPLE: Color = Color::Rgb(0xBE, 0x95, 0xEB);

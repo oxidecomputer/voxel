@@ -111,16 +111,8 @@ pub fn draw(
         })
         .unwrap_or_else(|| "Oximeter collection health unavailable".into());
     let compact = area.width < 100;
-    let title = if compact {
-        format!(" Rack {} ◀ {}/{} ▶ ", rack.0, selected_index + 1, racks.len())
-    } else {
-        format!(
-            " Rack {} ◀ {}/{} ▶ · selected rack summary ",
-            rack.0,
-            selected_index + 1,
-            racks.len()
-        )
-    };
+    let title =
+        format!(" Rack {} ◀ {}/{} ▶ ", rack.0, selected_index + 1, racks.len());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             ratatui::text::Span::styled(title, selection_style()),
@@ -155,7 +147,7 @@ pub fn draw(
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(format!(
-                    "Nexus/control plane unavailable · direct-probe fallback enabled · log: {}",
+                    "⚠ Nexus/control plane unavailable · direct-probe fallback enabled · log: {}",
                     app.durable_log_path
                 )),
                 Line::from(format!("{cause} · {}", error.message)),

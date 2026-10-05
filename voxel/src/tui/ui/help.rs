@@ -1,10 +1,13 @@
-use super::{colors::*, widgets::overlay_area};
+use super::{
+    colors::*,
+    widgets::{overlay_area, popup_backdrop, popup_block},
+};
 use crate::tui::App;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Clear, Paragraph, Wrap},
+    widgets::{Block, Paragraph, Wrap},
 };
 
 const GLOBAL: &[(&str, &str)] = &[
@@ -42,7 +45,7 @@ fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{key:<18}"),
-            Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD),
+            Style::default().fg(TUI_GREEN).add_modifier(Modifier::BOLD),
         ),
         Span::styled(description, Style::default().fg(OX_OFF_WHITE)),
     ])
@@ -115,7 +118,7 @@ pub fn draw(
     if area.width <= 2 || area.height <= 2 {
         return;
     }
-    frame.render_widget(Clear, area);
+    popup_backdrop(frame, area);
 
     let body = help_text();
     let metrics = text_metrics(&body, area);
@@ -127,18 +130,11 @@ pub fn draw(
         end,
         metrics.total
     );
-    let block = Block::bordered()
-        .border_style(Style::default().fg(TUI_GREY))
-        .title(title)
-        .title_style(
-            Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(OX_GREEN_DARKEST));
+    let block = popup_block(title);
     frame.render_widget(
         Paragraph::new(body)
             .wrap(Wrap { trim: false })
             .scroll((start as u16, 0))
-            .style(Style::default().bg(OX_GREEN_DARKEST))
             .block(block),
         area,
     );
@@ -442,7 +438,7 @@ mod tests {
                         assert_range_style(
                             &cells,
                             row_range.start..row_range.start + key_len,
-                            TUI_YELLOW,
+                            TUI_GREEN,
                             Some(Modifier::BOLD),
                             key,
                         );

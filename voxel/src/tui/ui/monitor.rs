@@ -1,7 +1,5 @@
 use super::{
-    colors::{
-        OX_GREEN_LIGHT, OX_RED, TUI_GREEN, TUI_GREY, TUI_GREY_DARK, TUI_YELLOW,
-    },
+    colors::{OX_RED, TUI_GREEN, TUI_GREY, TUI_GREY_DARK, TUI_YELLOW},
     renderer::LayoutMode,
     widgets::{
         format_rate, section_block, section_heights, section_rects,
@@ -349,8 +347,7 @@ fn draw_topology(
     if layout.divider.area() == 0 {
         return;
     }
-    let edge =
-        Style::default().fg(if focused { TUI_YELLOW } else { OX_GREEN_LIGHT });
+    let edge = super::widgets::line_style(focused);
     for y in layout.divider.y..layout.divider.bottom() {
         frame.render_widget(
             Paragraph::new("│").style(edge),
@@ -636,10 +633,10 @@ mod height_tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains(title), "missing {title:?}: {text}");
-        assert_eq!(buffer[(0, 0)].symbol(), "┌");
-        assert_eq!(buffer[(47, 0)].symbol(), "┐");
-        assert_eq!(buffer[(0, 1)].symbol(), "└");
-        assert_eq!(buffer[(47, 1)].symbol(), "┘");
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(47, 0)].symbol(), "╮");
+        assert_eq!(buffer[(0, 1)].symbol(), "╰");
+        assert_eq!(buffer[(47, 1)].symbol(), "╯");
         assert!(!text.contains('I'), "seeded content survived: {text}");
     }
 
@@ -672,10 +669,10 @@ mod height_tests {
         assert!(text.contains("Top Zones by Traffic"));
         assert!(!text.contains("height-two-zone-traffic"));
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(0, 0)].symbol(), "┌");
-        assert_eq!(buffer[(47, 0)].symbol(), "┐");
-        assert_eq!(buffer[(0, 1)].symbol(), "└");
-        assert_eq!(buffer[(47, 1)].symbol(), "┘");
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(47, 0)].symbol(), "╮");
+        assert_eq!(buffer[(0, 1)].symbol(), "╰");
+        assert_eq!(buffer[(47, 1)].symbol(), "╯");
     }
 
     #[test]
@@ -699,15 +696,21 @@ mod height_tests {
         };
 
         let focused = render(&app(), LayoutMode::Wide);
-        assert_eq!(focused[(layout.divider.x, area.y)].fg, TUI_YELLOW);
-        assert_eq!(focused[(layout.divider.x, area.y + 1)].fg, TUI_YELLOW);
+        assert_eq!(
+            focused[(layout.divider.x, area.y)].fg,
+            super::super::colors::TUI_GREEN_DARK
+        );
+        assert_eq!(
+            focused[(layout.divider.x, area.y + 1)].fg,
+            super::super::colors::TUI_GREEN_DARK
+        );
         assert!(text(&focused).contains("RACK 0 / SLED seeded"));
 
         let mut inactive_app = app();
         inactive_app.session.monitoring_pane = MonitoringPane::TopZones;
         let inactive = render(&inactive_app, LayoutMode::Wide);
-        assert_eq!(inactive[(layout.divider.x, area.y)].fg, OX_GREEN_LIGHT);
-        assert_eq!(inactive[(layout.divider.x, area.y + 1)].fg, OX_GREEN_LIGHT);
+        assert_eq!(inactive[(layout.divider.x, area.y)].fg, TUI_GREY);
+        assert_eq!(inactive[(layout.divider.x, area.y + 1)].fg, TUI_GREY);
 
         // Compact layouts show the rack, or the details once focused.
         let mut compact = app();

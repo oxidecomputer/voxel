@@ -1,12 +1,14 @@
 use crate::tui::{App, telemetry::RackId};
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
-use super::{colors::*, widgets::overlay_area};
+use super::widgets::{
+    header_style, help_function_style, help_key_style, overlay_area,
+    popup_backdrop, popup_block,
+};
 
 pub const GUIDE_URL: &str =
     "https://docs.oxide.computer/guides/integrations/opentelemetry";
@@ -59,12 +61,9 @@ pub fn draw(frame: &mut ratatui::Frame<'_>) {
     if area.width <= 2 || area.height <= 2 {
         return;
     }
-    frame.render_widget(Clear, area);
+    popup_backdrop(frame, area);
     let body = vec![
-        Line::styled(
-            "Setting up External Monitoring",
-            Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD),
-        ),
+        Line::styled("Setting up External Monitoring", header_style(true)),
         Line::default(),
         Line::from(
             "To monitor your Voxel deployment, copy the OpenTelemetry receiver",
@@ -73,18 +72,17 @@ pub fn draw(frame: &mut ratatui::Frame<'_>) {
         Line::from(GUIDE_URL),
         Line::default(),
         Line::from(vec![
-            Span::styled("s", Style::default().fg(TUI_YELLOW)),
-            Span::raw(" copy receiver YAML   "),
-            Span::styled("a", Style::default().fg(TUI_YELLOW)),
-            Span::raw(" copy guide URL   "),
-            Span::styled("Esc", Style::default().fg(TUI_YELLOW)),
-            Span::raw(" close"),
+            Span::styled("Copy receiver YAML ", help_function_style()),
+            Span::styled("<s>", help_key_style()),
+            Span::raw("  "),
+            Span::styled("Copy guide URL ", help_function_style()),
+            Span::styled("<a>", help_key_style()),
+            Span::raw("  "),
+            Span::styled("Close ", help_function_style()),
+            Span::styled("<Esc>", help_key_style()),
         ]),
     ];
-    let block = Block::bordered()
-        .title(" External monitoring ")
-        .border_style(Style::default().fg(TUI_PURPLE))
-        .style(Style::default().bg(OX_GREEN_DARKEST));
+    let block = popup_block(" External monitoring ");
     frame.render_widget(
         Paragraph::new(body).wrap(Wrap { trim: false }).block(block),
         area,

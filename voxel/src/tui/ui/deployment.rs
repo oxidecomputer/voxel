@@ -253,7 +253,7 @@ fn draw_phases(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(OX_RED).add_modifier(Modifier::BOLD),
             )
         } else if operation.completed_phases.contains(&phase) {
-            ("●", "Complete", Style::default().fg(TUI_GREEN))
+            ("✓", "Complete", Style::default().fg(TUI_GREEN))
         } else if operation.phase == Some(phase) {
             (
                 "◐",

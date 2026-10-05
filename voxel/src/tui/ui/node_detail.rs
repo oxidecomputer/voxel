@@ -2,16 +2,17 @@
 //! the node, scrollable labelled sections, and a bar of the keys that apply.
 
 use super::{
-    colors::{
-        OX_GREEN_LIGHT, OX_OFF_WHITE, OX_RED, OX_YELLOW, TUI_GREY, TUI_YELLOW,
-    },
+    colors::{OX_GREEN_LIGHT, OX_OFF_WHITE, OX_RED, OX_YELLOW, TUI_GREY},
     monitor::{
         collection_error_is_visible, detail_area, health_status_label,
         health_style, rate_line, resource_health_state,
         resource_health_summary, sparkline_data, visible_traffic_error,
     },
     topology::health_glyph,
-    widgets::{active_tab_style, format_rate, terminal_width},
+    widgets::{
+        format_rate, help_function_style, help_key_style, line_style,
+        rounded_block, terminal_width,
+    },
 };
 use crate::tui::{
     App,
@@ -21,12 +22,13 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 /// Below this height the title and key bars would leave no room for content.
 const CHROME_MIN_HEIGHT: u16 = 9;
 const BULLET: &str = "  • ";
+const CROSS: char = '✗';
 
 struct DetailLayout {
     title: Option<Rect>,
@@ -48,13 +50,7 @@ fn detail_layout(area: Rect) -> DetailLayout {
 }
 
 fn frame_block(focused: bool) -> Block<'static> {
-    Block::bordered().border_type(BorderType::Rounded).border_style(
-        if focused {
-            active_tab_style()
-        } else {
-            Style::default().fg(TUI_GREY)
-        },
-    )
+    rounded_block().border_style(line_style(focused))
 }
 
 /// The content block joins the key bar's top border, as in wicket.
@@ -128,11 +124,7 @@ pub(crate) fn draw(
             Paragraph::new(key_line(focused)).block(border),
             keys,
         );
-        let style = if focused {
-            active_tab_style()
-        } else {
-            Style::default().fg(TUI_GREY)
-        };
+        let style = line_style(focused);
         let buffer = frame.buffer_mut();
         buffer[(keys.x, keys.y)].set_symbol("├").set_style(style);
         buffer[(keys.right() - 1, keys.y)].set_symbol("┤").set_style(style);
@@ -165,14 +157,8 @@ fn key_line(focused: bool) -> Line<'static> {
     };
     let mut spans = Vec::new();
     for (function, key) in pairs {
-        spans.push(Span::styled(
-            format!("{function} "),
-            Style::default().fg(OX_OFF_WHITE),
-        ));
-        spans.push(Span::styled(
-            format!("<{key}>  "),
-            Style::default().fg(TUI_YELLOW).add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(format!("{function} "), help_function_style()));
+        spans.push(Span::styled(format!("<{key}>  "), help_key_style()));
     }
     Line::from(spans)
 }
@@ -525,7 +511,17 @@ fn detail_text(
             ),
         ]));
         for (label, message) in errors {
-            lines.push(item(label, bad(message)));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {CROSS} "),
+                    Style::default().fg(OX_RED),
+                ),
+                Span::styled(
+                    format!("{label}: "),
+                    Style::default().fg(OX_OFF_WHITE),
+                ),
+                bad(message),
+            ]));
         }
     }
     Text::from(lines)
