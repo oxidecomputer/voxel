@@ -50,3 +50,6 @@ libc = "0.2"
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).
 attest-mock.workspace = true
 sprockets-tls-test-utils.workspace = true
+
+[dev-dependencies]
+expectorate.workspace = true

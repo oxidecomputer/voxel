@@ -5790,6 +5790,7 @@ dependencies = [
  "attest-mock",
  "camino",
  "clap",
+ "expectorate",
  "flate2",
  "futures",
  "indicatif",

@@ -331,6 +331,30 @@ mod tests {
         VoxelConfig::from_toml(&text).expect("parse test config")
     }
 
+    /// config-rss.toml golden files. These render through omicron's
+    /// rack-init-config, so a pin bump that reshapes the config surfaces here
+    /// as a diff. Regenerate with `EXPECTORATE=overwrite`.
+    #[test]
+    fn golden_config_rss() {
+        let cases: [(&str, usize, &str, usize); 3] = [
+            ("bgp", 1, "router_mode = \"bgp\"", 0),
+            (
+                "static-bfd",
+                1,
+                "router_mode = \"static\"\ntransit_bfd = true",
+                0,
+            ),
+            ("bgp-rack1", 2, "router_mode = \"bgp\"", 1),
+        ];
+        for (name, racks, network, rack) in cases {
+            let cfg = config(racks, network);
+            expectorate::assert_contents(
+                format!("tests/output/config-rss-{name}.toml"),
+                &config_rss_toml(&cfg, rack).expect("render config-rss"),
+            );
+        }
+    }
+
     #[test]
     fn static_bfd_ports_and_peers() {
         let cfg = config(1, "router_mode = \"static\"\ntransit_bfd = true");
