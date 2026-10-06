@@ -130,7 +130,6 @@ fn uplink_port(
         bgp_peers,
         lldp: Some(lldp(&p.switch, &p.lldp)),
         tx_eq: None,
-        allow_ddm_traffic: false,
     }))
 }
 
