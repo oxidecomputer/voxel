@@ -139,13 +139,21 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     // The cargo-bay arrives without the exec bit, so the agent is copied to
     // local disk before running.
     if o.role.is_some() {
-        let bay = d
-            .exec(node, "ls /opt/cargo-bay")
+        // p9kp copies file by file without any integrity checking. If
+        // `voxel-init` or some other cargo-bay artifact comes up short on
+        // bytes, report it.
+        let want = std::fs::metadata(o.cargo_bay.join("voxel-init"))
+            .map(|m| m.len())
+            .with_context(|| format!("stat {}/voxel-init", o.cargo_bay))?;
+        let got = d
+            .exec(node, "wc -c < /opt/cargo-bay/voxel-init")
             .await
-            .map_err(|e| anyhow::anyhow!("list cargo-bay in guest: {e}"))?;
-        if !bay.contains("voxel-init") {
+            .map_err(|e| anyhow::anyhow!("size voxel-init in guest: {e}"))?;
+        if got.trim() != want.to_string() {
             bail!(
-                "cargo-bay copy incomplete in the builder; guest sees: {bay:?}"
+                "cargo-bay copy incomplete in the builder: voxel-init is \
+                 {want} bytes on the host, guest reports {:?}",
+                got.trim()
             );
         }
     }
@@ -162,7 +170,8 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         (None, None) => None,
     };
     if let Some((label, cmd)) = step {
-        d.exec(node, &cmd)
+        let console = d
+            .exec(node, &cmd)
             .await
             .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
 
@@ -178,8 +187,22 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
                 .exec(node, "tail -40 /tmp/install.log 2>/dev/null")
                 .await
                 .unwrap_or_default();
+            let last: Vec<&str> = console.lines().rev().take(40).collect();
+            let console_tail =
+                last.into_iter().rev().collect::<Vec<_>>().join("\n");
+            if !console_tail.trim().is_empty() {
+                eprintln!(
+                    "[voxel] guest console tail:\n{}",
+                    console_tail.trim_end()
+                );
+            }
             if tail.trim().is_empty() {
-                eprintln!("[voxel] no guest install log captured");
+                if o.role.is_some() {
+                    bail!(
+                        "{label} wrote no /tmp/install.log; the agent never \
+                         ran or died before producing output"
+                    );
+                }
             } else {
                 eprintln!(
                     "[voxel] guest install log tail:\n{}",
