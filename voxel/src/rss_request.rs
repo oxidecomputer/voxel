@@ -13,9 +13,9 @@ use rack_init_config::{
     BgpPeerConfig, BootstrapAddressDiscovery, IdOrdMap, IpRange, Ipv4Range,
     Ipv6Range, LinkFec, LinkSpeed, LldpAdminStatus, LldpPortConfig,
     MaxPathConfig, PortConfig, RackInitializeRequest, RackNetworkConfig,
-    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, ServiceIpPoolConfig,
-    SwitchSlot, UnnumberedRouter, UplinkAddress, UplinkAddressConfig,
-    UplinkPorts,
+    RecoverySiloConfig, RouteConfig, RouterLifetimeConfig, RouterPeerType,
+    ServiceIpPoolConfig, SwitchSlot, UnnumberedRouter, UplinkAddress,
+    UplinkAddressConfig, UplinkPorts,
 };
 use voxel_config::{RouterMode, UplinkPort, VoxelConfig};
 use wicketd_commission_types_versions::latest::rack_setup::MultirackJoinRequest;
@@ -87,13 +87,12 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
             vec![BgpPeerConfig {
                 asn: p.peer_asn,
                 port: p.port.clone(),
-                addr: UnnumberedRouter {
+                addr: RouterPeerType::Unnumbered(UnnumberedRouter {
                     router_lifetime: RouterLifetimeConfig::new(
                         p.router_lifetime,
                     )
                     .map_err(|e| anyhow::anyhow!("router_lifetime: {e}"))?,
-                }
-                .into(),
+                }),
                 hold_time: None,
                 idle_hold_time: None,
                 delay_open: None,

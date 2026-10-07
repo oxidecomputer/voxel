@@ -258,7 +258,7 @@ pub(crate) async fn cmd_launch(
             Err(e) if attempt < BOOT_ATTEMPTS => {
                 warn!(
                     topo.runner.log,
-                    "boot attempt {attempt}/{BOOT_ATTEMPTS} failed ({e}); tearing down + retrying"
+                    "boot attempt {attempt}/{BOOT_ATTEMPTS} failed ({e}); retrying"
                 );
                 let _ = teardown(&topo.runner, name);
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -288,6 +288,7 @@ pub(crate) async fn cmd_launch(
                 );
             }
             run_voxel_init(d, "gimlet", rack_sleds).await;
+
             let Some((s, n)) =
                 topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
             else {
