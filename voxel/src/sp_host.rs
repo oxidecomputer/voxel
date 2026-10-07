@@ -15,6 +15,8 @@
 //! co-resident rack running.
 
 use anyhow::{Context, anyhow, bail};
+
+use crate::pins::{Pin, pin};
 use camino::Utf8Path;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::future::Future;
@@ -195,44 +197,6 @@ pub(crate) fn fleet_dir(rack: usize) -> camino::Utf8PathBuf {
         Some(cwd) => cwd.join(rel.strip_prefix("./").unwrap_or(&rel)),
         None => rel,
     }
-}
-
-/// The repo's pins.toml, embedded so a shipped voxel binary carries its own
-/// pins. Each entry names a buildomat-published binary and the rev to fetch.
-const PINS: &str = include_str!("../../pins.toml");
-
-/// One pins.toml entry.
-struct Pin {
-    repo: String,
-    series: String,
-    rev: String,
-    artifact: String,
-}
-
-/// Look up one entry of the embedded pins.toml.
-fn pin(name: &str) -> anyhow::Result<Pin> {
-    let doc: toml::Table = PINS.parse().context("parse embedded pins.toml")?;
-    let entry = doc
-        .get(name)
-        .and_then(|v| v.as_table())
-        .with_context(|| format!("pins.toml has no [{name}]"))?;
-    let field = |key: &str| -> anyhow::Result<String> {
-        entry
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .with_context(|| format!("pins.toml [{name}] missing {key}"))
-    };
-    let p = Pin {
-        repo: field("repo")?,
-        series: field("series")?,
-        rev: field("rev")?,
-        artifact: field("artifact")?,
-    };
-    if p.rev.len() != 40 || !p.rev.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("pins.toml [{name}] rev is not a full git sha: {}", p.rev);
-    }
-    Ok(p)
 }
 
 /// The sp-emu to run the fleet with: [sp].emu_bin, else sp-emu on PATH,
@@ -826,14 +790,6 @@ pub(crate) fn down_all(cfg: &voxel_config::VoxelConfig) {
 
 #[cfg(test)]
 mod tests {
-    // Every pins.toml entry must parse and carry a full git sha, so a bad
-    // pin fails in CI rather than at fetch time on a user's box.
-    #[test]
-    fn pins_parse() {
-        super::pin("sp-emu").unwrap();
-        super::pin("faux-mgs").unwrap();
-    }
-
     /// PATH lookup takes the first executable regular file, skipping dirs
     /// that lack the name or hold a non-executable one.
     #[test]

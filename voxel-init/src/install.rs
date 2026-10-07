@@ -5,7 +5,7 @@
 //! Image-BUILD-time install, run inside the builder guest.
 //!
 //! `voxel image bake` runs `voxel-init install --role <role>` in the builder
-//! node. Each role installs baked software and applies NO topology-specific
+//! node. Each role installs baked software and applies no topology-specific
 //! configuration: per-topology config is generated on the host and pushed at
 //! LAUNCH by the `gimlet` / `router` roles.
 //!
@@ -312,11 +312,11 @@ fn sleep2() {
 }
 
 /// Helios control-plane image: install pinned deps, unpack the control-plane
-/// zone artifacts, bake what launch needs. Applies NO topology configuration -
+/// zone artifacts, bake what launch needs. Applies no topology configuration -
 /// config-rss injection, sprockets keys, SMBIOS identity and RSS all happen at
 /// launch.
 ///
-/// Deliberately NOT baked, kept ephemeral or per-launch: `xtask
+/// Not baked, kept ephemeral or per-launch: `xtask
 /// virtual-hardware create` (per-node emulated U.2/M.2), `scadm propolis
 /// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet. Flashing
 /// hubris images is a runtime concern, so `voxel launch --emu` stages the fleet
@@ -534,9 +534,16 @@ pub fn build_frr_image() -> Result<()> {
 
     // bgpd + bfdd on (static mode uses BFD-tracked routes); frr.conf itself is
     // generated per topology at launch.
+    //
+    // pimd carries externally sourced multicast from the host segment onto the
+    // rack-facing links.
     replace_in_file(
         "/etc/frr/daemons",
-        &[("bgpd=no", "bgpd=yes"), ("bfdd=no", "bfdd=yes")],
+        &[
+            ("bgpd=no", "bgpd=yes"),
+            ("bfdd=no", "bfdd=yes"),
+            ("pimd=no", "pimd=yes"),
+        ],
     );
 
     // Persistent forwarding; per-interface knobs are set at launch.

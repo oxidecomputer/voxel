@@ -44,10 +44,91 @@ pub struct StaticUplink {
     /// ASN to peer with at `peer` (the sidecar's rack ASN). The session never
     /// establishes in static mode (sidecar runs no BGP), but bgpd's connect
     /// retries keep softnpu's neighbor for this gateway resolved, which static
-    /// egress needs. Mirrors a4x2's router `frr-bgp.txt`.
+    /// egress needs. Matches a4x2's router `frr-bgp.txt`.
     pub peer_asn: u32,
     /// Rack prefix reached via `peer`, e.g. `198.51.100.0/24`.
     pub route: String,
+}
+
+/// The documentation prefix (RFC 5737 TEST-NET-1) an unnumbered rack-facing
+/// link is numbered from.
+///
+/// pimd needs a [primary IPv4 address] for a rack-facing multicast VIF.
+/// The `/32`s here provide one on each link.
+///
+/// [primary IPv4 address]: https://github.com/FRRouting/frr/blob/85cf1ed576deed121751e16a64970f8a652a9e1e/pimd/pim_iface.c#L973-L981
+pub const PIM_LINK_PREFIX: [u8; 3] = [192, 0, 2];
+
+/// The `/32` assigned to a router's nth unnumbered rack-facing link.
+///
+/// Both the router and the link index matter here to avoid
+/// address collision. Addresses come from [`PIM_LINK_PREFIX`].
+///
+/// # Examples
+///
+/// ```
+/// use voxel_config::frr::pim_link_addr;
+///
+/// assert_eq!(pim_link_addr(0, 0, 2), "192.0.2.1/32");
+/// assert_eq!(pim_link_addr(1, 1, 2), "192.0.2.4/32");
+/// ```
+pub fn pim_link_addr(
+    router: usize,
+    link: usize,
+    links_per_router: usize,
+) -> String {
+    let [a, b, c] = PIM_LINK_PREFIX;
+    format!("{a}.{b}.{c}.{}/32", router * links_per_router + link + 1)
+}
+
+/// The prefix list naming the range pimd treats as source-specific.
+pub const SSM_PREFIX_LIST: &str = "voxel-ssm";
+
+/// The configuration declaring the SSM range, one vtysh command per element.
+///
+/// This is shared between the rendered `frr.conf` and
+/// `voxel network multicast up`, which reasserts on every run.
+///
+/// A missing [`SSM_PREFIX_LIST`], or one without a matching entry,
+/// treats no group as source-specific. In that case, everything falls back to
+/// ASM.
+///
+/// The local network control block (224.0.0.0/24, RFC 5771) stays outside
+/// the emulated SSM range, as the 224.0.0.0/4 permit is an emulation artifact
+/// only.
+///
+/// # Examples
+///
+/// ```
+/// let cmds = voxel_config::frr::ssm_range_cmds();
+///
+/// assert_eq!(cmds[0], "ip prefix-list voxel-ssm seq 1 deny 224.0.0.0/24 le 32");
+/// assert_eq!(cmds[2], "router pim");
+/// ```
+pub fn ssm_range_cmds() -> [String; 5] {
+    [
+        format!(
+            "ip prefix-list {SSM_PREFIX_LIST} seq 1 deny 224.0.0.0/24 le 32"
+        ),
+        format!(
+            "ip prefix-list {SSM_PREFIX_LIST} seq 5 permit 224.0.0.0/4 le 32"
+        ),
+        "router pim".to_string(),
+        format!("ssm prefix-list {SSM_PREFIX_LIST}"),
+        "exit".to_string(),
+    ]
+}
+
+/// An interface that PIM holds a passive multicast VIF on.
+///
+/// `address` is `Some` only when the interface carries no IPv4 address
+/// (unnumbered BGP ~ RFC 5549). The `/32` comes from [`pim_link_addr`].
+///
+/// Every VIF is passive. Nothing on the other end of any link speaks PIM.
+#[derive(Debug, Clone)]
+pub struct PimIface {
+    pub interface: String,
+    pub address: Option<String>,
 }
 
 /// A router's FRR config. `static_uplinks` empty renders unnumbered eBGP;
@@ -63,6 +144,10 @@ pub struct FrrRouter {
     /// Static mode: BFD-track the routes (`ip route ... bfd` + `bfd`/`peer`
     /// blocks). Off renders plain static routes (the a4x2 default).
     pub track_bfd: bool,
+    /// Links carrying a multicast VIF.
+    ///
+    /// This is empty on a router that forwards no multicast.
+    pub pim: Vec<PimIface>,
 }
 
 impl fmt::Display for FrrRouter {
@@ -103,6 +188,44 @@ impl FrrRouter {
         Ok(())
     }
 
+    /// Treat 224.0.0.0/4 as source-specific (except 224.0.0.0/24).
+    ///
+    /// Voxel's assignments name a sender, making every entry an `(S,G)`, but
+    /// pimd judges that by address range.
+    ///
+    /// For ASM groups, pimd can add the register VIF and receive packet
+    /// copies from the kernel. Without a rendezvous point, those copies are
+    /// discarded before PIM Register encapsulation.
+    ///
+    /// SSM [skips adding the register VIF].
+    ///
+    /// [skips adding the register VIF]: https://github.com/FRRouting/frr/blob/85cf1ed576deed121751e16a64970f8a652a9e1e/pimd/pim_register.c#L37-L50
+    fn write_ssm_range(&self, o: &mut impl fmt::Write) -> fmt::Result {
+        if self.pim.is_empty() {
+            return Ok(());
+        }
+        for line in ssm_range_cmds() {
+            writeln!(o, "{line}")?;
+        }
+        writeln!(o, "!")
+    }
+
+    /// This configures PIM on the links an externally sourced group crosses.
+    ///
+    /// `voxel network multicast up` adds the per-group assignments at runtime,
+    /// since the groups are not known at launch.
+    fn write_pim(&self, o: &mut impl fmt::Write) -> fmt::Result {
+        for p in &self.pim {
+            writeln!(o, "interface {}", p.interface)?;
+            if let Some(addr) = &p.address {
+                writeln!(o, " ip address {addr}")?;
+            }
+            writeln!(o, " ip pim passive")?;
+            writeln!(o, "!")?;
+        }
+        Ok(())
+    }
+
     /// `router bgp` open, `no ebgp-requires-policy`, and the unnumbered eBGP
     /// neighbors (toward ce). Callers append numbered peers + address-families.
     fn write_bgp_open(&self, o: &mut impl fmt::Write) -> fmt::Result {
@@ -122,6 +245,8 @@ impl FrrRouter {
     fn render_bgp(&self, o: &mut impl fmt::Write) -> fmt::Result {
         self.write_header(o)?;
         self.write_neighbor_interfaces(o)?;
+        self.write_pim(o)?;
+        self.write_ssm_range(o)?;
         self.write_bgp_open(o)?;
         writeln!(o, " !")?;
         self.render_afi(o, "ipv4", &self.originate4, false)?;
@@ -139,6 +264,8 @@ impl FrrRouter {
             writeln!(o, " ip address {}", s.address)?;
             writeln!(o, "!")?;
         }
+        self.write_pim(o)?;
+        self.write_ssm_range(o)?;
 
         // Single-hop BFD sessions to the sidecars (only when BFD-tracking).
         if self.track_bfd {

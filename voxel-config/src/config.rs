@@ -4,9 +4,13 @@
 
 //! The configuration model behind voxel.toml; every per-node config renders from it.
 
+use std::net::Ipv4Addr;
+
 use serde::{Deserialize, Serialize};
 
-use crate::frr::{FrrNeighbor, FrrRouter, StaticUplink};
+use crate::frr::{
+    FrrNeighbor, FrrRouter, PimIface, StaticUplink, pim_link_addr,
+};
 
 /// Bootstrap-network IPv6 prefix (first three hextets); see
 /// SledDesc::bootstrap_addr. Each sled appends :{2*index+1}::1.
@@ -42,7 +46,7 @@ const DEFAULT_RACK_ASN: u32 = 65000;
 /// TRANSIT_ASN_BASE + i (i starts at 1). See VoxelConfig::to_frr.
 const TRANSIT_ASN_BASE: u32 = 65100;
 
-/// First enp0sN index the fabric routers wire from, mirroring falcon's slot
+/// First enp0sN index the fabric routers wire from, matching falcon's slot
 /// assignment; voxel-init verifies staged names against the node's real links.
 const FRR_IFACE_BASE: usize = 8;
 
@@ -53,7 +57,7 @@ pub const SLED_SERIAL_PREFIX: &str = "2FAKE00";
 /// Part number shared by all fake sleds.
 pub const SLED_PART_NUMBER: &str = "913-0000019";
 
-/// Top-level Voxel configuration (voxel.toml).
+/// Top-level voxel configuration (`voxel.toml`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VoxelConfig {
@@ -73,11 +77,25 @@ pub struct VoxelConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExternalMode {
-    /// Wire external VNICs onto an existing LAN with DHCP (default).
+    /// Wire external VNICs onto an existing LAN (default).
     #[default]
     Lan,
     /// Voxel-managed etherstub: NAT out uplink, static per-node addresses.
     Isolated,
+}
+
+/// How nodes get their external addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalAddressing {
+    /// Lease from whatever DHCP serves the external network (default).
+    #[default]
+    Dhcp,
+    /// Stage static per-node addresses from `ip_start`, for a LAN that runs
+    /// no DHCP.
+    ///
+    /// Isolated mode always addresses statically.
+    Static,
 }
 
 /// The rack's external segment. Host-only plumbing; never reaches the rack's
@@ -87,13 +105,28 @@ pub enum ExternalMode {
 pub struct External {
     /// lan (default; existing behavior) or isolated.
     pub mode: ExternalMode,
+    /// dhcp (default) or static. Ignored in isolated mode, which is always
+    /// static.
+    pub addressing: ExternalAddressing,
+    /// Link the nodes' external NICs attach to in lan mode (e.g. igb1), for
+    /// hosts whose default-route interface is not the LAN under test.
+    ///
+    /// `$EXT_INTERFACE` still overrides it.
+    ///
+    /// This is ignored in isolated mode, which wires the voxel-managed
+    /// etherstub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
     /// Physical link the isolated subnet NATs out of (e.g. igb0). Required
     /// in isolated mode, and validated before use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uplink: Option<String>,
-    /// The isolated segment's subnet.
+    /// The static addressing subnet: the isolated segment's, or the LAN's
+    /// under `addressing = "static"`.
     pub subnet: String,
-    /// Host address on the etherstub and the nodes' default gateway.
+    /// The nodes' default gateway. Isolated mode creates it as the host's
+    /// address on the etherstub. Static lan addressing expects it to already
+    /// exist on the LAN (e.g. the host's own address on `link`).
     pub host_ip: String,
     /// First static node address; nodes number contiguously from here in
     /// sleds() then routers order.
@@ -109,6 +142,8 @@ impl Default for External {
     fn default() -> Self {
         Self {
             mode: ExternalMode::Lan,
+            addressing: ExternalAddressing::Dhcp,
+            link: None,
             uplink: None,
             subnet: "172.30.199.0/24".into(),
             host_ip: "172.30.199.199".into(),
@@ -130,6 +165,30 @@ impl External {
         self.mode == ExternalMode::Isolated
     }
 
+    /// Whether nodes get staged static external addresses rather than DHCP
+    /// leases.
+    ///
+    /// Isolated mode always gets it. Lan mode gets it only when
+    /// `addressing = "static"`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let lan_static = voxel_config::VoxelConfig::from_toml(
+    ///     "[external]\nmode = \"lan\"\naddressing = \"static\"",
+    /// )
+    /// .unwrap();
+    /// assert!(lan_static.external.static_addressing());
+    ///
+    /// let lan_dhcp =
+    ///     voxel_config::VoxelConfig::from_toml("[external]\nmode = \"lan\"")
+    ///         .unwrap();
+    /// assert!(!lan_dhcp.external.static_addressing());
+    /// ```
+    pub fn static_addressing(&self) -> bool {
+        self.isolated() || self.addressing == ExternalAddressing::Static
+    }
+
     /// Prefix length parsed from subnet; None if it is not CIDR.
     pub fn prefix_length(&self) -> Option<u32> {
         Some(u32::from(self.subnet_net()?.width()))
@@ -142,7 +201,7 @@ impl External {
 
     /// Whether ip sits strictly between subnet's network and broadcast. /31
     /// and /32 have no usable range here; the segment needs distinct addresses.
-    fn ip_is_usable(&self, ip: std::net::Ipv4Addr) -> bool {
+    fn ip_is_usable(&self, ip: Ipv4Addr) -> bool {
         self.subnet_net().is_some_and(|net| {
             match (net.network(), net.broadcast()) {
                 (Some(network), Some(broadcast)) => {
@@ -161,13 +220,13 @@ impl External {
     /// Static address for the nth node: ip_start + nth. None on a boundary,
     /// outside the subnet, colliding with host_ip, or unparseable inputs.
     pub fn node_ip(&self, nth: usize) -> Option<String> {
-        let start: std::net::Ipv4Addr = self.ip_start.parse().ok()?;
-        let host: std::net::Ipv4Addr = self.host_ip.parse().ok()?;
+        let start: Ipv4Addr = self.ip_start.parse().ok()?;
+        let host: Ipv4Addr = self.host_ip.parse().ok()?;
         if !self.ip_is_usable(host) {
             return None;
         }
         let base = u32::from(start).checked_add(nth as u32)?;
-        let ip = std::net::Ipv4Addr::from(base);
+        let ip = Ipv4Addr::from(base);
         // A large rack can overrun an operator-set ip_start.
         if !self.ip_is_usable(ip) {
             return None;
@@ -178,20 +237,18 @@ impl External {
         Some(ip.to_string())
     }
 
-    /// Builder VM address: host_ip - 1 with subnet's prefix length. None if
-    /// either address is unusable.
+    /// Network assignment for the builder VM: ip_start - 1 + the host
+    /// gateway.
     pub fn builder_net(&self) -> Option<String> {
-        let host: std::net::Ipv4Addr = self.host_ip.parse().ok()?;
+        let host: Ipv4Addr = self.host_ip.parse().ok()?;
         if !self.ip_is_usable(host) {
             return None;
         }
-        let prev = u32::from(host).checked_sub(1)?;
-        let ip = std::net::Ipv4Addr::from(prev);
-        if !self.ip_is_usable(ip) {
-            return None;
-        }
+        let start: Ipv4Addr = self.ip_start.parse().ok()?;
+        let ip = Ipv4Addr::from(u32::from(start).checked_sub(1)?);
         let prefix = self.prefix_length()?;
-        Some(format!("{ip}/{prefix} {}", self.host_ip))
+        (self.ip_is_usable(ip) && ip != host)
+            .then(|| format!("{ip}/{prefix} {}", self.host_ip))
     }
 }
 
@@ -222,7 +279,7 @@ pub struct Falcon {
 }
 
 /// The binaries voxel stages to run an `--emu` rack's SP fleet. Firmware does
-/// NOT live here: an image built with --from-tuf carries the release's own SP,
+/// not live here: an image built with --from-tuf carries the release's own SP,
 /// RoT and bootloader images and launch uses those, with `--sp-firmware`
 /// overriding them for one launch.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -255,6 +312,16 @@ impl VoxelConfig {
 
     /// Every node's static external address, sleds then routers; truncates at
     /// the first address node_ip refuses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg =
+    ///     voxel_config::VoxelConfig::from_toml("[topology]\nsleds = 4").unwrap();
+    /// let ips = cfg.static_external_ips();
+    /// assert_eq!(ips[0], ("g0".to_string(), "172.30.199.10".to_string()));
+    /// assert_eq!(ips[1], ("g1".to_string(), "172.30.199.11".to_string()));
+    /// ```
     pub fn static_external_ips(&self) -> Vec<(String, String)> {
         self.sleds()
             .into_iter()
@@ -265,6 +332,46 @@ impl VoxelConfig {
                 self.external.node_ip(n).map(|ip| (name, ip))
             })
             .collect()
+    }
+
+    /// Validate the topology before launching.
+    pub fn validate(&self) -> Result<(), String> {
+        self.topology.validate()?;
+        let fabric =
+            self.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
+        let links = self.sleds().iter().filter(|s| s.scrimlet).count();
+
+        if self.network.router_mode == RouterMode::Bgp {
+            // PIM /32s use .1 through .254 from 192.0.2.0/24 (TEST-NET-1,
+            // RFC 5737 §3).
+            // See pim_link_addr in frr.rs.
+            let pim_count = fabric.saturating_mul(links);
+            if pim_count > 254 {
+                return Err(format!(
+                    "{fabric} fabric routers x {links} PIM links \
+                     need more PIM link addresses than 192.0.2.0/24 holds (254)",
+                ));
+            }
+            if let Some(external) = self.external.subnet_net() {
+                let pim_first = u32::from(Ipv4Addr::new(192, 0, 2, 1));
+                let pim_last = pim_first.saturating_add(
+                    u32::try_from(pim_count.saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                );
+                let external_first = u32::from(external.first_addr());
+                let external_last = u32::from(external.last_addr());
+                if pim_count > 0
+                    && external_first <= pim_last
+                    && pim_first <= external_last
+                {
+                    return Err(
+                        "[external].subnet overlaps generated PIM-link addresses"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -364,6 +471,9 @@ impl Topology {
     /// Reject a topology whose switch zones land outside the RSS set;
     /// reachable only via explicit scrimlets.
     pub fn validate(&self) -> Result<(), String> {
+        if self.sleds == 0 {
+            return Err("topology.sleds must be greater than zero".to_string());
+        }
         if let Some(s) = self.sleds().iter().find(|s| s.scrimlet && !s.rss) {
             return Err(format!(
                 "scrimlet {} is not in the RSS set (rss_sleds = {}): switch \
@@ -385,7 +495,7 @@ impl Topology {
             for local in 0..self.sleds {
                 let index = rack * self.sleds + local;
                 let name = format!("g{index}");
-                let serial_number = format!("{SLED_SERIAL_PREFIX}{}", index);
+                let serial_number = format!("{SLED_SERIAL_PREFIX}{index}");
                 let part_number = SLED_PART_NUMBER.to_string();
                 out.push(SledDesc {
                     rack,
@@ -477,8 +587,8 @@ impl SledDesc {
     }
 }
 
-/// Which image version to boot. Bundles are named voxel-cp-<version> /
-/// voxel-frr-<version>; cp/frr override the full name when set.
+/// Which image version to boot. Bundles are named `voxel-cp-<version>` /
+/// `voxel-frr-<version>`; cp/frr override the full name when set.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Image {
@@ -570,7 +680,7 @@ impl Image {
     }
 
     /// The omicron commit in the cp image name, locating the checkout under
-    /// build_root; None if the name is not voxel-cp-<commit>[-variant].
+    /// build_root; None if the name is not `voxel-cp-<commit>[-variant]`.
     pub fn cp_commit(&self) -> Option<String> {
         let name = self.cp_image();
         name.strip_prefix("voxel-cp-")
@@ -598,6 +708,34 @@ pub enum RouterMode {
     Static,
 }
 
+/// How much of the rack a group is delivered to.
+///
+/// This is only the default path. The `--steer` override names paths per group
+/// and takes precedence.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MulticastDelivery {
+    /// One path, from the first forwarding router toward switch0.
+    #[default]
+    Single,
+    /// Every switch from every forwarding router. `up` rejects this once a
+    /// rack has more than one switch, as a router may carry one outgoing
+    /// path per group.
+    All,
+}
+
+/// Customer multicast networking parameters.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+#[serde(default, deny_unknown_fields)]
+pub struct Multicast {
+    /// Delivery for a group whose `up` omits `--steer`.
+    pub delivery: MulticastDelivery,
+}
+
 /// Customer-network / RSS parameters. Maps onto PutRssUserConfigInsensitive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -609,7 +747,7 @@ pub struct Network {
     /// IPv6 /56. Empty -> not emitted.
     pub rack_subnet: String,
     /// Service IP pool (single range). Rendered as the rack's sole
-    /// service_ip_pools entry.
+    /// `service_ip_pools` entry.
     pub service_pool_first: String,
     pub service_pool_last: String,
     pub bgp_asn: u32,
@@ -621,6 +759,7 @@ pub struct Network {
     pub transit_prefix: String,
     /// Static mode: BFD-track the transit routes. Defaults off, matching a4x2.
     pub transit_bfd: bool,
+    pub multicast: Multicast,
     /// Scrimlet uplink ports (one per switch toward the customer routers).
     pub uplinks: Vec<UplinkCfg>,
 }
@@ -643,6 +782,7 @@ impl Default for Network {
             router_mode: RouterMode::Bgp,
             transit_prefix: "198.51.101.0/24".into(),
             transit_bfd: false,
+            multicast: Multicast::default(),
             uplinks: vec![
                 UplinkCfg::default_for("switch0", "uplink0"),
                 UplinkCfg::default_for("switch1", "uplink1"),
@@ -671,10 +811,10 @@ fn map_addr(s: &str, f: impl FnOnce(&str) -> Option<String>) -> String {
 /// wrapping, so an out-of-range rack can't silently alias another rack's net).
 fn offset_v4(s: &str, rack: usize) -> String {
     map_addr(s, |addr| {
-        let ip = addr.parse::<std::net::Ipv4Addr>().ok()?;
+        let ip = addr.parse::<Ipv4Addr>().ok()?;
         let mut o = ip.octets();
         o[2] = o[2].checked_add(u8::try_from(rack).ok()?)?;
-        Some(std::net::Ipv4Addr::from(o).to_string())
+        Some(Ipv4Addr::from(o).to_string())
     })
 }
 
@@ -695,7 +835,7 @@ fn offset_v6_rack56(s: &str, rack: usize) -> String {
 
 impl Network {
     /// The network for rack N: v4 nets shift by rack in octet 3, the subnet by
-    /// /56, the ASN by rack; the DNS zone becomes rack{N+1}.<zone> (1-based).
+    /// /56, the ASN by rack; the DNS zone becomes `rack{N+1}.<zone>` (1-based).
     pub fn for_rack(&self, rack: usize) -> Network {
         // Saturating so an absurd rack count cannot wrap onto a lower rack's ASN.
         let rack_asn = u32::try_from(rack).unwrap_or(u32::MAX);
@@ -717,6 +857,7 @@ impl Network {
             router_mode: self.router_mode,
             transit_prefix: offset_v4(&self.transit_prefix, rack),
             transit_bfd: self.transit_bfd,
+            multicast: self.multicast,
             // peer_asn references the switch's local [[bgp]] entry, whose asn
             // is offset above, so it must track the rack's ASN.
             uplinks: self
@@ -731,7 +872,7 @@ impl Network {
     }
 
     /// Base address of transit_prefix (its .0). None if it doesn't parse.
-    fn transit_base(&self) -> Option<std::net::Ipv4Addr> {
+    fn transit_base(&self) -> Option<Ipv4Addr> {
         self.transit_prefix.split('/').next()?.parse().ok()
     }
 
@@ -741,14 +882,14 @@ impl Network {
         let block = u32::try_from(block).ok()?;
         let b = u32::from(self.transit_base()?)
             .checked_add(block.checked_mul(4)?)?;
-        let gateway = std::net::Ipv4Addr::from(b.checked_add(1)?);
-        let sidecar = std::net::Ipv4Addr::from(b.checked_add(2)?);
+        let gateway = Ipv4Addr::from(b.checked_add(1)?);
+        let sidecar = Ipv4Addr::from(b.checked_add(2)?);
         Some((gateway.to_string(), sidecar.to_string()))
     }
 
     /// The transit /30 for router_index to switch_slot; block = router *
     /// n_switches + slot. Single source for both the sidecar and router side.
-    pub fn transit_slash30_for(
+    fn transit_slash30_for(
         &self,
         router_index: usize,
         switch_slot: usize,
@@ -762,15 +903,15 @@ impl Network {
     pub fn infra_ip_range(
         &self,
         nblocks: usize,
-    ) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    ) -> Option<(Ipv4Addr, Ipv4Addr)> {
         if nblocks == 0 {
             return None;
         }
         let nblocks = u32::try_from(nblocks).ok()?;
         let b = u32::from(self.transit_base()?);
-        let first = std::net::Ipv4Addr::from(b.checked_add(1)?);
+        let first = Ipv4Addr::from(b.checked_add(1)?);
         let span = nblocks.checked_mul(4)?.checked_sub(1)?;
-        let last = std::net::Ipv4Addr::from(b.checked_add(span)?);
+        let last = Ipv4Addr::from(b.checked_add(span)?);
         Some((first, last))
     }
 }
@@ -781,8 +922,7 @@ impl Network {
 pub struct UplinkPort {
     pub switch: String,
     pub switch_slot: usize,
-    pub router_index: usize,
-    /// qsfp{router_index}; fabric uplinks take the first front ports.
+    pub router: String,
     pub port: String,
     pub peer_asn: u32,
     pub router_lifetime: u16,
@@ -799,7 +939,6 @@ pub struct UplinkPort {
 #[serde(deny_unknown_fields)]
 pub struct UplinkCfg {
     pub switch: String,
-    pub port: String,
     pub peer_asn: u32,
     pub router_lifetime: u16,
     pub port_speed: String,
@@ -810,7 +949,6 @@ impl UplinkCfg {
     fn default_for(switch: &str, description: &str) -> Self {
         Self {
             switch: switch.into(),
-            port: "qsfp0".into(),
             peer_asn: DEFAULT_RACK_ASN,
             router_lifetime: 300,
             port_speed: "40G".into(),
@@ -844,7 +982,25 @@ impl Default for RecoverySiloCfg {
 impl VoxelConfig {
     /// Routers other than ce.
     pub fn fabric_router_count(&self) -> usize {
-        self.topology.routers.iter().filter(|r| r.as_str() != "ce").count()
+        self.multicast_routers().len()
+    }
+
+    /// Routers that receive multicast forwarding setup.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg =
+    ///     voxel_config::VoxelConfig::from_toml("[topology]\nsleds = 4").unwrap();
+    /// assert_eq!(cfg.multicast_routers(), ["cr1", "cr2"]);
+    /// ```
+    pub fn multicast_routers(&self) -> Vec<String> {
+        self.topology
+            .routers
+            .iter()
+            .filter(|r| r.as_str() != "ce")
+            .cloned()
+            .collect()
     }
 
     /// Number of scrimlets (switches) in rack.
@@ -856,25 +1012,25 @@ impl VoxelConfig {
     }
 
     /// Generated uplink ports for rack: every switch fans out to every fabric
-    /// router (qsfp{router}); static block = router * n_switches + switch.
+    /// router, the i-th taking qsfp{i}; static block = i * n_switches + switch.
     pub fn uplink_ports(&self, rack: usize) -> Vec<UplinkPort> {
         let net = self.network.for_rack(rack);
-        let n_cr = self.fabric_router_count();
+        let routers = self.multicast_routers();
         let n_sc = self.scrimlets_in_rack(rack);
         let mut out = Vec::new();
         for (sc, u) in net.uplinks.iter().enumerate() {
-            for c in 0..n_cr {
+            for (c, router) in routers.iter().enumerate() {
                 let (gateway, sidecar) =
                     net.transit_slash30_for(c, sc, n_sc).unwrap_or_default();
                 out.push(UplinkPort {
                     switch: u.switch.clone(),
                     switch_slot: sc,
-                    router_index: c,
+                    router: router.clone(),
                     port: format!("qsfp{c}"),
                     peer_asn: u.peer_asn,
                     router_lifetime: u.router_lifetime,
                     port_speed: u.port_speed.clone(),
-                    lldp: format!("{}-cr{}", u.lldp_port_description, c + 1),
+                    lldp: format!("{}-{router}", u.lldp_port_description),
                     sidecar_addr: format!("{sidecar}/30"),
                     gateway,
                 });
@@ -911,16 +1067,87 @@ impl VoxelConfig {
     /// The enp0sN name of a router's external NIC, derived from build_topo's
     /// link order; voxel-init verifies it against the node's actual links.
     pub fn router_ext_iface(&self, router: &str) -> String {
-        let fabric_router_count =
-            self.topology.routers.iter().filter(|r| r.as_str() != "ce").count();
-        let total_scrimlet_count =
-            self.sleds().into_iter().filter(|s| s.scrimlet).count();
         let n = if router == "ce" {
-            FRR_IFACE_BASE + fabric_router_count
+            FRR_IFACE_BASE + self.fabric_router_count()
         } else {
-            FRR_IFACE_BASE + 1 + total_scrimlet_count
+            FRR_IFACE_BASE + 1 + self.scrimlet_count()
         };
         format!("enp0s{n}")
+    }
+
+    /// A fabric router's `ce`-facing NIC.
+    pub fn router_ce_iface(&self) -> String {
+        format!("enp0s{FRR_IFACE_BASE}")
+    }
+
+    /// `ce`'s fabric-router-facing NICs, one per fabric router.
+    pub fn ce_fabric_ifaces(&self) -> Vec<String> {
+        (0..self.fabric_router_count())
+            .map(|k| format!("enp0s{}", FRR_IFACE_BASE + k))
+            .collect()
+    }
+
+    /// How many scrimlets the topology has, which is how many switches an
+    /// externally sourced group can be delivered to.
+    pub fn scrimlet_count(&self) -> usize {
+        self.sleds().into_iter().filter(|s| s.scrimlet).count()
+    }
+
+    /// A fabric router's scrimlet-facing NIC names in `sleds()` order. This is
+    /// empty for `ce`, which links only fabric routers.
+    ///
+    /// Same layout as [`Self::router_ext_iface`]: a fabric router links
+    /// `ce` at `FRR_IFACE_BASE`, then every scrimlet across every rack.
+    ///
+    /// Scrimlet `k` sits at `enp0s{FRR_IFACE_BASE + 1 + k}`. If a falcon change
+    /// shifts the base, then it has to move these names too, along with the
+    /// external NIC voxel-init verifies at bringup.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg =
+    ///     voxel_config::VoxelConfig::from_toml("[topology]\nsleds = 4").unwrap();
+    /// assert_eq!(cfg.router_scrimlet_ifaces("cr1"), ["enp0s9", "enp0s10"]);
+    /// assert_eq!(cfg.router_ext_iface("cr1"), "enp0s11");
+    /// ```
+    pub fn router_scrimlet_ifaces(&self, router: &str) -> Vec<String> {
+        if router == "ce" {
+            return Vec::new();
+        }
+        (0..self.scrimlet_count())
+            .map(|k| format!("enp0s{}", FRR_IFACE_BASE + 1 + k))
+            .collect()
+    }
+
+    /// The links a transit router holds a multicast VIF on.
+    ///
+    /// This covers every scrimlet-facing link, plus the host-facing link
+    /// an externally sourced group arrives on. `number` assigns a `/32`
+    /// to each scrimlet-facing link. FRR can also borrow an IPv4 address
+    /// from loopback when an interface has IPv6 but not IPv4.
+    fn pim_ifaces(&self, router: &str, number: bool) -> Vec<PimIface> {
+        // The address is unique per (router, link). We need the router's
+        // position in the fabric set.
+        let fabric = self.multicast_routers();
+        let switches = self.scrimlet_count();
+        let router_idx = fabric
+            .iter()
+            .position(|r| r == router)
+            .expect("pim_ifaces takes a router from topology.routers");
+
+        self.router_scrimlet_ifaces(router)
+            .into_iter()
+            .enumerate()
+            .map(|(k, interface)| PimIface {
+                interface,
+                address: number.then(|| pim_link_addr(router_idx, k, switches)),
+            })
+            .chain(std::iter::once(PimIface {
+                interface: self.router_ext_iface(router),
+                address: None,
+            }))
+            .collect()
     }
 
     /// Each customer router's frr.conf. cr* peer ce plus every scrimlet across
@@ -947,14 +1174,12 @@ impl VoxelConfig {
         let mut cr_index = 0u32;
         for name in &self.topology.routers {
             let router = if name == "ce" {
-                let neighbors = fabric
-                    .iter()
-                    .enumerate()
-                    .map(|(k, r)| {
-                        FrrNeighbor::new(
-                            format!("enp0s{}", FRR_IFACE_BASE + k),
-                            format!("to {r}"),
-                        )
+                let neighbors = self
+                    .ce_fabric_ifaces()
+                    .into_iter()
+                    .zip(fabric.iter())
+                    .map(|(interface, r)| {
+                        FrrNeighbor::new(interface, format!("to {r}"))
                     })
                     .collect();
                 FrrRouter {
@@ -965,11 +1190,11 @@ impl VoxelConfig {
                     originate6: vec!["::/0".into()],
                     static_uplinks: vec![],
                     track_bfd: false,
+                    pim: Vec::new(),
                 }
             } else {
                 cr_index += 1;
-                let ce_nb =
-                    FrrNeighbor::new(format!("enp0s{FRR_IFACE_BASE}"), "to ce");
+                let ce_nb = FrrNeighbor::new(self.router_ce_iface(), "to ce");
                 match self.network.router_mode {
                     RouterMode::Bgp => {
                         let mut neighbors = vec![ce_nb];
@@ -981,6 +1206,8 @@ impl VoxelConfig {
                                 format!("to {sname} (rack{rack} switch{slot})"),
                             ));
                         }
+                        // Unnumbered rack-facing links need an address
+                        // before PIM will build a VIF on them.
                         FrrRouter {
                             hostname: name.clone(),
                             asn: TRANSIT_ASN_BASE + cr_index,
@@ -989,6 +1216,7 @@ impl VoxelConfig {
                             originate6: vec![],
                             static_uplinks: vec![],
                             track_bfd: false,
+                            pim: self.pim_ifaces(name, true),
                         }
                     }
                     // Numbered /30 to every scrimlet, block = router *
@@ -1023,6 +1251,9 @@ impl VoxelConfig {
                             originate6: vec![],
                             static_uplinks,
                             track_bfd: self.network.transit_bfd,
+                            // The numbered /30s given already satisfy PIM, so
+                            // these links need no address of their own.
+                            pim: self.pim_ifaces(name, false),
                         }
                     }
                 }
@@ -1386,8 +1617,41 @@ mod tests {
         let cfg = VoxelConfig::from_toml(&out).unwrap();
         assert!(cfg.external.isolated());
         assert_eq!(cfg.external.uplink.as_deref(), Some("igb0"));
+        // The lan-mode link pin round-trips and defaults to unset.
+        assert!(d.external.link.is_none());
+        let out = set(&d.to_toml(), "external.link", "igb1").unwrap();
+        let cfg = VoxelConfig::from_toml(&out).unwrap();
+        assert_eq!(cfg.external.link.as_deref(), Some("igb1"));
         // deny_unknown_fields catches typos.
         assert!(set(&out, "external.uplnk", "igb0").is_err());
+    }
+
+    #[test]
+    fn static_addressing_follows_mode_and_config() {
+        // Default lan mode leases.
+        let d = External::default();
+        assert!(!d.static_addressing());
+        // Lan mode can go static while not being isolated.
+        let lan_static = External {
+            addressing: ExternalAddressing::Static,
+            ..External::default()
+        };
+        assert!(lan_static.static_addressing() && !lan_static.isolated());
+
+        // Isolated mode is always static.
+        let isolated =
+            External { mode: ExternalMode::Isolated, ..External::default() };
+        assert!(isolated.static_addressing());
+
+        // Round-trip the config.
+        let out = set(
+            &VoxelConfig::default().to_toml(),
+            "external.addressing",
+            "static",
+        )
+        .unwrap();
+        let cfg = VoxelConfig::from_toml(&out).unwrap();
+        assert!(cfg.external.static_addressing() && !cfg.external.isolated());
     }
 
     #[test]
@@ -1576,13 +1840,108 @@ mod tests {
     }
 
     #[test]
-    fn frr_transit_peers_every_scrimlet_across_racks() {
-        // Single rack: cr1 peers ce + the rack's 2 scrimlets (g0,g3), edge first.
+    fn frr_with_the_multicast_range_source_specific() {
         let cfg = VoxelConfig::from_toml(indoc! {"
             [topology]
             sleds = 4
         "})
         .unwrap();
+
+        let frr = cfg.to_frr();
+        let cr1 = frr.iter().find(|(n, _)| n == "cr1").unwrap().1.render();
+        assert!(cr1.contains(
+            "ip prefix-list voxel-ssm seq 5 permit 224.0.0.0/4 le 32"
+        ));
+
+        // The local network control block stays any-source. For SSM groups,
+        // pimd ignores IGMPv2 reports and IGMPv3 exclude-mode records.
+        assert!(cr1.contains(
+            "ip prefix-list voxel-ssm seq 1 deny 224.0.0.0/24 le 32"
+        ));
+        assert!(cr1.contains("router pim\nssm prefix-list voxel-ssm"));
+
+        let ce = frr.iter().find(|(n, _)| n == "ce").unwrap().1.render();
+        assert!(!ce.contains("voxel-ssm"));
+        assert!(!ce.contains("ip pim"));
+    }
+
+    #[test]
+    fn frr_numbers_rack_facing_links_for_pim_when_unnumbered() {
+        // Unnumbered eBGP case: PIM cannot build a VIF without an IPv4 address.
+        //
+        // Each rack-facing link takes a /32 the config generates.
+
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+        "})
+        .unwrap();
+        let frr = cfg.to_frr();
+        let cr1 = frr.iter().find(|(n, _)| n == "cr1").unwrap().1.render();
+        assert!(cr1.contains(
+            "interface enp0s9\n ip address 192.0.2.1/32\n ip pim passive"
+        ));
+        assert!(cr1.contains(
+            "interface enp0s10\n ip address 192.0.2.2/32\n ip pim passive"
+        ));
+
+        // Router indices keep the addresses distinct: cr1 ends at .2, cr2
+        // continues at .3, etc.
+        let cr2 = frr.iter().find(|(n, _)| n == "cr2").unwrap().1.render();
+        assert!(cr2.contains("interface enp0s9\n ip address 192.0.2.3/32"));
+        assert!(cr2.contains("interface enp0s10\n ip address 192.0.2.4/32"));
+
+        // The host-facing link is where the groups arrive. It holds an address
+        // already, so it takes a VIF and nothing else.
+        assert!(cr1.contains("interface enp0s11\n ip pim passive"));
+    }
+
+    #[test]
+    fn pim_link_addresses_are_unique_across_routers() {
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+            racks = 2
+        "})
+        .unwrap();
+
+        let addrs: Vec<String> = cfg
+            .to_frr()
+            .iter()
+            .flat_map(|(_, router)| router.pim.iter())
+            .filter_map(|iface| iface.address.clone())
+            .collect();
+
+        let unique: std::collections::HashSet<_> = addrs.iter().collect();
+        assert_eq!(addrs.len(), unique.len(), "duplicate /32: {addrs:?}");
+        // Two fabric routers x four links.
+        assert_eq!(addrs.len(), 8);
+
+        // Static mode already numbers the rack-facing links.
+        let cfg = VoxelConfig::from_toml(indoc! {r#"
+            [topology]
+            sleds = 4
+            [network]
+            router_mode = "static"
+        "#})
+        .unwrap();
+
+        let cr1 =
+            cfg.to_frr().iter().find(|(n, _)| n == "cr1").unwrap().1.render();
+        assert!(cr1.contains("ip pim passive"));
+        assert!(!cr1.contains("192.0.2."));
+    }
+
+    #[test]
+    fn frr_transit_peers_every_scrimlet_across_racks() {
+        // Single rack: cr1 peers ce + the rack's 2 scrimlets (g0,g3), edge first.
+
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+        "})
+        .unwrap();
+
         let frr = cfg.to_frr();
         let cr1 = &frr.iter().find(|(n, _)| n == "cr1").unwrap().1;
         assert_eq!(cr1.asn, 65101);
@@ -1598,6 +1957,7 @@ mod tests {
             sleds = 3
         "})
         .unwrap();
+
         let frr = cfg.to_frr();
         let cr1 = &frr.iter().find(|(n, _)| n == "cr1").unwrap().1;
         let ifaces: Vec<&str> =
@@ -1606,13 +1966,16 @@ mod tests {
             ifaces,
             vec!["enp0s8", "enp0s9", "enp0s10", "enp0s11", "enp0s12"]
         );
+
         // Descriptions carry the rack/switch identity for each peered scrimlet.
         let descs: Vec<&str> =
             cr1.neighbors.iter().map(|n| n.description.as_str()).collect();
+
         assert_eq!(descs[1], "to g0 (rack0 switch0)");
         assert_eq!(descs[2], "to g2 (rack0 switch1)");
         assert_eq!(descs[3], "to g3 (rack1 switch0)");
         assert_eq!(descs[4], "to g5 (rack1 switch1)");
+
         // ce still peers both fabric routers and originates the default.
         let ce = &frr.iter().find(|(n, _)| n == "ce").unwrap().1;
         assert_eq!(
@@ -1665,6 +2028,35 @@ mod tests {
         .unwrap();
         let err = cfg.topology.validate().unwrap_err();
         assert!(err.contains("g4"), "{err}");
+    }
+
+    #[test]
+    fn validate_bounds_the_pim_link_address_space() {
+        // 2 fabric routers x (64 racks x 2 scrimlets) = 256 /32s, past
+        // the 254 host addresses 192.0.2.0/24 holds. Unchecked, `pim_link_addr`
+        // renders an address FRR rejects, which can get us on
+        // the address-less pimd assert path.
+
+        let mut cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+            racks = 64
+        "})
+        .unwrap();
+
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("192.0.2.0/24"), "{err}");
+        cfg.network.router_mode = RouterMode::Static;
+        assert!(cfg.validate().is_ok());
+
+        let cfg = VoxelConfig::from_toml(indoc! {"
+            [topology]
+            sleds = 4
+            racks = 62
+        "})
+        .unwrap();
+
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -1748,23 +2140,36 @@ mod tests {
     }
 
     #[test]
-    fn builder_net_is_host_ip_minus_one() {
+    fn builder_net_precedes_ip_start() {
         let x = External::default();
         assert_eq!(
             x.builder_net().as_deref(),
-            Some("172.30.199.198/24 172.30.199.199")
+            Some("172.30.199.9/24 172.30.199.199")
         );
 
         let first_usable_gateway = External {
             subnet: "192.0.2.0/24".into(),
             host_ip: "192.0.2.1".into(),
+            ip_start: "192.0.2.10".into(),
             ..External::default()
         };
-        assert_eq!(first_usable_gateway.builder_net(), None);
+        assert_eq!(
+            first_usable_gateway.builder_net().as_deref(),
+            Some("192.0.2.9/24 192.0.2.1")
+        );
 
         let outside_gateway =
             External { host_ip: "198.51.100.1".into(), ..first_usable_gateway };
         assert_eq!(outside_gateway.builder_net(), None);
+    }
+
+    #[test]
+    fn zero_sled_topology_is_rejected() {
+        let cfg = VoxelConfig {
+            topology: Topology { sleds: 0, ..Topology::default() },
+            ..VoxelConfig::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -1792,6 +2197,26 @@ mod tests {
         assert_eq!(cfg.router_ext_iface("ce"), "enp0s10");
         assert_eq!(cfg.router_ext_iface("cr1"), "enp0s13");
         assert_eq!(cfg.router_ext_iface("cr2"), "enp0s13");
+    }
+
+    #[test]
+    fn router_scrimlet_ifaces_slots() {
+        // Scrimlet-facing NICs follow ce at enp0s8, starting at enp0s9 and
+        // stopping where `router_ext_iface` picks up.
+
+        let cfg = VoxelConfig::default();
+        assert_eq!(cfg.router_scrimlet_ifaces("cr1"), ["enp0s9", "enp0s10"]);
+        assert_eq!(cfg.router_ext_iface("cr1"), "enp0s11");
+        assert!(cfg.router_scrimlet_ifaces("ce").is_empty());
+
+        let multi =
+            VoxelConfig::from_toml("[topology]\nracks = 2\nsleds = 3\n")
+                .unwrap();
+        assert_eq!(
+            multi.router_scrimlet_ifaces("cr1"),
+            ["enp0s9", "enp0s10", "enp0s11", "enp0s12"]
+        );
+        assert_eq!(multi.router_ext_iface("cr1"), "enp0s13");
     }
 
     #[test]
