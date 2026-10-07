@@ -2,8 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Gimlet (sled) bring-up—replaces `gimlet-launch.sh`. Runs in the voxel-cp
-//! helios guest. The control plane is already installed (`/opt/oxide`); this
+//! The control plane is already installed (`/opt/oxide`); this
 //! applies the per-launch / topology bits that can't be baked: ephemeral virtual
 //! hardware, the detected underlay NICs, the generated sled + RSS configs, the
 //! switch1 identity for the 2nd scrimlet, then activates the control plane (which
@@ -56,7 +55,7 @@ pub fn bring_up() -> Result<()> {
     } else {
         setup_virtual_hardware();
     }
-    preseed_install_datasets();
+    preseed_install_datasets(tuf);
     inject_runtime_configs()?;
     unplumb_softnpu_source();
     maybe_start_switch_enforcer()?;
@@ -418,10 +417,11 @@ fn crash_dump() {
 }
 
 /// Scrimlets load the baked SoftNPU sidecar P4 program. Gimlets have no softnpu
-/// device, so `scadm propolis load-program` would fail there—gate on sled_mode.
+/// device, so `scadm propolis load-program` would fail there. The role comes
+/// from the `# voxel role:` marker voxel-config writes into the sled config.
 fn maybe_load_sidecar() {
     let scrimlet = fs::read_to_string(SLED_CFG)
-        .map(|s| s.contains(r#"sled_mode = "scrimlet""#))
+        .map(|s| s.contains("# voxel role: scrimlet"))
         .unwrap_or(false);
     if scrimlet {
         run(
@@ -725,18 +725,22 @@ const CORPUS: &[(&str, &[u8])] = &[
 /// has no `-d`, so it cannot locate an exported file-vdev pool; an imported one
 /// yields "already created/imported", which its import handler accepts.
 /// Best-effort: on any failure the sled falls back to the manual path.
-fn preseed_install_datasets() {
-    // Real sled disks put the internal pool on the M.2's ZfsPool partition
-    // (index 5 -> slice 5). Older, file-backed images fall through below.
-    let mut vdevs: Vec<String> = discover_disks()
-        .unwrap_or_default()
-        .iter()
-        .filter(|d| d.m2)
-        .map(|d| format!("/dev/dsk/{}s5", d.disk))
-        .collect();
-    if vdevs.is_empty()
-        && let Ok(entries) = fs::read_dir("/var/tmp")
-    {
+fn preseed_install_datasets(tuf: bool) {
+    // TUF images put the internal pool on each NVMe M.2's ZfsPool partition
+    // (index 5 -> slice 5), laid down by ensure_m2_layout. Old-school images
+    // never partition the NVMe disks: their M.2s are the file vdevs xtask
+    // virtual-hardware made in /var/tmp. Key on the image, not on whether
+    // NVMe disks are attached, since voxel attaches them to every guest.
+    let mut vdevs: Vec<String> = Vec::new();
+    if tuf {
+        vdevs.extend(
+            discover_disks()
+                .unwrap_or_default()
+                .iter()
+                .filter(|d| d.m2)
+                .map(|d| format!("/dev/dsk/{}s5", d.disk)),
+        );
+    } else if let Ok(entries) = fs::read_dir("/var/tmp") {
         for e in entries.flatten() {
             let p = e.path();
             let is_m2 = p

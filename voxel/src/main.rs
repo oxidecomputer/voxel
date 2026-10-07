@@ -54,11 +54,11 @@ mod wicket_setup;
 )]
 struct Cli {
     /// voxel.toml to use (default: ~/.config/voxel/voxel.toml, then /etc/voxel/voxel.toml).
-    #[arg(long, global = true, env = "VOXEL_CONFIG")]
+    #[arg(long, global = true, env = "VOXEL_CONFIG", value_parser = abs_path)]
     config: Option<Utf8PathBuf>,
 
     /// Project root that cargo-bay/ and .falcon/ live under.
-    #[arg(long, global = true, env = "VOXEL_WORKDIR")]
+    #[arg(long, global = true, env = "VOXEL_WORKDIR", value_parser = abs_path)]
     workdir: Option<Utf8PathBuf>,
 
     /// Topology (falcon deployment) name.
@@ -70,7 +70,7 @@ struct Cli {
     dataset: Option<String>,
 
     /// Build root for `image create` (default: `$HOME/voxel-builds`).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = abs_path)]
     build_root: Option<Utf8PathBuf>,
 
     #[command(subcommand)]
@@ -88,26 +88,34 @@ enum Cmd {
         #[arg(long)]
         no_route: bool,
         /// Run the rack on emulated hardware: real-firmware SPs and RoTs on
-        /// `sp-emu` instead of `sp-sim`, with rack setup driven through wicketd.
+        /// `sp-emu` instead of `sp-sim`. Rack setup goes through wicketd's
+        /// commission API as on every launch.
         ///
         /// Firmware comes from the image's own TUF repo (`image create
         /// --from-tuf`), so an --emu rack runs the release it reports.
         #[arg(long)]
         emu: bool,
+        /// Let sled-agent initialize the rack itself from a staged
+        /// config-rss.toml instead of driving setup through wicketd's
+        /// commission API. sp-sim only.
+        #[arg(long, conflicts_with = "emu")]
+        init_rss: bool,
         /// Run the emulated fleet on the firmware in DIR instead of the
         /// image's own: sp-gimlet-c.zip, sp-sidecar-c.zip, rot-a.zip and
         /// bootleby.zip, laid out as `image create --from-tuf` extracts them.
         ///
         /// For trying a hubris build before it ships. The rack then reports a
         /// release it is not running, so say so wherever that is claimed.
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", value_parser = abs_path)]
         sp_firmware: Option<Utf8PathBuf>,
     },
-    /// (debug) Print the wicketd RSS config body that `--wicket-setup` would PUT,
-    /// reshaped from a generated config-rss.toml (validates the mapping offline).
+    /// (debug) Print the wicketd RSS config body the legacy wicketd path would
+    /// PUT, reshaped from a generated config-rss.toml (validates the mapping
+    /// offline). Launch drives setup through the commission API instead.
     #[command(hide = true)]
     WicketDryrun {
         /// Path to a generated config-rss.toml.
+        #[arg(value_parser = abs_path)]
         config_rss: Utf8PathBuf,
         /// Per-rack sled count (the bootstrap slot set).
         #[arg(default_value_t = 4)]
@@ -186,7 +194,12 @@ enum Cmd {
         reference: Option<String>,
 
         /// Use an existing Omicron checkout without fetching or changing it.
-        #[arg(long, value_name = "PATH", conflicts_with = "reference")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "reference",
+            value_parser = abs_path
+        )]
         source: Option<Utf8PathBuf>,
 
         /// Rack to target (1-based).
@@ -226,7 +239,10 @@ enum ConfigCmd {
     /// Set a dotted scalar key, e.g. `topology.sleds 3`.
     Set { key: String, value: String },
     /// Validate and install a prepared voxel.toml.
-    Load { file: Utf8PathBuf },
+    Load {
+        #[arg(value_parser = abs_path)]
+        file: Utf8PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -246,18 +262,22 @@ enum ImageCmd {
         commit: Option<String>,
         /// Build from an existing omicron checkout/worktree AS-IS (host build,
         /// for dev): skips clone + checkout so your working-tree edits are built.
-        #[arg(long)]
+        #[arg(long, value_parser = abs_path)]
         src: Option<Utf8PathBuf>,
         /// Build the image from this TUF repo's artifacts with no omicron
         /// compile: zones + corpus byte exact, GZ software from the host OS
         /// phase 2 payload, switch zone recomposed for softnpu.
-        #[arg(long, value_name = "REPO_ZIP")]
+        #[arg(long, value_name = "REPO_ZIP", value_parser = abs_path)]
         from_tuf: Option<Utf8PathBuf>,
-        /// With --from-tuf: an omicron-sled-agent package tar built with
-        /// switch-softnpu, staged in place of the phase 2 sled-agent. The
-        /// standard-image binary hardwires scrimlet = tofino ASIC, so softnpu
-        /// scrimlets need this build.
-        #[arg(long, value_name = "PKG_TAR", requires = "from_tuf")]
+        /// With --from-tuf: an omicron-sled-agent package tar staged in place
+        /// of the phase 2 sled-agent, for trying a sled-agent build. The
+        /// phase 2 one detects softnpu scrimlets at runtime.
+        #[arg(
+            long,
+            value_name = "PKG_TAR",
+            requires = "from_tuf",
+            value_parser = abs_path
+        )]
         sled_agent: Option<Utf8PathBuf>,
     },
     /// Export an image bundle to a file for distribution.
@@ -268,6 +288,7 @@ enum ImageCmd {
         /// Image name (e.g. `voxel-cp-a3fee0ec`).
         name: String,
         /// Output file (default `<name>.zfs.zst`, or `<name>.raw.xz` with --raw).
+        #[arg(value_parser = abs_path)]
         out: Option<Utf8PathBuf>,
         /// Portable raw disk image (`dd | xz`) instead of a zfs stream.
         #[arg(long)]
@@ -276,6 +297,7 @@ enum ImageCmd {
     /// Import an image bundle (`.zfs.zst` or `.raw.xz`) from `image export`.
     Import {
         /// File to import (name is derived from it).
+        #[arg(value_parser = abs_path)]
         file: Utf8PathBuf,
     },
     /// Remove an image bundle (`zfs destroy <dataset>/img/<name>`).
@@ -348,6 +370,7 @@ enum ImageCmd {
     #[command(hide = true)]
     RenderSmf {
         /// Path to the omicron checkout root.
+        #[arg(value_parser = abs_path)]
         omicron_root: Utf8PathBuf,
         /// Number of gimlet SPs to simulate (sp-sim).
         #[arg(long, default_value_t = 4)]
@@ -487,8 +510,10 @@ enum SpCmd {
     /// Flash a hubris `.zip` into an sp-emu slot-A flash file (offline).
     Flash {
         /// Hubris image archive (e.g. build-gimlet-c-image-default.zip).
+        #[arg(value_parser = abs_path)]
         image: Utf8PathBuf,
         /// Output flash file.
+        #[arg(value_parser = abs_path)]
         out: Utf8PathBuf,
     },
     /// Re-flash a live SP (or the shared RoT) and restart its sp-emu service.
@@ -500,6 +525,7 @@ enum SpCmd {
         /// Target: `sidecar` | `gN` | a port | `rot`.
         target: String,
         /// Hubris `.zip` (SP) or raw oxide-rot-1 flash image (target `rot`).
+        #[arg(value_parser = abs_path)]
         image: Utf8PathBuf,
         #[arg(long, default_value = "switch0")]
         switch: String,
@@ -603,6 +629,7 @@ enum RepoCmd {
     /// waiting out TUF replication. Run after the repo upload.
     Seed {
         /// The TUF repo zip that was uploaded.
+        #[arg(value_parser = abs_path)]
         repo: Utf8PathBuf,
     },
 }
@@ -628,9 +655,17 @@ fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     Ok(cfg)
 }
 
-/// Make a path absolute against the current directory.
+/// clap parser for path arguments. main chdirs to the workdir before
+/// dispatching, so relative paths must be resolved while parsing, against
+/// the directory voxel was invoked from.
+fn abs_path(s: &str) -> Result<Utf8PathBuf, String> {
+    Ok(absolutize(Utf8PathBuf::from(s)))
+}
+
+/// Make a path absolute against the current directory, dropping `.`
+/// components so `./x` reads as `<cwd>/x`.
 fn absolutize(p: Utf8PathBuf) -> Utf8PathBuf {
-    if p.is_absolute() {
+    let abs = if p.is_absolute() {
         p
     } else {
         let cwd = std::env::current_dir()
@@ -638,7 +673,10 @@ fn absolutize(p: Utf8PathBuf) -> Utf8PathBuf {
             .and_then(|d| Utf8PathBuf::try_from(d).ok())
             .unwrap_or_default();
         cwd.join(p)
-    }
+    };
+    abs.components()
+        .filter(|c| !matches!(c, camino::Utf8Component::CurDir))
+        .collect()
 }
 
 /// Discover the `voxel.toml` to use, as an absolute path. Order: explicit
@@ -786,19 +824,15 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
-        Cmd::Launch { no_progress, no_route, emu, sp_firmware } => {
-            // One flag: emulated SPs, the RoT bridge on top of them, and
-            // wicketd-driven setup are the same configuration in practice, and
-            // the combinations that split them apart are not worth carrying.
-            rack::cmd_launch(
-                &load_config(&config_path)?,
-                &cli.name,
-                *no_progress,
-                *no_route,
-                *emu,
-                sp_firmware.as_deref(),
-            )
-            .await
+        Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
+            let opts = rack::LaunchOpts {
+                no_progress: *no_progress,
+                no_route: *no_route,
+                emu: *emu,
+                init_rss: *init_rss,
+                sp_firmware: sp_firmware.as_deref(),
+            };
+            rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
         }
         Cmd::WicketDryrun { config_rss, sleds } => {
             wicket_setup::dryrun(config_rss, *sleds)
