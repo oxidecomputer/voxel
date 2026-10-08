@@ -9,25 +9,23 @@ use camino::Utf8Path;
 use libfalcon::{NodeRef, Runner};
 use slog::{Logger, info, warn};
 use std::collections::HashSet;
-use std::fmt;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use voxel_config::VoxelConfig;
 
 use crate::isolated_external::{
     DryRun, link_mtu, probe_out, up as external_up,
 };
 use crate::net::{
-    ce_static_ip, resolve_external_ip, set_external_route, ssh_capture,
-    ssh_output, static_external_ip, wait_external_reachable, zlogin,
+    ce_static_ip, set_external_route, static_external_ip,
+    wait_external_reachable,
 };
-use crate::network::{enable_link, switch_ready};
 use crate::rss::watch_rss;
 use crate::topo::{
     Topo, build_topo, is_tuf_image, reset_node_cargo_bay, stage_config,
     stage_sprockets,
 };
-use crate::{commission, disks, image, sp_host};
+use crate::{disks, image, sp_host};
 
 #[derive(Clone, Copy)]
 pub(crate) struct LaunchOpts<'a> {
@@ -176,126 +174,6 @@ async fn run_voxel_init(d: &Runner, role: &str, nodes: Vec<(String, NodeRef)>) {
     futures::future::join_all(handles).await;
 }
 
-/// One interconnect port's state on a held rack's switch.
-enum PortState {
-    NoSwitch,
-    LinkError(anyhow::Error),
-    NoLinkLocal,
-    Up,
-}
-
-impl fmt::Display for PortState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoSwitch => {
-                write!(
-                    f,
-                    "waiting for the switch zone (dendrite not answering)"
-                )
-            }
-            Self::LinkError(e) => write!(f, "link create/enable: {e}"),
-            Self::NoLinkLocal => {
-                write!(f, "waiting for the link-local to reach ok")
-            }
-            Self::Up => write!(f, "up (link-local)"),
-        }
-    }
-}
-
-/// Bring up the cross-rack interconnect front ports on a held (pre-RSS) rack,
-/// which early networking never configures. No-op for a single rack.
-async fn bring_up_interconnect(
-    d: &Runner,
-    topo: &Topo,
-    cfg: &VoxelConfig,
-    rack: usize,
-) {
-    const TIMEOUT: Duration = Duration::from_secs(600);
-    const POLL: Duration = Duration::from_secs(5);
-    let ports = cfg.interconnect_ports(rack);
-    if ports.is_empty() {
-        return;
-    }
-    let label = rack_label(cfg.topology.racks(), rack, "rack");
-    // Scrimlets in slot order, matching the switch{slot} names in interconnect_ports.
-    let scrimlets: Vec<(NodeRef, String)> = topo
-        .sleds
-        .iter()
-        .filter(|(s, _)| s.rack == rack && s.scrimlet)
-        .map(|(s, n)| (*n, s.name.clone()))
-        .collect();
-    for (sw, port) in ports {
-        let Some((n, sled)) = sw
-            .strip_prefix("switch")
-            .and_then(|s| s.parse::<usize>().ok())
-            .and_then(|slot| scrimlets.get(slot))
-        else {
-            continue;
-        };
-        let ip = match resolve_external_ip(cfg, d, sled, *n, false).await {
-            Ok(ip) => ip,
-            Err(e) => {
-                warn!(
-                    d.log,
-                    "{label}: interconnect {port}: no switch IP ({e})"
-                );
-                continue;
-            }
-        };
-        // The held rack's switch zone may still be installing. Poll a create,
-        // enable, and addrconf pass matching rack 0's 100G no-FEC cluster ports.
-        let deadline = Instant::now() + TIMEOUT;
-        let mut last = String::new();
-        let mut up = false;
-        while Instant::now() < deadline {
-            let state = if !switch_ready(&ip) {
-                PortState::NoSwitch
-            } else if let Err(e) = enable_link(&ip, sled, &port, "100G", "none")
-            {
-                PortState::LinkError(e)
-            } else {
-                let _ = ssh_output(
-                    &ip,
-                    &zlogin(&format!(
-                        "ipadm create-addr -T addrconf tfport{port}_0/ll 2>/dev/null || true"
-                    )),
-                );
-                let addr = ssh_capture(
-                    &ip,
-                    &zlogin(&format!(
-                        "ipadm show-addr -po addrobj,state | grep tfport{port}_0"
-                    )),
-                )
-                .unwrap_or_default();
-                if addr.contains(":ok") {
-                    PortState::Up
-                } else {
-                    PortState::NoLinkLocal
-                }
-            };
-            if matches!(state, PortState::Up) {
-                up = true;
-                break;
-            }
-            let step = state.to_string();
-            if step != last {
-                info!(d.log, "{label}: interconnect {sled}:{port}: {step}");
-                last = step;
-            }
-            tokio::time::sleep(POLL).await;
-        }
-        if up {
-            info!(d.log, "{label}: interconnect {sled}:{port} up (link-local)");
-        } else {
-            warn!(
-                d.log,
-                "{label}: interconnect {sled}:{port}: not up within {}s",
-                TIMEOUT.as_secs()
-            );
-        }
-    }
-}
-
 pub(crate) async fn cmd_launch(
     cfg: &VoxelConfig,
     name: &str,
@@ -410,28 +288,40 @@ pub(crate) async fn cmd_launch(
                 );
             }
             run_voxel_init(d, "gimlet", rack_sleds).await;
-            // Only rack 0 is initialized; omicron has no multirack join yet.
-            if rack > 0 {
-                info!(
-                    d.log,
-                    "rack{}: booted, left uninitialized (no multirack join yet)",
-                    rack + 1
-                );
-                continue;
-            }
+
             let Some((s, n)) =
                 topo.rss_sleds().into_iter().find(|(s, _)| s.rack == rack)
             else {
                 continue;
             };
             let tag = rack_label(racks, rack, "rack-init");
+
+            // Only rack 0 (the cluster) runs RSS. Every other rack
+            // joins it through the multirack-join service.
+            if rack > 0 {
+                if let Err(e) = crate::multirack_join::drive(
+                    cfg, d, *n, &s.name, rack, &tag,
+                )
+                .await
+                {
+                    warn!(d.log, "{tag}: multirack join failed: {e:#}");
+                }
+                continue;
+            }
+
+            // Default: no config-rss was staged for sled-agent, so drive
+            // rack setup through wicketd's commission API; watch_rss then
+            // reports the bring-up as usual. --init-rss staged one and
+            // sled-agent initializes the rack on its own.
             if !opts.init_rss
                 && let Err(e) =
-                    commission::drive(cfg, d, *n, &s.name, rack, &tag).await
+                    crate::commission::drive(cfg, d, *n, &s.name, rack, &tag)
+                        .await
             {
                 warn!(
                     d.log,
-                    "{tag}: commission setup failed: {e:#}; rack will not initialize"
+                    "{tag}: commission setup failed: {e:#}; \
+                        rack will not initialize"
                 );
             }
             watch_rss(
@@ -469,11 +359,6 @@ pub(crate) async fn cmd_launch(
         }
     }
 
-    // Last, once the held racks' switch zones are past their startup dendrite
-    // restart, which would wipe these runtime links.
-    for rack in 1..racks {
-        bring_up_interconnect(d, &topo, cfg, rack).await;
-    }
     Ok(())
 }
 

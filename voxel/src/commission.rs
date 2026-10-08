@@ -121,7 +121,7 @@ fn uplink_port(
             vec![],
         ),
     };
-    Ok(types::UserSpecifiedPortConfig::Manual(types::ManualPortConfig {
+    Ok(types::UserSpecifiedPortConfig::Uplink(types::UplinkPortConfig {
         routes,
         addresses,
         uplink_port_speed: link_speed(&p.port_speed)?,
@@ -133,21 +133,15 @@ fn uplink_port(
     }))
 }
 
-/// A cross-rack interconnect port: addrconf only, 100G, no routes or BGP.
+/// A cross-rack interconnect port to run DDM over.
 fn interconnect_port(
     switch: &str,
     port: &str,
 ) -> types::UserSpecifiedPortConfig {
-    types::UserSpecifiedPortConfig::Manual(types::ManualPortConfig {
-        routes: vec![],
-        addresses: vec![types::UserSpecifiedUplinkAddressConfig {
-            address: types::UplinkAddress::AddrConf,
-            vlan_id: None,
-        }],
-        uplink_port_speed: types::LinkSpeed::Speed100G,
-        uplink_port_fec: Some(types::LinkFec::None),
+    types::UserSpecifiedPortConfig::Ddm(types::L1PortConfig {
+        speed: types::LinkSpeed::Speed100G,
+        fec: Some(types::LinkFec::None),
         autoneg: false,
-        bgp_peers: vec![],
         lldp: Some(lldp(switch, &format!("interconnect-{port}"))),
         tx_eq: None,
     })
@@ -256,49 +250,8 @@ pub(crate) async fn drive(
     rack: usize,
     tag: &str,
 ) -> Result<()> {
-    let gz_ip =
-        crate::net::resolve_external_ip(cfg, d, scrimlet_name, scrimlet, false)
-            .await
-            .map_err(|e| anyhow!("find scrimlet IP: {e}"))?;
-
-    // The switch zone, its sshd amendment, and wicketd all come up behind the
-    // sled boot. Establish the tunnel and confirm the API in one deadline,
-    // rebuilding the tunnel each attempt until the whole path answers.
-    let deadline = Instant::now() + Duration::from_secs(600);
-    let mut last = String::new();
-    // The tunnel must outlive the client that forwards through it. Rebuild it
-    // only when its ssh child has died (zone/sshd not up yet); a live tunnel
-    // is reused so its forward has time to establish before the next poll.
-    let mut conn: Option<(Tunnel, Client)> = None;
-    let (_tunnel, client) = loop {
-        let step = if conn.as_mut().is_none_or(|(t, _)| t.dead()) {
-            match connect(&gz_ip, &d.log) {
-                Ok(c) => {
-                    conn = Some(c);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    "tunnel opened".to_string()
-                }
-                Err(e) => {
-                    conn = None;
-                    format!("{e:#}")
-                }
-            }
-        } else {
-            match conn.as_ref().unwrap().1.get_location().await {
-                Ok(_) => break conn.take().unwrap(),
-                Err(e) => e.to_string(),
-            }
-        };
-        if Instant::now() >= deadline {
-            bail!("commission API not up within 600s: {step}");
-        }
-        if step != last {
-            slog::info!(d.log, "{tag}: waiting for the commission API: {step}");
-            last = step;
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    };
-    slog::info!(d.log, "{tag}: commission API reachable on {scrimlet_name}");
+    let (_tunnel, client) =
+        connect_client(cfg, d, scrimlet, scrimlet_name, tag).await?;
 
     // Bootstrap sleds fill in as MGS discovers SPs and the bootstrap network
     // connects peers; poll until this rack's slots all report ready.
@@ -413,9 +366,60 @@ fn zone_bootstrap_addr(gz_ip: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no bootstrap address on oxz_switch"))
 }
 
+/// Connect to the scrimlet's commission API in wicketd through an ssh tunnel.
+///
+/// The returned [`Tunnel`] must outlive the client that forwards through it.
+pub(crate) async fn connect_client(
+    cfg: &VoxelConfig,
+    d: &libfalcon::Runner,
+    scrimlet: libfalcon::NodeRef,
+    scrimlet_name: &str,
+    tag: &str,
+) -> Result<(Tunnel, Client)> {
+    let gz_ip =
+        crate::net::resolve_external_ip(cfg, d, scrimlet_name, scrimlet, false)
+            .await
+            .map_err(|e| anyhow!("find scrimlet IP: {e}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut last = String::new();
+
+    // Attempt to connect until success, then reuse the tunnel.
+    let mut conn: Option<(Tunnel, Client)> = None;
+    let conn = loop {
+        let step = if conn.as_mut().is_none_or(|(t, _)| t.dead()) {
+            match connect(&gz_ip, &d.log) {
+                Ok(c) => {
+                    conn = Some(c);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    "tunnel opened".to_string()
+                }
+                Err(e) => {
+                    conn = None;
+                    format!("{e:#}")
+                }
+            }
+        } else {
+            match conn.as_ref().unwrap().1.get_location().await {
+                Ok(_) => break conn.take().unwrap(),
+                Err(e) => e.to_string(),
+            }
+        };
+        if Instant::now() >= deadline {
+            bail!("commission API not up within 600s: {step}");
+        }
+        if step != last {
+            slog::info!(d.log, "{tag}: waiting for the commission API: {step}");
+            last = step;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    slog::info!(d.log, "{tag}: commission API reachable on {scrimlet_name}");
+    Ok(conn)
+}
+
 /// Discover the switch zone's bootstrap address, open a tunnel to its
-/// commission port, and build a client over it. Retried by `drive` until the
-/// whole path (zone networked, sshd opened, wicketd up) answers.
+/// commission port, and build a client over it.
 fn connect(gz_ip: &str, log: &slog::Logger) -> Result<(Tunnel, Client)> {
     let zone_addr =
         zone_bootstrap_addr(gz_ip).context("switch-zone bootstrap address")?;
@@ -432,7 +436,7 @@ fn connect(gz_ip: &str, log: &slog::Logger) -> Result<(Tunnel, Client)> {
 /// An ssh local-forward from a host loopback port to the commission API's
 /// in-zone loopback, jumping through the scrimlet global zone. Kills the ssh
 /// child on drop.
-struct Tunnel {
+pub(crate) struct Tunnel {
     child: Child,
     local_port: u16,
 }
@@ -446,6 +450,7 @@ impl Tunnel {
             .chain(PASSWORD_AUTH_OPTS)
             .copied()
             .collect();
+
         // Note, the quoting below is important: even though `Command::arg`
         // doesn't pass args through the shell, ssh will execute the command for
         // ProxyCommand in the local shell, and zsh will try to do a glob with
@@ -571,14 +576,14 @@ mod tests {
         );
         assert!(!c.rack_network_config.switch0.is_empty());
         assert!(c.external_jumbo_frames_opt_in_enabled);
-        let types::UserSpecifiedPortConfig::Manual(port) = c
+        let types::UserSpecifiedPortConfig::Uplink(port) = c
             .rack_network_config
             .switch0
             .values()
             .next()
             .expect("switch0 has a port")
         else {
-            panic!("expected a manual port config");
+            panic!("expected an uplink port config");
         };
         assert_eq!(port.bgp_peers.len(), 1);
         assert!(matches!(
@@ -593,14 +598,14 @@ mod tests {
         let cfg = config("router_mode = \"static\"");
         let c = rss_config(&cfg, 0).unwrap();
         assert!(c.rack_network_config.bgp.is_empty());
-        let types::UserSpecifiedPortConfig::Manual(port) = c
+        let types::UserSpecifiedPortConfig::Uplink(port) = c
             .rack_network_config
             .switch0
             .values()
             .next()
             .expect("switch0 has a port")
         else {
-            panic!("expected a manual port config");
+            panic!("expected an uplink port config");
         };
         assert!(port.bgp_peers.is_empty());
         assert_eq!(port.routes.len(), 1);
