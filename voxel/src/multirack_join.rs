@@ -54,13 +54,13 @@ pub(crate) async fn drive(
                 // Therefore, upon each error we check to see whether there is
                 // a MULTIRACK_JOIN in progress and if so, break so we can go
                 // to `watch`.
-                if let Ok(status) = client.get_rack_setup_state().await {
-                    if let Some(op) = status.into_inner().operation {
-                        if op.kind == types::RackOperationKind::MULTIRACK_JOIN {
-                            break;
-                        }
-                    }
+                if let Ok(status) = client.get_rack_setup_state().await
+                    && let Some(op) = status.into_inner().operation
+                    && op.kind == types::RackOperationKind::MULTIRACK_JOIN
+                {
+                    break;
                 }
+
                 info!(d.log, "{tag}: multirack join not started yet ({e})");
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
