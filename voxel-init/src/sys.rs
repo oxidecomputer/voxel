@@ -8,7 +8,8 @@
 //! aborting. Mirror that—`run`/`run_quiet` never panic and return success.
 
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -73,53 +74,158 @@ pub fn warn(msg: impl AsRef<str>) {
     println!("[voxel-init] WARN: {}", msg.as_ref());
 }
 
+/// Install the staged `root_authorized_keys` into the
+/// `/root/.ssh/authorized_keys` path as a block between the
+/// demarcated markers of `# voxel-managed-begin` and `# voxel-managed-end`.
+///
+/// Lines outside these markers are left unchanged, while an empty staged file
+/// drops the block, and a missing one leaves the file untouched.
 pub fn sync_authorized_keys(staged: &str) {
     sync_authorized_keys_in(Path::new(staged), Path::new("/root/.ssh"));
 }
 
-fn sync_authorized_keys_in(staged: &Path, dir: &Path) {
-    let keys = match fs::read_to_string(staged) {
-        Ok(k) => k,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            warn(format!("authorized_keys: read {}: {e}", staged.display()));
-            return;
-        }
-    };
+const MANAGED_BEGIN: &str = "# voxel-managed-begin";
+const MANAGED_END: &str = "# voxel-managed-end";
 
-    if let Err(e) =
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
-    {
-        warn(format!("authorized_keys: {}: {e}", dir.display()));
-        return;
+/// Outcome of a sync against `/root/.ssh/authorized_keys`; the caller
+/// can report it in one place.
+enum KeySync {
+    /// No staged file, or nothing to clear; the file was not opened for
+    /// writing.
+    Untouched,
+    /// The merged content matched what was already on disk, so nothing was
+    /// written.
+    Unchanged,
+    /// The demarcated managed block was dropped and nothing remained, so it
+    /// was safe to remove the file, which we did.
+    Cleared,
+    /// The file was rewritten through a temp file and rename.
+    Synced,
+}
+
+fn sync_authorized_keys_in(staged: impl AsRef<Path>, dir: impl AsRef<Path>) {
+    match sync_authorized_keys_io(staged.as_ref(), dir.as_ref()) {
+        Ok(KeySync::Untouched) => {}
+        Ok(KeySync::Unchanged) => note("root authorized_keys up to date"),
+        Ok(KeySync::Cleared) => note("cleared root authorized_keys"),
+        Ok(KeySync::Synced) => note("synced root authorized_keys"),
+        Err(e) => warn(format!("authorized_keys: {e}")),
+    }
+}
+
+fn sync_authorized_keys_io(staged: &Path, dir: &Path) -> io::Result<KeySync> {
+    let Some(keys) = read_if_present(staged)? else {
+        return Ok(KeySync::Untouched);
+    };
+    let path = dir.join("authorized_keys");
+    let existing = read_if_present(&path)?.unwrap_or_default();
+    let out = merge_managed_block(&existing, &keys);
+
+    if out.is_empty() {
+        return remove_if_present(&path).map(|removed| {
+            if removed { KeySync::Cleared } else { KeySync::Untouched }
+        });
+    }
+    if out == existing {
+        return Ok(KeySync::Unchanged);
     }
 
-    let out = keys
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .and_then(|()| {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        })
+        .map_err(|e| at(e, "mkdir", dir))?;
+
+    let tmp = dir.join(".authorized_keys.voxel-tmp");
+    write_private(&tmp, &out)
+        .and_then(|()| fs::rename(&tmp, &path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+        .map(|()| KeySync::Synced)
+        .map_err(|e| at(e, "write", &path))
+}
+
+fn read_if_present(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(at(e, "read", path)),
+    }
+}
+
+fn remove_if_present(path: &Path) -> io::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(at(e, "remove", path)),
+    }
+}
+
+fn write_private(path: &Path, body: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+fn at(e: io::Error, what: &str, path: &Path) -> io::Error {
+    io::Error::new(e.kind(), format!("{what} {}: {e}", path.display()))
+}
+
+fn merge_managed_block(existing: &str, staged: &str) -> String {
+    let mut out = String::new();
+    let mut in_block = false;
+    for line in existing.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim_end() == MANAGED_BEGIN {
+            in_block = true;
+            continue;
+        }
+        if line.trim_end() == MANAGED_END {
+            in_block = false;
+            continue;
+        }
+        if in_block {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+
+    let keys: Vec<&str> = staged
         .lines()
         .map(|line| line.trim_end_matches('\r'))
         .filter(|line| !line.is_empty())
-        .fold(String::new(), |mut out, line| {
-            out.push_str(line);
-            out.push('\n');
-            out
-        });
-
-    let path = dir.join("authorized_keys");
-    if let Err(e) = fs::write(&path, &out) {
-        warn(format!("authorized_keys: write: {e}"));
-        return;
+        .collect();
+    if keys.is_empty() {
+        return if out.trim().is_empty() { String::new() } else { out };
     }
 
-    if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-    {
-        warn(format!("authorized_keys: chmod {}: {e}", dir.display()));
+    if !out.is_empty() {
+        out.push('\n');
     }
-
-    if let Err(e) =
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-    {
-        warn(format!("authorized_keys: chmod {}: {e}", path.display()));
+    out.push_str(MANAGED_BEGIN);
+    out.push('\n');
+    for key in keys {
+        out.push_str(key);
+        out.push('\n');
     }
+    out.push_str(MANAGED_END);
+    out.push('\n');
+    out
 }
 
 /// Apply literal `(from, to)` substitutions to `path` in one rewrite. Both role
@@ -193,89 +299,173 @@ pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn missing_staged_keys_preserve_existing_file() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let dir = temp.path().join(".ssh");
-        fs::create_dir(&dir)?;
-        let path = dir.join("authorized_keys");
-        let keys = b"ssh-ed25519 AAA existing\n";
-        fs::write(&path, keys)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
-
-        sync_authorized_keys_in(&temp.path().join("missing"), &dir);
-
-        assert_eq!(fs::read(&path)?, keys);
-        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
-        Ok(())
+    fn mode_of(path: impl AsRef<Path>) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
-    fn missing_staged_keys_do_not_create_directory() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let dir = temp.path().join(".ssh");
+    fn sync_missing_staged_touches_nothing() {
+        let tmp = camino_tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ssh");
+        let missing = tmp.path().join("missing");
 
-        sync_authorized_keys_in(&temp.path().join("missing"), &dir);
-
+        sync_authorized_keys_in(&missing, &dir);
         assert!(!dir.exists());
-        Ok(())
-    }
 
-    #[test]
-    fn invalid_staged_keys_preserve_existing_file() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let dir = temp.path().join(".ssh");
-        fs::create_dir(&dir)?;
+        fs::create_dir(&dir).unwrap();
         let path = dir.join("authorized_keys");
         let keys = b"ssh-ed25519 AAA existing\n";
-        fs::write(&path, keys)?;
-        let staged = temp.path().join("staged");
-        fs::write(&staged, b"\xff")?;
+        fs::write(&path, keys).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
 
-        sync_authorized_keys_in(&staged, &dir);
-
-        assert_eq!(fs::read(&path)?, keys);
-        Ok(())
+        sync_authorized_keys_in(&missing, &dir);
+        assert_eq!(fs::read(&path).unwrap(), keys);
+        assert_eq!(mode_of(&path), 0o640);
     }
 
     #[test]
-    fn staged_keys_replace_existing_file() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let dir = temp.path().join(".ssh");
-        fs::create_dir(&dir)?;
+    fn sync_invalid_staged_preserves_file() {
+        let tmp = camino_tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ssh");
+        fs::create_dir(&dir).unwrap();
         let path = dir.join("authorized_keys");
-        fs::write(&path, b"ssh-ed25519 AAA existing\n")?;
-        let staged = temp.path().join("staged");
-        fs::write(&staged, b"ssh-ed25519 AAA staged\r\n\r\n")?;
+        let keys = b"ssh-ed25519 AAA existing\n";
+        fs::write(&path, keys).unwrap();
+        let staged = tmp.path().join("staged");
+        fs::write(&staged, b"\xff").unwrap();
 
-        for _ in 0..2 {
-            sync_authorized_keys_in(&staged, &dir);
+        sync_authorized_keys_in(&staged, &dir);
 
-            assert_eq!(fs::read(&path)?, b"ssh-ed25519 AAA staged\n");
-            assert_eq!(fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
-            assert_eq!(
-                fs::metadata(&path)?.permissions().mode() & 0o777,
-                0o600
-            );
-        }
-        Ok(())
+        assert_eq!(fs::read(&path).unwrap(), keys);
     }
 
     #[test]
-    fn empty_staged_keys_clear_installed_keys() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let dir = temp.path().join(".ssh");
-        let staged = temp.path().join("staged");
+    fn sync_replaces_block_keeps_other_lines() {
+        let tmp = camino_tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ssh");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("authorized_keys");
+        fs::write(
+            &path,
+            b"ssh-ed25519 AAA manual\n# voxel-managed-begin\nssh-ed25519 AAA old\n# voxel-managed-end\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let staged = tmp.path().join("staged");
+        fs::write(&staged, b"ssh-ed25519 AAA staged\r\n\r\n").unwrap();
+
+        sync_authorized_keys_in(&staged, &dir);
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"ssh-ed25519 AAA manual\n\n# voxel-managed-begin\nssh-ed25519 AAA staged\n# voxel-managed-end\n"
+        );
+        assert_eq!(mode_of(&dir), 0o700);
+        assert_eq!(mode_of(&path), 0o600);
+        assert!(!dir.join(".authorized_keys.voxel-tmp").exists());
+    }
+
+    #[test]
+    fn sync_creates_file_and_dir() {
+        let tmp = camino_tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ssh");
+        let staged = tmp.path().join("staged");
+        fs::write(&staged, b"ssh-ed25519 AAA staged\n").unwrap();
+
+        sync_authorized_keys_in(&staged, &dir);
+
+        assert_eq!(
+            fs::read(dir.join("authorized_keys")).unwrap(),
+            b"# voxel-managed-begin\nssh-ed25519 AAA staged\n# voxel-managed-end\n"
+        );
+        assert_eq!(mode_of(&dir), 0o700);
+    }
+
+    #[test]
+    fn sync_empty_staged_drops_block() {
+        let tmp = camino_tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ssh");
+        let staged = tmp.path().join("staged");
         let path = dir.join("authorized_keys");
 
-        fs::write(&staged, b"ssh-ed25519 AAA staged\n")?;
+        fs::write(&staged, b"").unwrap();
         sync_authorized_keys_in(&staged, &dir);
-        assert_eq!(fs::read(&path)?, b"ssh-ed25519 AAA staged\n");
+        assert!(!dir.exists());
 
-        fs::write(&staged, b"")?;
+        fs::write(&staged, b"ssh-ed25519 AAA staged\n").unwrap();
         sync_authorized_keys_in(&staged, &dir);
-        assert_eq!(fs::read(&path)?, b"");
-        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
-        Ok(())
+        assert!(path.exists());
+
+        fs::write(&staged, b"").unwrap();
+        sync_authorized_keys_in(&staged, &dir);
+        assert!(!path.exists());
+
+        fs::write(&path, b"ssh-ed25519 AAA manual\n").unwrap();
+        fs::write(&staged, b"ssh-ed25519 AAA staged\n").unwrap();
+        sync_authorized_keys_in(&staged, &dir);
+        fs::write(&staged, b"").unwrap();
+        sync_authorized_keys_in(&staged, &dir);
+        assert_eq!(fs::read(&path).unwrap(), b"ssh-ed25519 AAA manual\n");
+    }
+
+    #[test]
+    fn sync_unchanged_keeps_permissions() {
+        let tmp = camino_tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ssh");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("authorized_keys");
+        let content = b"ssh-ed25519 AAA manual\n\n# voxel-managed-begin\nssh-ed25519 AAA staged\n# voxel-managed-end\n";
+        fs::write(&path, content).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let staged = tmp.path().join("staged");
+        fs::write(&staged, b"ssh-ed25519 AAA staged\n").unwrap();
+
+        sync_authorized_keys_in(&staged, &dir);
+
+        assert_eq!(fs::read(&path).unwrap(), content);
+        assert_eq!(mode_of(&path), 0o640);
+    }
+
+    #[test]
+    fn merge_moves_middle_block_and_matches_padded_markers() {
+        let merged = merge_managed_block(
+            "a\n# voxel-managed-begin \nold\n# voxel-managed-end\t\nb",
+            "new\n",
+        );
+        assert_eq!(
+            merged,
+            "a\nb\n\n# voxel-managed-begin\nnew\n# voxel-managed-end\n"
+        );
+        assert_eq!(merge_managed_block(&merged, "new\n"), merged);
+        assert_eq!(
+            merge_managed_block("manual  \r\n", "k\n"),
+            "manual  \n\n# voxel-managed-begin\nk\n# voxel-managed-end\n"
+        );
+    }
+
+    #[test]
+    fn merge_edge_cases() {
+        // A begin marker without an ending slurps up everything after it;
+        // only voxel writes these markers, making a missing end part of
+        // voxel's block.
+        assert_eq!(
+            merge_managed_block(
+                "ssh-ed25519 AAA manual\n# voxel-managed-begin\nold\nafter\n",
+                "ssh-ed25519 AAA new\n",
+            ),
+            "ssh-ed25519 AAA manual\n\n# voxel-managed-begin\nssh-ed25519 AAA new\n# voxel-managed-end\n"
+        );
+        // Nothing in, nothing out: empty, whitespace-only, and block-only files
+        // all merge to "" so the caller removes the file.
+        assert_eq!(merge_managed_block("", ""), "");
+        assert_eq!(merge_managed_block("\n\n", ""), "");
+        assert_eq!(
+            merge_managed_block(
+                "# voxel-managed-begin\nk\n# voxel-managed-end\n",
+                ""
+            ),
+            ""
+        );
     }
 }

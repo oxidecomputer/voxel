@@ -62,11 +62,12 @@ knobs set via `voxel config set`:
   images, exported as `BUILD_ROOT`, holding the omicron checkout
 * falcon.workdir: Location where voxel will do its configuration and setup for
   new launches
-* falcon.ssh_pubkey: SSH public key staged into every node, allowing
-  `ssh root@<node>` to authenticate by key rather than the empty root password.
-  This defaults to the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`,
-  `id_rsa.pub`. When the key has a non-standard name, set it directly:
-  `voxel config set falcon.ssh_pubkey ~/.ssh/github_ed25519.pub`
+* falcon.ssh_pubkey: SSH public key staged into every node allowing
+  `ssh root@<node>` to work by key instead of via the empty root password. This
+  defaults to the first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`,
+  `id_rsa.pub`; set it explicitly for a key with another name
+  (`voxel config set falcon.ssh_pubkey ~/.ssh/github_ed25519.pub`), or to `""`
+  for none
 
 ## Privileges
 

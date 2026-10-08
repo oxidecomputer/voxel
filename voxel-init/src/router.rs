@@ -48,6 +48,11 @@ pub fn bring_up() -> Result<()> {
     Ok(())
 }
 
+/// SSH convenience for `voxel host login <router>`, the router-role counterpart
+/// of the gimlet agent's `setup_ssh`. `openssh-server` is already in the image
+/// (install-frr.sh), so this only syncs any staged operator key and relaxes
+/// sshd_config: voxel authenticates as root with the rack's empty password, and
+/// Debian's stock `PermitRootLogin prohibit-password` refuses that.
 fn setup_ssh() {
     sync_authorized_keys("/opt/cargo-bay/root_authorized_keys");
 
