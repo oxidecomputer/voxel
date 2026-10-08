@@ -46,6 +46,21 @@ pub(crate) async fn drive(
         match client.post_run_multirack_join(&body).await {
             Ok(_) => break,
             Err(e) if Instant::now() < deadline => {
+                // Multirack Join may have started, but the response got lost.
+                // If it completes before the next retry, we'll get an error
+                // back and fail retries indefinitely until `POST_DEADLINE` is
+                // exceeded. We don't want to make voxel users wait for that.
+                //
+                // Therefore, upon each error we check to see whether there is
+                // a MULTIRACK_JOIN in progress and if so, break so we can go
+                // to `watch`.
+                if let Ok(status) = client.get_rack_setup_state().await {
+                    if let Some(op) = status.into_inner().operation {
+                        if op.kind == types::RackOperationKind::MULTIRACK_JOIN {
+                            break;
+                        }
+                    }
+                }
                 info!(d.log, "{tag}: multirack join not started yet ({e})");
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
@@ -54,13 +69,17 @@ pub(crate) async fn drive(
     }
     info!(d.log, "{tag}: multirack join requested");
 
-    watch(d, tag, &client).await;
+    watch(d, tag, &client).await?;
     Ok(())
 }
 
 /// Poll the join until it completes or fails. Like RSS watching, an expired
 /// deadline is not fatal: the rack keeps converging on its own.
-async fn watch(d: &libfalcon::Runner, tag: &str, client: &Client) {
+async fn watch(
+    d: &libfalcon::Runner,
+    tag: &str,
+    client: &Client,
+) -> Result<()> {
     let start = Instant::now();
     let mut last = String::new();
     loop {
@@ -73,7 +92,7 @@ async fn watch(d: &libfalcon::Runner, tag: &str, client: &Client) {
                 WATCH_DEADLINE.as_secs() / 60,
                 if last.is_empty() { "unknown" } else { &last }
             );
-            return;
+            return Ok(());
         }
         let Ok(status) = client.get_rack_setup_state().await else {
             continue;
@@ -87,18 +106,17 @@ async fn watch(d: &libfalcon::Runner, tag: &str, client: &Client) {
         match op.state {
             types::RackOperationState::Completed => {
                 info!(d.log, "{tag}: multirack join complete");
-                return;
+                return Ok(());
             }
             types::RackOperationState::Failed { message, .. } => {
-                slog::warn!(d.log, "{tag}: multirack join failed: {message}");
-                return;
+                let e = format!("{tag}: multirack join failed: {message}");
+                slog::warn!(d.log, "{e}");
+                bail!("{e}");
             }
             types::RackOperationState::Panicked => {
-                slog::warn!(
-                    d.log,
-                    "{tag}: the multirack join service panicked"
-                );
-                return;
+                let e = format!("{tag}: the multirack join service panicked");
+                slog::warn!(d.log, "{e}");
+                bail!("{e}");
             }
             types::RackOperationState::InProgress { current_step } => {
                 let step = current_step.map_or_else(

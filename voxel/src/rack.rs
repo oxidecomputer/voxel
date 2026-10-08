@@ -320,7 +320,7 @@ pub(crate) async fn cmd_launch(
             {
                 warn!(
                     d.log,
-                    "{tag}: commission setup failed: {e:#};
+                    "{tag}: commission setup failed: {e:#}; \
                         rack will not initialize"
                 );
             }

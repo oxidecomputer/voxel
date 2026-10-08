@@ -143,7 +143,7 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
 
 /// A cross-rack sidecar interconnect front port.
 ///
-/// This port cotnains only L1 information and is configured as 100G to match
+/// This port contains only L1 information and is configured as 100G to match
 /// the sidecar rear-port links. This isn't strictly necessary, but is helpful
 /// for inspection/debugging purposes.
 ///
