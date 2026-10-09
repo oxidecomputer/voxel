@@ -517,6 +517,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino-tempfile"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64308c4c82a5c38679945ddf88738dc1483dcc563bbb5780755ae9f8497d2b20"
+dependencies = [
+ "camino",
+ "tempfile",
+]
+
+[[package]]
 name = "cargo_toml"
 version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5789,6 +5799,7 @@ dependencies = [
  "anyhow",
  "attest-mock",
  "camino",
+ "camino-tempfile",
  "clap",
  "flate2",
  "futures",
@@ -5832,6 +5843,7 @@ version = "0.9.0"
 dependencies = [
  "anyhow",
  "camino",
+ "camino-tempfile",
  "clap",
  "indoc",
  "libc",
