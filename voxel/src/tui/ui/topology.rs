@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Rack elevation for the Monitor view, after wicket's rack widget: sleds
 //! fill their cubbies around the switches and power shelves, coloured by
 //! health, with the fleet's routers in an uplink strip above the rack.

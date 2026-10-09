@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use ratatui::style::Color;
 pub const OX_YELLOW: Color = Color::Rgb(0xF5, 0xCF, 0x65);
 pub const OX_OFF_WHITE: Color = Color::Rgb(0xE0, 0xE0, 0xE0);
