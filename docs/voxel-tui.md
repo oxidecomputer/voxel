@@ -13,9 +13,12 @@ Build Voxel and prepare images as described in the [project
 quickstart](../README.md#quickstart), then start the interface:
 
 ```console
-$ cargo build -p voxel --bin voxel
+$ cargo build -p voxel --bin voxel --features tui
 $ pfexec ./target/debug/voxel tui
 ```
+
+The TUI is the `voxel` crate's opt-in `tui` feature; a build without it has no
+`voxel tui` subcommand.
 
 Logs are written to `<resolved workdir>/voxel-tui.log` and displayed in a
 bounded on-screen history. The TUI can launch and destroy Voxel deployments,
@@ -109,9 +112,9 @@ displays its minimum-size requirement instead of clipping an unsafe layout.
 ## Testing
 
 ```sh
-cargo test -p voxel tui::app::tests -- --nocapture
-cargo test -p voxel tui::terminal::tests -- --nocapture
-cargo test -p voxel tui::ui::confirm_dialog::tests -- --nocapture
-cargo test -p voxel tui::ui::widgets::tests -- --nocapture
-cargo test -p voxel tui::effects::tests -- --nocapture
+cargo test -p voxel --features tui tui::app::tests -- --nocapture
+cargo test -p voxel --features tui tui::terminal::tests -- --nocapture
+cargo test -p voxel --features tui tui::ui::confirm_dialog::tests -- --nocapture
+cargo test -p voxel --features tui tui::ui::widgets::tests -- --nocapture
+cargo test -p voxel --features tui tui::effects::tests -- --nocapture
 ```

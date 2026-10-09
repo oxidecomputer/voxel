@@ -43,6 +43,7 @@ mod sp_cmd;
 mod sp_host;
 mod topo;
 mod tufrepo;
+#[cfg(feature = "tui")]
 mod tui;
 mod util;
 mod wicket_setup;
@@ -81,6 +82,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Open the terminal interface.
+    #[cfg(feature = "tui")]
     Tui {
         #[command(subcommand)]
         cmd: Option<TuiCmd>,
@@ -223,6 +225,7 @@ enum Cmd {
     },
 }
 
+#[cfg(feature = "tui")]
 #[derive(Subcommand)]
 enum TuiCmd {
     /// Resume a detached TUI session.
@@ -787,6 +790,7 @@ fn anchor_workdir(
     Ok(())
 }
 
+#[cfg(feature = "tui")]
 fn resolve_tui_context(
     cli: &Cli,
     config_path: &Utf8Path,
@@ -829,9 +833,11 @@ fn resolve_tui_context(
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let cli = Cli::parse();
+    #[cfg(feature = "tui")]
     if let Cmd::Tui { cmd: Some(TuiCmd::Resume { choose }) } = &cli.cmd {
         return tui::resume(*choose);
     }
+    #[cfg(feature = "tui")]
     let invocation_dir = Utf8PathBuf::try_from(
         std::env::current_dir().context("resolve invocation directory")?,
     )
@@ -848,6 +854,7 @@ async fn main() -> Result<(), Error> {
     resolve_falcon_env(&cli, cfg.as_ref());
     anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
     match &cli.cmd {
+        #[cfg(feature = "tui")]
         Cmd::Tui { cmd } => {
             debug_assert!(
                 cmd.is_none(),
@@ -1150,10 +1157,15 @@ mod main_tests {
 
     #[test]
     fn parses_tui_commands_and_preserves_launch_parsing() {
-        assert!(Cli::try_parse_from(["voxel", "tui"]).is_ok());
-        assert!(Cli::try_parse_from(["voxel", "tui", "resume"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["voxel", "tui", "resume", "--choose"]).is_ok()
+        let tui = cfg!(feature = "tui");
+        assert_eq!(Cli::try_parse_from(["voxel", "tui"]).is_ok(), tui);
+        assert_eq!(
+            Cli::try_parse_from(["voxel", "tui", "resume"]).is_ok(),
+            tui
+        );
+        assert_eq!(
+            Cli::try_parse_from(["voxel", "tui", "resume", "--choose"]).is_ok(),
+            tui
         );
         assert!(Cli::try_parse_from(["voxel", "launch", "--emu"]).is_ok());
     }

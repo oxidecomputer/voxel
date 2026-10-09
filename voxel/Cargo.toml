@@ -10,12 +10,17 @@ edition = "2024"
 name = "voxel"
 path = "src/main.rs"
 
+[features]
+# `voxel tui`. Building without it leaves the CLI and drops the terminal UI's
+# dependencies.
+tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm", "dep:base64", "dep:chrono"]
+
 [dependencies]
 tokio.workspace = true
-tokio-util.workspace = true
-ratatui.workspace = true
-crossterm.workspace = true
-base64.workspace = true
+tokio-util = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 libfalcon.workspace = true
 propolis-client.workspace = true
 anyhow.workspace = true
@@ -41,7 +46,7 @@ tar = "0.4"
 flate2 = "1"
 libc = "0.2"
 reqwest.workspace = true
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"], optional = true }
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).
