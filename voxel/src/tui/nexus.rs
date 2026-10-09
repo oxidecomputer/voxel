@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Nexus access for monitoring. Finds the rack's Nexus among the configured
+//! service-pool addresses or through external DNS, logs into the recovery
+//! silo, and runs OxQL timeseries queries, failing over between endpoints.
+
 use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::{Context, anyhow, ensure};

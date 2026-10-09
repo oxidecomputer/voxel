@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The help overlay, listing key bindings for each view and dialog.
+
 use super::{
     colors::*,
     widgets::{overlay_area, popup_backdrop, popup_block},

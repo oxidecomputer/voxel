@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The render loop. Chooses a layout mode from the terminal size, limits
+//! redraws to a frame budget, and moves events and effects between the
+//! [`App`] and the runtime.
+
 use crate::tui::{App, AppEvent, Effect};
 use ratatui::{Terminal, backend::Backend, layout::Rect};
 use std::{

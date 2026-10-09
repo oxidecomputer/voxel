@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Rendering. Each submodule draws one view, pane or overlay from an
+//! immutable [`App`](crate::tui::App).
+
 pub mod colors;
 pub mod confirm_dialog;
 pub mod deployment;

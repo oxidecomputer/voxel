@@ -2,6 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Periodic telemetry collection. Probes sleds and routers over Falcon
+//! serial and SSH for link counters, addresses, service health and RSS
+//! progress, queries Nexus with OxQL for oximeter metrics once the control
+//! plane is up, and publishes the samples as [`AppEvent`]s on a bounded
+//! schedule.
+
 #[cfg(test)]
 mod tests {
     use super::*;

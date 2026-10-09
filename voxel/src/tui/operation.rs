@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Lifecycle operation vocabulary: the launch, destroy and route operations,
+//! their ordered phases, and the outcomes and log levels a child's output is
+//! classified into.
+
 use std::process::ExitStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

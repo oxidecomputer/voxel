@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Detached TUI sessions. Detaching records the session and its resolved
+//! node addresses in a private directory; `voxel tui resume` selects a record
+//! and re-executes the TUI with that claim.
+
 use std::{
     collections::BTreeMap,
     ffi::OsString,

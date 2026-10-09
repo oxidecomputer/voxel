@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The vocabulary shared by input, background tasks, the [`App`](super::App)
+//! state machine and the effects runner: views and panes, key actions,
+//! confirmations and their options, effects and application events.
+
 use std::time::Instant;
 
 use crate::tui::operation::{LogLevel, OperationEvent, OperationKind};

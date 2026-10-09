@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The external monitoring overlay: points at the OpenTelemetry guide and
+//! renders the per-rack receiver YAML an operator can copy into a collector.
+
 use crate::tui::{App, telemetry::RackId};
 use ratatui::{
     layout::Rect,

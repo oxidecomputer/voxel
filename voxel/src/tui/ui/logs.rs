@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The log pane: filtered, scrollable application and child log entries,
+//! styled by level, with a summary title when collapsed.
+
 use super::{
     colors::*,
     widgets::{fit_terminal_width, section_block, terminal_width},

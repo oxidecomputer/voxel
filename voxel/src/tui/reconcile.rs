@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Reconciles the TUI with what actually exists. Probes storage, node
+//! processes, host routes and RSS state, and reduces that evidence to the
+//! deployment state the TUI starts from or returns to after an operation.
+
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::process::Stdio;

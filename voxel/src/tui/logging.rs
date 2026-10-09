@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The durable `voxel-tui.log`, shared by the TUI and the Falcon runner,
+//! which keeps a record after the terminal UI exits or detaches.
+
 use std::{
     fs::{File, OpenOptions},
     io::{self, Write},

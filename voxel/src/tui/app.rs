@@ -2,6 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The TUI state machine. [`App::update`] folds each [`AppEvent`] into the
+//! deployment, operation, observability and session state and returns the
+//! [`Effect`]s the runtime must carry out; it performs no I/O, so the renderer
+//! and tests drive it directly.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 

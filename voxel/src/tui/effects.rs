@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Carries out the effects [`App`](super::App) requests. Owns the single
+//! lifecycle child (`voxel launch`, `route` or `destroy`), streams its output
+//! back as events, and handles cancellation and force stop.
+
 use std::{sync::Arc, time::Duration};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};

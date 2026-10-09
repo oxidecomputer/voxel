@@ -2,6 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The `voxel tui` terminal interface. [`run`] wires the collector, the
+//! effects runner, the renderer and the input and tick tasks around one
+//! [`App`], and orders startup and shutdown so the terminal is restored before
+//! anything that can wait without a bound.
+
 mod app;
 mod collector;
 mod context;

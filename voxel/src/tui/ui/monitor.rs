@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The Monitor view. Lays out the rack summary, topology and node details,
+//! and derives health and traffic freshness from collected telemetry.
+
 use super::{
     colors::{OX_RED, TUI_GREEN, TUI_GREY, TUI_GREY_DARK, TUI_YELLOW},
     renderer::LayoutMode,

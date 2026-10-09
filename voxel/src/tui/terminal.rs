@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Terminal plumbing: the raw-mode and alternate-screen lifecycle on
+//! `/dev/tty`, key mapping, the input and tick tasks, and OSC 52 clipboard
+//! writes.
+
 use std::{io, thread, time::Duration};
 
 use base64::Engine;

@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The TUI palette: Oxide brand colours plus the TUI's own accents, so the
+//! interface matches the console and wicket.
+
 use ratatui::style::Color;
 pub const OX_YELLOW: Color = Color::Rgb(0xF5, 0xCF, 0x65);
 pub const OX_OFF_WHITE: Color = Color::Rgb(0xE0, 0xE0, 0xE0);

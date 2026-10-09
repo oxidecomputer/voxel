@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The confirmation overlay for launch, route, detach, quit and destroy
+//! requests, with the options and shortcuts each confirmation offers.
+
 use super::{
     colors::TUI_PURPLE,
     widgets::{overlay_area, popup_backdrop, popup_block, terminal_width},

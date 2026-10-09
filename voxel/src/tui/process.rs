@@ -2,6 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Supervises a lifecycle child process: spawns it with piped output, drains
+//! stdout and stderr into bounded lines without deadlocking, keeps a stderr
+//! summary for failures, and force stops it on request.
+
 use std::{collections::VecDeque, io, process::ExitStatus};
 
 use tokio::{

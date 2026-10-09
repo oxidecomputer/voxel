@@ -2,6 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! Infers lifecycle operation phases from child output lines, so the
+//! deployment view can show progress through launch, destroy and route.
+
 use super::operation::{
     DestroyPhase, LaunchPhase, OperationKind, OperationPhase, OutputStream,
     RoutePhase,
