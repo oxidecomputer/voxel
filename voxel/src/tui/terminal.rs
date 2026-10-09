@@ -6,7 +6,13 @@
 //! `/dev/tty`, key mapping, the input and tick tasks, and OSC 52 clipboard
 //! writes.
 
-use std::{io, thread, time::Duration};
+use std::{
+    io::{self, Write},
+    panic::{self, PanicHookInfo},
+    sync::{Arc, Mutex, MutexGuard},
+    thread,
+    time::Duration,
+};
 
 use base64::Engine;
 
@@ -23,9 +29,12 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::tui::event::{Action, AppEvent};
+use crate::tui::{
+    event::{Action, AppEvent},
+    logging::DurableLog,
+};
 
-pub type TuiTerminal = Terminal<CrosstermBackend<io::BufWriter<std::fs::File>>>;
+pub type TuiTerminal = Terminal<CrosstermBackend<io::BufWriter<PanicGate>>>;
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 64;
 const INPUT_POLL: Duration = Duration::from_millis(50);
@@ -236,8 +245,73 @@ impl Lifecycle {
 }
 struct RealOps {
     fallback: io::BufWriter<std::fs::File>,
-    backend_writer: Option<io::BufWriter<std::fs::File>>,
+    backend_writer: Option<io::BufWriter<PanicGate>>,
     terminal: Option<TuiTerminal>,
+}
+
+/// The renderer's writer, which discards output once the panic hook has
+/// handed the terminal back. A frame drawn between a panic and the render loop
+/// observing shutdown would otherwise repaint over the panic message.
+pub struct PanicGate {
+    tty: std::fs::File,
+    released: Released,
+}
+impl Write for PanicGate {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Held across the write so the hook cannot restore the terminal
+        // between this check and the bytes reaching it.
+        let released = released(&self.released);
+        if *released { Ok(buf.len()) } else { self.tty.write(buf) }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let released = released(&self.released);
+        if *released { Ok(()) } else { self.tty.flush() }
+    }
+}
+
+/// Whether the panic hook has taken the terminal back from the renderer.
+type Released = Arc<Mutex<bool>>;
+
+fn released(state: &Released) -> MutexGuard<'_, bool> {
+    // Nothing panics while holding the lock, but a panic hook must not
+    // panic over a poisoned one either.
+    state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+/// Restores the terminal before the previous hook prints. The default hook
+/// runs before unwinding reaches [`TerminalSession`]'s `Drop`, and a panic in
+/// a spawned task never unwinds the UI at all, so without this the message
+/// lands in the alternate screen in raw mode. Cancelling `shutdown` makes the
+/// TUI exit through its usual failure path instead of running on with no
+/// screen; the durable log keeps the message for detached sessions.
+fn install_panic_hook(
+    tty: std::fs::File,
+    state: Released,
+    shutdown: CancellationToken,
+    log: DurableLog,
+) -> Arc<PanicHook> {
+    let previous = Arc::new(panic::take_hook());
+    let chained = previous.clone();
+    panic::set_hook(Box::new(move |info| {
+        {
+            let mut released = released(&state);
+            if !*released {
+                *released = true;
+                // Errors are ignored: failing here would lose the panic.
+                let _ = execute!(&mut &tty, Show, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+            }
+        }
+        shutdown.cancel();
+        let _ = log.write_line_within(
+            &format!("ERROR TUI {info}"),
+            Duration::from_millis(100),
+        );
+        chained(info);
+    }));
+    previous
 }
 impl LifecycleOps for RealOps {
     fn raw(&mut self) -> io::Result<()> {
@@ -278,24 +352,47 @@ pub struct TerminalSession {
     terminal: Option<TuiTerminal>,
     fallback: Option<io::BufWriter<std::fs::File>>,
     lifecycle: Lifecycle,
+    released: Released,
+    /// The hook [`install_panic_hook`] replaced, until it is reinstated.
+    previous_hook: Option<Arc<PanicHook>>,
 }
 impl TerminalSession {
-    pub fn enter(writer: std::fs::File) -> io::Result<Self> {
+    /// Takes over `writer` until [`restore`](Self::restore). A panic on any
+    /// thread in the meantime restores the terminal, cancels `shutdown`, and
+    /// records the panic in `log`.
+    pub fn enter(
+        writer: std::fs::File,
+        shutdown: CancellationToken,
+        log: DurableLog,
+    ) -> io::Result<Self> {
         let fallback = io::BufWriter::new(writer.try_clone()?);
+        let hook_tty = writer.try_clone()?;
+        let released = Released::default();
         let mut ops = RealOps {
             fallback,
-            backend_writer: Some(io::BufWriter::new(writer)),
+            backend_writer: Some(io::BufWriter::new(PanicGate {
+                tty: writer,
+                released: released.clone(),
+            })),
             terminal: None,
         };
         let lifecycle = Lifecycle::setup(&mut ops)?;
+        let previous_hook =
+            Some(install_panic_hook(hook_tty, released.clone(), shutdown, log));
         Ok(Self {
             terminal: ops.terminal,
             fallback: Some(ops.fallback),
             lifecycle,
+            released,
+            previous_hook,
         })
     }
     pub fn terminal_mut(&mut self) -> &mut TuiTerminal {
         self.terminal.as_mut().expect("active terminal")
+    }
+    /// Whether a panic has taken the terminal back from the renderer.
+    pub fn panicked(&self) -> bool {
+        *released(&self.released)
     }
     pub fn restore(&mut self) -> io::Result<()> {
         let mut ops = RealOps {
@@ -306,6 +403,13 @@ impl TerminalSession {
         let result = self.lifecycle.restore(&mut ops);
         self.terminal = ops.terminal;
         self.fallback = Some(ops.fallback);
+        // set_hook panics on a panicking thread, so while unwinding the
+        // restoring hook stays installed for the rest of the process.
+        if !thread::panicking()
+            && let Some(previous) = self.previous_hook.take()
+        {
+            panic::set_hook(Box::new(move |info| previous(info)));
+        }
         result
     }
 }

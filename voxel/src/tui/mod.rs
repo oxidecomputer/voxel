@@ -142,8 +142,12 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         .open("/dev/tty")
         .context("open controlling terminal")?;
     let clipboard_writer = terminal_writer.try_clone()?;
-    let mut terminal = terminal::TerminalSession::enter(terminal_writer)
-        .context("enter terminal UI")?;
+    let mut terminal = terminal::TerminalSession::enter(
+        terminal_writer,
+        shutdown.clone(),
+        durable.clone(),
+    )
+    .context("enter terminal UI")?;
     let mut app = App::new(topology, 500, 120);
     app.durable_log_path = context.workdir.join("voxel-tui.log").to_string();
     if let Some((level, message)) = external_note {
@@ -291,6 +295,12 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
                 "TUI renderer cancelled unexpectedly".into()
             });
         }
+    }
+
+    if terminal.panicked() {
+        primary = Some(
+            "The Voxel TUI has panicked! See above output for details.".into(),
+        );
     }
 
     // Restore before Falcon or a lifecycle child can make shutdown wait without
