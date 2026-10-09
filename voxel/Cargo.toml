@@ -13,7 +13,7 @@ path = "src/main.rs"
 [features]
 # `voxel tui`. Building without it leaves the CLI and drops the terminal UI's
 # dependencies.
-tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm", "dep:base64", "dep:chrono"]
+tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm", "dep:base64", "dep:chrono", "dep:oxide-client"]
 
 [dependencies]
 tokio.workspace = true
@@ -36,6 +36,7 @@ voxel-config = { path = "../voxel-config" }
 rack-init-config.workspace = true
 wicketd-commission-types-versions.workspace = true
 wicketd-commission-client.workspace = true
+oxide-client = { workspace = true, optional = true }
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"

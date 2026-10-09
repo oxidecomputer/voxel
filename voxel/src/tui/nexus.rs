@@ -5,14 +5,23 @@
 //! Nexus access for monitoring. Finds the rack's Nexus among the configured
 //! service-pool addresses or through external DNS, logs into the recovery
 //! silo, and runs OxQL timeseries queries, failing over between endpoints.
+//! Requests and responses use omicron's generated `oxide-client`.
 
-use std::{net::Ipv4Addr, time::Duration};
+use std::{future::Future, net::Ipv4Addr, time::Duration};
 
 use anyhow::{Context, anyhow, ensure};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::FuturesUnordered};
-use reqwest::{RequestBuilder, Response, StatusCode, Url};
-use serde::{Deserialize, Serialize};
+pub(crate) use oxide_client::types::{MetricType, OxqlQueryResult};
+use oxide_client::{
+    ClientLoginExt, ClientSystemMetricsExt, ClientSystemStatusExt,
+    ResponseValue,
+    types::{
+        FieldValue, Name, Timeseries, TimeseriesQuery,
+        UsernamePasswordCredentials, ValueArray,
+    },
+};
+use reqwest::{StatusCode, Url};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use voxel_config::{Network, RecoverySiloCfg, VoxelConfig};
@@ -68,163 +77,75 @@ pub(crate) fn rack_endpoints(
         .collect()
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct OxqlQueryResult {
-    pub(crate) tables: Vec<OxqlTable>,
+type Point<T> = (Option<DateTime<Utc>>, DateTime<Utc>, Option<T>);
+pub(crate) type IntegerPoint = Point<i64>;
+
+/// Reads string fields and the single value column of a generated OxQL
+/// timeseries.
+pub(crate) trait TimeseriesExt {
+    fn field(&self, name: &str) -> Option<&str>;
+    fn integer_points(&self) -> anyhow::Result<Vec<IntegerPoint>>;
+    fn numeric_points(&self) -> anyhow::Result<Vec<Point<f64>>>;
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct OxqlTable {
-    pub(crate) name: String,
-    pub(crate) timeseries: Vec<OxqlTimeseries>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OxqlTimeseries {
-    pub(crate) fields: std::collections::BTreeMap<String, FieldValue>,
-    pub(crate) points: OxqlPoints,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct FieldValue {
-    #[serde(rename = "type")]
-    kind: String,
-    value: serde_json::Value,
-}
-
-impl FieldValue {
-    pub(crate) fn as_str(&self) -> Option<&str> {
-        match self.kind.as_str() {
-            "string" | "uuid" => self.value.as_str(),
+impl TimeseriesExt for Timeseries {
+    fn field(&self, name: &str) -> Option<&str> {
+        match self.fields.get(name)? {
+            FieldValue::String(value) => Some(value),
             _ => None,
         }
     }
-}
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct OxqlPoints {
-    #[serde(default)]
-    pub(crate) start_times: Option<Vec<DateTime<Utc>>>,
-    pub(crate) timestamps: Vec<DateTime<Utc>>,
-    pub(crate) values: Vec<OxqlValues>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OxqlValues {
-    pub(crate) values: ValueArray,
-    pub(crate) metric_type: MetricType,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MetricType {
-    Gauge,
-    Cumulative,
-    Delta,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", content = "values", rename_all = "snake_case")]
-pub(crate) enum ValueArray {
-    Integer(Vec<Option<i64>>),
-    Double(Vec<Option<f64>>),
-}
-
-pub(crate) type IntegerPoint =
-    (Option<DateTime<Utc>>, DateTime<Utc>, Option<i64>);
-
-impl OxqlTimeseries {
-    pub(crate) fn field(&self, name: &str) -> Option<&str> {
-        self.fields.get(name).and_then(FieldValue::as_str)
-    }
-
-    pub(crate) fn integer_points(&self) -> anyhow::Result<Vec<IntegerPoint>> {
-        ensure!(
-            self.points.values.len() == 1,
-            "expected one OxQL value column"
-        );
-        let ValueArray::Integer(values) = &self.points.values[0].values else {
+    fn integer_points(&self) -> anyhow::Result<Vec<IntegerPoint>> {
+        let ValueArray::Integer(values) = value_column(self)? else {
             return Err(anyhow!("expected integer OxQL values"));
         };
-        ensure!(
-            values.len() == self.points.timestamps.len(),
-            "OxQL value and timestamp lengths differ"
-        );
-        if let Some(starts) = &self.points.start_times {
-            ensure!(
-                starts.len() == values.len(),
-                "OxQL interval lengths differ"
-            );
-        }
-        Ok(values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                (
-                    self.points
-                        .start_times
-                        .as_ref()
-                        .map(|starts| starts[index]),
-                    self.points.timestamps[index],
-                    *value,
-                )
-            })
-            .collect())
+        points(self, values.clone())
     }
 
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn numeric_points(
-        &self,
-    ) -> anyhow::Result<Vec<(Option<DateTime<Utc>>, DateTime<Utc>, Option<f64>)>>
-    {
-        ensure!(
-            self.points.values.len() == 1,
-            "expected one OxQL value column"
-        );
-        let values = match &self.points.values[0].values {
+    fn numeric_points(&self) -> anyhow::Result<Vec<Point<f64>>> {
+        let values = match value_column(self)? {
             ValueArray::Integer(values) => values
                 .iter()
                 .map(|value| value.map(|value| value as f64))
                 .collect(),
             ValueArray::Double(values) => values.clone(),
+            _ => return Err(anyhow!("expected numeric OxQL values")),
         };
-        ensure!(
-            values.len() == self.points.timestamps.len(),
-            "OxQL value and timestamp lengths differ"
-        );
-        if let Some(starts) = &self.points.start_times {
-            ensure!(
-                starts.len() == values.len(),
-                "OxQL interval lengths differ"
-            );
-        }
-        Ok(values
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                (
-                    self.points
-                        .start_times
-                        .as_ref()
-                        .map(|starts| starts[index]),
-                    self.points.timestamps[index],
-                    value,
-                )
-            })
-            .collect())
+        points(self, values)
     }
 }
 
-#[derive(Serialize)]
-struct LoginRequest<'a> {
-    username: &'a str,
-    password: &'a str,
+fn value_column(series: &Timeseries) -> anyhow::Result<&ValueArray> {
+    ensure!(series.points.values.len() == 1, "expected one OxQL value column");
+    Ok(&series.points.values[0].values)
 }
 
-#[derive(Serialize)]
-struct QueryRequest<'a> {
-    query: &'a str,
-    include_summaries: bool,
+/// Pairs each value with its timestamp and, when the series has intervals,
+/// its start time.
+fn points<T>(
+    series: &Timeseries,
+    values: Vec<Option<T>>,
+) -> anyhow::Result<Vec<Point<T>>> {
+    let points = &series.points;
+    ensure!(
+        values.len() == points.timestamps.len(),
+        "OxQL value and timestamp lengths differ"
+    );
+    if let Some(starts) = &points.start_times {
+        ensure!(starts.len() == values.len(), "OxQL interval lengths differ");
+    }
+    Ok(values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            (
+                points.start_times.as_ref().map(|starts| starts[index]),
+                points.timestamps[index],
+                value,
+            )
+        })
+        .collect())
 }
 
 /// Bounds the TCP connect separately from the request timeout. Most
@@ -250,6 +171,16 @@ pub(crate) struct NexusClient {
     operation: Mutex<()>,
     login: RecoveryLogin,
     timeout: Duration,
+}
+
+type NexusError = oxide_client::Error<oxide_client::types::Error>;
+
+/// Summarizes a client error as the status Nexus returned, if any.
+fn describe(error: &NexusError) -> String {
+    match error.status() {
+        Some(status) => format!("returned {status}"),
+        None => format!("failed: {error}"),
+    }
 }
 
 /// The A records in `dig +short` output; CNAME targets and noise are skipped.
@@ -348,18 +279,31 @@ impl NexusClient {
         Vec::new()
     }
 
-    async fn send(
+    /// The generated client for `endpoint`, sharing the session cookies of
+    /// `http`.
+    fn api(&self, endpoint: &Url) -> oxide_client::Client {
+        oxide_client::Client::new_with_client(
+            endpoint.as_str().trim_end_matches('/'),
+            self.http.clone(),
+        )
+    }
+
+    /// Runs one Nexus call, including reading the response body, within the
+    /// request timeout. The outer error is cancellation or timeout. The inner
+    /// result is the Nexus response.
+    async fn call<T>(
         &self,
-        request: RequestBuilder,
+        call: impl Future<Output = Result<ResponseValue<T>, NexusError>>,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<Response> {
+    ) -> anyhow::Result<Result<T, NexusError>> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(anyhow!("cancelled")),
-            result = tokio::time::timeout(self.timeout, request.send()) => {
-                result
-                    .map_err(|_| anyhow!("Nexus request timed out after {:?}", self.timeout))?
-                    .context("send Nexus request")
+            result = tokio::time::timeout(self.timeout, call) => {
+                let result = result.map_err(|_| {
+                    anyhow!("Nexus request timed out after {:?}", self.timeout)
+                })?;
+                Ok(result.map(ResponseValue::into_inner))
             }
         }
     }
@@ -386,27 +330,21 @@ impl NexusClient {
         {
             let endpoint = endpoint.clone();
             probes.push(async move {
-                let ping =
-                    endpoint.join("v1/ping").context("build Nexus ping URL")?;
-                Ok::<_, anyhow::Error>((
-                    endpoint,
-                    self.send(self.http.get(ping), cancel).await,
-                ))
+                let api = self.api(&endpoint);
+                let response = self.call(api.ping().send(), cancel).await;
+                (endpoint, response)
             });
         }
         let mut errors = Vec::new();
-        while let Some(probe) = probes.next().await {
-            let (endpoint, response) = probe?;
+        while let Some((endpoint, response)) = probes.next().await {
             match response {
-                Ok(response) if response.status().is_success() => {
+                Ok(Ok(_)) => {
                     *self.endpoint.lock().await = Some(endpoint.clone());
                     return Ok(endpoint);
                 }
-                Ok(response) => errors.push(format!(
-                    "{} returned {}",
-                    endpoint,
-                    response.status()
-                )),
+                Ok(Err(error)) => {
+                    errors.push(format!("{endpoint} {}", describe(&error)))
+                }
                 Err(error) if cancel.is_cancelled() => return Err(error),
                 Err(error) => errors.push(format!("{endpoint}: {error:#}")),
             }
@@ -419,21 +357,27 @@ impl NexusClient {
         endpoint: &Url,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
-        let url = endpoint
-            .join(&format!("v1/login/{}/local", self.login.silo))
-            .context("build Nexus login URL")?;
-        let response = self
-            .send(
-                self.http.post(url).json(&LoginRequest {
-                    username: &self.login.username,
-                    password: &self.login.password,
-                }),
-                cancel,
-            )
-            .await?;
-        if !response.status().is_success() {
-            return Err(anyhow!("Nexus login returned {}", response.status()));
-        }
+        let silo = Name::try_from(self.login.silo.as_str())
+            .context("recovery silo name")?;
+        let credentials = UsernamePasswordCredentials {
+            username: self
+                .login
+                .username
+                .parse()
+                .context("recovery user name")?,
+            password: self
+                .login
+                .password
+                .parse()
+                .context("recovery password")?,
+        };
+        let api = self.api(endpoint);
+        self.call(
+            api.login_local().silo_name(silo).body(credentials).send(),
+            cancel,
+        )
+        .await?
+        .map_err(|error| anyhow!("Nexus login {}", describe(&error)))?;
         *self.authenticated.lock().await = Some(endpoint.clone());
         Ok(())
     }
@@ -443,17 +387,10 @@ impl NexusClient {
         endpoint: &Url,
         query: &str,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<Response> {
-        let url = endpoint
-            .join("v1/system/timeseries/query")
-            .context("build Nexus timeseries URL")?;
-        self.send(
-            self.http
-                .post(url)
-                .json(&QueryRequest { query, include_summaries: false }),
-            cancel,
-        )
-        .await
+    ) -> anyhow::Result<Result<OxqlQueryResult, NexusError>> {
+        let api = self.api(endpoint);
+        let body = TimeseriesQuery { query: query.into() };
+        self.call(api.system_timeseries_query().body(body).send(), cancel).await
     }
 
     async fn query_from(
@@ -463,7 +400,9 @@ impl NexusClient {
         cancel: &CancellationToken,
     ) -> anyhow::Result<OxqlQueryResult> {
         let mut response = self.query_once(endpoint, query, cancel).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
+        if response.as_ref().is_err_and(|error| {
+            error.status() == Some(StatusCode::UNAUTHORIZED)
+        }) {
             let _operation = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(anyhow!("cancelled")),
@@ -478,21 +417,9 @@ impl NexusClient {
             self.login(endpoint, cancel).await?;
             response = self.query_once(endpoint, query, cancel).await?;
         }
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Nexus timeseries query returned {}",
-                response.status()
-            ));
-        }
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(anyhow!("cancelled")),
-            result = tokio::time::timeout(self.timeout, response.json()) => {
-                result
-                    .map_err(|_| anyhow!("Nexus response timed out after {:?}", self.timeout))?
-                    .context("decode Nexus timeseries response")
-            }
-        }
+        response.map_err(|error| {
+            anyhow!("Nexus timeseries query {}", describe(&error))
+        })
     }
 
     pub(crate) async fn ready(
@@ -563,6 +490,10 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
     use voxel_config::VoxelConfig;
+
+    const PING: &str = r#"{"status":"ok"}"#;
+    // Nexus answers every error with a JSON body naming the request.
+    const UNAUTHORIZED: &str = r#"{"request_id":"test","error_code":"Unauthorized","message":"credentials missing or invalid"}"#;
 
     struct TestResponse {
         status: &'static str,
@@ -702,54 +633,13 @@ mod tests {
         assert_eq!(RecoveryLogin::from_config(&config), None);
     }
 
-    #[test]
-    fn oxql_fields_decode_every_api_field_type() {
-        let result: OxqlQueryResult = serde_json::from_value(serde_json::json!({
-            "tables": [{
-                "name": "test:metric",
-                "timeseries": [{
-                    "fields": {
-                        "string": {"type": "string", "value": "value"},
-                        "i8": {"type": "i8", "value": -1},
-                        "u8": {"type": "u8", "value": 1},
-                        "i16": {"type": "i16", "value": -2},
-                        "u16": {"type": "u16", "value": 2},
-                        "i32": {"type": "i32", "value": -3},
-                        "u32": {"type": "u32", "value": 3},
-                        "i64": {"type": "i64", "value": -4},
-                        "u64": {"type": "u64", "value": 4},
-                        "ip_addr": {"type": "ip_addr", "value": "192.0.2.1"},
-                        "uuid": {
-                            "type": "uuid",
-                            "value": "00000000-0000-0000-0000-000000000001"
-                        },
-                        "bool": {"type": "bool", "value": true}
-                    },
-                    "points": {
-                        "timestamps": [],
-                        "values": []
-                    }
-                }]
-            }]
-        }))
-        .unwrap();
-        let fields = &result.tables[0].timeseries[0].fields;
-
-        assert_eq!(fields["string"].as_str(), Some("value"));
-        assert_eq!(
-            fields["uuid"].as_str(),
-            Some("00000000-0000-0000-0000-000000000001")
-        );
-        assert_eq!(fields["ip_addr"].as_str(), None);
-    }
-
     #[tokio::test]
     async fn readiness_authenticates_once_without_querying_timeseries() {
         let (endpoint, requests, server) = test_server(vec![
             TestResponse {
                 status: "200 OK",
-                headers: "",
-                body: "pong",
+                headers: "Content-Type: application/json\r\n",
+                body: PING,
                 delay: Duration::ZERO,
             },
             TestResponse {
@@ -787,8 +677,8 @@ mod tests {
         let (endpoint, requests, server) = test_server(vec![
             TestResponse {
                 status: "200 OK",
-                headers: "",
-                body: "pong",
+                headers: "Content-Type: application/json\r\n",
+                body: PING,
                 delay: Duration::ZERO,
             },
             TestResponse {
@@ -799,8 +689,8 @@ mod tests {
             },
             TestResponse {
                 status: "401 Unauthorized",
-                headers: "",
-                body: "",
+                headers: "Content-Type: application/json\r\n",
+                body: UNAUTHORIZED,
                 delay: Duration::ZERO,
             },
             TestResponse {
@@ -841,12 +731,15 @@ mod tests {
         assert!(requests[1].starts_with("POST /v1/login/recovery/local "));
         assert!(
             requests[1]
-                .contains(r#"{"username":"recovery","password":"oxide"}"#)
+                .contains(r#"{"password":"oxide","username":"recovery"}"#)
         );
         assert!(requests[2].contains("cookie: session=first"));
         assert!(requests[3].starts_with("POST /v1/login/recovery/local "));
         assert!(requests[4].contains("cookie: session=second"));
-        assert!(requests[4].contains(r#""include_summaries":false"#));
+        assert!(
+            requests[4]
+                .contains(r#"{"query":"get sled_data_link:bytes_sent"}"#)
+        );
     }
 
     #[tokio::test]
@@ -854,8 +747,8 @@ mod tests {
         let (stalled, stalled_requests, stalled_server) = test_server(vec![
             TestResponse {
                 status: "200 OK",
-                headers: "",
-                body: "pong",
+                headers: "Content-Type: application/json\r\n",
+                body: PING,
                 delay: Duration::ZERO,
             },
             TestResponse {
@@ -875,14 +768,14 @@ mod tests {
         let (healthy, healthy_requests, healthy_server) = test_server(vec![
             TestResponse {
                 status: "200 OK",
-                headers: "",
-                body: "pong",
+                headers: "Content-Type: application/json\r\n",
+                body: PING,
                 delay: Duration::from_millis(20),
             },
             TestResponse {
                 status: "200 OK",
-                headers: "",
-                body: "pong",
+                headers: "Content-Type: application/json\r\n",
+                body: PING,
                 delay: Duration::ZERO,
             },
             TestResponse {
@@ -943,8 +836,8 @@ mod tests {
         let (second, _, second_server) = test_server(vec![
             TestResponse {
                 status: "200 OK",
-                headers: "",
-                body: "pong",
+                headers: "Content-Type: application/json\r\n",
+                body: PING,
                 delay: Duration::ZERO,
             },
             TestResponse {
@@ -970,8 +863,8 @@ mod tests {
             },
             TestResponse {
                 status: "200 OK",
-                headers: "",
-                body: "pong",
+                headers: "Content-Type: application/json\r\n",
+                body: PING,
                 delay: Duration::ZERO,
             },
             TestResponse {

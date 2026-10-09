@@ -1074,7 +1074,7 @@ use voxel_config::VoxelConfig;
 
 use crate::tui::event::AppEvent;
 use crate::tui::nexus::{
-    MetricType, NexusClient, OxqlQueryResult, RecoveryLogin,
+    MetricType, NexusClient, OxqlQueryResult, RecoveryLogin, TimeseriesExt,
 };
 use crate::tui::reconcile::RssObservation;
 use crate::tui::telemetry::{

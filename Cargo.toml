@@ -14,6 +14,8 @@ anyhow = "1.0.102"
 rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
 wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
 wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
+# Nexus external API client for TUI monitoring.
+oxide-client = { git = "https://github.com/oxidecomputer/omicron", rev = "2e55f4ddac2fe51fc37e9a70e0619a013509750f" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
