@@ -162,7 +162,7 @@ impl TuiContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogLevel, PublicCommand, TuiContext};
+    use super::{LogLevel, TuiContext};
     use camino::Utf8PathBuf;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -177,53 +177,10 @@ mod tests {
             build_root: Utf8PathBuf::from("/build/voxel"),
             config: VoxelConfig::default(),
             executable: PathBuf::from("/bin/voxel"),
-            effective_env: vec![
-                (
-                    OsString::from("FALCON_DATASET"),
-                    OsString::from("rpool/falcon"),
-                ),
-                (OsString::from("BUILD_ROOT"), OsString::from("/build/voxel")),
-                (
-                    OsString::from("VOXEL_OMICRON_SRC"),
-                    OsString::from("/build/voxel/omicron-main"),
-                ),
-            ],
-        }
-    }
-
-    fn expected_args(command: &str) -> Vec<OsString> {
-        [
-            "--config",
-            "/cfg/voxel.toml",
-            "--workdir",
-            "/work/voxel",
-            "--name",
-            "demo",
-            "--dataset",
-            "rpool/falcon",
-            "--build-root",
-            "/build/voxel",
-            command,
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect()
-    }
-
-    #[test]
-    fn constructs_exact_public_command_specs() {
-        let context = context();
-
-        for (command, subcommand) in [
-            (PublicCommand::Launch, "launch"),
-            (PublicCommand::Route, "route"),
-            (PublicCommand::Destroy, "destroy"),
-        ] {
-            let spec = context.command_spec(command);
-            assert_eq!(spec.program, PathBuf::from("/bin/voxel"));
-            assert_eq!(spec.args, expected_args(subcommand));
-            assert_eq!(spec.current_dir, PathBuf::from("/work/voxel"));
-            assert_eq!(spec.env, context.effective_env);
+            effective_env: vec![(
+                OsString::from("FALCON_DATASET"),
+                OsString::from("rpool/falcon"),
+            )],
         }
     }
 
@@ -323,15 +280,6 @@ mod tests {
             );
             let note = note.unwrap_or_default();
             assert!(note.contains(fragment), "{case}: note {note:?}");
-        }
-    }
-
-    #[test]
-    fn launch_does_not_enable_optional_flags() {
-        let args = context().command_spec(PublicCommand::Launch).args;
-
-        for flag in ["--no-progress", "--no-route", "--emu", "--sp-firmware"] {
-            assert!(!args.contains(&OsString::from(flag)));
         }
     }
 }

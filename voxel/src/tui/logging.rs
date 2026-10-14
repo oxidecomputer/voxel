@@ -78,37 +78,24 @@ impl slog::Drain for DurableDrain {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use slog::warn;
 
     use super::*;
 
     #[test]
     fn falcon_logger_writes_to_durable_log() {
-        let nonce =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "voxel-tui-falcon-log-{}-{nonce}",
-            std::process::id()
-        ));
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let durable = DurableLog::open(&path).unwrap();
 
         warn!(durable.falcon_logger(), "serial retry"; "node" => "g0");
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("WARN serial retry"), "{contents:?}");
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn bounded_write_gives_up_on_a_lock_its_own_thread_holds() {
-        let nonce =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "voxel-tui-bounded-log-{}-{nonce}",
-            std::process::id()
-        ));
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let durable = DurableLog::open(&path).unwrap();
 
         let held = durable.0.lock().unwrap();
@@ -121,6 +108,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "written\n");
-        std::fs::remove_file(path).unwrap();
     }
 }

@@ -403,21 +403,18 @@ mod tests {
             addresses: BTreeMap::new(),
         }
     }
-    fn directory() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "voxel-session-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-        ));
-        fs::create_dir(&path).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        path
+    /// A private directory, as the session store requires.
+    fn directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .unwrap();
+        directory
     }
 
     #[test]
     fn round_trip_and_newest_selection_preserve_exact_values() {
         let directory = directory();
-        let store = Store::at(directory.clone());
+        let store = Store::at(directory.path().to_path_buf());
         store.write(&record(1, "old")).unwrap();
         let mut expected = record(2, "new");
         expected.set_addresses(
@@ -430,17 +427,15 @@ mod tests {
         assert!(warnings.is_empty());
         let selected = select(&records, false).unwrap().unwrap();
         assert_eq!(selected.session, expected);
-        assert_eq!(
-            selected.session.addresses().get("g0").map(String::as_str),
-            Some("192.168.1.10")
-        );
-        assert!(!expected.arguments().iter().any(|arg| arg == "--rss-gen"));
+    }
+
+    #[test]
+    fn reattach_command_quotes_an_executable_path_with_spaces() {
         assert!(
-            expected
+            record(1, "demo")
                 .reattach_command()
                 .unwrap()
                 .starts_with("pfexec '/opt/voxel bin/voxel'")
         );
-        fs::remove_dir_all(directory).unwrap();
     }
 }

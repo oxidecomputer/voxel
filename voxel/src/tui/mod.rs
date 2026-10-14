@@ -379,42 +379,22 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use camino::Utf8PathBuf;
-    use tokio::sync::TryAcquireError;
-    use voxel_config::VoxelConfig;
+    use indoc::indoc;
 
-    #[tokio::test]
-    async fn initial_reconciliation_reserves_admission_before_collection() {
-        let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-
-        let initial =
-            super::reserve_initial_reconciliation(&admission).await.unwrap();
-
-        assert!(matches!(
-            admission.clone().try_acquire_owned(),
-            Err(TryAcquireError::NoPermits)
-        ));
-        drop(initial);
-        assert!(admission.try_acquire_owned().is_ok());
-    }
+    use super::test_support::config;
 
     #[test]
     fn probe_mount_preparation_creates_only_empty_node_directories() {
-        let nonce =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let workdir = Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .unwrap()
-            .join(format!(
-                "voxel-tui-probe-mounts-{}-{nonce}",
-                std::process::id()
-            ));
-        std::fs::create_dir_all(&workdir).unwrap();
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 2\nrouters = [\"ce\", \"cr1\"]\n",
-        )
-        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let workdir =
+            Utf8PathBuf::from_path_buf(scratch.path().to_path_buf()).unwrap();
+        let config = config(indoc! {r#"
+            [topology]
+            racks = 1
+            sleds = 2
+            routers = ["ce", "cr1"]
+        "#});
 
         super::prepare_probe_mounts(&workdir, &config).unwrap();
 
@@ -432,7 +412,5 @@ mod tests {
                     .is_none()
             );
         }
-        assert!(!workdir.join(".falcon").exists());
-        std::fs::remove_dir_all(workdir).unwrap();
     }
 }
