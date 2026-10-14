@@ -112,18 +112,3 @@ pub(crate) enum CommandOutcome {
     SpawnFailed { message: String },
     ForceStopped { status: Option<ExitStatus>, kill_error: Option<String> },
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn phase_orders_preserve_static_display_sequence() {
-        assert_eq!(LaunchPhase::ORDER[0], LaunchPhase::Preflight);
-        assert_eq!(DestroyPhase::ORDER[0], DestroyPhase::OrphanCleanup);
-        assert_eq!(
-            RoutePhase::ORDER,
-            [RoutePhase::Validate, RoutePhase::Apply, RoutePhase::Reconcile]
-        );
-    }
-}

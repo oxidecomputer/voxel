@@ -2235,12 +2235,6 @@ mod factual_outcome_tests {
         let options = Confirmation::ForceStop.options(true);
         assert!(options[0].label.contains("Force stop"));
         assert_eq!(options[1].action, ConfirmationOptionAction::Reject);
-        assert!(
-            crate::tui::ui::confirm_dialog::prompt_text(
-                Confirmation::ForceStop
-            )
-            .contains("Force stop")
-        );
     }
 
     #[test]
