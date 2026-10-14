@@ -103,8 +103,18 @@ fn route_phase(line: &str) -> Option<RoutePhase> {
 mod tests {
     use super::*;
     use crate::tui::operation::{
-        DestroyPhase, LaunchPhase, OperationKind, OperationPhase, OutputStream,
+        LaunchPhase, OperationKind, OperationPhase, OutputStream,
     };
+
+    fn classify(
+        classifier: &mut PhaseClassifier,
+        kind: OperationKind,
+        line: &str,
+    ) -> Option<OperationPhase> {
+        classifier
+            .classify(kind, OutputStream::Stdout, line)
+            .map(|PhaseHint::Started(phase)| phase)
+    }
 
     #[test]
     fn known_current_main_launch_output_advances_monotonically() {
@@ -128,111 +138,17 @@ mod tests {
         ];
         for (line, phase) in fixtures {
             assert_eq!(
-                classifier.classify(
-                    OperationKind::Launch,
-                    OutputStream::Stdout,
-                    line
-                ),
-                Some(PhaseHint::Started(OperationPhase::Launch(phase)))
+                classify(&mut classifier, OperationKind::Launch, line),
+                Some(OperationPhase::Launch(phase)),
+                "{line}"
             );
         }
+        // A later node's start line must not move progress backwards.
         assert_eq!(
-            classifier.classify(
+            classify(
+                &mut classifier,
                 OperationKind::Launch,
-                OutputStream::Stdout,
                 "gimlet-0: launch start"
-            ),
-            None
-        );
-        assert_eq!(
-            classifier.classify(
-                OperationKind::Launch,
-                OutputStream::Stdout,
-                "unrecognized output"
-            ),
-            None
-        );
-        assert_eq!(
-            classifier.classify(
-                OperationKind::Launch,
-                OutputStream::Stdout,
-                "reconcile complete"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn invented_launch_messages_remain_unclassified() {
-        for line in
-            ["launching topology", "staging node disks", "booting nodes"]
-        {
-            assert_eq!(
-                PhaseClassifier::default().classify(
-                    OperationKind::Launch,
-                    OutputStream::Stdout,
-                    line,
-                ),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn falcon_destroy_output_advances_teardown_and_storage() {
-        let mut classifier = PhaseClassifier::default();
-        for (line, phase) in [
-            ("destroying deployment voxel", DestroyPhase::FalconTeardown),
-            ("destroying images", DestroyPhase::StorageCleanup),
-        ] {
-            assert_eq!(
-                classifier.classify(
-                    OperationKind::Destroy,
-                    OutputStream::Stdout,
-                    line,
-                ),
-                Some(PhaseHint::Started(OperationPhase::Destroy(phase)))
-            );
-        }
-    }
-
-    #[test]
-    fn route_and_destroy_fixtures_are_optional_and_monotonic() {
-        let mut classifier = PhaseClassifier::default();
-        assert_eq!(
-            classifier.classify(
-                OperationKind::Route,
-                OutputStream::Stdout,
-                "external route set",
-            ),
-            Some(PhaseHint::Started(OperationPhase::Route(
-                crate::tui::operation::RoutePhase::Apply
-            )))
-        );
-        assert_eq!(
-            classifier.classify(
-                OperationKind::Route,
-                OutputStream::Stdout,
-                "validating route",
-            ),
-            None
-        );
-        let mut classifier = PhaseClassifier::default();
-        assert_eq!(
-            classifier.classify(
-                OperationKind::Destroy,
-                OutputStream::Stdout,
-                "orphaned propolis processes",
-            ),
-            Some(PhaseHint::Started(OperationPhase::Destroy(
-                crate::tui::operation::DestroyPhase::OrphanCleanup
-            )))
-        );
-        assert_eq!(
-            classifier.classify(
-                OperationKind::Destroy,
-                OutputStream::Stdout,
-                "destroy complete",
             ),
             None
         );

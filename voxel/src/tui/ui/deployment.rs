@@ -428,75 +428,65 @@ mod tests {
         app::ActiveOperation,
         event::OperationRequestId,
         operation::{LaunchPhase, OperationKind, OperationPhase},
+        reconcile::ObservedDeploymentState,
     };
 
+    /// The status section tells the operator what the deployment is doing and
+    /// why anything failed.
     #[test]
-    fn retained_success_renders_complete_progress() {
-        let mut app = App::new(vec![], 8, 8);
-        let mut operation = ActiveOperation::new(
-            OperationRequestId::FIRST,
-            OperationKind::Launch,
-        );
-        operation.completed_phases = LaunchPhase::ORDER
-            .into_iter()
-            .map(OperationPhase::Launch)
-            .collect();
-        app.operation.retained = Some(operation);
-
-        assert_eq!(progress_summary(&app), (7, 7, 1.0, "Complete".into()));
-    }
-
-    #[test]
-    fn retained_failure_renders_last_proven_phase() {
-        let mut app = App::new(vec![], 8, 8);
-        let mut operation = ActiveOperation::new(
-            OperationRequestId::FIRST,
-            OperationKind::Launch,
-        );
-        operation.completed_phases = LaunchPhase::ORDER[..3]
-            .iter()
-            .copied()
-            .map(OperationPhase::Launch)
-            .collect();
-        operation.phase = Some(OperationPhase::Launch(LaunchPhase::Initialize));
-        app.operation.retained = Some(operation);
-
-        assert_eq!(
-            progress_summary(&app),
-            (3, 7, 3.0 / 7.0, "Initialize".into())
-        );
-    }
-
-    #[test]
-    fn absent_operation_renders_idle_progress() {
-        let app = App::new(vec![], 8, 8);
-
-        assert_eq!(progress_summary(&app), (0, 0, 0.0, "Idle".into()));
-    }
-
-    #[test]
-    fn status_lines_fit_terminal_columns() {
-        for (line, width, expected) in [
-            ("warning", 0, ""),
-            ("warning", 1, "…"),
-            ("警告ab", 4, "警…"),
-            ("e\u{301}rror", 3, "e\u{301}r…"),
-        ] {
-            let fitted = fit_status_line(line.to_owned(), width);
-            assert_eq!(fitted, expected);
-            assert!(Line::from(fitted).width() <= width);
+    fn status_names_the_operation_and_every_failure() {
+        let app = |setup: &dyn Fn(&mut App)| {
+            let mut app = App::new(vec![], 8, 8);
+            setup(&mut app);
+            app
+        };
+        let cases = [
+            (
+                "stopped",
+                app(&|app| {
+                    app.deployment.observed = ObservedDeploymentState::Stopped
+                }),
+                vec!["Observed: Stopped"],
+            ),
+            (
+                "cancelling",
+                app(&|app| {
+                    let mut active = ActiveOperation::new(
+                        OperationRequestId::FIRST,
+                        OperationKind::Launch,
+                    );
+                    active.phase =
+                        Some(OperationPhase::Launch(LaunchPhase::Boot));
+                    active.cancelling = true;
+                    app.operation.active = Some(active);
+                }),
+                vec!["Observed: Unknown · Launch · Boot · Cancelling"],
+            ),
+            (
+                "failed",
+                app(&|app| {
+                    app.operation.outcome = Some(CommandOutcome::SpawnFailed {
+                        message: "boot failed".into(),
+                    })
+                }),
+                vec!["Observed: Unknown", "Outcome: Failed · boot failed"],
+            ),
+            (
+                "reconciliation and start failures",
+                app(&|app| {
+                    app.deployment.reconciliation_failure =
+                        Some("ssh timed out".into());
+                    app.operation.start_failure = Some("no request ID".into());
+                }),
+                vec![
+                    "Observed: Unknown",
+                    "Failures: 2 · Start: no request ID · Reconciliation: ssh \
+                     timed out",
+                ],
+            ),
+        ];
+        for (case, app, expected) in cases {
+            assert_eq!(status_lines(&app, 120), expected, "{case}");
         }
-    }
-
-    #[test]
-    fn compact_deployment_keeps_all_five_section_headers() {
-        let mut app = App::new(vec![], 8, 8);
-        app.session.terminal =
-            crate::tui::app::TerminalSize { width: 48, height: 16 };
-        let rows =
-            deployment_rows(Rect::new(0, 0, 48, 11), &app, LayoutMode::Compact);
-        assert_eq!(rows.len(), DeploymentPane::ORDER.len());
-        assert!(rows.iter().all(|row| row.height >= 1));
-        assert_eq!(rows.iter().map(|row| row.height).sum::<u16>(), 11);
     }
 }

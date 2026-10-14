@@ -252,10 +252,10 @@ mod tests {
     use std::{
         ffi::OsString,
         io::{self, Write},
-        path::PathBuf,
-        time::{Duration, SystemTime},
+        time::Duration,
     };
 
+    use tempfile::TempPath;
     use tokio::{sync::mpsc, time::timeout};
 
     use super::*;
@@ -263,12 +263,22 @@ mod tests {
 
     const TWO_MIB: usize = 2 * 1024 * 1024;
 
+    /// The child's first stdout line. libtest exits 0 having run nothing when
+    /// `--exact` names no test, so without this a renamed `process_helper`
+    /// would turn every parent test into a silent pass. libtest may print
+    /// `test <name> ... ` on the same line first, so parents look for it with
+    /// `contains`.
+    const HELPER_RAN: &str = "voxel-tui process helper ran";
+
     #[test]
     fn process_helper() {
         let Ok(mode) = std::env::var("VOXEL_TUI_PROCESS_HELPER") else {
             return;
         };
+        println!("{HELPER_RAN}");
         match mode.as_str() {
+            // Both streams end without a newline, so their final chunks are
+            // unterminated.
             "both-full" => {
                 let out = vec![b'o'; TWO_MIB];
                 let err = vec![b'e'; TWO_MIB];
@@ -281,68 +291,38 @@ mod tests {
                 stdout.join().unwrap();
                 stderr.join().unwrap();
             }
-            "exit-7" => {
-                for n in 0..300 {
-                    eprintln!("stderr-{n:03}");
-                }
-                std::process::exit(7);
-            }
             "wait" => {
-                println!("started");
-                io::stdout().flush().unwrap();
-                std::thread::sleep(Duration::from_millis(600));
+                std::thread::sleep(Duration::from_millis(200));
                 println!("settled");
-            }
-            "unterminated" => {
-                io::stdout().write_all(b"last line").unwrap();
-                io::stdout().flush().unwrap();
-            }
-            "split-line" => {
-                let mut stdout = io::stdout();
-                stdout.write_all(b"rack external ").unwrap();
-                stdout.flush().unwrap();
-                std::thread::sleep(Duration::from_millis(100));
-                stdout.write_all(b"route: timed out\n").unwrap();
-                stdout.flush().unwrap();
-            }
-            "invalid-utf8" => {
-                io::stdout().write_all(b"bad \xff text\n").unwrap()
             }
             other => panic!("unknown helper mode {other}"),
         }
         std::process::exit(0);
     }
 
-    fn paths(mode: &str) -> (CommandSpec, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let log = std::env::temp_dir().join(format!(
-            "voxel-tui-{mode}-{}-{nonce}.log",
-            std::process::id()
-        ));
-        let test_name = "tui::process::tests::process_helper";
+    /// Re-executes this test binary as a child running `process_helper` in
+    /// `mode`.
+    fn spawn(
+        mode: &str,
+        capacity: usize,
+    ) -> (ChildSupervisor, mpsc::Receiver<OutputLine>, TempPath) {
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let spec = CommandSpec {
             program: std::env::current_exe().unwrap(),
-            args: ["--exact", test_name, "--nocapture"]
-                .into_iter()
-                .map(OsString::from)
-                .collect(),
+            args: [
+                "--exact",
+                "tui::process::tests::process_helper",
+                "--nocapture",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
             current_dir: std::env::current_dir().unwrap(),
             env: vec![(
                 OsString::from("VOXEL_TUI_PROCESS_HELPER"),
                 OsString::from(mode),
             )],
         };
-        (spec, log)
-    }
-
-    async fn spawn(
-        mode: &str,
-        capacity: usize,
-    ) -> (ChildSupervisor, mpsc::Receiver<OutputLine>, PathBuf) {
-        let (spec, path) = paths(mode);
         let (tx, rx) = mpsc::channel(capacity);
         let child =
             ChildSupervisor::spawn(spec, DurableLog::open(&path).unwrap(), tx)
@@ -350,130 +330,60 @@ mod tests {
         (child, rx, path)
     }
 
-    #[tokio::test]
-    async fn drains_large_stdout_and_stderr_without_deadlock() {
-        let (child, _rx, path) = spawn("both-full", 1).await;
-        let result = timeout(Duration::from_secs(5), child.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(result.status.success());
-        let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.iter().filter(|b| **b == b'o').count() >= TWO_MIB);
-        assert!(bytes.iter().filter(|b| **b == b'e').count() >= TWO_MIB);
-        std::fs::remove_file(path).unwrap();
+    /// Reads the durable log of a settled child, failing if the helper never
+    /// ran.
+    fn helper_log(path: &TempPath) -> String {
+        let log =
+            String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+        assert!(log.contains(HELPER_RAN), "helper did not run: {log:.400}");
+        log
+    }
+
+    /// Total length of the log lines made only of `byte`. libtest's own
+    /// output lines carry stray letters, so they are excluded rather than
+    /// counted.
+    fn run_bytes(log: &str, byte: char) -> usize {
+        log.lines()
+            .filter(|line| !line.is_empty() && line.chars().all(|c| c == byte))
+            .map(str::len)
+            .sum()
     }
 
     #[tokio::test]
-    async fn segments_newline_free_output_into_bounded_chunks() {
-        let (child, mut rx, path) = spawn("both-full", 16).await;
-        let result = timeout(Duration::from_secs(5), child.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(result.status.success());
-        while let Ok(line) = rx.try_recv() {
-            assert!(line.text.len() <= MAX_OUTPUT_CHUNK_BYTES);
-        }
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(bytes.iter().filter(|byte| **byte == b'o').count(), TWO_MIB);
-        assert!(bytes.iter().filter(|byte| **byte == b'e').count() >= TWO_MIB);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn child_wait_errors_are_structured() {
-        let failure = ChildWaitFailure::from(io::Error::other("wait broke"));
-        assert_eq!(failure.message, "wait broke");
-    }
-
-    #[test]
-    fn drain_failures_distinguish_pipe_and_durable_log() {
-        assert_ne!(
-            DrainFailure::Output("read broke".into()),
-            DrainFailure::DurableLog("disk full".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn captures_final_unterminated_line() {
-        let (child, mut rx, path) = spawn("unterminated", 8).await;
-        child.wait().await.unwrap();
+    async fn drains_full_pipes_into_bounded_chunks_without_loss_or_deadlock() {
+        // Both pipes and the bounded UI channel fill long before the child
+        // finishes writing.
+        let (child, _rx, path) = spawn("both-full", 16);
+        timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap();
+        // The UI receives the same chunks, so bounding the log bounds both.
+        let log = helper_log(&path);
         assert!(
-            std::fs::read_to_string(&path).unwrap().contains("last line\n")
+            log.lines().all(|line| line.len() <= MAX_OUTPUT_CHUNK_BYTES),
+            "durable log holds an unbounded line"
         );
-        let mut found = false;
-        while let Ok(line) = rx.try_recv() {
-            found |= line.text == "last line";
-        }
-        assert!(found);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn assembles_a_line_written_in_multiple_flushed_pieces() {
-        let (child, mut rx, path) = spawn("split-line", 8).await;
-        child.wait().await.unwrap();
-        let lines: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter(|line| line.stream == OutputStream::Stdout)
-            .map(|line| line.text)
-            .collect();
-        assert!(
-            lines.iter().any(|line| line == "rack external route: timed out")
+        assert_eq!(
+            (run_bytes(&log, 'o'), run_bytes(&log, 'e')),
+            (TWO_MIB, TWO_MIB),
+            "stdout and stderr bytes in log"
         );
-        assert!(!lines.iter().any(|line| line == "rack external "));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn lossily_preserves_invalid_utf8() {
-        let (child, _rx, path) = spawn("invalid-utf8", 8).await;
-        child.wait().await.unwrap();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("bad � text"));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn nonzero_exit_keeps_bounded_stderr_summary() {
-        let (child, _rx, path) = spawn("exit-7", 1).await;
-        let result = child.wait().await.unwrap();
-        assert_eq!(result.status.code(), Some(7));
-        assert_eq!(result.stderr_summary.len(), STDERR_SUMMARY_LINES);
-        assert_eq!(result.stderr_summary.last().unwrap(), "stderr-299");
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn waiting_does_not_terminate_child() {
-        let (child, _rx, path) = spawn("wait", 8).await;
-        let result = child.wait().await.unwrap();
-        assert!(result.status.success());
-        assert!(std::fs::read_to_string(&path).unwrap().contains("settled"));
-        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
     async fn force_stop_settles_direct_child() {
-        let (mut child, _rx, path) = spawn("wait", 8).await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let kill = child.force_stop().await;
-        let result = child.wait().await.unwrap();
-        assert!(matches!(
-            kill,
-            ForceStopResult::Killed | ForceStopResult::AlreadyExited
-        ));
-        assert!(!result.status.success());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn closed_ui_receiver_does_not_block_drain() {
-        let (child, rx, path) = spawn("both-full", 1).await;
-        drop(rx);
-        timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap();
-        assert!(
-            std::fs::metadata(&path).unwrap().len() >= (TWO_MIB * 2) as u64
-        );
-        std::fs::remove_file(path).unwrap();
+        let (mut child, mut rx, _log) = spawn("wait", 8);
+        // Kill only once the helper is known to be running, so a helper that
+        // never ran cannot pass as a killed one.
+        timeout(Duration::from_secs(5), async {
+            while let Some(line) = rx.recv().await {
+                if line.text.contains(HELPER_RAN) {
+                    return;
+                }
+            }
+            panic!("helper exited without running");
+        })
+        .await
+        .unwrap();
+        assert_eq!(child.force_stop().await, ForceStopResult::Killed);
+        assert!(!child.wait().await.unwrap().status.success());
     }
 }

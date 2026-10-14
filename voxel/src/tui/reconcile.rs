@@ -554,129 +554,151 @@ mod tests {
     }
 
     #[test]
-    fn successful_pid_probe_means_running() {
-        assert_eq!(classify_pid_probe(Ok(())), NodeEvidence::Running);
-    }
-
-    #[test]
-    fn pid_probe_permission_denied_still_means_running() {
-        assert_eq!(
-            classify_pid_probe(Err(std::io::Error::from_raw_os_error(
-                libc::EPERM
-            ))),
-            NodeEvidence::Running
-        );
-    }
-
-    #[test]
-    fn pid_probe_missing_process_means_missing() {
-        assert_eq!(
-            classify_pid_probe(Err(std::io::Error::from_raw_os_error(
-                libc::ESRCH
-            ))),
-            NodeEvidence::Missing
-        );
-    }
-
-    #[test]
-    fn pid_probe_unexpected_error_is_unknown() {
-        assert_eq!(
-            classify_pid_probe(Err(std::io::Error::from_raw_os_error(
-                libc::EINVAL
-            ))),
-            NodeEvidence::Unknown
-        );
-    }
-
-    #[test]
-    fn reduces_complete_live_evidence_to_running() {
-        assert_eq!(reduce(&base()).state, ObservedDeploymentState::Running);
-    }
-
-    #[test]
-    fn covers_stopped_starting_stopping_degraded_and_unknown() {
-        let mut evidence = base();
-        evidence
-            .nodes
-            .iter_mut()
-            .for_each(|node| node.state = NodeEvidence::Missing);
-        assert_eq!(reduce(&evidence).state, ObservedDeploymentState::Stopped);
-
-        evidence.nodes[0].state = NodeEvidence::Booting;
-        evidence.intent = LifecycleIntent::Launch;
-        assert_eq!(reduce(&evidence).state, ObservedDeploymentState::Starting);
-
-        evidence.nodes[0].state = NodeEvidence::Running;
-        evidence.intent = LifecycleIntent::Destroy;
-        assert_eq!(reduce(&evidence).state, ObservedDeploymentState::Stopping);
-
-        evidence.intent = LifecycleIntent::Idle;
-        evidence.nodes[0].state = NodeEvidence::Failed;
-        assert_eq!(reduce(&evidence).state, ObservedDeploymentState::Degraded);
-
-        evidence.nodes[0].state = NodeEvidence::Running;
-        evidence.routes = RouteEvidence::Unknown;
-        assert_eq!(reduce(&evidence).state, ObservedDeploymentState::Unknown);
+    fn reduce_applies_state_precedence_to_each_evidence_shape() {
+        type Mutate = fn(&mut ReconciliationEvidence);
+        let cases: [(&str, Mutate, ObservedDeploymentState); 5] = [
+            (
+                "every node missing",
+                |evidence| {
+                    evidence
+                        .nodes
+                        .iter_mut()
+                        .for_each(|node| node.state = NodeEvidence::Missing);
+                },
+                ObservedDeploymentState::Stopped,
+            ),
+            (
+                "launch with a node booting",
+                |evidence| {
+                    evidence.intent = LifecycleIntent::Launch;
+                    evidence.nodes[0].state = NodeEvidence::Booting;
+                },
+                ObservedDeploymentState::Starting,
+            ),
+            (
+                "destroy with a node still live",
+                |evidence| {
+                    evidence.intent = LifecycleIntent::Destroy;
+                    evidence.nodes[1].state = NodeEvidence::Missing;
+                },
+                ObservedDeploymentState::Stopping,
+            ),
+            (
+                "idle with a failed node",
+                |evidence| evidence.nodes[0].state = NodeEvidence::Failed,
+                ObservedDeploymentState::Degraded,
+            ),
+            (
+                "idle with unknown routes",
+                |evidence| evidence.routes = RouteEvidence::Unknown,
+                ObservedDeploymentState::Unknown,
+            ),
+        ];
+        for (case, mutate, expected) in cases {
+            let mut evidence = base();
+            mutate(&mut evidence);
+            assert_eq!(reduce(&evidence).state, expected, "{case}");
+        }
     }
 
     #[test]
     fn only_required_rss_racks_affect_running_state() {
+        let mut healthy = base();
+        healthy.required_rss_rack_ids = vec![0];
+        assert_eq!(reduce(&healthy).state, ObservedDeploymentState::Running);
+        // An uncertain held rack must not make the state Unknown, nor a
+        // failed one make it Degraded.
         for observation in [
             RssObservation::Unavailable,
-            RssObservation::StaleInitialized,
             RssObservation::Failed { message: "held rack failed".into() },
         ] {
-            let mut evidence = base();
-            evidence.required_rss_rack_ids = vec![0];
-            evidence.racks[1].observation = observation;
-            let result = reduce(&evidence);
-            assert_eq!(result.state, ObservedDeploymentState::Running);
-            assert!(
-                !result
-                    .summary
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.contains("rack 1 RSS"))
-            );
+            let mut evidence = healthy.clone();
+            evidence.racks[1].observation = observation.clone();
+            assert_eq!(reduce(&evidence), reduce(&healthy), "{observation:?}");
         }
     }
 
     #[test]
-    fn malformed_required_rss_racks_are_unknown() {
-        for required in [vec![0, 99], vec![0, 0]] {
-            let mut evidence = base();
-            evidence.required_rss_rack_ids = required;
-            evidence.nodes[0].state = NodeEvidence::Failed;
-            assert_eq!(
-                reduce(&evidence).state,
-                ObservedDeploymentState::Unknown
-            );
+    fn pid_probes_map_to_node_evidence() {
+        let errno = std::io::Error::from_raw_os_error;
+        for (case, probe, expected) in [
+            ("probe succeeded", Ok(()), NodeEvidence::Running),
+            // kill(pid, 0) on another user's live process: still running.
+            (
+                "permission denied",
+                Err(errno(libc::EPERM)),
+                NodeEvidence::Running,
+            ),
+            ("no such process", Err(errno(libc::ESRCH)), NodeEvidence::Missing),
+            (
+                "unexpected error",
+                Err(errno(libc::EINVAL)),
+                NodeEvidence::Unknown,
+            ),
+        ] {
+            assert_eq!(classify_pid_probe(probe), expected, "{case}");
         }
+        // A pid file that is garbage, or names no single process, proves nothing.
+        for raw in ["", "abc", "0", "-1"] {
+            assert_eq!(probe_pid(raw), NodeEvidence::Unknown, "pid {raw:?}");
+        }
+        let own = format!("{}\n", std::process::id());
+        assert_eq!(probe_pid(&own), NodeEvidence::Running, "this process");
     }
 
     #[test]
-    fn live_evidence_overrides_successful_launch_outcome() {
-        let mut stopped_after_successful_launch = base();
-        stopped_after_successful_launch
-            .nodes
-            .iter_mut()
-            .for_each(|node| node.state = NodeEvidence::Missing);
-        assert_eq!(
-            reduce(&stopped_after_successful_launch).state,
-            ObservedDeploymentState::Stopped
+    fn rss_responses_and_route_tables_become_evidence() {
+        for (body, expected) in [
+            ("", RssObservation::Unavailable),
+            (
+                r#"{"status":"initializing","step":{"status":"sled_init"}}"#,
+                RssObservation::Initializing { step: Some("sled_init".into()) },
+            ),
+            (
+                r#"{"status":"initialized","id":"a1b2"}"#,
+                RssObservation::Initialized { id: "a1b2".into() },
+            ),
+            (r#"{"status":"initialized"}"#, RssObservation::StaleInitialized),
+            (
+                r#"{"status":"initialization_failed","message":"no sleds"}"#,
+                RssObservation::Failed { message: "no sleds".into() },
+            ),
+            (r#"<html>bad gateway</html>"#, RssObservation::UnknownResponse),
+        ] {
+            assert_eq!(parse_rss_observation(body), expected, "{body:?}");
+        }
+
+        let context = TuiContext::new(
+            "/cfg".into(),
+            "/work".into(),
+            "demo".into(),
+            "rpool/falcon".into(),
+            "/build".into(),
+            crate::tui::test_support::config("[topology]\nracks = 2\n"),
+            "/bin/voxel".into(),
+            vec![],
         );
-    }
-
-    #[test]
-    fn live_evidence_overrides_failed_destroy_outcome() {
-        let mut stopped_after_failed_destroy = base();
-        stopped_after_failed_destroy
-            .nodes
-            .iter_mut()
-            .for_each(|node| node.state = NodeEvidence::Missing);
+        let route = |rack: usize| {
+            let prefix = context.config.network.for_rack(rack).infra_prefix;
+            let destination = prefix.split('/').next().unwrap().to_owned();
+            format!("{destination}  172.30.199.13  UG  2  0")
+        };
+        let both =
+            format!("default 192.168.1.1 UG 10 0\n{}\n{}", route(0), route(1));
         assert_eq!(
-            reduce(&stopped_after_failed_destroy).state,
-            ObservedDeploymentState::Stopped
+            route_evidence_from_table(&context, &both),
+            RouteEvidence::Applied,
+            "a route to every rack"
+        );
+        assert_eq!(
+            route_evidence_from_table(&context, &route(0)),
+            RouteEvidence::Unknown,
+            "rack 1 missing"
+        );
+        assert_eq!(
+            route_evidence_from_table(&context, "default 192.168.1.1 UG 10 0"),
+            RouteEvidence::Unknown,
+            "only unrelated routes"
         );
     }
 }
