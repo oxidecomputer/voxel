@@ -119,9 +119,5 @@ displays its minimum-size requirement instead of clipping an unsafe layout.
 ## Testing
 
 ```sh
-cargo test -p voxel --features tui tui::app::tests -- --nocapture
-cargo test -p voxel --features tui tui::terminal::tests -- --nocapture
-cargo test -p voxel --features tui tui::ui::confirm_dialog::tests -- --nocapture
-cargo test -p voxel --features tui tui::ui::widgets::tests -- --nocapture
-cargo test -p voxel --features tui tui::effects::tests -- --nocapture
+cargo test -p voxel --features tui tui::
 ```
