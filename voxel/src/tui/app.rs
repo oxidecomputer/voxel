@@ -1771,13 +1771,10 @@ fn command_succeeded(outcome: &CommandOutcome) -> bool {
 }
 
 #[cfg(test)]
-mod factual_outcome_tests {
+mod tests {
     use super::*;
-    use crate::tui::operation::LaunchPhase;
-    use crate::tui::telemetry::{
-        BidirectionalRate, RackId, ResourceDescriptor, ResourceId,
-        ResourceKind, TrafficSample, TrafficSource,
-    };
+    use crate::tui::telemetry::{RackId, TrafficSource};
+    use crate::tui::test_support::{sample, sled};
     use std::os::unix::process::ExitStatusExt;
     use std::time::Duration;
 
@@ -1797,162 +1794,59 @@ mod factual_outcome_tests {
         }
     }
 
-    fn successful_outcome() -> CommandOutcome {
-        CommandOutcome::Exited {
-            status: std::process::ExitStatus::from_raw(0),
-            stderr_summary: vec![],
-        }
-    }
-
-    #[test]
-    fn switching_to_monitoring_selects_first_resource() {
-        let descriptor = ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: "g0".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(vec![descriptor.clone()], 8, 8);
-
-        app.update(AppEvent::Action(Action::ToggleView));
-
-        assert_eq!(app.session.selected_resource, Some(descriptor.id));
-    }
-
-    #[test]
-    fn splash_swallows_the_first_key_and_expires_on_ticks() {
-        let mut app = App::new(vec![], 8, 8);
-        app.splash = Some(crate::tui::ui::splash::Splash::default());
-        app.update(AppEvent::Action(Action::ToggleView));
-        assert!(app.splash.is_none());
-        assert_eq!(app.session.view, View::Deployment);
-
-        let start = Instant::now();
-        app.splash = Some(crate::tui::ui::splash::Splash::default());
-        app.update(AppEvent::Tick { now: start });
-        assert!(app.splash.is_some());
-        app.update(AppEvent::Tick {
-            now: start + crate::tui::ui::splash::DURATION,
-        });
-        assert!(app.splash.is_none());
-    }
-
-    #[test]
-    fn topology_arrows_walk_the_rack_elevation() {
-        let sled = |cubby: u8| ResourceDescriptor {
-            id: ResourceId::rack(
-                RackId(0),
-                ResourceKind::Sled,
-                format!("g{cubby}"),
-            ),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: format!("g{cubby}"),
-            host: None,
-            slot: Some(cubby),
-        };
-        let mut app = App::new(vec![sled(0), sled(1), sled(2)], 8, 8);
-        app.update(AppEvent::Action(Action::ToggleView));
-        assert_eq!(app.session.monitoring_pane, MonitoringPane::Topology);
-        assert_eq!(app.session.selected_resource, Some(sled(0).id));
-
-        // Cubby 2 sits above cubby 0 in the elevation.
+    /// Chooses an open confirmation's affirmative option, which sits just
+    /// above the Back or Cancel option every dialog starts on.
+    fn confirm(app: &mut App) -> Vec<Effect> {
         app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        assert_eq!(app.session.selected_resource, Some(sled(2).id));
-        app.update(AppEvent::Action(Action::Scroll { delta: 1, page: false }));
-        assert_eq!(app.session.selected_resource, Some(sled(0).id));
-        app.update(AppEvent::Action(Action::Right));
-        assert_eq!(app.session.selected_resource, Some(sled(1).id));
-        // There is no sled to the right of cubby 1 or below it.
-        app.update(AppEvent::Action(Action::Right));
-        app.update(AppEvent::Action(Action::Scroll { delta: 1, page: false }));
-        assert_eq!(app.session.selected_resource, Some(sled(1).id));
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        assert_eq!(app.session.selected_resource, Some(sled(2).id));
+        app.update(AppEvent::Action(Action::Activate))
     }
 
-    #[test]
-    fn details_scroll_within_bounds_and_cycle_nodes() {
-        let sled = |cubby: u8| ResourceDescriptor {
-            id: ResourceId::rack(
-                RackId(0),
-                ResourceKind::Sled,
-                format!("g{cubby}"),
-            ),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: format!("g{cubby}"),
-            host: None,
-            slot: Some(cubby),
-        };
-        let mut app = App::new(vec![sled(0), sled(1)], 8, 8);
-        app.update(AppEvent::Resize { width: 120, height: 24 });
-        app.update(AppEvent::Action(Action::ToggleView));
-        app.update(AppEvent::Action(Action::Activate));
-        assert!(app.session.detail_open);
-
-        let (_, limit) = crate::tui::ui::node_detail::scroll_limits(&app);
-        assert!(limit > 0);
-        for _ in 0..4 {
-            app.update(AppEvent::Action(Action::Scroll {
-                delta: 1,
-                page: true,
-            }));
-        }
-        assert_eq!(app.session.detail_scroll, limit);
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        assert_eq!(app.session.detail_scroll, limit - 1);
-
-        app.update(AppEvent::Action(Action::Right));
-        assert_eq!(app.session.selected_resource, Some(sled(1).id));
-        assert_eq!(app.session.detail_scroll, 0);
-        app.update(AppEvent::Action(Action::Close));
-        assert!(!app.session.detail_open);
-        assert_eq!(app.session.selected_resource, Some(sled(1).id));
+    fn finish(
+        app: &mut App,
+        request_id: OperationRequestId,
+        outcome: CommandOutcome,
+    ) -> Vec<Effect> {
+        app.update(AppEvent::Operation {
+            request_id,
+            event: OperationEvent::Finished(outcome),
+        })
     }
 
     #[test]
     fn monitoring_errors_are_logged_once_and_on_recovery() {
         let rack = RackId(0);
-        let mut app = App::new(vec![], 8, 8);
-        let now = Instant::now();
+        let at = Instant::now();
         let unavailable = |message: &str| AppEvent::NexusUnavailable {
             rack,
-            at: now,
+            at,
             message: message.into(),
         };
-        let recorded = |effects: Vec<Effect>| {
-            effects
-                .into_iter()
-                .filter_map(|effect| match effect {
-                    Effect::RecordMonitoring { level, message } => {
-                        Some((level, message))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
+        let mut app = App::new(vec![], 8, 8);
+
+        let recorded = [
+            unavailable("connect refused"),
+            unavailable("connect refused"),
+            unavailable("timed out"),
+            AppEvent::NexusAvailable { rack, at },
+            AppEvent::NexusAvailable { rack, at },
+        ]
+        .into_iter()
+        .flat_map(|event| app.update(event))
+        .filter_map(|effect| match effect {
+            Effect::RecordMonitoring { level, message } => {
+                Some((level, message))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
         assert_eq!(
-            recorded(app.update(unavailable("connect refused"))),
-            [(LogLevel::Warning, "rack 0 Nexus: connect refused".to_owned())]
-        );
-        assert!(
-            recorded(app.update(unavailable("connect refused"))).is_empty()
-        );
-        assert_eq!(
-            recorded(app.update(unavailable("timed out"))),
-            [(LogLevel::Warning, "rack 0 Nexus: timed out".to_owned())]
-        );
-        assert_eq!(
-            recorded(app.update(AppEvent::NexusAvailable { rack, at: now })),
-            [(LogLevel::Info, "rack 0 Nexus: recovered".to_owned())]
-        );
-        assert!(
-            recorded(app.update(AppEvent::NexusAvailable { rack, at: now }))
-                .is_empty()
+            recorded,
+            [
+                (LogLevel::Warning, "rack 0 Nexus: connect refused".to_owned()),
+                (LogLevel::Warning, "rack 0 Nexus: timed out".to_owned()),
+                (LogLevel::Info, "rack 0 Nexus: recovered".to_owned()),
+            ]
         );
         // The Deployment view's log pane carries the same trail.
         assert!(
@@ -1963,250 +1857,52 @@ mod factual_outcome_tests {
     }
 
     #[test]
-    fn toggle_view_moves_between_deployment_and_monitoring() {
-        let mut app = App::new(vec![], 8, 8);
-
-        app.update(AppEvent::Action(Action::ToggleView));
-        assert_eq!(app.session.view, View::Monitor);
-
-        app.update(AppEvent::Action(Action::ToggleView));
-        assert_eq!(app.session.view, View::Deployment);
-    }
-
-    #[test]
-    fn arrows_do_not_move_between_sections_without_nested_content() {
-        let mut app = App::new(vec![], 8, 8);
-        assert_eq!(
-            app.session.deployment_pane,
-            DeploymentPane::OverallProgress
-        );
-
-        app.update(AppEvent::Action(Action::Scroll { delta: 1, page: false }));
-
-        assert_eq!(
-            app.session.deployment_pane,
-            DeploymentPane::OverallProgress
-        );
-    }
-
-    #[test]
-    fn tab_actions_move_between_sections() {
-        let mut app = App::new(vec![], 8, 8);
-
-        app.update(AppEvent::Action(Action::NextSection));
-        assert_eq!(app.session.deployment_pane, DeploymentPane::Phases);
-
-        app.update(AppEvent::Action(Action::PreviousSection));
-        assert_eq!(
-            app.session.deployment_pane,
-            DeploymentPane::OverallProgress
-        );
-    }
-
-    #[test]
-    fn monitoring_x_opens_external_monitoring() {
-        let mut app = App::new(vec![], 8, 8);
-        app.session.view = View::Monitor;
-
-        app.update(AppEvent::Action(Action::RequestCancelAndDestroy));
-
-        assert!(app.session.external_monitoring_open);
-        assert!(app.session.confirmation.is_none());
-    }
-
-    #[test]
-    fn nexus_failure_and_recovery_are_rack_scoped() {
-        let descriptors = (0..2)
-            .map(|rack| ResourceDescriptor {
-                id: ResourceId::rack(
-                    RackId(rack),
-                    ResourceKind::Sled,
-                    format!("g{rack}"),
-                ),
-                rack: Some(RackId(rack)),
-                kind: ResourceKind::Sled,
-                name: format!("g{rack}"),
-                host: None,
-                slot: None,
-            })
-            .collect();
-        let mut app = App::new(descriptors, 8, 8);
-        let started = Instant::now();
-
-        app.update(AppEvent::NexusUnavailable {
-            rack: RackId(0),
-            at: started,
-            message: "Nexus is unavailable".into(),
-        });
-
-        assert_eq!(
-            app.observability.nexus[&RackId(0)]
-                .latest_error
-                .as_ref()
-                .map(|error| error.message.as_str()),
-            Some("Nexus is unavailable")
-        );
-        assert!(app.observability.nexus[&RackId(1)].latest_error.is_none());
-
-        app.update(AppEvent::NexusAvailable {
-            rack: RackId(0),
-            at: started + Duration::from_secs(1),
-        });
-
-        assert!(app.observability.nexus[&RackId(0)].latest_error.is_none());
-        assert!(app.observability.nexus[&RackId(0)].good.is_some());
-    }
-
-    #[test]
     fn oximeter_supersedes_direct_until_its_next_failure() {
-        let id = ResourceId::rack(RackId(0), ResourceKind::Sled, "g0");
-        let descriptor = ResourceDescriptor {
-            id: id.clone(),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: "g0".into(),
-            host: None,
-            slot: None,
-        };
+        let descriptor = sled(0, 0);
+        let id = descriptor.id.clone();
         let mut app = App::new(vec![descriptor], 8, 8);
         let started = Instant::now();
-        let direct = TrafficSample {
-            total: BidirectionalRate {
-                rx_bytes_sec: 10.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        app.update(AppEvent::Traffic {
-            id: id.clone(),
-            at: started,
-            sample: direct,
-        });
-        app.update(AppEvent::Traffic {
-            id: id.clone(),
-            at: started + Duration::from_secs(2),
-            sample: TrafficSample {
-                total: BidirectionalRate {
-                    rx_bytes_sec: 30.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        });
+        let after = |seconds| started + Duration::from_secs(seconds);
+        for (seconds, rx_bytes_sec) in [(0, 10.0), (2, 30.0)] {
+            app.update(AppEvent::Traffic {
+                id: id.clone(),
+                at: after(seconds),
+                sample: sample(rx_bytes_sec, TrafficSource::DirectProbe),
+            });
+        }
         app.update(AppEvent::OximeterTraffic {
             id: id.clone(),
             // The request completed after the newer direct probe, while the
             // Oximeter sample itself retains its source timestamp.
-            at: started + Duration::from_secs(3),
-            samples: vec![(
-                started + Duration::from_secs(1),
-                TrafficSample {
-                    total: BidirectionalRate {
-                        rx_bytes_sec: 20.0,
-                        ..Default::default()
-                    },
-                    source: TrafficSource::Oximeter,
-                    ..Default::default()
-                },
-            )],
+            at: after(3),
+            samples: vec![(after(1), sample(20.0, TrafficSource::Oximeter))],
         });
-
-        let state = &app.observability.telemetry.resources[&id];
-        assert_eq!(state.current_sample.source, TrafficSource::Oximeter);
-        assert_eq!(state.current_rate.rx_bytes_sec, 20.0);
+        let rate = |app: &App| {
+            app.observability.telemetry.resources[&id].current_rate.rx_bytes_sec
+        };
+        assert_eq!(rate(&app), 20.0);
 
         app.update(AppEvent::OximeterTrafficFailed {
             rack: RackId(0),
-            at: started + Duration::from_secs(4),
+            at: after(4),
             message: "Nexus timed out".into(),
         });
 
-        let state = &app.observability.telemetry.resources[&id];
-        assert_eq!(state.current_sample.source, TrafficSource::DirectProbe);
-        assert_eq!(state.current_rate.rx_bytes_sec, 30.0);
+        assert_eq!(rate(&app), 30.0);
         assert!(app.observability.traffic_failures[&id].latest_error.is_none());
-    }
-
-    #[test]
-    fn later_phase_completes_skipped_predecessors() {
-        let mut app = active_app();
-
-        app.update(AppEvent::Operation {
-            request_id: OperationRequestId::FIRST,
-            event: OperationEvent::PhaseStarted {
-                phase: OperationPhase::Launch(LaunchPhase::Initialize),
-            },
-        });
-
-        let operation = app.operation.active.as_ref().unwrap();
-        assert_eq!(
-            operation.completed_phases,
-            vec![
-                OperationPhase::Launch(LaunchPhase::Preflight),
-                OperationPhase::Launch(LaunchPhase::Stage),
-                OperationPhase::Launch(LaunchPhase::Boot),
-            ]
-        );
-        assert_eq!(
-            operation.phase,
-            Some(OperationPhase::Launch(LaunchPhase::Initialize))
-        );
-    }
-
-    #[test]
-    fn successful_operation_retains_complete_phase_history() {
-        let mut app = active_app();
-        app.update(AppEvent::Operation {
-            request_id: OperationRequestId::FIRST,
-            event: OperationEvent::PhaseStarted {
-                phase: OperationPhase::Launch(LaunchPhase::Initialize),
-            },
-        });
-
-        app.update(AppEvent::Operation {
-            request_id: OperationRequestId::FIRST,
-            event: OperationEvent::Finished(successful_outcome()),
-        });
-
-        assert!(app.operation.active.is_none());
-        let operation = app.operation.displayed().unwrap();
-        assert_eq!(
-            operation.completed_phases,
-            crate::tui::ui::deployment::phase_order(OperationKind::Launch)
-        );
-        assert_eq!(operation.phase, None);
-    }
-
-    #[test]
-    fn failed_operation_retains_only_proven_phase_history() {
-        let mut app = active_app();
-        app.update(AppEvent::Operation {
-            request_id: OperationRequestId::FIRST,
-            event: OperationEvent::PhaseStarted {
-                phase: OperationPhase::Launch(LaunchPhase::Initialize),
-            },
-        });
-
-        app.update(AppEvent::Operation {
-            request_id: OperationRequestId::FIRST,
-            event: OperationEvent::Finished(failed_outcome()),
-        });
-
-        let operation = app.operation.displayed().unwrap();
-        assert_eq!(operation.completed_phases.len(), 3);
-        assert_eq!(
-            operation.phase,
-            Some(OperationPhase::Launch(LaunchPhase::Initialize))
-        );
     }
 
     #[test]
     fn new_operation_clears_retained_phase_history() {
         let mut app = active_app();
-        app.update(AppEvent::Operation {
-            request_id: OperationRequestId::FIRST,
-            event: OperationEvent::Finished(successful_outcome()),
-        });
+        finish(
+            &mut app,
+            OperationRequestId::FIRST,
+            CommandOutcome::Exited {
+                status: std::process::ExitStatus::from_raw(0),
+                stderr_summary: vec![],
+            },
+        );
         assert!(app.operation.displayed().is_some());
 
         app.start(OperationKind::Route);
@@ -2215,40 +1911,12 @@ mod factual_outcome_tests {
     }
 
     #[test]
-    fn confirmation_shortcut_confirms_launch() {
-        let mut app = App::new(vec![], 8, 8);
-        app.deployment.observed = ObservedDeploymentState::Stopped;
-        app.open_confirmation(Confirmation::Launch);
-
-        assert_eq!(
-            app.update(AppEvent::Action(Action::CopyReattachCommand)),
-            vec![Effect::Start {
-                request_id: OperationRequestId::FIRST,
-                kind: OperationKind::Launch,
-            }]
-        );
-        assert!(app.session.confirmation.is_none());
-    }
-
-    #[test]
-    fn force_stop_is_separate_and_defaults_to_back() {
-        let options = Confirmation::ForceStop.options(true);
-        assert!(options[0].label.contains("Force stop"));
-        assert_eq!(options[1].action, ConfirmationOptionAction::Reject);
-    }
-
-    #[test]
-    fn direct_cancel_destroy_starts_destroy_only_after_finished_and_stays_open()
-    {
+    fn cancel_and_destroy_waits_for_the_launch_and_keeps_the_tui_open() {
         let mut app = active_app();
 
+        app.update(AppEvent::Action(Action::RequestCancelAndDestroy));
         assert_eq!(
-            app.update(AppEvent::Action(Action::RequestCancelAndDestroy)),
-            vec![]
-        );
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        assert_eq!(
-            app.update(AppEvent::Action(Action::Activate)),
+            confirm(&mut app),
             vec![Effect::Cancel {
                 request_id: OperationRequestId::FIRST,
                 choice: CancelChoice::Destroy,
@@ -2258,138 +1926,83 @@ mod factual_outcome_tests {
             app.update(AppEvent::ReconciliationStarted { at: Instant::now() }),
             vec![]
         );
-        assert!(app.operation.pending.is_none());
 
-        let effects = app.update(AppEvent::Operation {
-            request_id: OperationRequestId::FIRST,
-            event: OperationEvent::Finished(failed_outcome()),
-        });
         let destroy_request = OperationRequestId::FIRST.next().unwrap();
         assert_eq!(
-            effects,
+            finish(&mut app, OperationRequestId::FIRST, failed_outcome()),
             vec![Effect::Start {
                 request_id: destroy_request,
                 kind: OperationKind::Destroy,
             }]
         );
-        assert!(!app.session.quitting);
-        assert_eq!(app.session.exit, None);
-
         app.update(AppEvent::Operation {
             request_id: destroy_request,
             event: OperationEvent::Started { kind: OperationKind::Destroy },
         });
-        assert_eq!(
-            app.update(AppEvent::Operation {
-                request_id: destroy_request,
-                event: OperationEvent::Finished(failed_outcome()),
-            }),
-            vec![]
-        );
-        assert!(!app.session.quitting);
-        assert_eq!(app.session.exit, None);
+        assert_eq!(finish(&mut app, destroy_request, failed_outcome()), vec![]);
+        assert_eq!((app.session.quitting, app.session.exit), (false, None));
+    }
+
+    /// Every dialog that destroys or kills opens on Back, so a stray Enter
+    /// cannot confirm it.
+    #[test]
+    fn destructive_confirmations_open_on_back() {
+        // Once a stop and destroy is in flight, `x` offers to force stop.
+        let mut cancelling = active_app();
+        cancelling.cancel(CancelChoice::Destroy);
+        let cases = [
+            (
+                "quit and destroy",
+                App::new(vec![], 8, 8),
+                Action::RequestQuit,
+                Confirmation::QuitAndDestroy,
+            ),
+            (
+                "cancel and destroy",
+                active_app(),
+                Action::RequestCancelAndDestroy,
+                Confirmation::CancelAndDestroy,
+            ),
+            (
+                "force stop",
+                cancelling,
+                Action::RequestCancelAndDestroy,
+                Confirmation::ForceStop,
+            ),
+        ];
+        for (case, mut app, request, confirmation) in cases {
+            app.session.view = View::Deployment;
+            app.update(AppEvent::Action(request));
+            assert_eq!(app.session.confirmation, Some(confirmation), "{case}");
+
+            let effects = app.update(AppEvent::Action(Action::Activate));
+
+            assert_eq!(
+                (effects, app.session.confirmation, app.session.quitting),
+                (vec![], None, false),
+                "{case}: Enter on the default option"
+            );
+        }
     }
 
     #[test]
-    fn cancellation_intent_only_escalates() {
-        let mut app = active_app();
-        app.cancel(CancelChoice::Leave);
-        assert!(app.can_upgrade_cancel_to_destroy());
-        assert_eq!(
-            app.update(AppEvent::Action(Action::RequestCancelAndDestroy)),
-            vec![]
-        );
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        assert_eq!(
-            app.update(AppEvent::Action(Action::Activate)),
-            vec![Effect::Cancel {
-                request_id: OperationRequestId::FIRST,
-                choice: CancelChoice::Destroy,
-            }]
-        );
-        assert!(!app.can_upgrade_cancel_to_destroy());
-        assert_eq!(
-            app.cancel(CancelChoice::Leave),
-            Effect::Cancel {
-                request_id: OperationRequestId::FIRST,
-                choice: CancelChoice::Destroy,
-            }
-        );
-
-        assert_eq!(
-            app.operation.active.unwrap().cancel_choice,
-            Some(CancelChoice::Destroy)
-        );
-    }
-
-    #[test]
-    fn stop_key_escalates_to_force_stop_once_cancelling() {
-        let mut app = active_app();
-        app.session.view = View::Deployment;
-
-        // First press stops and destroys.
-        app.update(AppEvent::Action(Action::RequestCancelAndDestroy));
-        assert_eq!(
-            app.session.confirmation,
-            Some(Confirmation::CancelAndDestroy)
-        );
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        app.update(AppEvent::Action(Action::Activate));
-
-        // With the stop already in flight, the same key is the only remaining
-        // lever against a child that will not settle.
-        app.update(AppEvent::Action(Action::RequestCancelAndDestroy));
-        assert_eq!(app.session.confirmation, Some(Confirmation::ForceStop));
-    }
-
-    #[test]
-    fn force_stop_can_be_requested_once_while_safe_waiting() {
-        let mut app = active_app();
-        app.cancel(CancelChoice::Leave);
-
-        app.open_confirmation(Confirmation::ForceStop);
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        assert_eq!(
-            app.update(AppEvent::Action(Action::Activate)),
-            vec![Effect::ForceStop { request_id: OperationRequestId::FIRST }]
-        );
-        app.open_confirmation(Confirmation::ForceStop);
-    }
-
-    #[test]
-    fn detach_during_active_launch_defers_and_cancels() {
+    fn detach_during_launch_defers_and_quit_stays_reachable() {
         let mut app = active_app();
         app.reattach_command = Some("pfexec voxel tui".into());
+        app.deployment.observed = ObservedDeploymentState::Running;
 
+        // Detach is deferred because a launch is active, which it cancels.
         app.open_confirmation(Confirmation::Detach);
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
         assert_eq!(
-            app.update(AppEvent::Action(Action::Activate)),
+            confirm(&mut app),
             vec![Effect::Cancel {
                 request_id: OperationRequestId::FIRST,
                 choice: CancelChoice::Leave,
             }]
         );
-        assert!(!app.session.quitting);
         assert_eq!(
-            app.session.post_operation_exit,
-            Some(PostOperationExit::Detach)
-        );
-    }
-
-    #[test]
-    fn quit_is_reachable_while_detach_is_pending() {
-        let mut app = active_app();
-        app.reattach_command = Some("pfexec voxel tui".into());
-        app.deployment.observed = ObservedDeploymentState::Running;
-
-        // Request detach — deferred because a launch is active.
-        app.open_confirmation(Confirmation::Detach);
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
-        app.update(AppEvent::Action(Action::Activate));
-        assert_eq!(
-            app.session.post_operation_exit,
-            Some(PostOperationExit::Detach)
+            (app.session.quitting, app.session.post_operation_exit),
+            (false, Some(PostOperationExit::Detach))
         );
 
         // Quit must still be reachable; it clears the deferred detach.
