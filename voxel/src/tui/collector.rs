@@ -8,1059 +8,6 @@
 //! plane is up, and publishes the samples as [`AppEvent`]s on a bounded
 //! schedule.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio::sync::Notify;
-    use voxel_config::VoxelConfig;
-
-    fn response(generation: u64, command: &str) -> String {
-        if command == KSTAT {
-            format!(
-                "0:link:net0:rbytes64\t{}\n0:link:net0:obytes64\t{}\n0:link:net0:ipackets64\t{}\n0:link:net0:opackets64\t{}\n",
-                100 + generation,
-                200 + generation,
-                10 + generation,
-                20 + generation
-            )
-        } else if command == DLADM {
-            "net0:oxz_nexus_deadbeef0\n".into()
-        } else if command == LINUX_COUNTERS {
-            format!(
-                "eth0 {} {} {} {}\n",
-                100 + generation,
-                200 + generation,
-                10 + generation,
-                20 + generation
-            )
-        } else if command == IPADM {
-            "net0/v4:192.0.2.10/24\nnet0/v6:fd00::10/64\n".into()
-        } else if command == LINUX_ADDRESSES {
-            "1: lo inet 127.0.0.1/8 scope host lo\n2: eth0 inet6 fd00::20/64 scope global\n".into()
-        } else if command == SLED_AGENT_STATE {
-            "online\n".into()
-        } else if command == MAINTENANCE_SERVICES {
-            "svc:/oxide/broken:default\n".into()
-        } else if command == "zoneadm list -cp | cut -d: -f2" {
-            "global\noxz_ntp_deadbeef\n".into()
-        } else if command
-            == "zlogin oxz_ntp_deadbeef chronyc -n tracking 2>/dev/null"
-        {
-            "Stratum : 3\nLeap status : Normal\n".into()
-        } else if command.starts_with("curl -s --max-time 5 ") {
-            r#"{"status":"initializing","step":"sled_init"}"#.into()
-        } else {
-            String::new()
-        }
-    }
-
-    struct FakeExecutor {
-        generation: AtomicU64,
-        calls: std::sync::Mutex<Vec<(NodeTarget, String)>>,
-    }
-
-    impl NodeExecutor for FakeExecutor {
-        fn execute<'a>(
-            &'a self,
-            target: &'a NodeTarget,
-            command: &'a str,
-        ) -> BoxFuture<'a, anyhow::Result<String>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((target.clone(), command.to_owned()));
-            let n = self.generation.load(Ordering::SeqCst);
-            Box::pin(async move { Ok(response(n, command)) })
-        }
-    }
-
-    struct Gate {
-        open: AtomicBool,
-        notify: Notify,
-    }
-
-    impl Gate {
-        fn closed() -> Self {
-            Self { open: AtomicBool::new(false), notify: Notify::new() }
-        }
-
-        async fn wait(&self) {
-            while !self.open.load(Ordering::Acquire) {
-                let notified = self.notify.notified();
-                if self.open.load(Ordering::Acquire) {
-                    break;
-                }
-                notified.await;
-            }
-        }
-
-        fn release(&self) {
-            self.open.store(true, Ordering::Release);
-            self.notify.notify_waiters();
-        }
-    }
-
-    struct ActiveCall<'a> {
-        executor: &'a ControlledExecutor,
-        traffic: bool,
-    }
-
-    impl Drop for ActiveCall<'_> {
-        fn drop(&mut self) {
-            self.executor.active.fetch_sub(1, Ordering::SeqCst);
-            if self.traffic {
-                self.executor.traffic_active.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-    }
-
-    struct ControlledExecutor {
-        calls: std::sync::Mutex<Vec<(NodeTarget, String)>>,
-        active: AtomicUsize,
-        max_active: AtomicUsize,
-        traffic_active: AtomicUsize,
-        overlap: AtomicBool,
-        block_traffic: bool,
-        block_router: bool,
-        gate: Gate,
-    }
-
-    impl ControlledExecutor {
-        fn new(block_traffic: bool, block_router: bool) -> Self {
-            Self {
-                calls: Default::default(),
-                active: AtomicUsize::new(0),
-                max_active: AtomicUsize::new(0),
-                traffic_active: AtomicUsize::new(0),
-                overlap: AtomicBool::new(false),
-                block_traffic,
-                block_router,
-                gate: Gate::closed(),
-            }
-        }
-
-        fn has_command(&self, command: &str) -> bool {
-            self.calls.lock().unwrap().iter().any(|(_, c)| c == command)
-        }
-    }
-
-    impl NodeExecutor for ControlledExecutor {
-        fn execute<'a>(
-            &'a self,
-            target: &'a NodeTarget,
-            command: &'a str,
-        ) -> BoxFuture<'a, anyhow::Result<String>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((target.clone(), command.to_owned()));
-            Box::pin(async move {
-                let traffic = command == KSTAT
-                    || command == DLADM
-                    || command == LINUX_COUNTERS;
-                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-                self.max_active.fetch_max(active, Ordering::SeqCst);
-                if traffic {
-                    self.traffic_active.fetch_add(1, Ordering::SeqCst);
-                } else if self.traffic_active.load(Ordering::SeqCst) > 0 {
-                    self.overlap.store(true, Ordering::SeqCst);
-                }
-                let _active = ActiveCall { executor: self, traffic };
-                let should_block = (self.block_traffic && traffic)
-                    || (self.block_router
-                        && matches!(target, NodeTarget::Router { .. }));
-                if should_block {
-                    self.gate.wait().await;
-                }
-                Ok(response(0, command))
-            })
-        }
-    }
-
-    struct SlowTrafficExecutor {
-        calls: std::sync::Mutex<Vec<(NodeTarget, String)>>,
-    }
-
-    impl SlowTrafficExecutor {
-        fn has_command(&self, command: &str) -> bool {
-            self.calls.lock().unwrap().iter().any(|(_, c)| c == command)
-        }
-
-        fn has_command_starting_with(&self, prefix: &str) -> bool {
-            self.calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, c)| c.starts_with(prefix))
-        }
-    }
-
-    impl NodeExecutor for SlowTrafficExecutor {
-        fn execute<'a>(
-            &'a self,
-            target: &'a NodeTarget,
-            command: &'a str,
-        ) -> BoxFuture<'a, anyhow::Result<String>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((target.clone(), command.to_owned()));
-            Box::pin(async move {
-                if matches!(command, KSTAT | DLADM | LINUX_COUNTERS) {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Ok(response(0, command))
-            })
-        }
-    }
-
-    async fn wait_until(mut condition: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !condition() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("condition was not reached");
-    }
-
-    fn collector_with_targets<E: NodeExecutor>(
-        executor: Arc<E>,
-        resources: Vec<ResourceTarget>,
-        concurrency: usize,
-    ) -> Arc<Collector<E>> {
-        Arc::new(Collector {
-            executor,
-            targets: CollectorTargets { resources, rss: vec![] },
-            baselines: Default::default(),
-            nexus: Default::default(),
-            sled_serials: Default::default(),
-            oximeter_attempts: Default::default(),
-            oximeter_diagnostic_attempts: Default::default(),
-            concurrency,
-        })
-    }
-
-    fn resource_target(name: &str, kind: ResourceKind) -> ResourceTarget {
-        let id = match kind {
-            ResourceKind::Router => ResourceId::fleet(kind, name),
-            _ => ResourceId::rack(RackId(0), kind, name),
-        };
-        ResourceTarget {
-            id,
-            kind,
-            target: match kind {
-                ResourceKind::Sled => NodeTarget::Sled { name: name.into() },
-                ResourceKind::SwitchZone => NodeTarget::SwitchZone {
-                    host: name.into(),
-                    zone: "oxz_switch".into(),
-                },
-                ResourceKind::Router => {
-                    NodeTarget::Router { name: name.into() }
-                }
-            },
-        }
-    }
-
-    #[test]
-    fn discovers_typed_targets_and_one_rss_target_per_rack() {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 2\nsleds = 3\nrouters = [\"ce\", \"cr1\"]\n",
-        )
-        .unwrap();
-        let targets = CollectorTargets::from_config(&config);
-        assert_eq!(targets.resources.len(), 12);
-        assert_eq!(targets.rss.len(), 2);
-        assert_eq!(targets.rss[0].rack, crate::tui::telemetry::RackId(0));
-        assert_eq!(
-            targets.rss[0].target,
-            NodeTarget::Sled { name: "g0".into() }
-        );
-        assert_eq!(
-            targets.rss[1].target,
-            NodeTarget::Sled { name: "g3".into() }
-        );
-        assert!(targets.resources.iter().any(|target| matches!(
-            &target.target,
-            NodeTarget::SwitchZone { host, zone } if host == "g5" && zone == "oxz_switch"
-        )));
-        assert!(targets.resources.iter().any(|target| matches!(
-            &target.target,
-            NodeTarget::Router { name } if name == "ce"
-        )));
-    }
-
-    #[test]
-    fn isolated_node_addresses_are_available_without_serial_discovery() {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 3\nrouters = [\"ce\"]\n\
-             [external]\nmode = \"isolated\"\n",
-        )
-        .unwrap();
-
-        let cache =
-            IpCache::from_config_and_addresses(&config, BTreeMap::new());
-
-        assert_eq!(
-            cache.resolved.get("g0").map(String::as_str),
-            Some("172.30.199.10")
-        );
-        assert_eq!(
-            cache.resolved.get("ce").map(String::as_str),
-            Some("172.30.199.13")
-        );
-        assert!(cache.in_flight.is_empty());
-
-        assert!(
-            IpCache::from_config_and_addresses(
-                &VoxelConfig::default(),
-                BTreeMap::new(),
-            )
-            .resolved
-            .is_empty()
-        );
-        let resumed = IpCache::from_config_and_addresses(
-            &VoxelConfig::default(),
-            [("g0".to_string(), "192.168.1.184".to_string())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(
-            resumed.resolved.get("g0").map(String::as_str),
-            Some("192.168.1.184")
-        );
-        assert!(resumed.address_for_probe("g0", true).is_ok());
-        assert!(
-            IpCache::default()
-                .address_for_probe("g0", true)
-                .unwrap_err()
-                .to_string()
-                .contains("unavailable after resuming")
-        );
-        assert_eq!(
-            IpCache::default().address_for_probe("g0", false).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn oximeter_attempts_are_throttled_from_completion_per_rack() {
-        let start = Instant::now();
-        let mut attempts = BTreeMap::new();
-
-        assert!(oximeter_due(&attempts, RackId(0), start));
-        attempts.insert(RackId(0), start);
-        assert!(!oximeter_due(
-            &attempts,
-            RackId(0),
-            start + OXIMETER_INTERVAL - Duration::from_nanos(1)
-        ));
-        assert!(oximeter_due(&attempts, RackId(0), start + OXIMETER_INTERVAL));
-        assert!(oximeter_due(
-            &attempts,
-            RackId(1),
-            start + Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn scheduler_configuration_rejects_zero_values() {
-        assert!(
-            SchedulerConfig::new(
-                std::time::Duration::ZERO,
-                std::time::Duration::from_secs(1),
-                1,
-            )
-            .is_err()
-        );
-        assert!(
-            SchedulerConfig::new(
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(1),
-                0,
-            )
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn first_sample_is_zero_with_detail_and_all_resource_kinds_emit() {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 1\nrouters = [\"ce\"]\n",
-        )
-        .unwrap();
-        let fake = Arc::new(FakeExecutor {
-            generation: AtomicU64::new(0),
-            calls: Default::default(),
-        });
-        let collector = Collector::new(fake.clone(), &config, 2).unwrap();
-        let (sender, mut receiver) = mpsc::channel(8);
-        assert!(
-            collector.collect_traffic(&sender, &CancellationToken::new()).await
-        );
-        let mut events = Vec::new();
-        while let Ok(event) = receiver.try_recv() {
-            events.push(event);
-        }
-        assert_eq!(events.len(), 3);
-        let mut kinds = std::collections::BTreeSet::new();
-        let mut timestamp = None;
-        for event in events {
-            let AppEvent::Traffic { id, at, sample } = event else {
-                panic!("unexpected failure event")
-            };
-            assert_eq!(sample.total.total_bytes_sec(), 0.0);
-            assert!(sample.links.is_empty());
-            assert_eq!(timestamp.get_or_insert(at), &at);
-            kinds.insert(id.kind);
-        }
-        assert_eq!(kinds.len(), 3);
-        assert!(fake.calls.lock().unwrap().iter().any(
-            |(target, _)| matches!(target, NodeTarget::SwitchZone { host, .. } if host == "g0")
-        ));
-        let calls = fake.calls.lock().unwrap();
-        assert!(calls.iter().any(|(target, command)|
-            matches!(target, NodeTarget::Sled { name } if name == "g0")
-                && command == "kstat -p -c net link:::rbytes64 link:::obytes64 link:::ipackets64 link:::opackets64"));
-        assert!(calls.iter().any(
-            |(target, command)| matches!(target, NodeTarget::Sled { name } if name == "g0")
-                && command == "dladm show-linkprop -c -p zone -o link,value"
-        ));
-        assert!(calls.iter().any(|(target, command)|
-            matches!(target, NodeTarget::SwitchZone { host, zone } if host == "g0" && zone == "oxz_switch")
-                && command == "kstat -p -c net link:::rbytes64 link:::obytes64 link:::ipackets64 link:::opackets64"));
-        assert!(calls.iter().any(
-            |(target, command)| matches!(target, NodeTarget::Router { name } if name == "ce")
-                && command == LINUX_COUNTERS
-        ));
-    }
-
-    #[tokio::test]
-    async fn second_generation_uses_elapsed_time_and_retains_link_and_zone_detail()
-     {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 1\nrouters = []\n",
-        )
-        .unwrap();
-        let fake = Arc::new(FakeExecutor {
-            generation: AtomicU64::new(0),
-            calls: Default::default(),
-        });
-        let collector = Collector::new(fake.clone(), &config, 2).unwrap();
-        let (sender, mut receiver) = mpsc::channel(16);
-        assert!(
-            collector.collect_traffic(&sender, &CancellationToken::new()).await
-        );
-        while receiver.try_recv().is_ok() {}
-        for state in collector.baselines.lock().await.values_mut() {
-            state.baseline.as_mut().unwrap().captured_at -=
-                Duration::from_secs(2);
-        }
-        fake.generation.store(100, Ordering::SeqCst);
-        assert!(
-            collector.collect_traffic(&sender, &CancellationToken::new()).await
-        );
-        let sample = std::iter::from_fn(|| receiver.try_recv().ok())
-            .find_map(|event| match event {
-                AppEvent::Traffic { id, sample, .. }
-                    if id.kind == ResourceKind::Sled =>
-                {
-                    Some(sample)
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert!((90.0..110.0).contains(&sample.total.total_bytes_sec()));
-        assert!(sample.links.contains_key("net0"));
-        assert_eq!(sample.zones[0].name, "oxz_nexus_deadbeef0");
-        assert!(sample.zones[0].rate.total_bytes_sec() > 0.0);
-    }
-
-    #[tokio::test]
-    async fn addresses_sled_health_and_multi_rack_rss_publish_typed_results_in_order()
-     {
-        assert_eq!(
-            SLED_AGENT_STATE,
-            "svcs -H -o state svc:/oxide/sled-agent:default"
-        );
-        assert_eq!(
-            MAINTENANCE_SERVICES,
-            "svcs -H -o state,fmri -a | awk '$1 == \"maintenance\" { print $2 }'"
-        );
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 2\nsleds = 2\nrouters = [\"ce\"]\n",
-        )
-        .unwrap();
-        let fake = Arc::new(FakeExecutor {
-            generation: AtomicU64::new(0),
-            calls: Default::default(),
-        });
-        let collector = Collector::new(fake.clone(), &config, 2).unwrap();
-        let (sender, mut receiver) = mpsc::channel(32);
-        assert!(
-            collector.collect_health(&sender, &CancellationToken::new()).await
-        );
-        let events: Vec<_> =
-            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
-        for kind in
-            [ResourceKind::Sled, ResourceKind::SwitchZone, ResourceKind::Router]
-        {
-            assert!(
-                events
-                    .iter()
-                    .any(|e| matches!(e, AppEvent::Addresses { id, .. } if id.kind == kind))
-            );
-        }
-        assert_eq!(events.iter().filter(|e| matches!(e, AppEvent::Health { diagnostic, .. } if diagnostic.sled_agent == Some(crate::tui::telemetry::ServiceState::Online) && diagnostic.ntp.synchronized == Some(true))).count(), 4);
-        assert_eq!(
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    AppEvent::Health { diagnostic, .. } => Some(diagnostic),
-                    _ => None,
-                })
-                .filter(|diagnostic| {
-                    diagnostic.sled_agent
-                        == Some(crate::tui::telemetry::ServiceState::Online)
-                        && diagnostic.failed_services == ["oxide/broken"]
-                        && diagnostic.ntp.synchronized == Some(true)
-                })
-                .count(),
-            4
-        );
-        assert_eq!(
-            events.iter().filter(|e| matches!(e, AppEvent::Rss { .. })).count(),
-            2
-        );
-        let calls = fake.calls.lock().unwrap();
-        let zone = calls
-            .iter()
-            .position(|(_, c)| c == "zoneadm list -cp | cut -d: -f2")
-            .unwrap();
-        let ntp = calls
-            .iter()
-            .position(|(_, c)| {
-                c == "zlogin oxz_ntp_deadbeef chronyc -n tracking 2>/dev/null"
-            })
-            .unwrap();
-        assert!(zone < ntp);
-        assert!(calls.iter().any(|(_, command)| command == SLED_AGENT_STATE));
-        assert!(
-            calls.iter().any(|(_, command)| command == MAINTENANCE_SERVICES)
-        );
-        assert!(!calls.iter().any(|(_, command)| command == "svcs -xHo fmri"));
-    }
-
-    struct EmptyRouter(FakeExecutor);
-    impl NodeExecutor for EmptyRouter {
-        fn execute<'a>(
-            &'a self,
-            target: &'a NodeTarget,
-            command: &'a str,
-        ) -> BoxFuture<'a, anyhow::Result<String>> {
-            if matches!(target, NodeTarget::Router { .. })
-                && command == LINUX_COUNTERS
-            {
-                Box::pin(async { Ok(String::new()) })
-            } else {
-                self.0.execute(target, command)
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn empty_router_counters_fail_only_router_at_peer_generation_timestamp()
-     {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 1\nrouters = [\"ce\"]\n",
-        )
-        .unwrap();
-        let fake = Arc::new(EmptyRouter(FakeExecutor {
-            generation: AtomicU64::new(0),
-            calls: Default::default(),
-        }));
-        let collector = Collector::new(fake, &config, 3).unwrap();
-        let (sender, mut receiver) = mpsc::channel(8);
-        assert!(
-            collector.collect_traffic(&sender, &CancellationToken::new()).await
-        );
-        let events: Vec<_> =
-            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
-        let times: std::collections::BTreeSet<_> = events
-            .iter()
-            .map(|e| match e {
-                AppEvent::Traffic { at, .. }
-                | AppEvent::TrafficFailed { at, .. } => *at,
-                _ => unreachable!(),
-            })
-            .collect();
-        assert_eq!(times.len(), 1);
-        assert_eq!(events.iter().filter(|e| matches!(e, AppEvent::TrafficFailed { id, .. } if id.kind == ResourceKind::Router)).count(), 1);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, AppEvent::Traffic { .. }))
-                .count(),
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn cancellation_unblocks_bounded_sender_without_post_cancel_event() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender.send(AppEvent::Tick { now: Instant::now() }).await.unwrap();
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn({
-            let sender = sender.clone();
-            let cancel = cancel.clone();
-            async move {
-                Collector::<FakeExecutor>::send(
-                    &sender,
-                    &cancel,
-                    AppEvent::Tick { now: Instant::now() },
-                )
-                .await
-            }
-        });
-        cancel.cancel();
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap()
-        );
-        assert!(matches!(receiver.recv().await, Some(AppEvent::Tick { .. })));
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn receiver_closure_terminates_collection_cleanly() {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 1\nrouters = []\n",
-        )
-        .unwrap();
-        let fake = Arc::new(FakeExecutor {
-            generation: AtomicU64::new(0),
-            calls: Default::default(),
-        });
-        let collector = Collector::new(fake, &config, 1).unwrap();
-        let (sender, receiver) = mpsc::channel(1);
-        drop(receiver);
-        assert!(
-            !tokio::time::timeout(
-                Duration::from_secs(1),
-                collector.collect_traffic(&sender, &CancellationToken::new())
-            )
-            .await
-            .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn blocked_ssh_work_is_dropped_on_cancellation_without_an_event() {
-        let fake = Arc::new(ControlledExecutor::new(true, false));
-        let collector = collector_with_targets(
-            fake.clone(),
-            vec![resource_target("g0", ResourceKind::Sled)],
-            1,
-        );
-        let (sender, mut receiver) = mpsc::channel(1);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn({
-            let collector = collector.clone();
-            let cancel = cancel.clone();
-            async move { collector.collect_traffic(&sender, &cancel).await }
-        });
-        wait_until(|| fake.active.load(Ordering::SeqCst) == 1).await;
-
-        cancel.cancel();
-
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap()
-        );
-        assert_eq!(fake.active.load(Ordering::SeqCst), 0);
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn cancelled_router_call_finishes_its_safe_boundary_before_returning()
-    {
-        let fake = Arc::new(ControlledExecutor::new(false, true));
-        let collector = collector_with_targets(
-            fake.clone(),
-            vec![resource_target("ce", ResourceKind::Router)],
-            1,
-        );
-        let (sender, mut receiver) = mpsc::channel(1);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn({
-            let collector = collector.clone();
-            let cancel = cancel.clone();
-            async move { collector.collect_traffic(&sender, &cancel).await }
-        });
-        wait_until(|| fake.active.load(Ordering::SeqCst) == 1).await;
-
-        cancel.cancel();
-        tokio::task::yield_now().await;
-        assert!(
-            !task.is_finished(),
-            "an in-flight Falcon serial call must reach its timeout/result boundary"
-        );
-        fake.gate.release();
-
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap()
-        );
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn full_sender_cancellation_does_not_drop_an_in_flight_router_call() {
-        let fake = Arc::new(ControlledExecutor::new(false, true));
-        let collector = collector_with_targets(
-            fake.clone(),
-            vec![
-                resource_target("g0", ResourceKind::Sled),
-                resource_target("ce", ResourceKind::Router),
-            ],
-            2,
-        );
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender.send(AppEvent::Tick { now: Instant::now() }).await.unwrap();
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn({
-            let collector = collector.clone();
-            let cancel = cancel.clone();
-            async move { collector.collect_traffic(&sender, &cancel).await }
-        });
-        wait_until(|| {
-            fake.calls.lock().unwrap().iter().any(|(target, command)| {
-                matches!(target, NodeTarget::Router { .. })
-                    && command == LINUX_COUNTERS
-            })
-        })
-        .await;
-
-        cancel.cancel();
-        tokio::task::yield_now().await;
-        assert!(!task.is_finished());
-        fake.gate.release();
-
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap()
-        );
-        assert!(matches!(receiver.recv().await, Some(AppEvent::Tick { .. })));
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn scheduler_uses_its_concurrency_limit_and_never_overlaps_cadences()
-    {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 2\nsleds = 2\nrouters = [\"ce\"]\n",
-        )
-        .unwrap();
-        let fake = Arc::new(ControlledExecutor::new(true, false));
-        // Deliberately differ from SchedulerConfig to prove the scheduler's
-        // configured limit, rather than the direct-collection default, wins.
-        let collector =
-            Arc::new(Collector::new(fake.clone(), &config, 8).unwrap());
-        let schedule = SchedulerConfig::new(
-            Duration::from_secs(3_600),
-            Duration::from_secs(3_600),
-            2,
-        )
-        .unwrap();
-        let (sender, _receiver) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(collector.run_gated(
-            schedule,
-            sender,
-            cancel.clone(),
-            Arc::new(tokio::sync::Semaphore::new(1)),
-        ));
-        wait_until(|| fake.max_active.load(Ordering::SeqCst) >= 2).await;
-
-        assert_eq!(fake.max_active.load(Ordering::SeqCst), 2);
-        assert!(!fake.has_command(IPADM));
-        fake.gate.release();
-        wait_until(|| fake.has_command(IPADM)).await;
-
-        assert!(
-            !fake.overlap.load(Ordering::SeqCst),
-            "health cadence began before the traffic run completed"
-        );
-        assert!(fake.max_active.load(Ordering::SeqCst) <= 2);
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn slow_traffic_does_not_starve_health_cadence() {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 1\nrouters = []\n",
-        )
-        .unwrap();
-        let fake = Arc::new(SlowTrafficExecutor { calls: Default::default() });
-        let collector =
-            Arc::new(Collector::new(fake.clone(), &config, 1).unwrap());
-        let schedule = SchedulerConfig::new(
-            Duration::from_millis(5),
-            Duration::from_millis(15),
-            1,
-        )
-        .unwrap();
-        let (sender, _receiver) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(collector.run_gated(
-            schedule,
-            sender,
-            cancel.clone(),
-            Arc::new(tokio::sync::Semaphore::new(1)),
-        ));
-
-        wait_until(|| {
-            fake.has_command(IPADM)
-                && fake.has_command_starting_with("curl -s --max-time 5 ")
-        })
-        .await;
-
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn stalled_nexus_does_not_block_direct_traffic_cadence() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = reqwest::Url::parse(&format!(
-            "http://{}/",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let server = tokio::spawn(async move {
-            while let Ok((connection, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let _connection = connection;
-                    std::future::pending::<()>().await;
-                });
-            }
-        });
-        let fake = Arc::new(FakeExecutor {
-            generation: AtomicU64::new(0),
-            calls: Default::default(),
-        });
-        let collector = Arc::new(Collector {
-            executor: fake,
-            targets: CollectorTargets {
-                resources: vec![resource_target("g0", ResourceKind::Sled)],
-                rss: vec![],
-            },
-            baselines: Default::default(),
-            nexus: BTreeMap::from([(
-                RackId(0),
-                Arc::new(
-                    NexusClient::new(
-                        vec![endpoint],
-                        None,
-                        RecoveryLogin {
-                            silo: "recovery".into(),
-                            username: "recovery".into(),
-                            password: "oxide".into(),
-                        },
-                        Duration::from_secs(5),
-                    )
-                    .unwrap(),
-                ),
-            )]),
-            sled_serials: Default::default(),
-            oximeter_attempts: Default::default(),
-            oximeter_diagnostic_attempts: Default::default(),
-            concurrency: 1,
-        });
-        let schedule = SchedulerConfig::new(
-            Duration::from_millis(20),
-            Duration::from_secs(3_600),
-            1,
-        )
-        .unwrap();
-        let (sender, mut receiver) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(collector.run_gated(
-            schedule,
-            sender,
-            cancel.clone(),
-            Arc::new(tokio::sync::Semaphore::new(1)),
-        ));
-
-        let direct_samples =
-            tokio::time::timeout(Duration::from_millis(250), async {
-                let mut count = 0;
-                while count < 3 {
-                    if matches!(
-                        receiver.recv().await,
-                        Some(AppEvent::Traffic { .. })
-                    ) {
-                        count += 1;
-                    }
-                }
-                count
-            })
-            .await
-            .expect("direct probes were blocked by the stalled Nexus request");
-
-        assert_eq!(direct_samples, 3);
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn unavailable_nexus_skips_dependent_queries() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = reqwest::Url::parse(&format!(
-            "http://{}/",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let server_requests = requests.clone();
-        let server = tokio::spawn(async move {
-            while let Ok((mut connection, _)) = listener.accept().await {
-                let mut buffer = [0; 4096];
-                let _count = connection.read(&mut buffer).await.unwrap();
-                server_requests.fetch_add(1, Ordering::SeqCst);
-                connection
-                    .write_all(
-                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
-        let collector = Collector {
-            executor: Arc::new(FakeExecutor {
-                generation: AtomicU64::new(0),
-                calls: Default::default(),
-            }),
-            targets: CollectorTargets { resources: vec![], rss: vec![] },
-            baselines: Default::default(),
-            nexus: BTreeMap::from([(
-                RackId(0),
-                Arc::new(
-                    NexusClient::new(
-                        vec![endpoint],
-                        None,
-                        RecoveryLogin {
-                            silo: "recovery".into(),
-                            username: "recovery".into(),
-                            password: "oxide".into(),
-                        },
-                        Duration::from_secs(1),
-                    )
-                    .unwrap(),
-                ),
-            )]),
-            sled_serials: BTreeMap::from([(
-                "serial-0".into(),
-                (RackId(0), "g0".into(), false),
-            )]),
-            oximeter_attempts: Default::default(),
-            oximeter_diagnostic_attempts: Default::default(),
-            concurrency: 1,
-        };
-        let (sender, mut receiver) = mpsc::channel(16);
-
-        assert!(
-            collector
-                .collect_oximeter(&sender, &CancellationToken::new())
-                .await
-        );
-        server.abort();
-        let events: Vec<_> =
-            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
-
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AppEvent::NexusUnavailable { rack: RackId(0), .. }
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AppEvent::OximeterTrafficFailed { rack: RackId(0), .. }
-        )));
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-    }
-
-    struct FailingSecondRackRss(FakeExecutor);
-
-    impl NodeExecutor for FailingSecondRackRss {
-        fn execute<'a>(
-            &'a self,
-            target: &'a NodeTarget,
-            command: &'a str,
-        ) -> BoxFuture<'a, anyhow::Result<String>> {
-            if matches!(target, NodeTarget::Sled { name } if name == "g2")
-                && command.starts_with("curl -s --max-time 5 ")
-            {
-                Box::pin(async { Err(anyhow!("rack 2 unreachable")) })
-            } else {
-                self.0.execute(target, command)
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn one_rss_failure_does_not_suppress_another_racks_observation() {
-        let config = VoxelConfig::from_toml(
-            "[topology]\nracks = 2\nsleds = 2\nrouters = []\n",
-        )
-        .unwrap();
-        let fake = Arc::new(FailingSecondRackRss(FakeExecutor {
-            generation: AtomicU64::new(0),
-            calls: Default::default(),
-        }));
-        let collector = Collector::new(fake, &config, 2).unwrap();
-        let (sender, mut receiver) = mpsc::channel(32);
-
-        assert!(
-            collector.collect_health(&sender, &CancellationToken::new()).await
-        );
-        let events: Vec<_> =
-            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AppEvent::Rss { rack: RackId(0), .. }
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AppEvent::RssFailed {
-                rack: RackId(1),
-                message,
-                ..
-            } if message == "rack 2 unreachable"
-        )));
-    }
-}
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -1524,314 +471,6 @@ fn parse_oximeter_exceptions(
     Ok(exceptions)
 }
 
-#[cfg(test)]
-mod oximeter_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn series(value: Option<i64>) -> serde_json::Value {
-        json!({
-            "fields": {
-                "sled_serial": {"type": "string", "value": "2FAKE000"},
-                "zone_name": {"type": "string", "value": "oxz_nexus_deadbeef0"},
-                "link_name": {"type": "string", "value": "net0"}
-            },
-            "points": {
-                "start_times": ["2026-08-17T00:00:00Z"],
-                "timestamps": ["2026-08-17T00:00:10Z"],
-                "values": [{
-                    "values": {"type": "integer", "values": [value]},
-                    "metric_type": "delta"
-                }]
-            }
-        })
-    }
-
-    fn traffic_result(null_table: Option<&str>) -> OxqlQueryResult {
-        let tables = [
-            "sled_data_link:bytes_received",
-            "sled_data_link:bytes_sent",
-            "sled_data_link:packets_received",
-            "sled_data_link:packets_sent",
-            "sled_data_link:errors_received",
-            "sled_data_link:errors_sent",
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, name)| {
-            json!({
-                "name": name,
-                "timeseries": [series((null_table != Some(name)).then_some((index + 1) as i64))]
-            })
-        })
-        .collect::<Vec<_>>();
-        serde_json::from_value(json!({"tables": tables})).unwrap()
-    }
-
-    #[test]
-    fn traffic_queries_bound_each_response_to_one_sled() {
-        let serials = BTreeMap::from([
-            ("2FAKE000".into(), (RackId(0), "g0".into(), true)),
-            ("2FAKE\"001".into(), (RackId(0), "g1".into(), false)),
-            ("2FAKE002".into(), (RackId(1), "g2".into(), false)),
-        ]);
-
-        let queries = oximeter_traffic_queries(RackId(0), &serials);
-
-        assert_eq!(queries.len(), 12);
-        assert!(queries.iter().any(|query| {
-            query
-                == "get sled_data_link:bytes_received | filter sled_serial == \"2FAKE000\" | last 1"
-        }));
-        assert!(queries.iter().any(|query| {
-            query
-                == "get sled_data_link:errors_sent | filter sled_serial == \"2FAKE\\\"001\" | last 1"
-        }));
-        assert!(queries.iter().all(|query| !query.contains("2FAKE002")));
-    }
-
-    #[test]
-    fn zfs_queries_request_one_metric_each() {
-        for query in [ZFS_ALLOCATED_QUERY, ZFS_TOTAL_QUERY] {
-            assert_eq!(query.matches("get zfs_pool:").count(), 1);
-        }
-    }
-
-    #[test]
-    fn zone_cpu_query_discards_missing_values_before_selecting_latest() {
-        let operators = ZONE_CPU_QUERY
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('|'))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            operators,
-            [
-                "| filter timestamp > @now() - 2m",
-                "| align mean_within(10s)",
-                "| group_by [sled_serial, zone_name, zone_type, state], sum",
-                "| filter datum >= 0.0",
-                "| last 1",
-            ]
-        );
-    }
-
-    #[test]
-    fn traffic_parser_maps_deltas_and_rejects_partial_samples() {
-        let serials = BTreeMap::from([(
-            "2FAKE000".into(),
-            (RackId(0), "g0".into(), true),
-        )]);
-        let parsed = parse_oximeter_traffic(
-            traffic_result(None),
-            RackId(0),
-            &serials,
-            Instant::now(),
-        )
-        .unwrap();
-        let sample = &parsed
-            [&ResourceId::rack(RackId(0), ResourceKind::Sled, "g0")][0]
-            .1;
-        assert_eq!(sample.source, TrafficSource::Oximeter);
-        assert_eq!(sample.total.rx_bytes_sec, 0.1);
-        assert_eq!(sample.errors.tx_sec, 0.6);
-        assert_eq!(sample.zones[0].name, "oxz_nexus_deadbeef0");
-
-        assert!(
-            parse_oximeter_traffic(
-                traffic_result(Some("sled_data_link:bytes_sent")),
-                RackId(0),
-                &serials,
-                Instant::now(),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn traffic_parser_combines_latest_metrics_with_different_timestamps() {
-        let serials = BTreeMap::from([(
-            "2FAKE000".into(),
-            (RackId(0), "g0".into(), true),
-        )]);
-        let mut result = traffic_result(None);
-        for (index, table) in result.tables.iter_mut().enumerate() {
-            table.timeseries[0].points.timestamps[0] =
-                "2026-08-17T00:00:10Z".parse::<DateTime<Utc>>().unwrap()
-                    + chrono::Duration::seconds(index as i64);
-        }
-
-        let parsed =
-            parse_oximeter_traffic(result, RackId(0), &serials, Instant::now())
-                .unwrap();
-
-        assert_eq!(
-            parsed[&ResourceId::rack(RackId(0), ResourceKind::Sled, "g0")]
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn diagnostic_parsers_aggregate_cpu_pair_zfs_and_count_exceptions() {
-        let fields = |extra: serde_json::Value| {
-            let mut fields = serde_json::Map::from_iter([(
-                "sled_serial".into(),
-                json!({"type": "string", "value": "2FAKE000"}),
-            )]);
-            fields.extend(extra.as_object().unwrap().clone());
-            fields
-        };
-        let points =
-            |metric_type: &str, start_times: serde_json::Value, value| {
-                json!({
-                    "start_times": start_times,
-                    "timestamps": ["2026-08-17T00:00:10Z"],
-                    "values": [{
-                        "values": {"type": "integer", "values": [value]},
-                        "metric_type": metric_type
-                    }]
-                })
-            };
-        let serials = BTreeMap::from([(
-            "2FAKE000".into(),
-            (RackId(0), "g0".into(), true),
-        )]);
-        let cpu_tables = ["user", "sys", "waitrq"]
-            .into_iter()
-            .map(|state| {
-                json!({
-                    "fields": fields(json!({
-                        "zone_name": {"type": "string", "value": "oxz_nexus_deadbeef0"},
-                        "zone_type": {"type": "string", "value": "nexus"},
-                        "state": {"type": "string", "value": state}
-                    })),
-                    "points": {
-                        "start_times": [
-                            "2026-08-17T00:00:00Z",
-                            "2026-08-17T00:00:10Z"
-                        ],
-                        "timestamps": [
-                            "2026-08-17T00:00:10Z",
-                            "2026-08-17T00:00:20Z"
-                        ],
-                        "values": [{
-                            "values": {
-                                "type": "integer",
-                                "values": [
-                                    1_000_000_000_i64,
-                                    2_000_000_000_i64
-                                ]
-                            },
-                            "metric_type": "delta"
-                        }]
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let cpu: OxqlQueryResult = serde_json::from_value(json!({
-            "tables": [{"name": "zone:cpu_nsec", "timeseries": cpu_tables}]
-        }))
-        .unwrap();
-        let cpu = parse_zone_cpu(cpu, RackId(0), &serials).unwrap();
-        assert_eq!(cpu[0].user_percent, 20.0);
-        assert_eq!(cpu[0].system_percent, 20.0);
-        assert_eq!(cpu[0].wait_percent, 20.0);
-
-        let zfs_tables = [
-            ("zfs_pool:bytes_allocated", 40_i64),
-            ("zfs_pool:bytes_total", 100_i64),
-        ]
-        .into_iter()
-        .map(|(name, value)| {
-            json!({
-                "name": name,
-                "timeseries": [{
-                    "fields": fields(json!({
-                        "pool_name": {"type": "string", "value": "oxp_test"}
-                    })),
-                    "points": points("gauge", serde_json::Value::Null, value)
-                }]
-            })
-        })
-        .collect::<Vec<_>>();
-        let zfs = parse_zfs_headroom(
-            serde_json::from_value(json!({"tables": zfs_tables})).unwrap(),
-            RackId(0),
-            &serials,
-        )
-        .unwrap();
-        assert_eq!(zfs[0].available_bytes(), 60);
-
-        let exception_tables = [
-            ("oximeter_collector:failed_collections", 2_i64),
-            ("oximeter_collector:database_samples_dropped", 3_i64),
-        ]
-        .into_iter()
-        .map(|(name, value)| json!({
-            "name": name,
-            "timeseries": [{
-                "fields": {
-                    "collector_id": {
-                        "type": "uuid",
-                        "value": "00000000-0000-0000-0000-000000000001"
-                    },
-                    "collector_ip": {"type": "ip_addr", "value": "192.0.2.1"},
-                    "collector_port": {"type": "u16", "value": 12223}
-                },
-                "points": points("delta", json!(["2026-08-17T00:00:00Z"]), value)
-            }]
-        }))
-        .collect::<Vec<_>>();
-        let exceptions = parse_oximeter_exceptions(
-            serde_json::from_value(json!({"tables": exception_tables}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(exceptions.failed_collections, 2);
-        assert_eq!(exceptions.dropped_samples, 3);
-    }
-
-    #[test]
-    fn zone_cpu_parser_accepts_aligned_grouped_values() {
-        let serials = BTreeMap::from([(
-            "2FAKE000".into(),
-            (RackId(0), "g0".into(), true),
-        )]);
-        let timeseries = ["user", "sys", "waitrq"]
-            .into_iter()
-            .map(|state| {
-                json!({
-                    "fields": {
-                        "sled_serial": {"type": "string", "value": "2FAKE000"},
-                        "zone_name": {"type": "string", "value": "oxz_nexus_deadbeef0"},
-                        "zone_type": {"type": "string", "value": "nexus"},
-                        "state": {"type": "string", "value": state}
-                    },
-                    "points": {
-                        "timestamps": ["2026-08-17T00:00:10Z"],
-                        "values": [{
-                            "values": {"type": "double", "values": [2_000_000_000.0]},
-                            "metric_type": "gauge"
-                        }]
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let result = serde_json::from_value(json!({
-            "tables": [{"name": "zone:cpu_nsec", "timeseries": timeseries}]
-        }))
-        .unwrap();
-
-        let cpu = parse_zone_cpu(result, RackId(0), &serials).unwrap();
-
-        assert_eq!(cpu[0].user_percent, 20.0);
-        assert_eq!(cpu[0].system_percent, 20.0);
-        assert_eq!(cpu[0].wait_percent, 20.0);
-    }
-}
-
 fn json_string_field(input: &str, key: &str) -> String {
     let pattern = format!("\"{key}\":\"");
     input
@@ -2241,19 +880,10 @@ pub struct Collector<E> {
     sled_serials: BTreeMap<String, (RackId, String, bool)>,
     oximeter_attempts: Mutex<BTreeMap<RackId, Instant>>,
     oximeter_diagnostic_attempts: Mutex<BTreeMap<RackId, Instant>>,
-    #[cfg(test)]
-    concurrency: usize,
 }
 
 impl<E: NodeExecutor> Collector<E> {
-    pub fn new(
-        executor: Arc<E>,
-        config: &VoxelConfig,
-        concurrency: usize,
-    ) -> anyhow::Result<Self> {
-        if concurrency == 0 {
-            return Err(anyhow!("collector concurrency must be nonzero"));
-        }
+    pub fn new(executor: Arc<E>, config: &VoxelConfig) -> anyhow::Result<Self> {
         let login = RecoveryLogin::from_config(config);
         let nexus = if cfg!(test) {
             BTreeMap::new()
@@ -2292,8 +922,6 @@ impl<E: NodeExecutor> Collector<E> {
             sled_serials,
             oximeter_attempts: Default::default(),
             oximeter_diagnostic_attempts: Default::default(),
-            #[cfg(test)]
-            concurrency,
         })
     }
 
@@ -2333,15 +961,6 @@ impl<E: NodeExecutor> Collector<E> {
             _ = cancel.cancelled() => false,
             result = sender.send(event) => result.is_ok(),
         }
-    }
-
-    #[cfg(test)]
-    async fn collect_traffic(
-        &self,
-        sender: &mpsc::Sender<AppEvent>,
-        cancel: &CancellationToken,
-    ) -> bool {
-        self.collect_traffic_with_limit(sender, cancel, self.concurrency).await
     }
 
     async fn collect_traffic_with_limit(
@@ -2583,15 +1202,6 @@ impl<E: NodeExecutor> Collector<E> {
             zones: state.top_zones(usize::MAX),
             ..Default::default()
         })
-    }
-
-    #[cfg(test)]
-    async fn collect_health(
-        &self,
-        sender: &mpsc::Sender<AppEvent>,
-        cancel: &CancellationToken,
-    ) -> bool {
-        self.collect_health_with_limit(sender, cancel, self.concurrency).await
     }
 
     async fn collect_health_with_limit(
@@ -2894,5 +1504,975 @@ impl<E: NodeExecutor> Collector<E> {
             }
         };
         tokio::join!(probes, oximeter);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::App;
+    use crate::tui::reconcile::ObservedDeploymentState;
+    use crate::tui::telemetry::HealthState;
+    use crate::tui::test_support::{config, recovery};
+    use crate::tui::ui::monitor::resource_health_state;
+    use httptest::matchers::any;
+    use httptest::responders::{delay_and_then, status_code};
+    use httptest::{Expectation, Server};
+    use indoc::indoc;
+    use oxide_client::types::{
+        FieldValue, OxqlTable, Points, Timeseries, ValueArray, Values,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// How long a step may take before it counts as hung. Only a failing
+    /// test waits this long.
+    const HANG: Duration = Duration::from_secs(5);
+
+    const ZONEADM: &str = "zoneadm list -cp | cut -d: -f2";
+    const NTP_TRACKING: &str =
+        "zlogin oxz_ntp_deadbeef chronyc -n tracking 2>/dev/null";
+    const RSS_PROBE: &str = "curl -s --max-time 5 ";
+
+    /// What a healthy node answers; every counter reads `counter`.
+    fn response(counter: u64, command: &str) -> String {
+        match command {
+            KSTAT => format!(
+                "0:link:net0:rbytes64\t{counter}\n0:link:net0:obytes64\t{counter}\n0:link:net0:ipackets64\t{counter}\n0:link:net0:opackets64\t{counter}\n"
+            ),
+            DLADM => "net0:oxz_nexus_deadbeef0\n".into(),
+            LINUX_COUNTERS => {
+                format!("eth0 {counter} {counter} {counter} {counter}\n")
+            }
+            SLED_AGENT_STATE => "online\n".into(),
+            ZONEADM => "global\noxz_ntp_deadbeef\n".into(),
+            NTP_TRACKING => "Stratum : 3\nLeap status : Normal\n".into(),
+            _ if command.starts_with(RSS_PROBE) => {
+                r#"{"status":"initializing","step":"sled_init"}"#.into()
+            }
+            // No addresses, and no service in maintenance.
+            _ => String::new(),
+        }
+    }
+
+    /// What a scripted command does instead of answering with `response`.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        Output(&'static str),
+        Fail(&'static str),
+        Delay(Duration),
+        /// Wait until `FakeExecutor::release` is cancelled.
+        Held,
+    }
+
+    /// The node it applies to (any if `None`), a command prefix, and the reply.
+    type Rule = (Option<&'static str>, &'static str, Reply);
+
+    /// A node executor that answers from `response`, except where a rule
+    /// scripts another reply, and records every command it is given.
+    #[derive(Default)]
+    struct FakeExecutor {
+        rules: Vec<Rule>,
+        generation: AtomicU64,
+        commands: std::sync::Mutex<Vec<String>>,
+        release: CancellationToken,
+    }
+
+    impl FakeExecutor {
+        fn commands(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    fn fake(rules: Vec<Rule>) -> Arc<FakeExecutor> {
+        Arc::new(FakeExecutor { rules, ..Default::default() })
+    }
+
+    impl NodeExecutor for FakeExecutor {
+        fn execute<'a>(
+            &'a self,
+            target: &'a NodeTarget,
+            command: &'a str,
+        ) -> BoxFuture<'a, anyhow::Result<String>> {
+            self.commands.lock().unwrap().push(command.to_owned());
+            let node = match target {
+                NodeTarget::Sled { name } | NodeTarget::Router { name } => name,
+                NodeTarget::SwitchZone { host, .. } => host,
+            };
+            let reply = self
+                .rules
+                .iter()
+                .find(|(on, prefix, _)| {
+                    on.is_none_or(|on| on == node)
+                        && command.starts_with(prefix)
+                })
+                .map(|(_, _, reply)| *reply);
+            Box::pin(async move {
+                match reply {
+                    Some(Reply::Output(output)) => return Ok(output.into()),
+                    Some(Reply::Fail(message)) => return Err(anyhow!(message)),
+                    Some(Reply::Delay(delay)) => {
+                        tokio::time::sleep(delay).await
+                    }
+                    Some(Reply::Held) => self.release.cancelled().await,
+                    None => {}
+                }
+                Ok(response(self.generation.load(Ordering::SeqCst), command))
+            })
+        }
+    }
+
+    /// A Nexus client pointed at a test server.
+    fn nexus(server: &Server, timeout: Duration) -> Arc<NexusClient> {
+        let endpoint = reqwest::Url::parse(&server.url_str("/")).unwrap();
+        Arc::new(
+            NexusClient::new(vec![endpoint], None, recovery(), timeout)
+                .unwrap(),
+        )
+    }
+
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(HANG, async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}: not reached within {HANG:?}"));
+    }
+
+    /// A collector over explicit targets, with no Nexus and no serials.
+    fn collector(
+        executor: Arc<FakeExecutor>,
+        resources: Vec<ResourceTarget>,
+    ) -> Collector<FakeExecutor> {
+        Collector {
+            executor,
+            targets: CollectorTargets { resources, rss: vec![] },
+            baselines: Default::default(),
+            nexus: Default::default(),
+            sled_serials: Default::default(),
+            oximeter_attempts: Default::default(),
+            oximeter_diagnostic_attempts: Default::default(),
+        }
+    }
+
+    /// The fleet's resources become typed probe targets with the right
+    /// address source. A first traffic round reports every resource at the
+    /// round's timestamp; the next turns counter deltas into rates over the
+    /// elapsed time. A router whose counters come back empty fails alone.
+    #[tokio::test]
+    async fn traffic_round_reports_rates_for_every_resource() {
+        let fleet = config(indoc! {r#"
+            [topology]
+            racks = 2
+            sleds = 3
+            routers = ["ce", "cr1"]
+        "#});
+
+        let targets = CollectorTargets::from_config(&fleet);
+        let sled = |name: &str| NodeTarget::Sled { name: name.into() };
+        let switch = |host: &str| NodeTarget::SwitchZone {
+            host: host.into(),
+            zone: "oxz_switch".into(),
+        };
+        let router = |name: &str| NodeTarget::Router { name: name.into() };
+        assert_eq!(
+            targets
+                .rss
+                .iter()
+                .map(|rss| (rss.rack, rss.target.clone()))
+                .collect::<Vec<_>>(),
+            [(RackId(0), sled("g0")), (RackId(1), sled("g3"))]
+        );
+        // Order is not part of the contract, so compare sorted by name.
+        let mut probed: Vec<_> = targets
+            .resources
+            .iter()
+            .map(|resource| resource.target.clone())
+            .collect();
+        probed.sort_by_key(|target| format!("{target:?}"));
+        let mut expected_targets = vec![
+            sled("g0"),
+            switch("g0"),
+            sled("g1"),
+            sled("g2"),
+            switch("g2"),
+            sled("g3"),
+            switch("g3"),
+            sled("g4"),
+            sled("g5"),
+            switch("g5"),
+            router("ce"),
+            router("cr1"),
+        ];
+        expected_targets.sort_by_key(|target| format!("{target:?}"));
+        assert_eq!(probed, expected_targets);
+
+        let isolated = config(indoc! {r#"
+            [topology]
+            racks = 1
+            sleds = 3
+            routers = ["ce"]
+            [external]
+            mode = "isolated"
+        "#});
+        let default = VoxelConfig::default();
+        let addresses = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(host, ip)| ((*host).to_owned(), (*ip).to_owned()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let none = BTreeMap::new;
+        let saved = addresses(&[("g0", "192.168.1.184")]);
+        // (case, config, saved addresses, resumed, addresses the cache
+        // holds, and g0's probe address or the error it gives)
+        let cases = [
+            (
+                "isolated",
+                &isolated,
+                none(),
+                false,
+                addresses(&[
+                    ("g0", "172.30.199.10"),
+                    ("g1", "172.30.199.11"),
+                    ("g2", "172.30.199.12"),
+                    ("ce", "172.30.199.13"),
+                ]),
+                Ok(Some("172.30.199.10".to_owned())),
+            ),
+            ("default", &default, none(), false, none(), Ok(None)),
+            (
+                "resumed",
+                &default,
+                saved.clone(),
+                true,
+                saved,
+                Ok(Some("192.168.1.184".to_owned())),
+            ),
+            (
+                "resumed without a saved address",
+                &default,
+                none(),
+                true,
+                none(),
+                Err("telemetry for g0 is unavailable after resuming without a saved address".to_owned()),
+            ),
+        ];
+        for (case, config, saved, resumed, holds, g0) in cases {
+            let cache = IpCache::from_config_and_addresses(config, saved);
+            let probe = cache
+                .address_for_probe("g0", resumed)
+                .map_err(|error| error.to_string());
+            assert_eq!((cache.resolved, probe), (holds, g0), "{case}");
+        }
+
+        let fake = fake(vec![(Some("cr1"), LINUX_COUNTERS, Reply::Output(""))]);
+        let collector = Collector::new(fake.clone(), &fleet).unwrap();
+        let cr1 = ResourceId::fleet(ResourceKind::Router, "cr1");
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        assert!(
+            collector.collect_traffic_with_limit(&sender, &cancel, 4).await
+        );
+        let mut round1: Vec<_> =
+            std::iter::from_fn(|| receiver.try_recv().ok())
+                .map(|event| match event {
+                    AppEvent::Traffic { id, at, sample } => {
+                        (id, at, Some(sample.total.total_bytes_sec()))
+                    }
+                    AppEvent::TrafficFailed { id, at, .. } => (id, at, None),
+                    other => panic!("unexpected event {other:?}"),
+                })
+                .collect();
+        assert!(
+            round1.iter().all(|(_, at, _)| *at == round1[0].1),
+            "round 1 events do not share the round's timestamp"
+        );
+        round1.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: Vec<_> = targets
+            .resources
+            .iter()
+            .map(|resource| {
+                let id = resource.id.clone();
+                // Without a baseline there is no rate yet.
+                let rate = (id != cr1).then_some(0.0);
+                (id, rate)
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            round1
+                .into_iter()
+                .map(|(id, _, rate)| (id, rate))
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        // Round 2 comes twenty seconds after round 1, with every counter
+        // 1,000 higher; so long an interval keeps the rate whole however
+        // slowly the round runs.
+        for state in collector.baselines.lock().await.values_mut() {
+            state.baseline.as_mut().unwrap().captured_at -=
+                Duration::from_secs(20);
+        }
+        fake.generation.store(1_000, Ordering::SeqCst);
+        assert!(
+            collector.collect_traffic_with_limit(&sender, &cancel, 4).await
+        );
+        let whole = |rate: BidirectionalRate| rate.total_bytes_sec().round();
+        let round2: BTreeMap<_, _> =
+            std::iter::from_fn(|| receiver.try_recv().ok())
+                .filter_map(|event| match event {
+                    AppEvent::Traffic { id, sample, .. } => Some((
+                        id,
+                        (
+                            whole(sample.total),
+                            sample.links.into_keys().collect::<Vec<_>>(),
+                            sample
+                                .zones
+                                .into_iter()
+                                .map(|zone| (zone.name, whole(zone.rate)))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )),
+                    _ => None,
+                })
+                .collect();
+        // 50 bytes a second each way, with a sled's VNIC traffic
+        // attributed to its zone.
+        let expected = targets
+            .resources
+            .iter()
+            .filter(|resource| resource.id != cr1)
+            .map(|resource| {
+                let (links, zones) = match resource.kind {
+                    ResourceKind::Sled => (
+                        vec!["net0".to_owned()],
+                        vec![("oxz_nexus_deadbeef0".to_owned(), 100.0)],
+                    ),
+                    ResourceKind::SwitchZone => (vec!["net0".into()], vec![]),
+                    ResourceKind::Router => (vec!["eth0".into()], vec![]),
+                };
+                (resource.id.clone(), (100.0, links, zones))
+            })
+            .collect();
+        assert_eq!(round2, expected);
+    }
+
+    /// After a traffic round and a health round, every resource and rack has
+    /// been observed and the monitor shows it: rack 0 is healthy, while rack
+    /// 1 has a service in maintenance and an unreachable RSS sled, neither of
+    /// which hides rack 0's observations.
+    #[tokio::test]
+    async fn health_round_reaches_the_operator_for_every_resource_and_rack() {
+        let config = config(indoc! {r#"
+            [topology]
+            racks = 2
+            sleds = 2
+            routers = ["ce"]
+        "#});
+        let broken = Reply::Output("svc:/oxide/broken:default\n");
+        let fake = fake(vec![
+            (Some("g2"), MAINTENANCE_SERVICES, broken),
+            (Some("g3"), MAINTENANCE_SERVICES, broken),
+            (Some("g2"), RSS_PROBE, Reply::Fail("unreachable")),
+        ]);
+        let collector = Collector::new(fake, &config).unwrap();
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        assert!(
+            collector.collect_traffic_with_limit(&sender, &cancel, 2).await
+        );
+        assert!(collector.collect_health_with_limit(&sender, &cancel, 2).await);
+        let events: Vec<_> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+
+        let resources = resource_descriptors(&config);
+        let addressed: BTreeSet<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::Addresses { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            addressed,
+            resources.iter().map(|resource| resource.id.clone()).collect(),
+            "resources whose addresses are published"
+        );
+        let rss: BTreeMap<_, _> = events
+            .iter()
+            .filter_map(|event| match event {
+                AppEvent::Rss { rack, .. } => Some((*rack, None)),
+                AppEvent::RssFailed { rack, message, .. } => {
+                    Some((*rack, Some(message.as_str())))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rss,
+            BTreeMap::from([
+                (RackId(0), None),
+                (RackId(1), Some("unreachable"))
+            ]),
+            "RSS failures by rack"
+        );
+
+        let mut app = App::new(resources.clone(), 8, 8);
+        app.deployment.observed = ObservedDeploymentState::Running;
+        for event in events {
+            app.update(event);
+        }
+        app.update(AppEvent::Tick { now: Instant::now() });
+        let rack1_sleds = [
+            ResourceId::rack(RackId(1), ResourceKind::Sled, "g2"),
+            ResourceId::rack(RackId(1), ResourceKind::Sled, "g3"),
+        ];
+        let shown: Vec<_> = resources
+            .iter()
+            .map(|resource| {
+                (resource.id.clone(), resource_health_state(&app, &resource.id))
+            })
+            .collect();
+        let expected: Vec<_> = resources
+            .iter()
+            .map(|resource| {
+                let state = if rack1_sleds.contains(&resource.id) {
+                    HealthState::Degraded
+                } else {
+                    HealthState::Healthy
+                };
+                (resource.id.clone(), state)
+            })
+            .collect();
+        assert_eq!(shown, expected, "operator view");
+    }
+
+    /// Wherever a round is blocked, cancelling it ends the round promptly
+    /// without publishing anything further, except that a Falcon serial call
+    /// is not safe to drop, so the round waits for it first. A round also
+    /// stops once the UI stops receiving.
+    #[tokio::test]
+    async fn collection_stops_cleanly_when_cancelled_or_the_ui_closes() {
+        let sled = || ResourceTarget {
+            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
+            kind: ResourceKind::Sled,
+            target: NodeTarget::Sled { name: "g0".into() },
+        };
+        let router = || ResourceTarget {
+            id: ResourceId::fleet(ResourceKind::Router, "ce"),
+            kind: ResourceKind::Router,
+            target: NodeTarget::Router { name: "ce".into() },
+        };
+        // (case, resources, the command held until release, and whether the
+        // event channel starts full)
+        let rows = [
+            ("sending into a full event channel", vec![sled()], None, true),
+            ("in-flight SSH probe", vec![sled()], Some(KSTAT), false),
+            (
+                "in-flight router call",
+                vec![router()],
+                Some(LINUX_COUNTERS),
+                false,
+            ),
+            (
+                "in-flight router call with a full event channel",
+                vec![sled(), router()],
+                Some(LINUX_COUNTERS),
+                true,
+            ),
+        ];
+        for (case, resources, held, queued_event) in rows {
+            let fake = fake(
+                held.map(|command| (None, command, Reply::Held))
+                    .into_iter()
+                    .collect(),
+            );
+            let limit = resources.len();
+            let collector = collector(fake.clone(), resources);
+            let (sender, mut receiver) = mpsc::channel(1);
+            if queued_event {
+                sender
+                    .send(AppEvent::Tick { now: Instant::now() })
+                    .await
+                    .unwrap();
+            }
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn({
+                let cancel = cancel.clone();
+                async move {
+                    collector
+                        .collect_traffic_with_limit(&sender, &cancel, limit)
+                        .await
+                }
+            });
+            // Unheld, the round blocks sending the sample its last command
+            // produced.
+            let blocked_on = held.unwrap_or(DLADM);
+            wait_until(case, || {
+                fake.commands().iter().any(|c| c == blocked_on)
+            })
+            .await;
+
+            cancel.cancel();
+            if held == Some(LINUX_COUNTERS) {
+                tokio::task::yield_now().await;
+                assert!(
+                    !task.is_finished(),
+                    "{case}: returned before the router call finished"
+                );
+                fake.release.cancel();
+            }
+
+            assert!(
+                matches!(tokio::time::timeout(HANG, task).await, Ok(Ok(false))),
+                "{case}: the round did not stop and report cancellation"
+            );
+            assert_eq!(
+                std::iter::from_fn(|| receiver.try_recv().ok()).count(),
+                usize::from(queued_event),
+                "{case}: events left in the channel"
+            );
+        }
+
+        let collector = collector(fake(vec![]), vec![sled()]);
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let cancel = CancellationToken::new();
+        let round = collector.collect_traffic_with_limit(&sender, &cancel, 1);
+        assert!(
+            matches!(tokio::time::timeout(HANG, round).await, Ok(false)),
+            "UI closed: the round did not stop"
+        );
+    }
+
+    /// Oximeter is asked at most once per interval per rack, and not at all
+    /// past an unavailable Nexus. The scheduler keeps its concurrency limit
+    /// and never runs the traffic and health cadences at once, yet slow
+    /// probes and a stalled Nexus hold up neither cadence.
+    #[tokio::test]
+    async fn slow_or_failed_sources_do_not_block_the_others() {
+        let start = Instant::now();
+        let asked = BTreeMap::from([(RackId(0), start)]);
+        let almost = start + OXIMETER_INTERVAL - Duration::from_nanos(1);
+        assert_eq!(
+            [
+                oximeter_due(&BTreeMap::new(), RackId(0), start),
+                oximeter_due(&asked, RackId(0), almost),
+                oximeter_due(&asked, RackId(0), start + OXIMETER_INTERVAL),
+                oximeter_due(&asked, RackId(1), start),
+            ],
+            [true, false, true, true],
+            "Oximeter due: never asked, within the interval, after it, \
+             another rack"
+        );
+
+        let config = config(indoc! {r#"
+            [topology]
+            racks = 2
+            sleds = 2
+            routers = ["ce"]
+        "#});
+
+        // Exactly one request: the readiness check, and no query after it.
+        let mut unavailable = Server::run();
+        unavailable.expect(
+            Expectation::matching(any()).respond_with(status_code(503)),
+        );
+        let collector = Collector {
+            nexus: BTreeMap::from([(
+                RackId(0),
+                nexus(&unavailable, Duration::from_secs(1)),
+            )]),
+            ..Collector::new(fake(vec![]), &config).unwrap()
+        };
+        let (sender, mut receiver) = mpsc::channel(16);
+        assert!(
+            collector
+                .collect_oximeter(&sender, &CancellationToken::new())
+                .await
+        );
+        let events: Vec<_> =
+            std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                events[..],
+                [
+                    AppEvent::NexusUnavailable { rack: RackId(0), .. },
+                    AppEvent::OximeterTrafficFailed { rack: RackId(0), .. },
+                ]
+            ),
+            "unavailable Nexus: {events:?}"
+        );
+        unavailable.verify_and_clear();
+
+        let gate = || Arc::new(tokio::sync::Semaphore::new(1));
+
+        let held = fake(vec![
+            (None, KSTAT, Reply::Held),
+            (None, LINUX_COUNTERS, Reply::Held),
+        ]);
+        let collector =
+            Arc::new(Collector::new(held.clone(), &config).unwrap());
+        let hour = Duration::from_secs(3_600);
+        let (sender, _receiver) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        tokio::spawn(collector.run_gated(
+            SchedulerConfig::new(hour, hour, 2).unwrap(),
+            sender,
+            cancel.clone(),
+            gate(),
+        ));
+        wait_until("two traffic probes running", || held.commands().len() >= 2)
+            .await;
+        let commands = held.commands();
+        assert!(
+            commands.len() == 2
+                && commands.iter().all(|c| *c == KSTAT || *c == LINUX_COUNTERS),
+            "probes beyond the limit, or health during traffic: {commands:?}"
+        );
+        cancel.cancel();
+
+        // Traffic probes outlast the traffic interval, so traffic is always
+        // due, and rack 0's Nexus never answers.
+        let stalled = Server::run();
+        stalled.expect(Expectation::matching(any()).times(..).respond_with(
+            delay_and_then(Duration::from_secs(3_600), status_code(200)),
+        ));
+        let slow = Reply::Delay(Duration::from_millis(20));
+        let collector = Arc::new(Collector {
+            // Longer than HANG, so a stall that blocked direct probes would
+            // outlast it.
+            nexus: BTreeMap::from([(
+                RackId(0),
+                nexus(&stalled, Duration::from_secs(60)),
+            )]),
+            ..Collector::new(
+                fake(vec![(None, KSTAT, slow), (None, LINUX_COUNTERS, slow)]),
+                &config,
+            )
+            .unwrap()
+        });
+        let (sender, mut receiver) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(
+            collector.run_gated(
+                SchedulerConfig::new(
+                    Duration::from_millis(5),
+                    Duration::from_millis(15),
+                    2,
+                )
+                .unwrap(),
+                sender,
+                cancel.clone(),
+                gate(),
+            ),
+        );
+        // HANG is shorter than NEXUS_READY_TIMEOUT, so a cadence blocked
+        // behind the stalled readiness check cannot meet it.
+        let mut traffic_rounds = BTreeSet::new();
+        let mut health_round = false;
+        let _ = tokio::time::timeout(HANG, async {
+            while traffic_rounds.len() < 3 || !health_round {
+                match receiver.recv().await {
+                    Some(AppEvent::Traffic { at, .. }) => {
+                        traffic_rounds.insert(at);
+                    }
+                    Some(AppEvent::Rss { .. }) => health_round = true,
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        })
+        .await;
+        assert!(
+            traffic_rounds.len() >= 3,
+            "direct traffic lost its cadence while Nexus stalls"
+        );
+        assert!(health_round, "health starved while traffic is always due");
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(HANG, task).await.is_ok_and(|r| r.is_ok()),
+            "the scheduler did not stop when cancelled"
+        );
+    }
+
+    // OxQL responses are built from the client's generated types, so a change
+    // to the response schema at the pinned omicron rev breaks them at compile
+    // time.
+
+    fn string(value: &str) -> FieldValue {
+        FieldValue::String(value.into())
+    }
+
+    fn points(
+        start_times: Option<&[&str]>,
+        timestamps: &[&str],
+        metric_type: MetricType,
+        values: ValueArray,
+    ) -> Points {
+        let at =
+            |times: &[&str]| times.iter().map(|t| t.parse().unwrap()).collect();
+        Points {
+            start_times: start_times.map(at),
+            timestamps: at(timestamps),
+            values: vec![Values { metric_type, values }],
+        }
+    }
+
+    fn series(fields: &[(&str, FieldValue)], points: Points) -> Timeseries {
+        Timeseries {
+            fields: fields
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+            points,
+        }
+    }
+
+    fn table(name: &str, timeseries: Vec<Timeseries>) -> OxqlTable {
+        OxqlTable { name: name.into(), timeseries }
+    }
+
+    /// One delta per traffic metric for sled 2FAKE000, valued by position,
+    /// each starting at 00:00:00 and ending a second later than the one
+    /// before, from 00:00:10; `null_table` reports a missing sample instead.
+    fn traffic_result(null_table: Option<&str>) -> OxqlQueryResult {
+        let tables = OXIMETER_TRAFFIC_METRICS
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let value =
+                    (null_table != Some(name)).then_some((index + 1) as i64);
+                let end = format!("2026-08-17T00:00:{}Z", 10 + index);
+                table(
+                    name,
+                    vec![series(
+                        &[
+                            ("sled_serial", string("2FAKE000")),
+                            ("zone_name", string("oxz_nexus_deadbeef0")),
+                            ("link_name", string("net0")),
+                        ],
+                        points(
+                            Some(&["2026-08-17T00:00:00Z"]),
+                            &[end.as_str()],
+                            MetricType::Delta,
+                            ValueArray::Integer(vec![value]),
+                        ),
+                    )],
+                )
+            })
+            .collect();
+        OxqlQueryResult { tables }
+    }
+
+    /// Every OxQL query the collector sends, as text, so a query edit shows up
+    /// as a reviewed diff. Regenerate with `EXPECTORATE=overwrite`.
+    #[test]
+    fn oxql_queries_match_their_golden_file() {
+        let serials = BTreeMap::from([
+            ("2FAKE000".into(), (RackId(0), "g0".into(), true)),
+            ("2FAKE001".into(), (RackId(0), "g1".into(), false)),
+        ]);
+        let mut text = String::from(
+            "# traffic, rack 0 with sleds 2FAKE000 and 2FAKE001\n",
+        );
+        for query in oximeter_traffic_queries(RackId(0), &serials) {
+            text.push_str(&query);
+            text.push('\n');
+        }
+        for (label, query) in [
+            ("zone CPU", ZONE_CPU_QUERY),
+            ("ZFS allocated", ZFS_ALLOCATED_QUERY),
+            ("ZFS total", ZFS_TOTAL_QUERY),
+            ("oximeter exceptions", OXIMETER_EXCEPTIONS_QUERY),
+        ] {
+            text.push_str(&format!("\n# {label}\n{query}\n"));
+        }
+        expectorate::assert_contents("tests/output/oxql-queries.txt", &text);
+    }
+
+    /// Traffic queries stay one sled per response, and each kind of Oximeter
+    /// response parses into the samples the monitor shows, rejecting a
+    /// partial one.
+    #[test]
+    fn oximeter_responses_parse_into_samples() {
+        let serials = BTreeMap::from([
+            ("2FAKE000".into(), (RackId(0), "g0".into(), true)),
+            ("2FAKE\"001".into(), (RackId(0), "g1".into(), false)),
+            ("2FAKE002".into(), (RackId(1), "g2".into(), false)),
+        ]);
+        let queries = oximeter_traffic_queries(RackId(0), &serials);
+        let filters: BTreeSet<_> = queries
+            .iter()
+            .filter_map(|query| query.split(" | ").nth(1))
+            .collect();
+        assert_eq!(
+            filters,
+            BTreeSet::from([
+                r#"filter sled_serial == "2FAKE000""#,
+                r#"filter sled_serial == "2FAKE\"001""#,
+            ]),
+            "traffic queries are each filtered to one of rack 0's sleds"
+        );
+
+        let g0 = ResourceId::rack(RackId(0), ResourceKind::Sled, "g0");
+        let zone = "oxz_nexus_deadbeef0";
+        let parse_traffic = |null_table| {
+            parse_oximeter_traffic(
+                traffic_result(null_table),
+                RackId(0),
+                &serials,
+                Instant::now(),
+            )
+        };
+        let samples: Vec<_> = parse_traffic(None)
+            .expect("a complete traffic response parses")
+            .into_iter()
+            .flat_map(|(id, samples)| {
+                samples.into_iter().map(move |(_, sample)| (id.clone(), sample))
+            })
+            .collect();
+        // Each metric's delta is its position over its own interval, and the
+        // metrics' different timestamps still make one sample.
+        let rate = BidirectionalRate {
+            rx_bytes_sec: 1.0 / 10.0,
+            tx_bytes_sec: 2.0 / 11.0,
+            rx_packets_sec: 3.0 / 12.0,
+            tx_packets_sec: 4.0 / 13.0,
+        };
+        let errors =
+            BidirectionalErrors { rx_sec: 5.0 / 14.0, tx_sec: 6.0 / 15.0 };
+        let sample = TrafficSample {
+            total: rate,
+            links: BTreeMap::from([(format!("{zone}/net0"), rate)]),
+            zones: vec![ZoneTraffic {
+                name: zone.into(),
+                short_name: "nexus".into(),
+                rate,
+                errors,
+            }],
+            errors,
+            source: TrafficSource::Oximeter,
+        };
+        assert_eq!(samples, [(g0.clone(), sample)]);
+        assert!(
+            parse_traffic(Some("sled_data_link:bytes_sent")).is_err(),
+            "a null metric must reject the partial sample"
+        );
+
+        // Each shape's latest point is two seconds of CPU in a ten-second
+        // window, so every state reads 20%.
+        let delta_pair = points(
+            Some(&["2026-08-17T00:00:00Z", "2026-08-17T00:00:10Z"]),
+            &["2026-08-17T00:00:10Z", "2026-08-17T00:00:20Z"],
+            MetricType::Delta,
+            ValueArray::Integer(vec![Some(1_000_000_000), Some(2_000_000_000)]),
+        );
+        let aligned_gauge = points(
+            None,
+            &["2026-08-17T00:00:10Z"],
+            MetricType::Gauge,
+            ValueArray::Double(vec![Some(2_000_000_000.0)]),
+        );
+        let cpu = ZoneCpu {
+            id: g0.clone(),
+            name: zone.into(),
+            kind: "nexus".into(),
+            user_percent: 20.0,
+            system_percent: 20.0,
+            wait_percent: 20.0,
+        };
+        for (case, points) in
+            [("delta pair", delta_pair), ("aligned gauge", aligned_gauge)]
+        {
+            let timeseries = ["user", "sys", "waitrq"]
+                .into_iter()
+                .map(|state| {
+                    series(
+                        &[
+                            ("sled_serial", string("2FAKE000")),
+                            ("zone_name", string(zone)),
+                            ("zone_type", string("nexus")),
+                            ("state", string(state)),
+                        ],
+                        points.clone(),
+                    )
+                })
+                .collect();
+            let parsed = parse_zone_cpu(
+                OxqlQueryResult {
+                    tables: vec![table("zone:cpu_nsec", timeseries)],
+                },
+                RackId(0),
+                &serials,
+            )
+            .unwrap_or_else(|error| panic!("zone CPU, {case}: {error:#}"));
+            assert_eq!(parsed, std::slice::from_ref(&cpu), "zone CPU, {case}");
+        }
+
+        let tables =
+            [("zfs_pool:bytes_allocated", 40), ("zfs_pool:bytes_total", 100)]
+                .into_iter()
+                .map(|(name, value)| {
+                    table(
+                        name,
+                        vec![series(
+                            &[
+                                ("sled_serial", string("2FAKE000")),
+                                ("pool_name", string("oxp_test")),
+                            ],
+                            points(
+                                None,
+                                &["2026-08-17T00:00:10Z"],
+                                MetricType::Gauge,
+                                ValueArray::Integer(vec![Some(value)]),
+                            ),
+                        )],
+                    )
+                })
+                .collect();
+        let zfs =
+            parse_zfs_headroom(OxqlQueryResult { tables }, RackId(0), &serials)
+                .expect("ZFS allocated and total gauges parse");
+        assert_eq!(
+            zfs,
+            [ZfsHeadroom {
+                id: g0,
+                pool: "oxp_test".into(),
+                allocated_bytes: 40,
+                total_bytes: 100,
+            }]
+        );
+
+        let tables = [
+            ("oximeter_collector:failed_collections", 2),
+            ("oximeter_collector:database_samples_dropped", 3),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            table(
+                name,
+                vec![series(
+                    &[("collector_port", FieldValue::U16(12223))],
+                    points(
+                        Some(&["2026-08-17T00:00:00Z"]),
+                        &["2026-08-17T00:00:10Z"],
+                        MetricType::Delta,
+                        ValueArray::Integer(vec![Some(value)]),
+                    ),
+                )],
+            )
+        })
+        .collect();
+        assert_eq!(
+            parse_oximeter_exceptions(OxqlQueryResult { tables })
+                .expect("Oximeter exception deltas parse"),
+            OximeterExceptions { failed_collections: 2, dropped_samples: 3 }
+        );
     }
 }

@@ -117,11 +117,8 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         resumed_claim.is_some(),
         Duration::from_secs(10),
     ));
-    let collector = Arc::new(collector::Collector::new(
-        executor.clone(),
-        &context.config,
-        8,
-    )?);
+    let collector =
+        Arc::new(collector::Collector::new(executor.clone(), &context.config)?);
     let schedule = collector::SchedulerConfig::new(
         Duration::from_secs(2),
         Duration::from_secs(10),
