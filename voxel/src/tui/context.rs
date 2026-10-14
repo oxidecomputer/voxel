@@ -89,7 +89,11 @@ impl TuiContext {
         if get("external.mode")?.is_some() {
             return Ok(None);
         }
-        let (text, uplink) = match (get("external.uplink")?, default_link) {
+        // `get` returns the TOML rendering, quotes included, so the link name
+        // comes from the parsed config instead.
+        let configured = VoxelConfig::from_toml(&text)
+            .with_context(|| format!("parse {}", self.config_path))?;
+        let (text, uplink) = match (configured.external.uplink, default_link) {
             (Some(uplink), _) => (text.clone(), uplink),
             (None, Some(link)) => (
                 vcfg::set(&text, "external.uplink", &link)
@@ -158,7 +162,7 @@ impl TuiContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{PublicCommand, TuiContext};
+    use super::{LogLevel, PublicCommand, TuiContext};
     use camino::Utf8PathBuf;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -223,33 +227,35 @@ mod tests {
         }
     }
 
-    fn context_with_config(name: &str, text: Option<&str>) -> TuiContext {
-        let dir = std::env::temp_dir()
-            .join(format!("voxel-tui-external-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = Utf8PathBuf::try_from(dir.join("voxel.toml")).unwrap();
+    /// A context whose config file holds `text`, or is absent for `None`.
+    /// The directory lives as long as the returned guard.
+    fn context_with_config(
+        text: Option<&str>,
+    ) -> (tempfile::TempDir, TuiContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            Utf8PathBuf::try_from(dir.path().join("voxel.toml")).unwrap();
         if let Some(text) = text {
-            std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(&path, text).unwrap();
         }
-        TuiContext { config_path: path, ..context() }
+        (dir, TuiContext { config_path: path, ..context() })
     }
 
     #[test]
     fn unconfigured_external_network_defaults_to_isolated() {
-        let mut context = context_with_config("default", None);
+        let (_dir, mut context) = context_with_config(None);
         let (_, note) = context
             .default_isolated_external(Some("ixgbe0".into()))
             .unwrap()
             .unwrap();
         assert!(note.contains("isolated mode out of ixgbe0"), "{note}");
-        assert!(context.config.external.isolated());
-        assert_eq!(context.config.external.uplink.as_deref(), Some("ixgbe0"));
-        let written = VoxelConfig::from_toml(
-            &std::fs::read_to_string(&context.config_path).unwrap(),
-        )
-        .unwrap();
-        assert!(written.external.isolated());
+        assert_eq!(
+            (
+                context.config.external.isolated(),
+                context.config.external.uplink.as_deref()
+            ),
+            (true, Some("ixgbe0"))
+        );
         // Once written, the mode is explicit and is not revisited.
         assert_eq!(
             context.default_isolated_external(Some("igb0".into())).unwrap(),
@@ -259,28 +265,65 @@ mod tests {
 
     #[test]
     fn explicit_external_choices_are_kept() {
-        let mut lan =
-            context_with_config("lan", Some("[external]\nmode = \"lan\"\n"));
-        assert_eq!(
-            lan.default_isolated_external(Some("ixgbe0".into())).unwrap(),
-            None
-        );
-        assert!(!lan.config.external.isolated());
-
-        let mut uplink = context_with_config(
-            "uplink",
-            Some("[external]\nuplink = \"igb1\"\n"),
-        );
-        uplink.default_isolated_external(Some("ixgbe0".into())).unwrap();
-        assert_eq!(uplink.config.external.uplink.as_deref(), Some("igb1"));
-        assert!(uplink.config.external.isolated());
-
-        let mut no_route = context_with_config("no-route", Some(""));
-        let (level, note) =
-            no_route.default_isolated_external(None).unwrap().unwrap();
-        assert_eq!(level, super::LogLevel::Warning);
-        assert!(note.contains("staying in lan mode"), "{note}");
-        assert!(!no_route.config.external.isolated());
+        // (case, config text, default link, expected log level, a fragment of
+        // the note, expected uplink, isolated after)
+        let cases = [
+            (
+                "explicit lan",
+                "[external]\nmode = \"lan\"\n",
+                Some("ixgbe0"),
+                None,
+                "",
+                None,
+                false,
+            ),
+            // The note names the configured link, not the default route's.
+            (
+                "explicit uplink",
+                "[external]\nuplink = \"igb1\"\n",
+                Some("ixgbe0"),
+                Some(LogLevel::Info),
+                "isolated mode out of igb1;",
+                Some("igb1"),
+                true,
+            ),
+            (
+                "explicit uplink without a default route",
+                "[external]\nuplink = \"vioif3\"\n",
+                None,
+                Some(LogLevel::Info),
+                "isolated mode out of vioif3;",
+                Some("vioif3"),
+                true,
+            ),
+            (
+                "no default route",
+                "",
+                None,
+                Some(LogLevel::Warning),
+                "staying in lan mode",
+                None,
+                false,
+            ),
+        ];
+        for (case, text, link, level, fragment, uplink, isolated) in cases {
+            let (_dir, mut context) = context_with_config(Some(text));
+            let (logged_level, note) = context
+                .default_isolated_external(link.map(String::from))
+                .unwrap()
+                .unzip();
+            assert_eq!(
+                (
+                    logged_level,
+                    context.config.external.uplink.as_deref(),
+                    context.config.external.isolated(),
+                ),
+                (level, uplink, isolated),
+                "{case}: log level, uplink and mode"
+            );
+            let note = note.unwrap_or_default();
+            assert!(note.contains(fragment), "{case}: note {note:?}");
+        }
     }
 
     #[test]
