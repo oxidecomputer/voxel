@@ -55,7 +55,6 @@ pub struct SessionState {
     pub collapsed_deployment: BTreeSet<DeploymentPane>,
     pub collapsed_monitoring: BTreeSet<MonitoringPane>,
     pub phase_scroll: usize,
-    pub subtask_scroll: usize,
     pub top_zones_scroll: usize,
     pub help_scroll: usize,
     pub help_open: bool,
@@ -330,7 +329,6 @@ impl App {
                 collapsed_deployment: BTreeSet::new(),
                 collapsed_monitoring: BTreeSet::new(),
                 phase_scroll: 0,
-                subtask_scroll: 0,
                 top_zones_scroll: 0,
                 help_scroll: 0,
                 help_open: false,
@@ -1111,22 +1109,13 @@ impl App {
                 {
                     match self.session.deployment_pane {
                         DeploymentPane::OverallProgress
-                        | DeploymentPane::Status => {}
+                        | DeploymentPane::Status
+                        | DeploymentPane::CurrentPhase => {}
                         DeploymentPane::Phases => {
                             let amount = crate::tui::ui::deployment::phase_content_height(self)
                                 .max(1) as isize;
                             self.session.phase_scroll =
                                 self.session.phase_scroll.saturating_add_signed(
-                                    delta.saturating_mul(amount),
-                                )
-                        }
-                        DeploymentPane::CurrentPhase => {
-                            let amount = crate::tui::ui::deployment::subtask_content_height(self)
-                                .max(1) as isize;
-                            self.session.subtask_scroll = self
-                                .session
-                                .subtask_scroll
-                                .saturating_add_signed(
                                     delta.saturating_mul(amount),
                                 )
                         }

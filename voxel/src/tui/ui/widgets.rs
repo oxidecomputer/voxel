@@ -394,16 +394,14 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
                 groups.push(group("↑/↓", "item"));
                 groups.push(group("Pg", if narrow { "" } else { "page" }));
             }
-            crate::tui::event::DeploymentPane::CurrentPhase => {
-                groups.push(group("Pg", if narrow { "" } else { "page" }));
-            }
             crate::tui::event::DeploymentPane::Logs => {
                 groups.push(group("f", "filter"));
                 groups.push(group("↑/↓", "log"));
                 groups.push(group("Pg", if narrow { "" } else { "page" }));
             }
             crate::tui::event::DeploymentPane::OverallProgress
-            | crate::tui::event::DeploymentPane::Status => {}
+            | crate::tui::event::DeploymentPane::Status
+            | crate::tui::event::DeploymentPane::CurrentPhase => {}
         }
     }
     groups

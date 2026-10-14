@@ -47,20 +47,10 @@ pub(crate) fn deployment_rows(
     app: &App,
     mode: LayoutMode,
 ) -> Vec<Rect> {
-    let has_subtasks = false;
-    let current_height = match mode {
-        LayoutMode::Wide if has_subtasks => 5,
-        LayoutMode::Wide => 3,
-        LayoutMode::Compact if has_subtasks => 4,
-        LayoutMode::Compact => 3,
-        LayoutMode::Minimum => 1,
-    };
     let preferred = match mode {
-        LayoutMode::Wide => {
-            [3, 5, status_height(app, area.width, mode), current_height, 7]
-        }
+        LayoutMode::Wide => [3, 5, status_height(app, area.width, mode), 3, 7],
         LayoutMode::Compact => {
-            [3, 4, status_height(app, area.width, mode), current_height, 7]
+            [3, 4, status_height(app, area.width, mode), 3, 7]
         }
         LayoutMode::Minimum => [1; 5],
     };
@@ -98,10 +88,6 @@ fn pane_content_height(app: &App, pane: usize) -> usize {
 
 pub(crate) fn phase_content_height(app: &App) -> usize {
     pane_content_height(app, 1)
-}
-
-pub(crate) fn subtask_content_height(app: &App) -> usize {
-    pane_content_height(app, 3)
 }
 
 pub(crate) fn phase_order(kind: OperationKind) -> Vec<OperationPhase> {
@@ -393,29 +379,10 @@ fn draw_subtasks(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(block, area);
         return;
     }
-    let rows: Vec<(Line<'_>, bool)> = Vec::new();
-    let lines = if rows.is_empty() {
-        vec![Line::from("No subtasks yet")]
-    } else {
-        let visible = area.height.saturating_sub(2) as usize;
-        let important = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (_, important))| important.then_some(index))
-            .collect::<Vec<_>>();
-        let start = subtask_window_start(
-            app.session.subtask_scroll,
-            visible,
-            rows.len(),
-            &important,
-        );
-        rows.into_iter()
-            .skip(start)
-            .take(visible)
-            .map(|(line, _)| line)
-            .collect()
-    };
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(
+        Paragraph::new(Line::from("No subtasks yet")).block(block),
+        area,
+    );
 }
 
 pub(crate) fn phase_window_start(
@@ -434,38 +401,6 @@ pub(crate) fn phase_window_start(
         }
     }
     start
-}
-
-pub(crate) fn subtask_window_start(
-    requested: usize,
-    visible: usize,
-    len: usize,
-    important: &[usize],
-) -> usize {
-    let maximum = len.saturating_sub(visible);
-    if visible == 0 || important.is_empty() {
-        return requested.min(maximum);
-    }
-    let first = important[0];
-    let last = *important.last().unwrap_or(&first);
-    if last.saturating_sub(first) < visible {
-        return requested
-            .min(first)
-            .max(last.saturating_add(1).saturating_sub(visible))
-            .min(maximum);
-    }
-    (0..=maximum)
-        .max_by_key(|start| {
-            let end = start.saturating_add(visible);
-            (
-                important
-                    .iter()
-                    .filter(|index| **index >= *start && **index < end)
-                    .count(),
-                std::cmp::Reverse(*start),
-            )
-        })
-        .unwrap_or(0)
 }
 
 fn operation_name(kind: OperationKind) -> &'static str {
@@ -563,17 +498,5 @@ mod tests {
         assert_eq!(rows.len(), DeploymentPane::ORDER.len());
         assert!(rows.iter().all(|row| row.height >= 1));
         assert_eq!(rows.iter().map(|row| row.height).sum::<u16>(), 11);
-    }
-
-    #[test]
-    fn important_window_contains_a_separated_range_when_it_fits() {
-        assert_eq!(subtask_window_start(99, 6, 12, &[3, 8]), 3);
-    }
-
-    #[test]
-    fn important_window_uses_deterministic_dense_coverage_when_range_cannot_fit()
-     {
-        assert_eq!(subtask_window_start(99, 3, 12, &[1, 4, 5, 9]), 3);
-        assert_eq!(subtask_window_start(0, 0, 12, &[1, 4]), 0);
     }
 }
