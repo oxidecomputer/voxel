@@ -8,6 +8,7 @@
 //! way voxel-config's tests build configs through `VoxelConfig::from_toml`.
 //! Fixtures that need a module's private state stay in that module's tests.
 
+use crossterm::event::KeyCode;
 use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer};
 use voxel_config::VoxelConfig;
 
@@ -73,6 +74,44 @@ pub(crate) fn sample(
         source,
         ..Default::default()
     }
+}
+
+/// The keys a footer or help label names, such as `"↑/↓"` or
+/// `"PgUp / PgDn"`. An unknown label panics, so a new label cannot slip past
+/// the checks that every advertised key is bound.
+pub(crate) fn key_codes(label: &str) -> Vec<KeyCode> {
+    label
+        .split('/')
+        .map(str::trim)
+        .flat_map(|token| match token {
+            // Arrows are written alone or run together, as in "↑↓←→".
+            _ if !token.is_empty()
+                && token.chars().all(|c| "↑↓←→".contains(c)) =>
+            {
+                token
+                    .chars()
+                    .map(|arrow| match arrow {
+                        '↑' => KeyCode::Up,
+                        '↓' => KeyCode::Down,
+                        '←' => KeyCode::Left,
+                        _ => KeyCode::Right,
+                    })
+                    .collect()
+            }
+            "Tab" => vec![KeyCode::Tab],
+            "S-Tab" | "Shift-Tab" | "⇧" => vec![KeyCode::BackTab],
+            "Enter" => vec![KeyCode::Enter],
+            "Esc" => vec![KeyCode::Esc],
+            "Space" => vec![KeyCode::Char(' ')],
+            "Pg" => vec![KeyCode::PageUp, KeyCode::PageDown],
+            "PgUp" => vec![KeyCode::PageUp],
+            "PgDn" => vec![KeyCode::PageDown],
+            _ => match token.chars().collect::<Vec<_>>()[..] {
+                [key] => vec![KeyCode::Char(key)],
+                _ => panic!("unknown key {token:?} in label {label:?}"),
+            },
+        })
+        .collect()
 }
 
 /// Draw one frame into an in-memory terminal of the given size.

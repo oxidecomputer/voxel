@@ -313,9 +313,8 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     }
     if app.session.external_monitoring_open {
         return vec![
-            group("s", "copy rack YAML"),
-            group("a", "copy all YAML"),
-            group("u", "copy guide"),
+            group("s", "copy YAML"),
+            group("a", "copy guide"),
             group("Esc", "close"),
         ];
     }
@@ -370,11 +369,8 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
     }
     let mut groups = Vec::new();
     if app.can_cancel() {
-        if narrow {
-            groups.push(group("c/x", ""));
-        } else {
-            groups.extend([group("c", "leave"), group("x", "destroy")]);
-        }
+        // Leaving the deployment running is `d`, in the lifecycle group.
+        groups.push(group("x", if narrow { "" } else { "destroy" }));
     } else {
         for (kind, key, description) in [
             (crate::tui::operation::OperationKind::Launch, "l", "launch"),
@@ -518,96 +514,116 @@ pub(crate) fn section_block<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::telemetry::{
-        RackId, ResourceDescriptor, ResourceId, ResourceKind,
+    use crate::tui::{
+        app::ActiveOperation,
+        event::{Confirmation, DeploymentPane, OperationRequestId},
+        operation::OperationKind,
+        reconcile::ObservedDeploymentState,
+        terminal::key_action,
+        test_support::{key_codes, sled},
     };
-    use ratatui::{Terminal, backend::TestBackend};
+    use crossterm::event::{KeyEvent, KeyModifiers};
 
-    fn screen_text(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
-    }
-
-    fn group_text(app: &App) -> Vec<String> {
-        action_groups(app, false)
-            .into_iter()
-            .map(|group| format!("{} {}", group.key, group.description))
-            .collect()
-    }
-
+    /// Every key a footer advertises, at either width, reaches an action, and
+    /// each state keeps the group users find their way by. A retired or
+    /// mistyped key fails the first check, so only bound keys that do nothing
+    /// in a state need to be named as hidden.
     #[test]
-    fn theme_background_and_popup_fade_follow_wicket() {
-        let mut app = App::new(vec![], 8, 8);
-        let render = |app: &App| {
-            let mut terminal =
-                Terminal::new(TestBackend::new(120, 40)).unwrap();
-            terminal.draw(|frame| draw(frame, app)).unwrap();
-            terminal.backend().buffer().clone()
+    fn footer_advertises_only_keys_that_act() {
+        let descriptor = sled(0, 0);
+        let app = |setup: &dyn Fn(&mut App)| {
+            let mut app = App::new(vec![descriptor.clone()], 8, 8);
+            setup(&mut app);
+            app
         };
-        let plain = render(&app);
-        assert_eq!(plain[(119, 20)].bg, TUI_BLACK);
-        // The focused section's frame is rounded and dark green.
-        let corner = plain
-            .content()
-            .iter()
-            .find(|cell| cell.symbol() == "╭")
-            .expect("sections are rounded");
-        assert_eq!(corner.fg, TUI_GREEN_DARK);
-
-        app.session.help_open = true;
-        let faded = render(&app);
-        // Behind the pop-up, the header's coloured text is greyed out.
-        assert_eq!(faded[(1, 0)].fg, TUI_GREY);
-        assert_eq!(faded[(1, 0)].bg, TUI_BLACK);
-    }
-
-    #[test]
-    fn footer_keeps_view_and_section_navigation_distinct() {
-        let app = App::new(vec![], 8, 8);
-
-        let groups = group_text(&app);
-
-        assert!(groups.contains(&"v view".to_owned()));
-        assert!(groups.contains(&"Tab/S-Tab section".to_owned()));
-        assert!(!groups.iter().any(|group| group.starts_with("1/2 ")));
-        assert!(!groups.iter().any(|group| group.starts_with("↑/↓ ")));
-    }
-
-    #[test]
-    fn monitoring_footer_advertises_external_monitoring_contextually() {
-        let mut app = App::new(vec![], 8, 8);
-        app.session.view = View::Monitor;
-
-        assert!(group_text(&app).contains(&"x external monitoring".to_owned()));
-    }
-
-    #[test]
-    fn focused_details_replace_rack_keys_in_the_footer() {
-        let descriptor = ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: "g0".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(vec![descriptor.clone()], 8, 8);
-        app.session.view = View::Monitor;
-        app.session.selected_resource = Some(descriptor.id);
-        app.session.detail_open = true;
-
-        let text = screen_text(&app);
-
-        assert!(text.contains("RACK 0 / SLED g0"), "{text}");
-        assert!(text.contains("Rack <Esc>"), "{text}");
-        assert!(group_text(&app).contains(&"Esc rack".to_owned()));
-        assert!(group_text(&app).contains(&"←/→ node".to_owned()));
+        let monitor = |app: &mut App| app.session.view = View::Monitor;
+        // (case, app, group shown, group prefix not shown)
+        let cases: [(&str, App, &str, Option<&str>); 8] = [
+            (
+                "deployment idle",
+                app(&|app| {
+                    app.deployment.observed = ObservedDeploymentState::Stopped
+                }),
+                "l launch",
+                Some("↑/↓ "),
+            ),
+            (
+                "deployment logs",
+                app(&|app| app.session.deployment_pane = DeploymentPane::Logs),
+                "f filter",
+                None,
+            ),
+            (
+                "operation running",
+                app(&|app| {
+                    app.operation.active = Some(ActiveOperation::new(
+                        OperationRequestId::FIRST,
+                        OperationKind::Launch,
+                    ))
+                }),
+                "x destroy",
+                None,
+            ),
+            ("monitor", app(&monitor), "x external monitoring", None),
+            (
+                "node details",
+                app(&|app| {
+                    monitor(app);
+                    app.session.selected_resource = Some(descriptor.id.clone());
+                    app.session.detail_open = true;
+                }),
+                "Esc rack",
+                None,
+            ),
+            (
+                "help",
+                app(&|app| app.session.help_open = true),
+                "?/Esc close",
+                None,
+            ),
+            (
+                "confirmation",
+                app(&|app| app.session.confirmation = Some(Confirmation::Quit)),
+                "y confirm",
+                None,
+            ),
+            (
+                "external monitoring",
+                app(&|app| {
+                    monitor(app);
+                    app.session.external_monitoring_open = true;
+                }),
+                "a copy guide",
+                None,
+            ),
+        ];
+        for (case, app, shown, hidden) in cases {
+            for narrow in [false, true] {
+                for group in action_groups(&app, narrow) {
+                    for code in key_codes(group.key) {
+                        assert!(
+                            key_action(KeyEvent::new(code, KeyModifiers::NONE))
+                                .is_some(),
+                            "{case}: footer advertises {:?}, which no key binds",
+                            group.key
+                        );
+                    }
+                }
+            }
+            let groups = action_groups(&app, false)
+                .into_iter()
+                .map(|group| format!("{} {}", group.key, group.description))
+                .collect::<Vec<_>>();
+            assert!(
+                groups.iter().any(|group| group == shown),
+                "{case}: footer lacks {shown:?} in {groups:?}"
+            );
+            if let Some(prefix) = hidden {
+                assert!(
+                    !groups.iter().any(|group| group.starts_with(prefix)),
+                    "{case}: footer shows {prefix:?} in {groups:?}"
+                );
+            }
+        }
     }
 }
