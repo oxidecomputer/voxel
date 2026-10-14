@@ -692,4 +692,68 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
     }
+
+    /// A panic on any thread restores the terminal, and the renderer cannot
+    /// draw afterwards: a later frame would land on top of the panic message.
+    #[test]
+    fn panic_restores_the_terminal_and_drops_later_frames() {
+        // A plain file stands in for the TTY so the test can read back exactly
+        // which bytes reached it. The pid and timestamp keep concurrent and
+        // repeated runs from sharing files.
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tty_path =
+            std::env::temp_dir().join(format!("voxel-tui-panic-tty-{unique}"));
+        let log_path =
+            std::env::temp_dir().join(format!("voxel-tui-panic-log-{unique}"));
+        let tty = std::fs::File::create(&tty_path).unwrap();
+        let released = Released::default();
+        let mut renderer = PanicGate {
+            tty: tty.try_clone().unwrap(),
+            released: released.clone(),
+        };
+        let shutdown = CancellationToken::new();
+        let original_hook = install_panic_hook(
+            tty,
+            released,
+            shutdown.clone(),
+            DurableLog::open(&log_path).unwrap(),
+        );
+
+        renderer.write_all(b"frame before").unwrap();
+        let panic_result =
+            std::thread::spawn(|| panic!("collector task failed")).join();
+        renderer.write_all(b"frame after").unwrap();
+        renderer.flush().unwrap();
+
+        // Reinstall the original hook before asserting, so a failing assertion
+        // below doesn't run through the hook under test.
+        panic::set_hook(Box::new(move |info| original_hook(info)));
+
+        assert!(panic_result.is_err(), "the spawned thread should panic");
+
+        // The TTY holds the frame from before the panic, then the restore
+        // sequence, and nothing written after it.
+        let mut expected_tty = b"frame before".to_vec();
+        execute!(expected_tty, Show, LeaveAlternateScreen).unwrap();
+        assert_eq!(std::fs::read(&tty_path).unwrap(), expected_tty);
+
+        assert!(shutdown.is_cancelled(), "the panic should cancel the TUI");
+
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.starts_with("ERROR TUI ")
+                && log.contains("collector task failed"),
+            "the durable log should record the panic, got {log:?}"
+        );
+
+        std::fs::remove_file(tty_path).unwrap();
+        std::fs::remove_file(log_path).unwrap();
+    }
 }
