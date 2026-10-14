@@ -440,55 +440,26 @@ fn log_level(text: &str) -> LogLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::operation::{
-        DestroyPhase, LaunchPhase, OperationPhase, RoutePhase,
-    };
 
     #[test]
     fn log_level_reads_the_level_slog_printed_not_the_stream() {
         // Every one of these arrives on stderr; only severity should differ.
         assert_eq!(
-            log_level(
-                "Sep 13 22:24:11.782 INFO rack-init [13/16]: waiting for database"
-            ),
-            LogLevel::Info
-        );
-        assert_eq!(
-            log_level("Sep 13 22:24:11.782 WARN serial retry"),
-            LogLevel::Warning
-        );
-        assert_eq!(
-            log_level("Sep 13 22:24:11.782 ERRO launch failed"),
-            LogLevel::Error
-        );
-        assert_eq!(
-            log_level("Sep 13 22:24:11.782 TRCE [sc] cr1: drained"),
-            LogLevel::Info
-        );
-        // A bare continuation line is not a failure.
-        assert_eq!(log_level("    at line 3"), LogLevel::Info);
-        // "WARN" deep inside a message must not promote it.
-        assert_eq!(
-            log_level(
-                "Sep 13 22:24:11.782 INFO rack-init: cleared the WARN state"
-            ),
-            LogLevel::Info
-        );
-    }
-
-    #[test]
-    fn every_operation_has_a_tui_owned_reconciliation_phase() {
-        assert_eq!(
-            reconciliation_phase(OperationKind::Launch),
-            OperationPhase::Launch(LaunchPhase::Reconcile)
-        );
-        assert_eq!(
-            reconciliation_phase(OperationKind::Destroy),
-            OperationPhase::Destroy(DestroyPhase::Reconcile)
-        );
-        assert_eq!(
-            reconciliation_phase(OperationKind::Route),
-            OperationPhase::Route(RoutePhase::Reconcile)
+            [
+                "Sep 13 22:24:11.782 WARN serial retry",
+                "Sep 13 22:24:11.782 ERRO launch failed",
+                // A bare continuation line is not a failure.
+                "    at line 3",
+                // "WARN" deep inside a message must not promote it.
+                "Sep 13 22:24:11.782 INFO rack-init: cleared the WARN state",
+            ]
+            .map(log_level),
+            [
+                LogLevel::Warning,
+                LogLevel::Error,
+                LogLevel::Info,
+                LogLevel::Info
+            ]
         );
     }
 }

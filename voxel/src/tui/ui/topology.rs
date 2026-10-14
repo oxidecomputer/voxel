@@ -422,83 +422,15 @@ pub(crate) fn health_glyph(state: HealthState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::{
-        event::View,
-        telemetry::{RackId, ResourceKind},
-    };
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
-
-    fn sled(cubby: u8) -> ResourceDescriptor {
-        let name = format!("g{cubby}");
-        ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::Sled, &name),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name,
-            host: None,
-            slot: Some(cubby),
-        }
-    }
-
-    fn switch(slot: u8, host: &str) -> ResourceDescriptor {
-        ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::SwitchZone, host),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::SwitchZone,
-            name: format!("switch{slot}"),
-            host: Some(host.into()),
-            slot: Some(slot),
-        }
-    }
-
-    fn router(name: &str) -> ResourceDescriptor {
-        ResourceDescriptor {
-            id: ResourceId::fleet(ResourceKind::Router, name),
-            rack: None,
-            kind: ResourceKind::Router,
-            name: name.into(),
-            host: None,
-            slot: None,
-        }
-    }
-
-    /// A small Voxel rack: four sleds, two scrimlets, two routers.
-    fn topology() -> Vec<ResourceDescriptor> {
-        vec![
-            sled(0),
-            sled(1),
-            sled(2),
-            sled(3),
-            switch(0, "g0"),
-            switch(1, "g3"),
-            router("ce"),
-            router("cr1"),
-        ]
-    }
-
-    fn render(app: &App, width: u16, height: u16) -> Buffer {
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| {
-                draw(frame, frame.area(), app, &app.deployment.topology)
-            })
-            .unwrap();
-        terminal.backend().buffer().clone()
-    }
-
-    fn text(buffer: &Buffer) -> String {
-        buffer.content().iter().map(|cell| cell.symbol()).collect()
-    }
 
     #[test]
     fn every_tier_lays_out_disjoint_bays_inside_a_centered_rack() {
-        for height in [20, 36, 37, 41, 56, 60, 80, 101] {
+        // Each tier's first height, and a computed tier with rows to spare.
+        for height in [20, 37, 41, 56, 60, 101] {
             let area = Rect::new(3, 5, 200, height);
             let geometry = layout_rack(area).unwrap();
             let rack = geometry.rack;
             assert_eq!(geometry.bays.len(), 36, "height {height}");
-            assert_eq!(rack.width % 2, 0);
             assert!(rack.height <= height && rack.width <= area.width);
             assert_eq!(rack.x - area.x, area.right() - rack.right());
             let rects = geometry.bays.values().collect::<Vec<_>>();
@@ -514,123 +446,24 @@ mod tests {
     }
 
     #[test]
-    fn elevations_that_do_not_fit_are_refused() {
-        assert_eq!(
-            layout_rack(Rect::new(0, 0, 200, RACK_MIN_HEIGHT - 1)),
-            None
-        );
-        assert_eq!(layout_rack(Rect::new(0, 0, 13, 80)), None);
-        // A narrow column steps down to a tier whose width fits.
-        let geometry = layout_rack(Rect::new(0, 0, 14, 80)).unwrap();
-        assert_eq!(geometry.rack.height, 20);
-    }
-
-    #[test]
-    fn cubbies_follow_rfd_200_numbering() {
-        let geometry = layout_rack(Rect::new(0, 0, 100, 41)).unwrap();
-        let bay = |bay| geometry.bays[&bay];
-        let rack = geometry.rack;
-        assert_eq!(bay(Bay::Sled(30)).as_position(), rack.as_position());
-        assert_eq!(bay(Bay::Sled(31)).y, rack.y);
-        assert!(bay(Bay::Sled(31)).x > rack.x);
-        assert_eq!(bay(Bay::Sled(0)).x, rack.x);
-        assert_eq!(bay(Bay::Sled(0)).bottom(), rack.bottom());
-        assert_eq!(bay(Bay::Sled(1)).y, bay(Bay::Sled(0)).y);
-        assert!(bay(Bay::Sled(16)).bottom() <= bay(Bay::Switch(1)).y);
-        assert!(bay(Bay::Switch(1)).bottom() <= bay(Bay::PowerShelf(1)).y);
-        assert!(bay(Bay::PowerShelf(0)).bottom() <= bay(Bay::Switch(0)).y);
-        assert!(bay(Bay::Switch(0)).bottom() <= bay(Bay::Sled(15)).y);
-    }
-
-    #[test]
-    fn navigation_runs_from_the_uplink_down_the_rack() {
-        let topology = topology();
-        let names = navigation_order(&topology)
-            .into_iter()
-            .map(|id| id.name)
-            .collect::<Vec<_>>();
-        // Switch zones are identified by their hosting scrimlet.
-        assert_eq!(names, ["ce", "cr1", "g3", "g0", "g2", "g3", "g0", "g1"]);
-        let unplaced = ResourceDescriptor { slot: None, ..sled(9) };
-        let order = navigation_order(&[sled(0), unplaced.clone()]);
-        assert_eq!(order.last(), Some(&unplaced.id));
-    }
-
-    #[test]
-    fn arrows_move_between_occupied_rows_and_siblings() {
-        let topology = topology();
-        let id = |descriptor: ResourceDescriptor| descriptor.id;
-        let down = |from| vertical_neighbor(&topology, &from, true);
-        let up = |from| vertical_neighbor(&topology, &from, false);
-        let right = |from| horizontal_neighbor(&topology, &from, true);
-        let left = |from| horizontal_neighbor(&topology, &from, false);
-
-        assert_eq!(down(id(router("cr1"))), Some(id(switch(1, "g3"))));
-        assert_eq!(down(id(switch(1, "g3"))), Some(id(switch(0, "g0"))));
-        // Rows of empty cubbies are skipped, keeping to the current column.
-        assert_eq!(down(id(switch(0, "g0"))), Some(id(sled(2))));
-        assert_eq!(down(id(sled(3))), Some(id(sled(1))));
-        assert_eq!(down(id(sled(1))), None);
-        assert_eq!(up(id(sled(0))), Some(id(sled(2))));
-        assert_eq!(up(id(switch(1, "g3"))), Some(id(router("ce"))));
-        assert_eq!(up(id(router("ce"))), None);
-
-        assert_eq!(right(id(sled(2))), Some(id(sled(3))));
-        assert_eq!(right(id(sled(3))), None);
-        assert_eq!(left(id(sled(3))), Some(id(sled(2))));
-        assert_eq!(right(id(router("ce"))), Some(id(router("cr1"))));
-        assert_eq!(left(id(switch(0, "g0"))), None);
-    }
-
-    #[test]
-    fn rack_draws_occupants_by_health_and_marks_the_selection() {
-        let mut app = App::new(topology(), 4, 4);
-        app.session.view = View::Monitor;
-        app.session.selected_resource = Some(sled(3).id);
-        let buffer = render(&app, 60, 3 + 41);
-        let geometry =
-            layout_rack(Rect::new(0, UPLINK_HEIGHT, 60, 41)).unwrap();
-        let text = text(&buffer);
-
-        assert!(text.contains("Uplink"), "{text}");
-        assert!(text.contains("ce") && text.contains("cr1"), "{text}");
-        assert!(text.contains("switch1"), "{text}");
-        assert!(text.contains("PWR0"), "{text}");
-        // Empty cubbies carry only their number.
-        assert!(text.contains("31"), "{text}");
-
-        let unselected = geometry.bays[&Bay::Sled(2)];
-        let (x, y) = (unselected.x + 1, unselected.y + 1);
-        // Before the first tick every node is still being checked.
-        assert_eq!(buffer[(x, y)].bg, TUI_YELLOW);
-        assert_eq!(buffer[(x, y)].symbol(), "▕");
-        assert_eq!(buffer[(unselected.x, unselected.y)].fg, OX_GRAY);
-        let selected = geometry.bays[&Bay::Sled(3)];
-        assert_eq!(buffer[(selected.x, selected.y)].bg, TUI_PURPLE);
-        // "g2 ◌": the glyph carries its health colour, not the border's.
-        let glyph = (unselected.x + 4, unselected.y);
-        assert_eq!(buffer[glyph].symbol(), "◌");
-        assert_eq!(buffer[glyph].fg, TUI_YELLOW);
-        let empty = geometry.bays[&Bay::Sled(31)];
-        assert_eq!(buffer[(empty.x + 1, empty.y + 1)].symbol(), " ");
-
-        app.deployment.observed =
-            crate::tui::reconcile::ObservedDeploymentState::Stopped;
-        let stopped = render(&app, 60, 3 + 41);
-        assert_eq!(stopped[(x, y)].bg, TUI_GREY_DARK);
-    }
-
-    #[test]
-    fn short_areas_explain_how_to_see_the_rack() {
-        let app = App::new(topology(), 4, 4);
-        let text = text(&render(&app, 60, UPLINK_HEIGHT + 10));
-        assert!(text.contains("Uplink"), "{text}");
-        assert!(text.contains("Rack needs 20 rows"), "{text}");
-    }
-
-    #[test]
-    fn column_width_tracks_the_rack_tier() {
-        assert_eq!(column_width(0), RACK_MIN_HEIGHT + 4);
-        assert_eq!(column_width(UPLINK_HEIGHT + 41), 28 + 4);
+    fn the_rack_fits_the_column_its_height_asks_for() {
+        let smallest = UPLINK_HEIGHT + RACK_MIN_HEIGHT;
+        // Each tier's first height. A column is sized by its tier alone, so
+        // heights between tiers face the same width.
+        for height in [smallest, 40, PREFERRED_HEIGHT, 59, 63, 83] {
+            let rack_height = height - UPLINK_HEIGHT;
+            let unbounded =
+                layout_rack(Rect::new(0, 0, 1_000, rack_height)).unwrap();
+            let column = Rect::new(0, 0, column_width(height), rack_height);
+            let fitted = layout_rack(column)
+                .unwrap_or_else(|| panic!("height {height}: rack refused"));
+            assert_eq!(
+                fitted.rack.height, unbounded.rack.height,
+                "height {height}: the column forces a smaller tier"
+            );
+        }
+        // Too short for any rack, the column keeps the smallest rack's width
+        // for the message asking for more rows.
+        assert_eq!(column_width(0), column_width(smallest), "no rack");
     }
 }

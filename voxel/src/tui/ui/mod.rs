@@ -28,18 +28,28 @@ mod tests {
 
     #[test]
     fn responsive_boundaries_are_explicit() {
-        assert_eq!(layout_mode(Rect::new(0, 0, 0, 0)), LayoutMode::Minimum);
-        assert_eq!(
-            layout_mode(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT)),
-            LayoutMode::Compact
-        );
-        assert_eq!(
-            layout_mode(Rect::new(0, 0, WIDE_WIDTH, MIN_HEIGHT)),
-            LayoutMode::Compact
-        );
-        assert_eq!(
-            layout_mode(Rect::new(0, 0, WIDE_WIDTH, WIDE_HEIGHT)),
-            LayoutMode::Wide
-        );
+        for (label, width, height, mode) in [
+            (
+                "one column short",
+                MIN_WIDTH - 1,
+                MIN_HEIGHT,
+                LayoutMode::Minimum,
+            ),
+            ("minimum", MIN_WIDTH, MIN_HEIGHT, LayoutMode::Compact),
+            ("wide but short", WIDE_WIDTH, MIN_HEIGHT, LayoutMode::Compact),
+            (
+                "one column short of wide",
+                WIDE_WIDTH - 1,
+                WIDE_HEIGHT,
+                LayoutMode::Compact,
+            ),
+            ("wide", WIDE_WIDTH, WIDE_HEIGHT, LayoutMode::Wide),
+        ] {
+            assert_eq!(
+                layout_mode(Rect::new(0, 0, width, height)),
+                mode,
+                "{label}: {width}x{height}"
+            );
+        }
     }
 }

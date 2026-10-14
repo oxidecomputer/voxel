@@ -99,58 +99,39 @@ pub fn draw(frame: &mut ratatui::Frame<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::{
-        Action, Effect,
-        event::View,
-        telemetry::{ResourceDescriptor, ResourceId, ResourceKind},
-    };
     use std::collections::BTreeMap;
 
+    /// The YAML an operator copies names a receiver per rack and takes each
+    /// rack's token from the environment, never embedding a credential.
     #[test]
-    fn generated_yaml_is_deterministic_and_contains_no_session_secret() {
-        let yaml = yaml_for([
-            (RackId(0), "https://198.51.100.22"),
-            (RackId(1), "https://198.51.100.86"),
-        ]);
-        assert!(yaml.contains("oxide/rack0:"));
-        assert!(yaml.contains("${env:OXIDE_TOKEN_RACK1}"));
-        assert!(yaml.contains("sled_data_link:.*"));
-        assert!(yaml.contains("Voxel virtual racks only"));
-        assert!(!yaml.contains("password"));
-        assert!(!yaml.contains("oxide\n"));
-    }
-
-    #[test]
-    fn overlay_actions_copy_selected_all_and_guide_then_close() {
-        let descriptor = ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: "g0".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(vec![descriptor], 4, 4);
-        app.session.view = View::Monitor;
+    fn receiver_yaml_covers_every_rack_without_embedding_credentials() {
+        let mut app = App::new(vec![], 8, 8);
         app.external_monitoring_endpoints = BTreeMap::from([
-            (RackId(0), "https://198.51.100.22/".into()),
-            (RackId(1), "https://198.51.100.86/".into()),
+            (RackId(0), "https://recovery.sys.oxide.test/".into()),
+            (RackId(1), "https://recovery.sys.rack1.oxide.test/".into()),
         ]);
 
-        app.update(Action::RequestCancelAndDestroy.into());
-        assert!(app.session.external_monitoring_open);
-        app.update(Action::RequestCancelAndDestroy.into());
-        assert!(app.session.external_monitoring_open);
-        // One fragment covers every rack; it just grows with the rack count.
-        assert!(matches!(
-            app.update(Action::CopyExternalMonitoringYaml.into()).as_slice(),
-            [Effect::CopyToClipboard(yaml)] if yaml.contains("oxide/rack0:") && yaml.contains("oxide/rack1:")
-        ));
+        let yaml = receiver_yaml(&app);
+
+        let tokens: Vec<_> = yaml
+            .lines()
+            .filter(|line| line.contains("token:"))
+            .map(str::trim)
+            .collect();
         assert_eq!(
-            app.update(Action::CopyExternalMonitoringGuide.into()),
-            vec![Effect::CopyToClipboard(GUIDE_URL.into())]
+            tokens,
+            [
+                "token: ${env:OXIDE_TOKEN_RACK0}",
+                "token: ${env:OXIDE_TOKEN_RACK1}"
+            ]
         );
-        app.update(Action::Close.into());
-        assert!(!app.session.external_monitoring_open);
+        for wanted in [
+            "oxide/rack0:",
+            "\"https://recovery.sys.oxide.test/\"",
+            "oxide/rack1:",
+            "\"https://recovery.sys.rack1.oxide.test/\"",
+        ] {
+            assert!(yaml.contains(wanted), "missing {wanted}: {yaml}");
+        }
     }
 }

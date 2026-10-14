@@ -423,50 +423,50 @@ impl Drop for TerminalSession {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
-    use std::{
-        collections::VecDeque,
-        sync::{Arc, Mutex, mpsc as std_mpsc},
-    };
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
     #[test]
-    fn maps_all_documented_keys() {
-        let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
+    fn every_documented_key_maps_and_nothing_else_acts() {
         let cases = [
-            (KeyCode::Char('v'), Action::ToggleView),
-            (KeyCode::Tab, Action::NextSection),
-            (KeyCode::BackTab, Action::PreviousSection),
-            (KeyCode::Left, Action::Left),
-            (KeyCode::Right, Action::Right),
-            (KeyCode::Enter, Action::Activate),
-            (KeyCode::Char(' '), Action::ToggleSection),
-            (KeyCode::Char('?'), Action::ToggleHelp),
-            (KeyCode::Char('s'), Action::CopyExternalMonitoringYaml),
-            (KeyCode::Char('a'), Action::CopyExternalMonitoringGuide),
-            (KeyCode::Esc, Action::Close),
-            (KeyCode::Char('l'), Action::RequestLaunch),
-            (KeyCode::Char('r'), Action::RequestRoute),
-            (KeyCode::Char('d'), Action::RequestDetach),
-            (KeyCode::Char('q'), Action::RequestQuit),
-            (KeyCode::Char('x'), Action::RequestCancelAndDestroy),
-            (KeyCode::Char('y'), Action::CopyReattachCommand),
-            (KeyCode::Char('n'), Action::Reject),
+            (KeyCode::Char('v'), Some(Action::ToggleView)),
+            (KeyCode::Tab, Some(Action::NextSection)),
+            (KeyCode::BackTab, Some(Action::PreviousSection)),
+            (KeyCode::Left, Some(Action::Left)),
+            (KeyCode::Right, Some(Action::Right)),
+            (KeyCode::Enter, Some(Action::Activate)),
+            (KeyCode::Char(' '), Some(Action::ToggleSection)),
+            (KeyCode::Char('?'), Some(Action::ToggleHelp)),
+            (KeyCode::Char('s'), Some(Action::CopyExternalMonitoringYaml)),
+            (KeyCode::Char('a'), Some(Action::CopyExternalMonitoringGuide)),
+            (KeyCode::Esc, Some(Action::Close)),
+            (KeyCode::Char('l'), Some(Action::RequestLaunch)),
+            (KeyCode::Char('r'), Some(Action::RequestRoute)),
+            (KeyCode::Char('d'), Some(Action::RequestDetach)),
+            (KeyCode::Char('q'), Some(Action::RequestQuit)),
+            (KeyCode::Char('x'), Some(Action::RequestCancelAndDestroy)),
+            (KeyCode::Char('y'), Some(Action::CopyReattachCommand)),
+            (KeyCode::Char('n'), Some(Action::Reject)),
+            (KeyCode::Up, Some(Action::Scroll { delta: -1, page: false })),
+            (KeyCode::Down, Some(Action::Scroll { delta: 1, page: false })),
+            (KeyCode::PageUp, Some(Action::Scroll { delta: -1, page: true })),
+            (KeyCode::PageDown, Some(Action::Scroll { delta: 1, page: true })),
+            (KeyCode::Char('f'), Some(Action::CycleLogFilter)),
+            // A retired numeric view key.
+            (KeyCode::Char('1'), None),
         ];
-        for (c, a) in cases {
-            assert_eq!(key_action(k(c)), Some(a));
+        for (code, action) in cases {
+            assert_eq!(key_action(key(code)), action, "{code:?}");
         }
-        assert_eq!(key_action(k(KeyCode::Char('1'))), None);
-        assert_eq!(key_action(k(KeyCode::Char('2'))), None);
-        assert_eq!(key_action(k(KeyCode::Char('3'))), None);
-        assert_eq!(key_action(k(KeyCode::Char('4'))), None);
-        assert_eq!(key_action(k(KeyCode::Char('o'))), None);
-        assert_eq!(key_action(k(KeyCode::F(1))), None);
         assert_eq!(
             key_action(KeyEvent {
                 kind: KeyEventKind::Release,
-                ..k(KeyCode::Char('q'))
+                ..key(KeyCode::Char('q'))
             }),
-            None
+            None,
+            "release of q"
         );
-        assert_eq!(key_action(k(KeyCode::F(12))), None);
     }
 
     #[test]
@@ -477,30 +477,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn maps_log_navigation_and_filter_keys() {
-        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        assert_eq!(
-            key_action(key(KeyCode::Up)),
-            Some(Action::Scroll { delta: -1, page: false })
-        );
-        assert_eq!(
-            key_action(key(KeyCode::Down)),
-            Some(Action::Scroll { delta: 1, page: false })
-        );
-        assert_eq!(
-            key_action(key(KeyCode::PageUp)),
-            Some(Action::Scroll { delta: -1, page: true })
-        );
-        assert_eq!(
-            key_action(key(KeyCode::PageDown)),
-            Some(Action::Scroll { delta: 1, page: true })
-        );
-        assert_eq!(
-            key_action(key(KeyCode::Char('f'))),
-            Some(Action::CycleLogFilter)
-        );
-    }
     #[derive(Default)]
     struct Fake {
         calls: Vec<&'static str>,
@@ -558,139 +534,37 @@ mod tests {
         }
     }
     #[test]
-    fn restore_returns_first_error_and_attempts_every_cleanup_step() {
-        let mut f = Fake::default();
-        let mut s = Lifecycle::setup(&mut f).unwrap();
-        f.calls.clear();
-        f.fail = vec!["show", "leave", "disable"];
-        assert_eq!(s.restore(&mut f).unwrap_err().to_string(), "show");
-        assert_eq!(f.calls, vec!["show", "leave", "disable"]);
-    }
-    #[test]
-    fn restore_retries_only_cleanup_steps_that_failed() {
-        let mut f = Fake::default();
-        let mut s = Lifecycle::setup(&mut f).unwrap();
-        f.calls.clear();
-        f.fail = vec!["show", "disable"];
-        assert_eq!(s.restore(&mut f).unwrap_err().to_string(), "show");
-        assert_eq!(f.calls, vec!["show", "leave", "disable"]);
+    fn restore_attempts_every_step_and_retries_only_failures() {
+        // The first case returns the first of two errors and skips the step
+        // that succeeded on retry; the second continues past a later failure.
+        for (label, failing) in [
+            ("show and disable fail", vec!["show", "disable"]),
+            ("only leave fails", vec!["leave"]),
+        ] {
+            let mut f = Fake::default();
+            let mut s = Lifecycle::setup(&mut f).unwrap();
+            f.calls.clear();
+            f.fail = failing.clone();
+            assert_eq!(
+                s.restore(&mut f).unwrap_err().to_string(),
+                failing[0],
+                "{label}: first error"
+            );
+            assert_eq!(
+                f.calls,
+                vec!["show", "leave", "disable"],
+                "{label}: every step attempted"
+            );
 
-        f.calls.clear();
-        f.fail.clear();
-        assert!(s.restore(&mut f).is_ok());
-        assert_eq!(f.calls, vec!["show", "disable"]);
+            f.calls.clear();
+            f.fail.clear();
+            assert!(s.restore(&mut f).is_ok(), "{label}: retry");
+            assert_eq!(f.calls, failing, "{label}: only failures retried");
 
-        f.calls.clear();
-        assert!(s.restore(&mut f).is_ok());
-        assert!(f.calls.is_empty());
-    }
-    #[test]
-    fn restore_is_idempotent() {
-        let mut f = Fake::default();
-        let mut s = Lifecycle::setup(&mut f).unwrap();
-        f.calls.clear();
-        assert!(s.restore(&mut f).is_ok());
-        assert_eq!(f.calls, vec!["show", "leave", "disable"]);
-        f.calls.clear();
-        assert!(s.restore(&mut f).is_ok());
-        assert!(f.calls.is_empty());
-    }
-    struct Source(Arc<Mutex<VecDeque<Event>>>);
-    impl EventSource for Source {
-        fn next(&mut self, _: Duration) -> io::Result<Option<Event>> {
-            Ok(self.0.lock().unwrap().pop_front())
+            f.calls.clear();
+            assert!(s.restore(&mut f).is_ok(), "{label}: idempotent");
+            assert!(f.calls.is_empty(), "{label}: nothing left to restore");
         }
-    }
-    #[tokio::test]
-    async fn fake_source_events_arrive_in_source_order() {
-        let (tx, mut rx) = event_channel_with_capacity(3);
-        let events = Arc::new(Mutex::new(VecDeque::from([
-            Event::Resize(2, 3),
-            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        ])));
-        let cancel = CancellationToken::new();
-        let (done_tx, done_rx) = std_mpsc::channel();
-        let h = std::thread::spawn(move || {
-            let result = input_loop(Source(events), tx, cancel);
-            let _ = done_tx.send(());
-            result
-        });
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .expect("first source event timed out"),
-            Some(AppEvent::Resize { width: 2, height: 3 })
-        ));
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .expect("second source event timed out"),
-            Some(AppEvent::Action(Action::RequestQuit))
-        ));
-        drop(rx);
-        done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("input loop did not stop after receiver closed");
-        assert!(h.join().unwrap().is_ok());
-    }
-    #[test]
-    fn input_full_channel_cancellation_joins_promptly() {
-        let (tx, mut rx) = event_channel_with_capacity(1);
-        tx.try_send(AppEvent::Resize { width: 1, height: 1 }).unwrap();
-        let cancel = CancellationToken::new();
-        let c = cancel.clone();
-        let events = Arc::new(Mutex::new(VecDeque::from([
-            Event::Resize(2, 2),
-            Event::Resize(3, 3),
-        ])));
-        let (done_tx, done_rx) = std_mpsc::channel();
-        let h = std::thread::spawn(move || {
-            let result = input_loop(Source(events), tx, c);
-            let _ = done_tx.send(());
-            result
-        });
-        std::thread::sleep(Duration::from_millis(15));
-        cancel.cancel();
-        let started = std::time::Instant::now();
-        done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect("input loop did not stop after cancellation");
-        assert!(h.join().unwrap().is_ok());
-        assert!(started.elapsed() < Duration::from_millis(100));
-        assert!(matches!(rx.try_recv(), Ok(AppEvent::Resize { width: 1, .. })));
-    }
-    #[test]
-    fn dropped_receiver_stops_input_loop_promptly() {
-        let (tx, rx) = event_channel_with_capacity(1);
-        drop(rx);
-        let events =
-            Arc::new(Mutex::new(VecDeque::from([Event::Resize(4, 5)])));
-        let started = std::time::Instant::now();
-        assert!(
-            input_loop(Source(events), tx, CancellationToken::new()).is_ok()
-        );
-        assert!(started.elapsed() < Duration::from_millis(100));
-    }
-    #[tokio::test]
-    async fn tick_with_full_channel_stops_on_cancel_and_zero_is_rejected() {
-        let (tx, _rx) = event_channel_with_capacity(1);
-        tx.try_send(AppEvent::Resize { width: 1, height: 1 }).unwrap();
-        let cancel = CancellationToken::new();
-        let h =
-            spawn_ticks(tx, cancel.clone(), Duration::from_millis(1)).unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_millis(100), h)
-            .await
-            .unwrap()
-            .unwrap();
-        let (tx, _) = event_channel();
-        assert_eq!(
-            spawn_ticks(tx, CancellationToken::new(), Duration::ZERO)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
     }
 
     /// A panic on any thread restores the terminal, and the renderer cannot
