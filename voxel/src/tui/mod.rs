@@ -157,12 +157,9 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
     }
     app.reattach_command = Some(reattach);
     app.external_monitoring_endpoints = (0..context.config.topology.racks())
-        .filter_map(|rack| {
-            nexus::rack_endpoints(&context.config, rack)
-                .ok()?
-                .into_iter()
-                .find(|endpoint| endpoint.scheme() == "https")
-                .map(|endpoint| (telemetry::RackId(rack), endpoint.to_string()))
+        .map(|rack| {
+            let name = nexus::nexus_name(&context.config, rack);
+            (telemetry::RackId(rack), format!("https://{name}/"))
         })
         .collect();
 
