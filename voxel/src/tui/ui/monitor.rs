@@ -571,348 +571,250 @@ pub(crate) fn zone_rate_cells(rate: BidirectionalRate) -> [Cell<'static>; 3] {
 }
 
 #[cfg(test)]
-mod height_tests {
+mod tests {
     use super::*;
-    use crate::tui::reconcile::ObservedDeploymentState;
+    use crate::tui::reconcile::{ObservedDeploymentState, RouteEvidence};
+    use crate::tui::test_support::{
+        rate, render, router, sample, sled, switch, text,
+    };
     use crate::tui::{
+        app::TerminalSize,
         event::AppEvent,
         telemetry::{
-            HealthDiagnostic, RackId, ResourceKind, ServiceState,
-            TrafficSample, ZoneTraffic,
+            HealthDiagnostic, NtpDiagnostic, RackId, ServiceState,
+            TrafficSample, TrafficSource, ZoneTraffic,
         },
     };
-    use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
     use std::time::Instant;
 
-    fn app() -> App {
-        let descriptor = ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "seeded"),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: "seeded".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(
-            vec![ResourceDescriptor {
-                id: descriptor.id.clone(),
-                ..descriptor.clone()
-            }],
-            4,
-            4,
-        );
-        app.update(AppEvent::Traffic {
-            id: descriptor.id,
-            at: Instant::now(),
-            sample: TrafficSample {
-                zones: vec![ZoneTraffic {
-                    name: "height-two-zone-traffic".into(),
-                    short_name: "height-two-zone-traffic".into(),
-                    rate: BidirectionalRate {
-                        rx_bytes_sec: 987_654.0,
-                        ..Default::default()
-                    },
-                    errors: Default::default(),
-                }],
-                ..Default::default()
-            },
-        });
+    #[test]
+    fn resource_health_stays_accurate_between_probes() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let tick = |seconds| AppEvent::Tick { now: at(seconds) };
+
+        let switch_zone = switch(0, 0, "g0");
+        let sled_g0 = sled(0, 0);
+        // (case, resource, [(when, event, health)], final summary)
+        let cases = [
+            (
+                "switch whose Oximeter samples stop while direct probes answer",
+                switch_zone.clone(),
+                vec![
+                    ("before any sample", tick(0), HealthState::Checking),
+                    (
+                        "after an Oximeter sample",
+                        AppEvent::OximeterTraffic {
+                            id: switch_zone.id.clone(),
+                            at: at(0),
+                            samples: vec![(
+                                at(0),
+                                sample(0.0, TrafficSource::Oximeter),
+                            )],
+                        },
+                        HealthState::Healthy,
+                    ),
+                    (
+                        "after five quiet minutes",
+                        tick(300),
+                        HealthState::Unavailable,
+                    ),
+                    (
+                        "after a direct probe success in the Oximeter gap",
+                        AppEvent::Traffic {
+                            id: switch_zone.id.clone(),
+                            at: at(300),
+                            sample: TrafficSample::default(),
+                        },
+                        HealthState::Healthy,
+                    ),
+                ],
+                "Healthy (last success 0s ago)",
+            ),
+            (
+                "sled whose health probe is slow to complete",
+                sled_g0.clone(),
+                vec![
+                    ("before any sample", tick(0), HealthState::Checking),
+                    (
+                        "after a healthy sample",
+                        AppEvent::Health {
+                            id: sled_g0.id.clone(),
+                            at: at(0),
+                            diagnostic: HealthDiagnostic {
+                                sled_agent: Some(ServiceState::Online),
+                                ntp: NtpDiagnostic {
+                                    synchronized: Some(true),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        },
+                        HealthState::Healthy,
+                    ),
+                    // Four serial probe calls with ten-second timeouts, plus
+                    // scheduling delay, can leave this long between
+                    // completions.
+                    ("50 s after the sample", tick(50), HealthState::Healthy),
+                ],
+                "Healthy (last success 50s ago)",
+            ),
+        ];
+
+        for (case, resource, steps, summary) in cases {
+            let id = resource.id.clone();
+            let mut app = App::new(vec![resource], 4, 4);
+            app.deployment.observed = ObservedDeploymentState::Running;
+            for (when, event, health) in steps {
+                app.update(event);
+                assert_eq!(
+                    resource_health_state(&app, &id),
+                    health,
+                    "{case}, {when}"
+                );
+            }
+            assert_eq!(resource_health_summary(&app, &id), summary, "{case}");
+        }
+    }
+
+    fn rack_summary_text(app: &App) -> String {
+        text(&render(120, 5, |frame| {
+            super::super::rack_selector::draw(
+                frame,
+                frame.area(),
+                app,
+                true,
+                true,
+            )
+        }))
+    }
+
+    fn node_details_text(app: &App) -> String {
+        text(&render(100, 40, |frame| {
+            super::super::node_detail::draw(frame, frame.area(), app, false)
+        }))
+    }
+
+    fn app_selecting(resource: ResourceDescriptor) -> App {
+        let mut app = App::new(vec![resource.clone()], 4, 4);
+        app.session.selected_resource = Some(resource.id);
         app
     }
 
-    fn assert_height_two_chrome(
-        title: &str,
-        draw_section: impl FnOnce(&mut ratatui::Frame<'_>, Rect, &App),
-    ) {
-        let mut terminal = Terminal::new(TestBackend::new(48, 2)).unwrap();
-        let app = app();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                frame.render_widget(Paragraph::new("I".repeat(96)), area);
-                draw_section(frame, area, &app);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let text = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains(title), "missing {title:?}: {text}");
-        assert_eq!(buffer[(0, 0)].symbol(), "╭");
-        assert_eq!(buffer[(47, 0)].symbol(), "╮");
-        assert_eq!(buffer[(0, 1)].symbol(), "╰");
-        assert_eq!(buffer[(47, 1)].symbol(), "╯");
-        assert!(!text.contains('I'), "seeded content survived: {text}");
-    }
-
-    #[test]
-    fn height_two_monitoring_sections_render_only_intact_chrome() {
-        assert_height_two_chrome("Rack Summary", |frame, area, app| {
-            super::super::rack_selector::draw(frame, area, app, false, true);
-        });
-        assert_height_two_chrome("Topology", |frame, area, app| {
-            draw_topology(frame, area, app, LayoutMode::Wide);
-        });
-        assert_height_two_chrome("Top Zones by Traffic", |frame, area, app| {
-            draw_top_zones(frame, area, app, Some(RackId(0)));
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(48, 2)).unwrap();
-        let app = app();
-        terminal
-            .draw(|frame| {
-                draw_top_zones(frame, frame.area(), &app, Some(RackId(0)))
-            })
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("Top Zones by Traffic"));
-        assert!(!text.contains("height-two-zone-traffic"));
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(0, 0)].symbol(), "╭");
-        assert_eq!(buffer[(47, 0)].symbol(), "╮");
-        assert_eq!(buffer[(0, 1)].symbol(), "╰");
-        assert_eq!(buffer[(47, 1)].symbol(), "╯");
-    }
-
-    #[test]
-    fn wide_topology_shows_details_beside_a_focus_coloured_divider() {
-        let area = Rect::new(0, 0, 160, 20);
-        let layout = middle_layout(area, LayoutMode::Wide);
-        let render = |app: &App, mode| {
-            let mut terminal =
-                Terminal::new(TestBackend::new(160, 20)).unwrap();
-            terminal
-                .draw(|frame| draw_topology(frame, area, app, mode))
-                .unwrap();
-            terminal.backend().buffer().clone()
-        };
-        let text = |buffer: &ratatui::buffer::Buffer| {
-            buffer
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        };
-
-        let focused = render(&app(), LayoutMode::Wide);
-        assert_eq!(
-            focused[(layout.divider.x, area.y)].fg,
-            super::super::colors::TUI_GREEN_DARK
-        );
-        assert_eq!(
-            focused[(layout.divider.x, area.y + 1)].fg,
-            super::super::colors::TUI_GREEN_DARK
-        );
-        assert!(text(&focused).contains("RACK 0 / SLED seeded"));
-
-        let mut inactive_app = app();
-        inactive_app.session.monitoring_pane = MonitoringPane::TopZones;
-        let inactive = render(&inactive_app, LayoutMode::Wide);
-        assert_eq!(inactive[(layout.divider.x, area.y)].fg, TUI_GREY);
-        assert_eq!(inactive[(layout.divider.x, area.y + 1)].fg, TUI_GREY);
-
-        // Compact layouts show the rack, or the details once focused.
-        let mut compact = app();
-        assert!(
-            !text(&render(&compact, LayoutMode::Compact)).contains("RACK 0 /")
-        );
-        compact.session.detail_open = true;
-        assert!(
-            text(&render(&compact, LayoutMode::Compact))
-                .contains("RACK 0 / SLED seeded")
-        );
-    }
-
-    #[test]
-    fn focused_topology_leaves_the_rack_summary_its_rows() {
-        let app = app();
-        assert_eq!(app.session.monitoring_pane, MonitoringPane::Topology);
-        for height in [30, 51, 80] {
-            let rows = monitor_rows(
-                Rect::new(0, 0, 160, height),
-                &app,
-                LayoutMode::Wide,
+    /// Asserts that `screen` shows every phrase, printing the screen when one
+    /// is missing.
+    #[track_caller]
+    fn assert_shows(screen: &str, phrases: &[&str]) {
+        for phrase in phrases {
+            assert!(
+                screen.contains(phrase),
+                "{phrase:?} missing from:\n{screen}"
             );
-            assert_eq!(rows[0].height, 5, "height {height}");
-            assert!(rows[1].height > rows[2].height, "height {height}");
         }
     }
 
     #[test]
-    fn top_zones_capacity_is_zero_when_only_chrome_is_visible() {
-        let mut app = app();
-        app.session.terminal =
-            crate::tui::app::TerminalSize { width: 48, height: 16 };
-
-        assert_eq!(top_zones_page_capacity(&app), 0);
-    }
-
-    #[test]
-    fn successful_traffic_probe_makes_non_sled_resources_healthy() {
-        let descriptors = [
-            (ResourceKind::SwitchZone, Some(RackId(0)), "switch0"),
-            (ResourceKind::Router, None, "ce"),
-        ]
-        .into_iter()
-        .map(|(kind, rack, name)| ResourceDescriptor {
-            id: rack.map_or_else(
-                || ResourceId::fleet(kind, name),
-                |rack| ResourceId::rack(rack, kind, name),
-            ),
-            rack,
-            kind,
-            name: name.into(),
-            host: None,
-            slot: None,
-        })
-        .collect::<Vec<_>>();
-        let mut app = App::new(descriptors.clone(), 4, 4);
+    fn operator_is_told_why_monitoring_is_missing() {
         let now = Instant::now();
-        app.deployment.observed = ObservedDeploymentState::Running;
-        app.update(AppEvent::Tick { now });
+        let log = "/work/voxel-tui.log";
 
-        for descriptor in &descriptors {
-            assert_eq!(
-                resource_health_state(&app, &descriptor.id),
-                HealthState::Checking
-            );
-            app.update(AppEvent::Traffic {
-                id: descriptor.id.clone(),
-                at: now,
-                sample: TrafficSample::default(),
-            });
-            assert_eq!(
-                resource_health_state(&app, &descriptor.id),
-                HealthState::Healthy
-            );
-        }
-    }
-
-    #[test]
-    fn direct_probes_keep_a_switch_healthy_through_oximeter_gaps() {
-        let id = ResourceId::rack(RackId(0), ResourceKind::SwitchZone, "g0");
-        let mut app = App::new(
-            vec![ResourceDescriptor {
-                id: id.clone(),
-                rack: Some(RackId(0)),
-                kind: ResourceKind::SwitchZone,
-                name: "switch0".into(),
-                host: Some("g0".into()),
-                slot: Some(0),
-            }],
-            4,
-            4,
-        );
-        let start = Instant::now();
-        app.deployment.observed = ObservedDeploymentState::Running;
-        app.update(AppEvent::OximeterTraffic {
-            id: id.clone(),
-            at: start,
-            samples: vec![(
-                start,
-                TrafficSample {
-                    source: crate::tui::telemetry::TrafficSource::Oximeter,
-                    ..Default::default()
-                },
-            )],
+        // Nexus outage: the rack summary names the outage, the log and the
+        // likely cause until Nexus answers again.
+        let rack = RackId(0);
+        let mut app = App::new(vec![sled(0, 0)], 4, 4);
+        app.update(AppEvent::NexusUnavailable {
+            rack,
+            at: now,
+            message: "Nexus is unavailable".into(),
         });
-        // Oximeter goes quiet for five minutes; the direct probe does not.
-        let later = start + Duration::from_secs(300);
-        app.update(AppEvent::Tick { now: later });
-        assert_eq!(resource_health_state(&app, &id), HealthState::Unavailable);
+        app.durable_log_path = log.into();
+        assert_shows(
+            &rack_summary_text(&app),
+            &[
+                "Nexus/control plane unavailable · direct-probe fallback \
+                 enabled · log: /work/voxel-tui.log",
+                "No host route to the rack's external network",
+            ],
+        );
+        app.deployment.routes = RouteEvidence::Applied;
+        assert_shows(
+            &rack_summary_text(&app),
+            &["traffic, CPU, ZFS, collector health may be stale"],
+        );
+        // The traffic history takes the banner's place once Nexus answers.
+        app.update(AppEvent::NexusAvailable {
+            rack,
+            at: now + Duration::from_secs(1),
+        });
+        assert_shows(
+            &rack_summary_text(&app),
+            &["Rack traffic (this TUI session)"],
+        );
+
+        // Oximeter queries failing: a sled's details explain each missing
+        // diagnostic and where the errors are logged.
+        let mut app = app_selecting(sled(0, 3));
+        app.update(AppEvent::ZoneCpuFailed {
+            rack,
+            at: now,
+            message: "CPU query timed out".into(),
+        });
+        app.update(AppEvent::ZfsHeadroomFailed {
+            rack,
+            at: now,
+            message: "ZFS response omitted a pool".into(),
+        });
+        app.durable_log_path = log.into();
+        assert_shows(
+            &node_details_text(&app),
+            &[
+                "no successful health sample",
+                "Errors · logged to /work/voxel-tui.log",
+                "Zone CPU unavailable: CPU query timed out",
+                "ZFS unavailable: ZFS response omitted a pool",
+            ],
+        );
+
+        // Router probes fail while the VM is still coming up, so errors from
+        // before the running reconciliation are noise; later ones are real,
+        // and a success clears them.
+        let id = router("ce").id;
+        let mut app = app_selecting(router("ce"));
+        app.update(AppEvent::TrafficFailed {
+            id: id.clone(),
+            at: now,
+            message: "propolis uuid for ce: No such file".into(),
+        });
+        app.deployment.observed = ObservedDeploymentState::Running;
+        app.deployment.last_reconciliation_at =
+            Some(now + Duration::from_secs(1));
+        let details = node_details_text(&app);
+        assert!(!details.contains("propolis uuid"), "{details}");
+
+        let after_reconciliation = now + Duration::from_secs(2);
+        app.update(AppEvent::TrafficFailed {
+            id: id.clone(),
+            at: after_reconciliation,
+            message: "router command failed after readiness".into(),
+        });
+        assert_shows(
+            &node_details_text(&app),
+            &["router command failed after readiness"],
+        );
         app.update(AppEvent::Traffic {
             id: id.clone(),
-            at: later,
+            at: after_reconciliation + Duration::from_secs(1),
             sample: TrafficSample::default(),
         });
-        assert_eq!(resource_health_state(&app, &id), HealthState::Healthy);
-        assert!(
-            resource_health_summary(&app, &id).contains("last success 0s ago")
-        );
+        assert!(!resource_health_summary(&app, &id).contains("latest error"));
     }
 
     #[test]
-    fn sled_health_does_not_expire_between_slow_probe_completions() {
-        let descriptor = ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: "g0".into(),
-            host: None,
-            slot: None,
-        };
+    fn operator_can_page_through_top_zones() {
+        // Sled g0 alone, with eight zones whose traffic falls with their
+        // index, so zone-0 tops the list.
+        let descriptor = sled(0, 0);
         let mut app = App::new(vec![descriptor.clone()], 4, 4);
-        let sampled_at = Instant::now();
-        app.deployment.observed = ObservedDeploymentState::Running;
-        app.update(AppEvent::Health {
-            id: descriptor.id.clone(),
-            at: sampled_at,
-            diagnostic: HealthDiagnostic {
-                sled_agent: Some(ServiceState::Online),
-                ntp: crate::tui::telemetry::NtpDiagnostic {
-                    synchronized: Some(true),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        });
-        app.update(AppEvent::Tick {
-            now: sampled_at + Duration::from_secs(45),
-        });
-
-        assert_eq!(
-            resource_health_state(&app, &descriptor.id),
-            HealthState::Healthy
-        );
-    }
-
-    #[test]
-    fn rack_summary_names_session_traffic_history() {
-        let app = app();
-        let mut terminal = Terminal::new(TestBackend::new(160, 5)).unwrap();
-
-        terminal
-            .draw(|frame| {
-                super::super::rack_selector::draw(
-                    frame,
-                    frame.area(),
-                    &app,
-                    false,
-                    true,
-                )
-            })
-            .unwrap();
-
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("Rack traffic (this TUI session)"), "{text}");
-    }
-
-    #[test]
-    fn top_zones_renders_the_scrolled_range() {
-        let descriptor = ResourceDescriptor {
-            id: ResourceId::rack(RackId(0), ResourceKind::Sled, "g0"),
-            rack: Some(RackId(0)),
-            kind: ResourceKind::Sled,
-            name: "g0".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(vec![descriptor.clone()], 4, 4);
-        app.session.top_zones_scroll = 1;
         app.update(AppEvent::Traffic {
             id: descriptor.id,
             at: Instant::now(),
@@ -921,122 +823,37 @@ mod height_tests {
                     .map(|index| ZoneTraffic {
                         name: format!("zone-{index}"),
                         short_name: format!("zone-{index}"),
-                        rate: BidirectionalRate {
-                            rx_bytes_sec: (8 - index) as f64,
-                            ..Default::default()
-                        },
+                        rate: rate((8 - index) as f64, 0.0),
                         errors: Default::default(),
                     })
                     .collect(),
                 ..Default::default()
             },
         });
-        let mut terminal = Terminal::new(TestBackend::new(100, 7)).unwrap();
 
-        terminal
-            .draw(|frame| {
-                draw_top_zones(frame, frame.area(), &app, Some(RackId(0)))
+        // The topology starts focused and takes most rows, but the rack
+        // summary keeps the rows its error banner needs.
+        assert_eq!(app.session.monitoring_pane, MonitoringPane::Topology);
+        let rows =
+            monitor_rows(Rect::new(0, 0, 160, 30), &app, LayoutMode::Wide);
+        assert_eq!(rows[0].height, 5);
+        assert!(rows[1].height > rows[2].height);
+
+        app.session.top_zones_scroll = 1;
+        let page = text(&render(100, 7, |frame| {
+            draw_top_zones(frame, frame.area(), &app, Some(RackId(0)))
+        }));
+        let visible = page
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace().find(|word| word.starts_with("zone-"))
             })
-            .unwrap();
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["zone-1", "zone-2", "zone-3", "zone-4"], "{page}");
+        assert_shows(&page, &["Top Zones by Traffic + CPU 2-5 of 8"]);
 
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("Top Zones by Traffic + CPU 2-5 of 8"), "{text}");
-        assert!(!text.contains("zone-0"), "{text}");
-        for zone in 1..=4 {
-            assert!(text.contains(&format!("zone-{zone}")), "{text}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tui::{
-        event::AppEvent,
-        telemetry::{BidirectionalRate, TrafficSample},
-    };
-    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
-    use std::time::Instant;
-
-    #[test]
-    fn sparkline_fits_width_and_clamps_values() {
-        assert_eq!(
-            sparkline_data([-1.0, 2.0, 3.0, 4.0].into_iter(), 2),
-            vec![3, 4]
-        );
-        assert_eq!(sparkline_data([-1.0, 2.9].into_iter(), 8), vec![0, 2]);
-    }
-
-    #[test]
-    fn zone_rate_cells_keep_independent_severity() {
-        let cells = zone_rate_cells(BidirectionalRate {
-            rx_bytes_sec: 100_000.0,
-            tx_bytes_sec: 5_000_000.0,
-            ..Default::default()
-        });
-        let row = Row::new(cells);
-        let table = Table::new(
-            [row],
-            [
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(12),
-            ],
-        );
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 36, 1));
-        table.render(Rect::new(0, 0, 36, 1), &mut buffer);
-        assert_eq!(buffer[(5, 0)].fg, super::super::colors::OX_OFF_WHITE);
-        assert_eq!(buffer[(17, 0)].fg, super::super::colors::TUI_YELLOW);
-        assert_eq!(buffer[(29, 0)].fg, super::super::colors::OX_RED);
-    }
-
-    #[test]
-    fn router_summary_hides_only_errors_before_running_reconciliation() {
-        let id = ResourceId::fleet(ResourceKind::Router, "ce");
-        let descriptor = ResourceDescriptor {
-            id: id.clone(),
-            rack: None,
-            kind: ResourceKind::Router,
-            name: "ce".into(),
-            host: None,
-            slot: None,
-        };
-        let mut app = App::new(vec![descriptor], 4, 4);
-        let before_reconciliation = Instant::now();
-        app.update(AppEvent::TrafficFailed {
-            id: id.clone(),
-            at: before_reconciliation,
-            message: "propolis uuid for ce: No such file".into(),
-        });
-        app.deployment.observed = ObservedDeploymentState::Running;
-        app.deployment.last_reconciliation_at =
-            Some(before_reconciliation + Duration::from_secs(1));
-
-        assert!(!resource_health_summary(&app, &id).contains("propolis uuid"));
-
-        let after_reconciliation =
-            before_reconciliation + Duration::from_secs(2);
-        app.update(AppEvent::TrafficFailed {
-            id: id.clone(),
-            at: after_reconciliation,
-            message: "router command failed after readiness".into(),
-        });
-        assert!(
-            resource_health_summary(&app, &id)
-                .contains("router command failed after readiness")
-        );
-
-        app.update(AppEvent::Traffic {
-            id: id.clone(),
-            at: after_reconciliation + Duration::from_secs(1),
-            sample: TrafficSample::default(),
-        });
-        assert!(!resource_health_summary(&app, &id).contains("latest error"));
+        // At this size Top Zones shows only its borders and header.
+        app.session.terminal = TerminalSize { width: 48, height: 16 };
+        assert_eq!(top_zones_page_capacity(&app), 0);
     }
 }

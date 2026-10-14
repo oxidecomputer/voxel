@@ -21,6 +21,8 @@ mod reconcile;
 mod session;
 mod telemetry;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 use std::{fs::OpenOptions, sync::Arc, time::Duration};

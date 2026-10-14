@@ -1019,9 +1019,10 @@ impl<T> LatestSample<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_support::{config, rate, router, sled, switch};
+    use indoc::indoc;
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
-    use voxel_config::VoxelConfig;
 
     fn counters(rx: u64, tx: u64) -> LinkCounters {
         LinkCounters {
@@ -1032,371 +1033,310 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discovers_stable_multi_rack_resources() {
-        let cfg = VoxelConfig::from_toml(
-            "[topology]\nracks = 2\nsleds = 3\nrouters = [\"ce\", \"cr1\"]\n",
-        )
-        .unwrap();
-        let resources = resource_descriptors(&cfg);
-        assert_eq!(
-            resources.iter().filter(|r| r.kind == ResourceKind::Sled).count(),
-            6
-        );
-        let switches: Vec<_> = resources
-            .iter()
-            .filter(|r| r.kind == ResourceKind::SwitchZone)
-            .collect();
-        assert_eq!(
-            switches
-                .iter()
-                .map(|r| (r.rack, r.name.as_str(), r.host.as_deref(), r.slot))
-                .collect::<Vec<_>>(),
-            vec![
-                (Some(RackId(0)), "switch0", Some("g0"), Some(0)),
-                (Some(RackId(0)), "switch1", Some("g2"), Some(1)),
-                (Some(RackId(1)), "switch0", Some("g3"), Some(0)),
-                (Some(RackId(1)), "switch1", Some("g5"), Some(1)),
-            ]
-        );
-        // Cubbies follow the global SP slot, so rack 1 starts at cubby 3.
-        assert_eq!(
-            resources
-                .iter()
-                .filter(|r| r.kind == ResourceKind::Sled)
-                .map(|r| (r.rack, r.slot))
-                .collect::<Vec<_>>(),
-            vec![
-                (Some(RackId(0)), Some(0)),
-                (Some(RackId(0)), Some(1)),
-                (Some(RackId(0)), Some(2)),
-                (Some(RackId(1)), Some(3)),
-                (Some(RackId(1)), Some(4)),
-                (Some(RackId(1)), Some(5)),
-            ]
-        );
-        assert!(
-            resources
-                .iter()
-                .filter(|r| r.kind == ResourceKind::Router)
-                .all(|r| r.rack.is_none())
-        );
-        assert_eq!(
-            resources
-                .iter()
-                .map(|r| &r.id)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            resources.len()
-        );
+    /// What any one host-command parser returns, so every parser's cases
+    /// can share a single table.
+    #[derive(Debug, PartialEq)]
+    enum Parsed {
+        Links(BTreeMap<String, LinkCounters>),
+        ZoneVnics(Vec<ZoneInfo>),
+        Addresses(NodeAddresses),
+        ZoneList(ZoneDiagnostic),
+        ServiceState(Option<ServiceState>),
+        FailedServices(Vec<String>),
+        Ntp(NtpDiagnostic),
+    }
 
-        let reordered = VoxelConfig::from_toml(
-            "[topology]\nracks = 1\nsleds = 3\nscrimlets = [\"g2\", \"g0\"]\nrouters = []\n",
+    type Parser = fn(&str) -> Parsed;
+
+    fn links<const N: usize>(entries: [(&str, LinkCounters); N]) -> Parsed {
+        Parsed::Links(
+            entries.into_iter().map(|(name, c)| (name.to_owned(), c)).collect(),
         )
-        .unwrap();
-        let switches: BTreeMap<_, _> = resource_descriptors(&reordered)
-            .into_iter()
-            .filter(|r| r.kind == ResourceKind::SwitchZone)
-            .map(|r| (r.host.clone().unwrap(), (r.id, r.name)))
-            .collect();
-        assert_eq!(switches["g2"].0.name, "g2");
-        assert!(switches["g2"].1.starts_with("switch"));
-        assert_eq!(switches["g0"].0.name, "g0");
-        assert!(switches["g0"].1.starts_with("switch"));
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|&s| s.to_owned()).collect()
+    }
+
+    fn addresses(ipv4: &[&str], ipv6: &[&str]) -> Parsed {
+        Parsed::Addresses(NodeAddresses {
+            ipv4: strings(ipv4),
+            ipv6: strings(ipv6),
+        })
+    }
+
+    fn zone(name: &str, short_name: &str, vnics: &[&str]) -> ZoneInfo {
+        ZoneInfo {
+            name: name.into(),
+            short_name: short_name.into(),
+            vnics: strings(vnics),
+        }
+    }
+
+    fn ntp(stratum: Option<u32>, synchronized: bool) -> Parsed {
+        Parsed::Ntp(NtpDiagnostic { stratum, synchronized: Some(synchronized) })
     }
 
     #[test]
-    fn parses_production_counter_and_zone_fixtures_resiliently() {
-        let kstat = "0:link:vioif0:rbytes64\t1000\n0:link:vioif0:obytes64\t2000\n0:link:vioif0:ipackets64\t50\n0:link:vioif0:opackets64\t60\n0:link:bad:rbytes64\tnot-a-number\nbroken\n";
-        assert_eq!(
-            parse_kstat_link_counters(kstat)["vioif0"],
-            counters(1000, 2000).with_packets(50, 60)
-        );
-        assert!(!parse_kstat_link_counters(kstat).contains_key("bad"));
-
-        let zones = parse_dladm_zone_vnics(
-            "vnic2:oxz_ntp_aabbccddeeff\nvnic2:oxz_ntp_aabbccddeeff\nvnic1:oxz_nexus_0123456789\nvnic0:global\nshared:oxz_one_deadbeef0\nshared:oxz_two_deadbeef0\n:global\nbad:zone:line\n",
-        );
-        assert_eq!(
-            zones[0],
-            ZoneInfo {
-                name: "global".into(),
-                short_name: "global".into(),
-                vnics: vec!["vnic0".into()]
-            }
-        );
-        assert_eq!(zones[1].short_name, "nexus");
-        assert_eq!(zones[2].short_name, "ntp");
-        assert!(
-            zones.iter().all(|zone| !zone.vnics.iter().any(|v| v == "shared"))
-        );
-        assert_eq!(zones[2].vnics, vec!["vnic2"]);
-
-        let linux = parse_linux_link_counters(
-            "eth1 10 20 1 2 ignored extra\neth0 30 40 3 4\nbad 1 nope 3 4 5\nshort 1\n",
-        );
-        assert_eq!(
-            linux.keys().cloned().collect::<Vec<_>>(),
-            vec!["eth0", "eth1"]
-        );
+    fn host_command_output_parses() {
+        // (case, parser, command output, expected result)
+        let cases: [(&str, Parser, &str, Parsed); 12] = [
+            (
+                "kstat keeps only links whose counters all parse",
+                |s| Parsed::Links(parse_kstat_link_counters(s)),
+                "0:link:vioif0:rbytes64\t1000\n\
+                 0:link:vioif0:obytes64\t2000\n\
+                 0:link:vioif0:ipackets64\t50\n\
+                 0:link:vioif0:opackets64\t60\n\
+                 0:link:bad:rbytes64\tnot-a-number\n\
+                 0:link:bad:obytes64\t1\n\
+                 0:link:bad:ipackets64\t1\n\
+                 0:link:bad:opackets64\t1\n",
+                links([("vioif0", counters(1000, 2000).with_packets(50, 60))]),
+            ),
+            (
+                "dladm groups vnics by zone and drops shared and malformed ones",
+                |s| Parsed::ZoneVnics(parse_dladm_zone_vnics(s)),
+                "vnic1:oxz_ntp_aabbccddeeff\n\
+                 vnic1:oxz_ntp_aabbccddeeff\n\
+                 vnic0:global\n\
+                 shared:oxz_one_deadbeef0\n\
+                 shared:oxz_two_deadbeef0\n\
+                 :global\n\
+                 vnic2:oxz_bad:zone\n",
+                Parsed::ZoneVnics(vec![
+                    zone("global", "global", &["vnic0"]),
+                    zone("oxz_ntp_aabbccddeeff", "ntp", &["vnic1"]),
+                ]),
+            ),
+            (
+                "linux counters ignore extra columns and skip malformed rows",
+                |s| Parsed::Links(parse_linux_link_counters(s)),
+                "eth1 10 20 1 2 ignored extra\n\
+                 bad 1 nope 3 4 5\n\
+                 short 1\n",
+                links([("eth1", counters(10, 20).with_packets(1, 2))]),
+            ),
+            (
+                "ipadm puts host LAN and underlay first and skips link-local",
+                |s| Parsed::Addresses(parse_ipadm_addresses(s)),
+                "net0/v4:10.0.0.1/24\n\
+                 vioif3/v4:192.168.68.122/22\n\
+                 net0/v6:2001\\:db8\\:\\:2/64\n\
+                 underlay0/sled6:fd00\\:1122\\:3344\\:101\\:\\:1/64\n\
+                 vioif1/ll:fe80\\:\\:1/10\n\
+                 malformed\n",
+                addresses(
+                    &["192.168.68.122/22", "10.0.0.1/24"],
+                    &["fd00:1122:3344:101::1/64", "2001:db8::2/64"],
+                ),
+            ),
+            (
+                "linux addresses skip bridges and invalid addresses",
+                |s| Parsed::Addresses(parse_linux_ip_addresses(s)),
+                "5: enp0s11    inet 192.168.68.108/22 scope global enp0s11\n\
+                 5: enp0s11    inet6 2001:db8::1/64 scope global\n\
+                 6: docker0    inet 172.17.0.1/16 scope global docker0\n\
+                 7: enp0s12    inet not-an-address scope global\n",
+                addresses(&["192.168.68.108/22"], &["2001:db8::1/64"]),
+            ),
+            (
+                "zone list is sorted, deduplicated and skips malformed names",
+                |s| Parsed::ZoneList(parse_zone_diagnostics(s)),
+                "global\noxz_switch\noxz_switch\noxz_ntp_deadbeef0\nbad zone\n",
+                Parsed::ZoneList(ZoneDiagnostic {
+                    zones: strings(&[
+                        "global",
+                        "oxz_ntp_deadbeef0",
+                        "oxz_switch",
+                    ]),
+                }),
+            ),
+            (
+                "service state is trimmed",
+                |s| Parsed::ServiceState(parse_service_state(s)),
+                " online\n",
+                Parsed::ServiceState(Some(ServiceState::Online)),
+            ),
+            (
+                "service state rejects unknown states",
+                |s| Parsed::ServiceState(parse_service_state(s)),
+                "garbage",
+                Parsed::ServiceState(None),
+            ),
+            (
+                "failed services are sorted FMRI names without noise",
+                |s| Parsed::FailedServices(parse_failed_services(s)),
+                "svc:/oxide/sled-agent:default\n\
+                 noise\n\
+                 svc:/network/dns/client:default\n",
+                Parsed::FailedServices(strings(&[
+                    "network/dns/client",
+                    "oxide/sled-agent",
+                ])),
+            ),
+            (
+                "chrony synchronised",
+                |s| Parsed::Ntp(parse_chrony_tracking(s)),
+                "Reference ID : A29FC87B\nStratum : 4\nLeap status : Normal\n",
+                ntp(Some(4), true),
+            ),
+            (
+                "chrony not synchronised",
+                |s| Parsed::Ntp(parse_chrony_tracking(s)),
+                "Stratum : 0\nLeap status : Not synchronised",
+                ntp(Some(0), false),
+            ),
+            (
+                "chrony malformed stratum",
+                |s| Parsed::Ntp(parse_chrony_tracking(s)),
+                "Stratum : nope\nmalformed\nLeap status : Unsynchronised",
+                ntp(None, false),
+            ),
+        ];
+        for (case, parse, output, expected) in cases {
+            assert_eq!(parse(output), expected, "{case}");
+        }
     }
 
     #[test]
-    fn parses_addresses_and_health_diagnostics() {
-        let illumos = parse_ipadm_addresses(
-            "net0/v4:10.0.0.1/24\nvioif3/v4:192.168.68.122/22\nnet0/v6:2001\\:db8\\:\\:2/64\nunderlay0/sled6:fd00\\:1122\\:3344\\:101\\:\\:1/64\nvioif1/ll:fe80\\:\\:1/10\nmalformed\n",
-        );
-        assert_eq!(illumos.ipv4, vec!["192.168.68.122/22", "10.0.0.1/24"]);
+    fn rates_history_and_totals_are_correct() {
+        // Discovery lists every rack's sleds, numbered across the fleet, with
+        // two switch zones on each rack's scrimlets, and fleet-wide routers.
+        let cfg = config(indoc! {r#"
+            [topology]
+            racks = 2
+            sleds = 3
+            routers = ["ce", "cr1"]
+        "#});
         assert_eq!(
-            illumos.ipv6,
-            vec!["fd00:1122:3344:101::1/64", "2001:db8::2/64"]
+            resource_descriptors(&cfg),
+            vec![
+                router("ce"),
+                router("cr1"),
+                sled(0, 0),
+                sled(0, 1),
+                sled(0, 2),
+                switch(0, 0, "g0"),
+                switch(0, 1, "g2"),
+                sled(1, 3),
+                sled(1, 4),
+                sled(1, 5),
+                switch(1, 0, "g3"),
+                switch(1, 1, "g5"),
+            ]
         );
-        let linux = parse_linux_ip_addresses(
-            "1: lo    inet 127.0.0.1/8 scope host lo\n5: enp0s11    inet 192.168.68.108/22 scope global enp0s11\n5: enp0s11    inet6 2001:db8::1/64 scope global\n6: docker0    inet 172.17.0.1/16 scope global docker0\ntruncated inet \n7: enp0s12    inet not-an-address scope global\nmalformed\n",
-        );
-        assert_eq!(linux.ipv4, vec!["192.168.68.108/22"]);
-        assert_eq!(linux.ipv6, vec!["2001:db8::1/64"]);
 
+        // Switch slots follow sled order, not the order scrimlets are listed
+        // in.
+        let reordered = config(indoc! {r#"
+            [topology]
+            racks = 1
+            sleds = 3
+            scrimlets = ["g2", "g0"]
+            routers = []
+        "#});
         assert_eq!(
-            parse_zone_diagnostics(
-                "global\noxz_switch\noxz_switch\noxz_ntp_deadbeef0\nbad zone\n"
+            resource_descriptors(&reordered),
+            vec![
+                sled(0, 0),
+                sled(0, 1),
+                sled(0, 2),
+                switch(0, 0, "g0"),
+                switch(0, 1, "g2"),
+            ]
+        );
+
+        // Link rates from successive counter snapshots.
+        let start = Instant::now();
+        let snapshot = |secs: u64, rx: u64| {
+            CounterSnapshot::new(
+                start + Duration::from_secs(secs),
+                BTreeMap::from([("net0".into(), counters(rx, 2 * rx))]),
             )
-            .zones,
-            vec!["global", "oxz_ntp_deadbeef0", "oxz_switch"]
-        );
-        assert_eq!(
-            parse_service_state(" online\n"),
-            Some(ServiceState::Online)
-        );
-        assert_eq!(parse_service_state("garbage"), None);
-        assert_eq!(
-            parse_failed_services(
-                "svc:/oxide/sled-agent:default\nnoise\nsvc:/network/dns/client:default\n"
-            ),
-            vec!["network/dns/client", "oxide/sled-agent"]
-        );
-        let ntp = parse_chrony_tracking(
-            "Reference ID : A29FC87B\nStratum : 4\nLeap status : Normal\n",
-        );
-        assert_eq!(
-            ntp,
-            NtpDiagnostic { stratum: Some(4), synchronized: Some(true) }
-        );
-        assert_eq!(
-            parse_chrony_tracking(
-                "Stratum : 0\nLeap status : Not synchronised"
-            ),
-            NtpDiagnostic { stratum: Some(0), synchronized: Some(false) }
-        );
-        assert_eq!(
-            parse_chrony_tracking(
-                "Stratum : nope\nmalformed\nLeap status : Unsynchronised"
-            ),
-            NtpDiagnostic { stratum: None, synchronized: Some(false) }
-        );
-    }
-
-    #[test]
-    fn rates_use_elapsed_time_reset_baseline_and_recover() {
-        let start = Instant::now();
-        let mut state = ResourceTelemetry::default();
-        state.update(CounterSnapshot::new(
-            start,
-            BTreeMap::from([("net0".into(), counters(100, 200))]),
-        ));
-        state.update(CounterSnapshot::new(
-            start + Duration::from_secs(4),
-            BTreeMap::from([("net0".into(), counters(500, 1000))]),
-        ));
-        assert_eq!(state.link_rates["net0"].rx_bytes_sec, 100.0);
-        state.update(CounterSnapshot::new(
-            start + Duration::from_secs(6),
-            BTreeMap::from([("net0".into(), counters(10, 20))]),
-        ));
-        assert!(!state.link_rates.contains_key("net0"));
-        state.update(CounterSnapshot::new(
-            start + Duration::from_secs(8),
-            BTreeMap::from([("net0".into(), counters(110, 220))]),
-        ));
-        assert_eq!(state.link_rates["net0"].rx_bytes_sec, 50.0);
-        state.update(CounterSnapshot::new(
-            start + Duration::from_secs(8),
-            BTreeMap::from([("net0".into(), counters(210, 420))]),
-        ));
-        assert!(state.link_rates.is_empty(), "zero elapsed has no rates");
-        state.update(CounterSnapshot::new(
-            start + Duration::from_secs(10),
-            BTreeMap::from([("net0".into(), counters(310, 620))]),
-        ));
-        assert_eq!(
-            state.link_rates["net0"].rx_bytes_sec, 50.0,
-            "zero elapsed still advances baseline"
-        );
-    }
-
-    #[test]
-    fn traffic_sample_preserves_total_links_and_zone_attribution() {
-        let sample = TrafficSample {
-            total: BidirectionalRate {
-                rx_bytes_sec: 7.0,
-                tx_bytes_sec: 3.0,
-                ..Default::default()
-            },
-            links: BTreeMap::from([(
-                "net0".into(),
-                BidirectionalRate::default(),
-            )]),
-            zones: vec![ZoneTraffic {
-                name: "oxz_nexus_deadbeef0".into(),
-                short_name: "nexus".into(),
-                rate: BidirectionalRate::default(),
-                errors: Default::default(),
-            }],
-            ..Default::default()
         };
-        assert_eq!(sample.total.total_bytes_sec(), 10.0);
-        assert!(sample.links.contains_key("net0"));
-        assert_eq!(sample.zones[0].short_name, "nexus");
-    }
+        let mut state = ResourceTelemetry::default();
+        state.update(snapshot(0, 100));
+        // (case, seconds, received bytes, expected received rate)
+        for (case, secs, rx, expected) in [
+            ("divided by the elapsed four seconds", 4, 500, Some(100.0)),
+            ("a counter reset drops the link", 6, 10, None),
+            ("rates resume from the post-reset baseline", 8, 110, Some(50.0)),
+            ("zero elapsed time has no rate", 8, 210, None),
+        ] {
+            state.update(snapshot(secs, rx));
+            assert_eq!(
+                state.link_rates.get("net0").map(|r| r.rx_bytes_sec),
+                expected,
+                "{case}"
+            );
+        }
 
-    #[test]
-    fn history_is_trailing_sixty_seconds_and_count_bounded() {
-        let start = Instant::now();
+        // Traffic history keeps the trailing sixty seconds, up to a count.
         let mut history = TrafficHistory::new(3);
-        for (secs, total) in [(0, 1.0), (30, 2.0), (59, 3.0), (61, 4.0)] {
+        let mut push = |secs: u64, rx: f64| {
             history.push(HistoryPoint {
                 captured_at: start + Duration::from_secs(secs),
-                rate: BidirectionalRate {
-                    rx_bytes_sec: total,
-                    ..Default::default()
-                },
+                rate: rate(rx, 0.0),
             });
-        }
-        assert_eq!(
             history
                 .points()
                 .iter()
                 .map(|p| p.rate.rx_bytes_sec)
-                .collect::<Vec<_>>(),
-            vec![2.0, 3.0, 4.0]
-        );
-        history.push(HistoryPoint {
-            captured_at: start + Duration::from_secs(62),
-            rate: Default::default(),
-        });
-        assert_eq!(history.len(), 3);
-
-        let mut ordered = TrafficHistory::new(8);
-        for secs in [0, 60] {
-            ordered.push(HistoryPoint {
-                captured_at: start + Duration::from_secs(secs),
-                rate: BidirectionalRate {
-                    rx_bytes_sec: secs as f64,
-                    ..Default::default()
-                },
-            });
+                .collect::<Vec<_>>()
+        };
+        push(0, 0.0);
+        // (case, seconds, rate, the rates of the points kept). Each point's
+        // rate is unique, so the rates identify the points.
+        for (case, secs, rx, expected) in [
+            ("a point sixty seconds old stays", 60, 1.0, vec![0.0, 1.0]),
+            ("a repeated timestamp replaces the last", 60, 2.0, vec![0.0, 2.0]),
+            ("an earlier timestamp adds nothing", 30, 3.0, vec![0.0, 2.0]),
+            ("older points leave the window", 61, 4.0, vec![2.0, 4.0]),
+            ("points within the window stay", 62, 5.0, vec![2.0, 4.0, 5.0]),
+            ("the capacity bounds the history", 63, 6.0, vec![4.0, 5.0, 6.0]),
+        ] {
+            assert_eq!(push(secs, rx), expected, "{case}");
         }
-        assert_eq!(ordered.len(), 2, "exact sixty-second boundary is retained");
-        ordered.push(HistoryPoint {
-            captured_at: start + Duration::from_secs(60),
-            rate: BidirectionalRate {
-                rx_bytes_sec: 61.0,
-                ..Default::default()
-            },
-        });
-        ordered.push(HistoryPoint {
-            captured_at: start + Duration::from_secs(30),
-            rate: BidirectionalRate {
-                rx_bytes_sec: 30.0,
-                ..Default::default()
-            },
-        });
-        assert_eq!(ordered.len(), 2);
-        assert_eq!(ordered.points().back().unwrap().rate.rx_bytes_sec, 61.0);
-        assert!(ordered.points().iter().map(|p| p.captured_at).is_sorted());
-    }
 
-    #[test]
-    fn aggregates_each_scoped_resource_once_and_ranks_zones() {
-        let cfg = VoxelConfig::from_toml(
-            "[topology]\nracks = 2\nsleds = 3\nrouters = []\n",
-        )
-        .unwrap();
+        // Fleet and rack totals count each current resource once.
+        let cfg = config(indoc! {"
+            [topology]
+            racks = 2
+            sleds = 3
+            routers = []
+        "});
         let mut model = TelemetryModel::new(resource_descriptors(&cfg), 64);
-        let now = Instant::now();
-        let sled0 = ResourceId::rack(RackId(0), ResourceKind::Sled, "g0");
-        let switch0 =
-            ResourceId::rack(RackId(0), ResourceKind::SwitchZone, "g0");
-        model.set_current_rate(
-            &sled0,
-            now,
-            BidirectionalRate {
-                rx_bytes_sec: 10.0,
-                tx_bytes_sec: 20.0,
-                ..Default::default()
-            },
-        );
-        model.set_current_rate(
-            &switch0,
-            now,
-            BidirectionalRate {
-                rx_bytes_sec: 1.0,
-                tx_bytes_sec: 2.0,
-                ..Default::default()
-            },
-        );
-        model.rebuild_aggregates(now);
-        assert_eq!(model.fleet_rate.total_bytes_sec(), 33.0);
-        assert_eq!(model.rack_rates[&RackId(0)].total_bytes_sec(), 33.0);
-        assert_eq!(model.rack_rates[&RackId(1)].total_bytes_sec(), 0.0);
-        assert_eq!(model.fleet_history.len(), 1);
-        model.rebuild_aggregates(now);
+        let sled0 = sled(0, 0).id;
+        model.set_current_rate(&sled0, start, rate(10.0, 20.0));
+        model.set_current_rate(&switch(0, 0, "g0").id, start, rate(1.0, 2.0));
+        model.rebuild_aggregates(start);
+        assert_eq!(model.fleet_rate, rate(11.0, 22.0));
         assert_eq!(
-            model.fleet_history.len(),
-            1,
-            "same generation replaces history"
+            model.rack_rates,
+            BTreeMap::from([
+                (RackId(0), rate(11.0, 22.0)),
+                (RackId(1), rate(0.0, 0.0)),
+            ])
         );
-        let next = now + Duration::from_secs(1);
-        model.set_current_rate(
-            &sled0,
-            next,
-            BidirectionalRate { rx_bytes_sec: 4.0, ..Default::default() },
-        );
+        // Only the sled reports in the next generation, so the switch's rate
+        // is stale and left out.
+        let next = start + Duration::from_secs(1);
+        model.set_current_rate(&sled0, next, rate(4.0, 0.0));
         model.rebuild_aggregates(next);
-        assert_eq!(
-            model.fleet_rate.total_bytes_sec(),
-            4.0,
-            "stale switch excluded"
-        );
+        assert_eq!(model.fleet_rate, rate(4.0, 0.0));
+        assert_eq!(model.fleet_history.len(), 2, "one point per generation");
 
+        // Top zones rank by rate; a vnic listed twice counts once, and one
+        // shared between zones counts for neither.
         let state = ResourceTelemetry {
             link_rates: BTreeMap::from([
-                (
-                    "a".into(),
-                    BidirectionalRate {
-                        rx_bytes_sec: 3.0,
-                        ..Default::default()
-                    },
-                ),
-                (
-                    "b".into(),
-                    BidirectionalRate {
-                        rx_bytes_sec: 8.0,
-                        ..Default::default()
-                    },
-                ),
+                ("a".into(), rate(3.0, 0.0)),
+                ("b".into(), rate(8.0, 0.0)),
             ]),
             zones: vec![
-                ZoneInfo {
-                    name: "zone-z".into(),
-                    short_name: "z".into(),
-                    vnics: vec!["a".into()],
-                },
-                ZoneInfo {
-                    name: "zone-a".into(),
-                    short_name: "a".into(),
-                    vnics: vec!["b".into(), "b".into(), "a".into()],
-                },
+                zone("zone-z", "z", &["a"]),
+                zone("zone-a", "a", &["b", "b", "a"]),
             ],
             ..Default::default()
         };
@@ -1404,188 +1344,97 @@ mod tests {
             state
                 .top_zones(2)
                 .iter()
-                .map(|z| z.name.as_str())
+                .map(|z| (z.name.as_str(), z.rate.total_bytes_sec()))
                 .collect::<Vec<_>>(),
-            vec!["zone-a", "zone-z"]
-        );
-        assert_eq!(state.top_zones(2)[0].rate.total_bytes_sec(), 8.0);
-        assert_eq!(state.top_zones(2)[1].rate.total_bytes_sec(), 0.0);
-    }
-
-    #[test]
-    fn severity_boundaries_are_strict() {
-        assert_eq!(
-            TrafficSeverity::for_bytes_per_sec(100_000.0),
-            TrafficSeverity::Normal
-        );
-        assert_eq!(
-            TrafficSeverity::for_bytes_per_sec(100_000.1),
-            TrafficSeverity::Elevated
-        );
-        assert_eq!(
-            TrafficSeverity::for_bytes_per_sec(5_000_000.0),
-            TrafficSeverity::Elevated
-        );
-        assert_eq!(
-            TrafficSeverity::for_bytes_per_sec(5_000_000.1),
-            TrafficSeverity::High
+            vec![("zone-a", 8.0), ("zone-z", 0.0)]
         );
     }
 
     #[test]
-    fn latest_good_survives_errors_with_deterministic_freshness() {
+    fn health_state_follows_freshness_and_diagnostics() {
+        // Severity boundaries are strict.
+        for (bytes_per_sec, severity) in [
+            (100_000.0, TrafficSeverity::Normal),
+            (100_000.1, TrafficSeverity::Elevated),
+            (5_000_000.0, TrafficSeverity::Elevated),
+            (5_000_000.1, TrafficSeverity::High),
+        ] {
+            assert_eq!(
+                TrafficSeverity::for_bytes_per_sec(bytes_per_sec),
+                severity,
+                "{bytes_per_sec} B/s"
+            );
+        }
+
+        // The latest good sample survives errors, and freshness is measured
+        // from it, with both boundaries inclusive.
         let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let fresh_for = Duration::from_secs(10);
+        let available_for = Duration::from_secs(30);
         let mut sample = LatestSample::default();
         assert_eq!(
-            sample.freshness(
-                start,
-                Duration::from_secs(10),
-                Duration::from_secs(30)
-            ),
+            sample.freshness(start, fresh_for, available_for),
             Freshness::Unavailable
         );
         sample.record_success(start, 7u32);
-        sample.record_error(start + Duration::from_secs(5), "timeout");
-        assert_eq!(sample.good.as_ref().map(|g| g.value), Some(7));
+        sample.record_error(at(5), "timeout");
         assert_eq!(sample.latest_error.as_ref().unwrap().message, "timeout");
-        assert_eq!(
-            sample.freshness(
-                start + Duration::from_secs(10),
-                Duration::from_secs(10),
-                Duration::from_secs(30)
-            ),
-            Freshness::Fresh
-        );
-        assert_eq!(
-            sample.freshness(
-                start + Duration::from_secs(11),
-                Duration::from_secs(10),
-                Duration::from_secs(30)
-            ),
-            Freshness::Stale
-        );
-        assert_eq!(
-            sample.freshness(
-                start + Duration::from_secs(30),
-                Duration::from_secs(10),
-                Duration::from_secs(30)
-            ),
-            Freshness::Stale
-        );
-        assert_eq!(
-            sample.freshness(
-                start + Duration::from_secs(31),
-                Duration::from_secs(10),
-                Duration::from_secs(30)
-            ),
-            Freshness::Unavailable
-        );
-        sample.record_success(start + Duration::from_secs(32), 8);
+        for (age, freshness) in [
+            (10, Freshness::Fresh),
+            (11, Freshness::Stale),
+            (30, Freshness::Stale),
+            (31, Freshness::Unavailable),
+        ] {
+            assert_eq!(
+                sample.freshness(at(age), fresh_for, available_for),
+                freshness,
+                "{age} s after the good sample"
+            );
+        }
+        sample.record_success(at(32), 8);
         assert_eq!(sample.good.as_ref().map(|g| g.value), Some(8));
-        assert!(
-            sample.latest_error.is_none(),
-            "success clears the active error"
-        );
-    }
+        assert!(sample.latest_error.is_none());
 
-    #[test]
-    fn health_does_not_use_zone_count_as_truth() {
-        let diagnostic = HealthDiagnostic {
+        // Health follows the context, then freshness, then the diagnostic.
+        // A healthy diagnostic sees only the global zone: the zone count is
+        // not evidence of health.
+        let healthy = HealthDiagnostic {
             sled_agent: Some(ServiceState::Online),
-            failed_services: vec![],
-            ntp: NtpDiagnostic { stratum: Some(4), synchronized: Some(true) },
+            ntp: NtpDiagnostic { stratum: None, synchronized: Some(true) },
             zones: ZoneDiagnostic { zones: vec!["global".into()] },
-            notes: vec![],
+            ..Default::default()
         };
-        assert_eq!(diagnostic.state(), HealthState::Healthy);
-        let mut failed = diagnostic.clone();
-        failed.failed_services.push("oxide/foo".into());
-        assert_eq!(failed.state(), HealthState::Degraded);
-
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Checking,
-                None,
-                Freshness::Unavailable
-            ),
-            HealthState::Checking
-        );
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Checking,
-                Some(&failed),
-                Freshness::Stale
-            ),
-            HealthState::Checking
-        );
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Active,
-                Some(&diagnostic),
-                Freshness::Fresh
-            ),
-            HealthState::Healthy
-        );
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Active,
-                Some(&failed),
-                Freshness::Fresh
-            ),
-            HealthState::Degraded
-        );
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Active,
-                Some(&diagnostic),
-                Freshness::Stale
-            ),
-            HealthState::Stale
-        );
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Active,
-                Some(&diagnostic),
-                Freshness::Unavailable
-            ),
-            HealthState::Unavailable
-        );
-        assert_eq!(
-            derive_health_state(HealthContext::Active, None, Freshness::Fresh),
-            HealthState::Unknown
-        );
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Stopped,
-                Some(&failed),
-                Freshness::Fresh
-            ),
-            HealthState::Stopped
-        );
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Stopped,
-                Some(&failed),
-                Freshness::Stale
-            ),
-            HealthState::Stopped
-        );
-
-        let mut hard_failure = diagnostic;
-        hard_failure.sled_agent = Some(ServiceState::Maintenance);
-        assert_eq!(
-            derive_health_state(
-                HealthContext::Active,
-                Some(&hard_failure),
-                Freshness::Fresh
-            ),
-            HealthState::Failed
-        );
-
-        let only_failed_services = HealthDiagnostic {
+        // A failed service degrades even when nothing else is known.
+        let failed_service = HealthDiagnostic {
             failed_services: vec!["oxide/foo".into()],
             ..Default::default()
         };
-        assert_eq!(only_failed_services.state(), HealthState::Degraded);
+        let sled_agent_maintenance = HealthDiagnostic {
+            sled_agent: Some(ServiceState::Maintenance),
+            ..healthy.clone()
+        };
+
+        use Freshness::{Fresh, Stale, Unavailable};
+        use HealthContext::{Active, Checking, Stopped};
+        // (context, diagnostic, freshness, state)
+        let cases = [
+            (Checking, Some(&failed_service), Stale, HealthState::Checking),
+            (Active, Some(&healthy), Fresh, HealthState::Healthy),
+            (Active, Some(&failed_service), Fresh, HealthState::Degraded),
+            (Active, Some(&sled_agent_maintenance), Fresh, HealthState::Failed),
+            (Active, Some(&healthy), Stale, HealthState::Stale),
+            (Active, Some(&healthy), Unavailable, HealthState::Unavailable),
+            (Active, None, Fresh, HealthState::Unknown),
+            (Stopped, Some(&failed_service), Stale, HealthState::Stopped),
+        ];
+        for (context, diagnostic, freshness, state) in cases {
+            assert_eq!(
+                derive_health_state(context, diagnostic, freshness),
+                state,
+                "{context:?}, {:?}, {freshness:?}",
+                diagnostic.map(HealthDiagnostic::state),
+            );
+        }
     }
 }
