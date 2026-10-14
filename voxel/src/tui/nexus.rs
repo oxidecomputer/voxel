@@ -499,80 +499,67 @@ impl NexusClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use crate::tui::test_support::recovery;
+    use httptest::matchers::{contains, eq, json_decoded, request};
+    use httptest::responders::{
+        Responder, delay_and_then, json_encoded, status_code,
+    };
+    use httptest::{Expectation, ExpectationBuilder, Server, all_of, cycle};
+    use serde_json::json;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
     use voxel_config::VoxelConfig;
 
-    const PING: &str = r#"{"status":"ok"}"#;
+    const PING_PATH: &str = "/v1/ping";
+    const LOGIN: &str = "/v1/login/recovery/local";
+    const QUERY: &str = "/v1/system/timeseries/query";
     // Nexus answers every error with a JSON body naming the request.
     const UNAUTHORIZED: &str = r#"{"request_id":"test","error_code":"Unauthorized","message":"credentials missing or invalid"}"#;
+    const UNSUPPORTED_VERSION: &str = r#"{"request_id":"test","message":"server does not support this API version: 2026081400.0.0"}"#;
 
-    struct TestResponse {
-        status: &'static str,
-        headers: &'static str,
-        body: &'static str,
-        delay: Duration,
+    fn endpoint(server: &Server) -> Url {
+        Url::parse(&server.url_str("/")).unwrap()
     }
 
-    async fn test_server(
-        responses: Vec<TestResponse>,
-    ) -> (Url, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let recorded = requests.clone();
-        let task = tokio::spawn(async move {
-            let mut responses = VecDeque::from(responses);
-            while let Some(response) = responses.pop_front() {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut bytes = Vec::new();
-                let mut buffer = [0; 4096];
-                loop {
-                    let count = stream.read(&mut buffer).await.unwrap();
-                    if count == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&buffer[..count]);
-                    let Some(headers_end) = bytes
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                    else {
-                        continue;
-                    };
-                    let headers =
-                        String::from_utf8_lossy(&bytes[..headers_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse().ok())
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= headers_end + 4 + content_length {
-                        break;
-                    }
-                }
-                recorded
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8(bytes).unwrap());
-                let reply = format!(
-                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
-                    response.status,
-                    response.body.len(),
-                    response.headers,
-                );
-                stream.write_all(reply.as_bytes()).await.unwrap();
-                tokio::time::sleep(response.delay).await;
-                stream.write_all(response.body.as_bytes()).await.unwrap();
-            }
-        });
-        (Url::parse(&format!("http://{address}/")).unwrap(), requests, task)
+    fn pong() -> impl Responder {
+        json_encoded(json!({"status": "ok"}))
+    }
+
+    fn ping() -> Expectation {
+        Expectation::matching(request::method_path("GET", PING_PATH))
+            .respond_with(pong())
+    }
+
+    fn login() -> ExpectationBuilder {
+        Expectation::matching(request::method_path("POST", LOGIN))
+    }
+
+    fn query() -> ExpectationBuilder {
+        Expectation::matching(request::method_path("POST", QUERY))
+    }
+
+    fn query_with_cookie(cookie: &'static str) -> ExpectationBuilder {
+        Expectation::matching(all_of![
+            request::method_path("POST", QUERY),
+            request::headers(contains(("cookie", cookie))),
+        ])
+    }
+
+    /// A successful login, which sets the session cookie Nexus uses.
+    fn session(name: &str) -> impl Responder + use<> {
+        status_code(204).append_header(
+            "Set-Cookie",
+            format!("session={name}; Path=/; HttpOnly"),
+        )
+    }
+
+    /// An answer that arrives well after any client timeout in these tests.
+    fn stall() -> impl Responder {
+        delay_and_then(Duration::from_millis(200), json_encoded(empty_result()))
+    }
+
+    fn empty_result() -> serde_json::Value {
+        json!({"tables": [], "query_summaries": null})
     }
 
     #[test]
@@ -614,11 +601,7 @@ mod tests {
         // hangs; either way the long request timeout must not apply.
         let client = NexusClient::new(
             vec![Url::parse("http://192.0.2.1/").unwrap()],
-            RecoveryLogin {
-                silo: "recovery".into(),
-                username: "recovery".into(),
-                password: "oxide".into(),
-            },
+            recovery(),
             Duration::from_secs(60),
         )
         .unwrap()
@@ -636,14 +619,7 @@ mod tests {
     #[test]
     fn automatic_login_requires_the_default_recovery_identity() {
         let mut config = VoxelConfig::default();
-        assert_eq!(
-            RecoveryLogin::from_config(&config),
-            Some(RecoveryLogin {
-                silo: "recovery".into(),
-                username: "recovery".into(),
-                password: "oxide".into(),
-            })
-        );
+        assert_eq!(RecoveryLogin::from_config(&config), Some(recovery()));
 
         config.recovery_silo.user_name = "operator".into();
         assert_eq!(RecoveryLogin::from_config(&config), None);
@@ -654,27 +630,24 @@ mod tests {
     /// the operator sees more than a bare 400.
     #[tokio::test]
     async fn an_older_nexus_is_reported_as_an_image_mismatch() {
-        let (endpoint, _, server) = test_server(vec![TestResponse {
-            status: "400 Bad Request",
-            headers: "Content-Type: application/json\r\n",
-            body: r#"{"request_id":"test","message":"server does not support this API version: 2026081400.0.0"}"#,
-            delay: Duration::ZERO,
-        }])
-        .await;
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", PING_PATH))
+                .respond_with(
+                    status_code(400)
+                        .append_header("Content-Type", "application/json")
+                        .body(UNSUPPORTED_VERSION),
+                ),
+        );
         let client = NexusClient::new(
-            vec![endpoint],
-            RecoveryLogin {
-                silo: "recovery".into(),
-                username: "recovery".into(),
-                password: "oxide".into(),
-            },
+            vec![endpoint(&server)],
+            recovery(),
             Duration::from_secs(2),
         )
         .unwrap();
 
         let error = client.ready(&CancellationToken::new()).await.unwrap_err();
 
-        server.await.unwrap();
         let error = format!("{error:#}");
         assert!(
             error.contains("does not support this API version")
@@ -688,28 +661,12 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_authenticates_once_without_querying_timeseries() {
-        let (endpoint, requests, server) = test_server(vec![
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: PING,
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=ready; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-        ])
-        .await;
+        let server = Server::run();
+        server.expect(ping());
+        server.expect(login().respond_with(session("ready")));
         let client = NexusClient::new(
-            vec![endpoint],
-            RecoveryLogin {
-                silo: "recovery".into(),
-                username: "recovery".into(),
-                password: "oxide".into(),
-            },
+            vec![endpoint(&server)],
+            recovery(),
             Duration::from_secs(2),
         )
         .unwrap();
@@ -717,56 +674,43 @@ mod tests {
 
         client.ready(&cancel).await.unwrap();
         client.ready(&cancel).await.unwrap();
-
-        server.await.unwrap();
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("GET /v1/ping "));
-        assert!(requests[1].starts_with("POST /v1/login/recovery/local "));
     }
 
     #[tokio::test]
     async fn query_logs_in_and_reauthenticates_once_after_unauthorized() {
-        let (endpoint, requests, server) = test_server(vec![
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: PING,
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=first; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "401 Unauthorized",
-                headers: "Content-Type: application/json\r\n",
-                body: UNAUTHORIZED,
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=second; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: r#"{"tables":[],"query_summaries":null}"#,
-                delay: Duration::ZERO,
-            },
-        ])
-        .await;
+        let server = Server::run();
+        server.expect(ping());
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", LOGIN),
+                request::body(json_decoded(eq(json!({
+                    "username": "recovery",
+                    "password": "oxide",
+                })))),
+            ])
+            .times(2)
+            .respond_with(cycle![session("first"), session("second")]),
+        );
+        server.expect(
+            query_with_cookie("session=first").respond_with(
+                status_code(401)
+                    .insert_header("Content-Type", "application/json")
+                    .body(UNAUTHORIZED),
+            ),
+        );
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("POST", QUERY),
+                request::headers(contains(("cookie", "session=second"))),
+                request::body(json_decoded(eq(json!({
+                    "query": "get sled_data_link:bytes_sent",
+                })))),
+            ])
+            .respond_with(json_encoded(empty_result())),
+        );
         let client = NexusClient::new(
-            vec![endpoint],
-            RecoveryLogin {
-                silo: "recovery".into(),
-                username: "recovery".into(),
-                password: "oxide".into(),
-            },
+            vec![endpoint(&server)],
+            recovery(),
             Duration::from_secs(2),
         )
         .unwrap();
@@ -777,184 +721,129 @@ mod tests {
             .unwrap();
 
         assert!(result.tables.is_empty());
-        server.await.unwrap();
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        assert!(requests[0].starts_with("GET /v1/ping "));
-        assert!(requests[1].starts_with("POST /v1/login/recovery/local "));
-        assert!(
-            requests[1]
-                .contains(r#"{"password":"oxide","username":"recovery"}"#)
-        );
-        assert!(requests[2].contains("cookie: session=first"));
-        assert!(requests[3].starts_with("POST /v1/login/recovery/local "));
-        assert!(requests[4].contains("cookie: session=second"));
-        assert!(
-            requests[4]
-                .contains(r#"{"query":"get sled_data_link:bytes_sent"}"#)
-        );
+    }
+
+    /// Fails over past every endpoint that stalls or refuses and answers from
+    /// the last one, whether the client found the first by probing or had
+    /// already settled on it.
+    #[tokio::test]
+    async fn query_succeeds_on_the_last_endpoint_after_earlier_ones_stall_or_fail()
+     {
+        type Servers = fn() -> Vec<Server>;
+        // (case, servers in candidate order, whether the client starts
+        // settled on the first)
+        let cases: [(&str, Servers, bool); 2] = [
+            (
+                "first chosen by probing",
+                || {
+                    let stalled = Server::run();
+                    stalled.expect(ping());
+                    stalled.expect(login().respond_with(session("stalled")));
+                    stalled.expect(query().respond_with(stall()));
+                    let healthy = Server::run();
+                    // The healthy endpoint answers its first ping late, so
+                    // the client settles on the stalled one first.
+                    healthy.expect(
+                        Expectation::matching(request::method_path(
+                            "GET", PING_PATH,
+                        ))
+                        .times(2)
+                        .respond_with(cycle![
+                            delay_and_then(Duration::from_millis(20), pong()),
+                            pong(),
+                        ]),
+                    );
+                    healthy.expect(login().respond_with(session("healthy")));
+                    healthy.expect(
+                        query().respond_with(json_encoded(empty_result())),
+                    );
+                    vec![stalled, healthy]
+                },
+                false,
+            ),
+            (
+                "first already settled",
+                || {
+                    let first = Server::run();
+                    first.expect(login().respond_with(session("first")));
+                    first.expect(query().respond_with(stall()));
+                    let second = Server::run();
+                    second.expect(ping());
+                    second.expect(login().respond_with(session("second")));
+                    second.expect(query().respond_with(stall()));
+                    let third = Server::run();
+                    third.expect(
+                        Expectation::matching(request::method_path(
+                            "GET", PING_PATH,
+                        ))
+                        .times(2)
+                        .respond_with(cycle![status_code(503), pong()]),
+                    );
+                    third.expect(login().respond_with(session("third")));
+                    third.expect(
+                        query().respond_with(json_encoded(empty_result())),
+                    );
+                    vec![first, second, third]
+                },
+                true,
+            ),
+        ];
+        for (case, servers, settled) in cases {
+            // Each server checks its expectations when dropped at the end of
+            // the case.
+            let servers = servers();
+            let client = NexusClient::new(
+                servers.iter().map(endpoint).collect(),
+                recovery(),
+                Duration::from_millis(50),
+            )
+            .unwrap();
+            if settled {
+                *client.endpoint.lock().await = Some(endpoint(&servers[0]));
+            }
+
+            let result = client
+                .query(
+                    "get sled_data_link:bytes_sent",
+                    &CancellationToken::new(),
+                )
+                .await;
+
+            assert!(
+                result.expect(case).tables.is_empty(),
+                "{case}: the last endpoint's answer"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn query_retries_another_endpoint_when_a_response_stalls() {
-        let (stalled, stalled_requests, stalled_server) = test_server(vec![
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: PING,
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=stalled; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: r#"{"tables":[],"query_summaries":null}"#,
-                delay: Duration::from_millis(200),
-            },
-        ])
-        .await;
-        let (healthy, healthy_requests, healthy_server) = test_server(vec![
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: PING,
-                delay: Duration::from_millis(20),
-            },
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: PING,
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=healthy; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: r#"{"tables":[],"query_summaries":null}"#,
-                delay: Duration::ZERO,
-            },
-        ])
-        .await;
+    async fn query_fails_with_the_first_error_once_every_endpoint_fails() {
+        let servers = [Server::run(), Server::run()];
+        for (server, name) in servers.iter().zip(["first", "second"]) {
+            // Readiness may probe every endpoint, so pings are not counted.
+            server.expect(
+                Expectation::matching(request::method_path("GET", PING_PATH))
+                    .times(1..)
+                    .respond_with(pong()),
+            );
+            server.expect(login().respond_with(session(name)));
+            server.expect(query().respond_with(status_code(500)));
+        }
         let client = NexusClient::new(
-            vec![stalled, healthy],
-            RecoveryLogin {
-                silo: "recovery".into(),
-                username: "recovery".into(),
-                password: "oxide".into(),
-            },
-            Duration::from_millis(50),
+            servers.iter().map(endpoint).collect(),
+            recovery(),
+            Duration::from_secs(2),
         )
         .unwrap();
 
-        let result = client
+        let error = client
             .query("get sled_data_link:bytes_sent", &CancellationToken::new())
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert!(result.tables.is_empty());
-        stalled_server.await.unwrap();
-        healthy_server.await.unwrap();
-        assert_eq!(stalled_requests.lock().unwrap().len(), 3);
-        assert_eq!(healthy_requests.lock().unwrap().len(), 4);
-    }
-
-    #[tokio::test]
-    async fn query_tries_every_endpoint_before_failing() {
-        let stalled_query = TestResponse {
-            status: "200 OK",
-            headers: "Content-Type: application/json\r\n",
-            body: r#"{"tables":[],"query_summaries":null}"#,
-            delay: Duration::from_millis(200),
-        };
-        let (first, _, first_server) = test_server(vec![
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=first; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            stalled_query,
-        ])
-        .await;
-        let (second, _, second_server) = test_server(vec![
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: PING,
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=second; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: r#"{"tables":[],"query_summaries":null}"#,
-                delay: Duration::from_millis(200),
-            },
-        ])
-        .await;
-        let (third, third_requests, third_server) = test_server(vec![
-            TestResponse {
-                status: "503 Service Unavailable",
-                headers: "",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: PING,
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "204 No Content",
-                headers: "Set-Cookie: session=third; Path=/; HttpOnly\r\n",
-                body: "",
-                delay: Duration::ZERO,
-            },
-            TestResponse {
-                status: "200 OK",
-                headers: "Content-Type: application/json\r\n",
-                body: r#"{"tables":[],"query_summaries":null}"#,
-                delay: Duration::ZERO,
-            },
-        ])
-        .await;
-        let client = NexusClient::new(
-            vec![first.clone(), second, third],
-            RecoveryLogin {
-                silo: "recovery".into(),
-                username: "recovery".into(),
-                password: "oxide".into(),
-            },
-            Duration::from_millis(50),
-        )
-        .unwrap();
-        *client.endpoint.lock().await = Some(first);
-
-        let result = client
-            .query("get sled_data_link:bytes_sent", &CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert!(result.tables.is_empty());
-        first_server.await.unwrap();
-        second_server.await.unwrap();
-        third_server.await.unwrap();
-        assert_eq!(third_requests.lock().unwrap().len(), 4);
+        assert!(
+            format!("{error:#}").contains("Nexus timeseries query"),
+            "{error:#}"
+        );
     }
 }

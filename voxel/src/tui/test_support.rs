@@ -12,6 +12,7 @@ use crossterm::event::KeyCode;
 use ratatui::{Frame, Terminal, backend::TestBackend, buffer::Buffer};
 use voxel_config::VoxelConfig;
 
+use super::nexus::RecoveryLogin;
 use super::telemetry::{
     BidirectionalRate, RackId, ResourceDescriptor, ResourceId, ResourceKind,
     TrafficSample, TrafficSource,
@@ -73,6 +74,15 @@ pub(crate) fn sample(
         total: rate(rx_bytes_sec, 0.0),
         source,
         ..Default::default()
+    }
+}
+
+/// The default recovery identity Voxel's racks are set up with.
+pub(crate) fn recovery() -> RecoveryLogin {
+    RecoveryLogin {
+        silo: "recovery".into(),
+        username: "recovery".into(),
+        password: "oxide".into(),
     }
 }
 
