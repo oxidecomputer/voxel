@@ -55,15 +55,11 @@ enum Targets {
     Scrimlets,
 }
 
-/// The switch zone's root, as seen from the sled global zone. Every overlay
-/// component (the switch infra) lands here; the GZ ddm uses `DirReplace` instead,
-/// so there's no GZ-overlay case to generalize over.
+/// Where overlay components land: the switch zone root from the sled GZ.
 const SWITCH_ROOT: &str = SWITCH_ZONE_ROOT;
 
-/// The buildomat artifact's on-disk form. omicron-package "zone" outputs are
-/// published gzipped (`<pkg>.tar.gz`) with an `oxide.json` + `root/` subtree;
-/// "tarball" outputs (the GZ ddm) are plain (`<pkg>.tar`) and flat (the contents
-/// of their install dir, no `root/`). Empirically confirmed against buildomat.
+/// The buildomat artifact's form: gzipped zone image with oxide.json and root/,
+/// or a plain flat tarball (the GZ ddm).
 #[derive(Clone, Copy)]
 enum Archive {
     TarGz,
@@ -77,9 +73,8 @@ impl Archive {
             Archive::Tar => "tar",
         }
     }
-    /// The SVR4-`tar` snippet to extract `remote` (the scp'd artifact) - prefixed
-    /// with `gzcat` for the gzipped form, since the sleds/switch zone have no
-    /// `gtar`. `members` restricts extraction (e.g. just `root`); empty = all.
+    /// The SVR4 tar snippet extracting the scp'd artifact, via gzcat for the
+    /// gzipped form. members restricts extraction; empty means all.
     fn extract(self, remote: &str, members: &str) -> String {
         match self {
             Archive::TarGz => {
@@ -93,30 +88,26 @@ impl Archive {
 /// How a component is applied on a node.
 #[derive(Clone, Copy)]
 enum Shape {
-    /// A zone image installed on demand (no running service): replace the on-disk
-    /// `dest` tarball. Effective on the next instantiation.
+    /// A zone image installed per instance: replace the on-disk dest tarball,
+    /// effective on the next instantiation.
     ZoneImage { dest: &'static str },
-    /// A running SMF service packaged as an omicron "zone" image: overlay the
-    /// tarball's `root/` subtree onto the switch zone root and `svcadm restart
-    /// fmri` in the switch zone.
+    /// An SMF service packaged as a zone image: overlay root/ onto the switch
+    /// zone root and svcadm restart fmri there.
     Overlay { fmri: &'static str },
-    /// A running SMF service packaged as a flat "tarball" (no `root/`): extract
-    /// the archive's contents straight into `dir` (its install dir) on the sled
-    /// GZ and `svcadm restart fmri`. Used by the GZ ddm (`mg-ddm-gz`).
+    /// An SMF service packaged as a flat tarball: extract into dir on the sled
+    /// GZ and svcadm restart fmri. The GZ ddm.
     DirReplace { dir: &'static str, fmri: &'static str },
 }
 
-/// A patchable component: its buildomat coordinates (`repo`/`pkg`) and its on-node
-/// shape. The artifact URL is `<BUILDOMAT>/<repo>/image/<ref>/<pkg>.tar.gz`.
+/// A patchable component: buildomat coordinates and on-node shape.
 struct Component {
-    /// The CLI name (`voxel rack patch <name> <ref>`).
+    /// The CLI name.
     name: &'static str,
     /// buildomat repo the artifact is published under.
     repo: &'static str,
-    /// Artifact basename (`<pkg>.<ext>` / `<pkg>.sha256.txt`); = omicron's
-    /// package name.
+    /// Artifact basename, omicron's package name.
     pkg: &'static str,
-    /// The artifact's on-disk form (gzipped zone vs plain tarball).
+    /// The artifact's on-disk form.
     archive: Archive,
     shape: Shape,
     targets: Targets,
@@ -124,9 +115,8 @@ struct Component {
     note: &'static str,
 }
 
-/// The component registry, grounded in `package-manifest.toml` @ 43bb5af and a
-/// live rack. The clean "everything except host OS + control-plane zones" set:
-/// prebuilt switch infra (restart in place) + propolis (zone image swap).
+/// The component registry, grounded in package-manifest.toml at 43bb5af and a
+/// live rack.
 fn registry() -> Vec<Component> {
     vec![
         Component {
@@ -159,8 +149,8 @@ fn registry() -> Vec<Component> {
             note: "switch-zone underlay ddm router",
         },
         Component {
-            // The GZ ddm is a "tarball" output: plain `mg-ddm-gz.tar`, flat layout
-            // (VERSION/ddmd/ddmadm/pkg) extracted straight into /opt/oxide/mg-ddm.
+            // A tarball output: plain mg-ddm-gz.tar, flat layout extracted into
+            // /opt/oxide/mg-ddm.
             name: "ddm-gz",
             repo: "maghemite",
             pkg: "mg-ddm-gz",
@@ -204,7 +194,7 @@ fn lookup(name: &str) -> anyhow::Result<Component> {
     })
 }
 
-/// Print the component registry (`voxel rack patch --list`).
+/// Print the component registry.
 pub(crate) fn list() {
     println!(
         "{:<10}  {:<10}  {:<16}  {:<10}  KIND",
@@ -230,10 +220,7 @@ pub(crate) fn list() {
     }
 }
 
-// --- acquire (on the box) --------------------------------------------------
-
-/// Where downloaded artifacts are cached on the box: `<build_root>/patch-cache`
-/// (build_root from `[falcon].build_root`/`$BUILD_ROOT`, else `$HOME/voxel-builds`).
+/// Box-side artifact cache: <build_root>/patch-cache.
 fn cache_dir() -> Utf8PathBuf {
     let root = std::env::var("BUILD_ROOT")
         .ok()
@@ -247,8 +234,7 @@ fn cache_dir() -> Utf8PathBuf {
     root.join("patch-cache")
 }
 
-/// sha256 of a file via illumos `digest -a sha256` (matches the buildomat
-/// `.sha256.txt` the manifest pins).
+/// sha256 of a file via illumos digest, matching buildomat's .sha256.txt.
 fn sha256(file: &Utf8Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("digest")
         .args(["-a", "sha256"])
@@ -265,8 +251,7 @@ fn sha256(file: &Utf8Path) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// `curl` a small text URL (the `.sha256.txt`) and return its first whitespace
-/// token (the hex digest).
+/// curl a .sha256.txt and return its first token, the hex digest.
 fn fetch_sha(url: &str) -> anyhow::Result<String> {
     let out = std::process::Command::new("curl")
         .args(["-fsSL", url])
@@ -285,9 +270,8 @@ fn fetch_sha(url: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow!("empty sha256 at {url}"))
 }
 
-/// Download `comp`'s artifact at `reference` to the box cache and sha-verify it
-/// against the buildomat-published `.sha256.txt`. Reuses a cached, already-correct
-/// download. Returns the local tarball path.
+/// Download comp's artifact at reference into the box cache, verified against
+/// the published sha256; a matching cached download is reused.
 fn acquire(comp: &Component, reference: &str) -> anyhow::Result<Utf8PathBuf> {
     let dir = cache_dir().join(comp.repo).join(reference);
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir))?;
@@ -313,8 +297,7 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<Utf8PathBuf> {
     }
     let url = format!("{base}/{}.{ext}", comp.pkg);
     eprintln!("[voxel] downloading {url}");
-    // `-sS`: no progress bar (it renders as carriage-return noise over the
-    // non-TTY ssh voxel runs under) but still surface errors.
+    // No progress bar, which is noise over non-TTY ssh; errors still reported.
     let status = std::process::Command::new("curl")
         .args(["-fsSL", "-o"])
         .arg(&tarball)
@@ -336,9 +319,7 @@ fn acquire(comp: &Component, reference: &str) -> anyhow::Result<Utf8PathBuf> {
     Ok(tarball)
 }
 
-// --- rack patch (live nodes) -----------------------------------------------
-
-/// Resolve a node's host-LAN IP under [`serial_bounded`]'s two-stage deadline.
+/// Resolve a node's host-LAN IP under serial_bounded's two-stage deadline.
 async fn node_ip(
     cfg: &VoxelConfig,
     d: &Runner,
@@ -353,7 +334,7 @@ async fn node_ip(
     .context("is the rack up?")
 }
 
-/// The target `(name, NodeRef)` set for a component.
+/// The target (name, NodeRef) set for a component.
 fn targets(topo: &Topo, comp: &Component) -> Vec<(String, NodeRef)> {
     topo.sleds
         .iter()
@@ -365,10 +346,8 @@ fn targets(topo: &Topo, comp: &Component) -> Vec<(String, NodeRef)> {
         .collect()
 }
 
-/// Overlay an omicron "zone" tarball's `root/` subtree onto `root_dir` on the
-/// node, using only SVR4 `tar` + `gzcat` (the sleds/switch zone have no `gtar`):
-/// unpack the `root/` member into a temp dir, then stream its contents into place
-/// via a tar pipe (both ends SVR4 tar, no flags). `remote` is the scp'd artifact.
+/// Overlay a zone tarball's root/ subtree onto the switch zone root with SVR4
+/// tar and gzcat only: unpack root/ to a temp dir, then tar-pipe it into place.
 fn overlay_cmd(comp: &Component, remote: &str) -> String {
     let tmp = format!("/var/tmp/voxel-patch-{}", comp.pkg);
     format!(
@@ -381,8 +360,7 @@ fn overlay_cmd(comp: &Component, remote: &str) -> String {
     )
 }
 
-/// Extract a flat "tarball" artifact (no `root/`) straight into its install
-/// `dir` on the node - the GZ ddm form.
+/// Extract a flat tarball straight into its install dir on the node.
 fn dir_replace_cmd(comp: &Component, remote: &str, dir: &str) -> String {
     format!(
         "mkdir -p {d} && ( cd {d} && {extract} ) && echo PATCH_PLACED_OK",
@@ -391,8 +369,8 @@ fn dir_replace_cmd(comp: &Component, remote: &str, dir: &str) -> String {
     )
 }
 
-/// Poll an SMF service until it reaches `online` (restart is async). `in_switch`
-/// selects the switch zone vs the GZ. Returns the final state seen.
+/// Poll an SMF service until online; in_switch selects the switch zone over
+/// the GZ. Returns the last state seen.
 fn wait_online(ip: &str, in_switch: bool, fmri: &str) -> String {
     let query = if in_switch {
         zlogin(&format!("svcs -H -o state {fmri}"))
@@ -412,8 +390,8 @@ fn wait_online(ip: &str, in_switch: bool, fmri: &str) -> String {
     last
 }
 
-/// `svcadm restart fmri` (in the switch zone or the GZ) + confirm it returns
-/// `online`. Logs the outcome against `node`.
+/// svcadm restart fmri in the switch zone or the GZ and confirm it comes back
+/// online, logging the outcome against node.
 fn restart_and_verify(
     d: &Runner,
     node: &str,
@@ -445,8 +423,7 @@ fn restart_and_verify(
     }
 }
 
-/// Apply an Overlay patch (omicron zone image) on one node: overlay `root/` onto
-/// the switch zone root, then restart + verify (switch-zone service).
+/// Apply an Overlay patch on one node, then restart and verify.
 fn apply_overlay(
     d: &Runner,
     node: &str,
@@ -465,8 +442,7 @@ fn apply_overlay(
     restart_and_verify(d, node, ip, comp.pkg, true, fmri);
 }
 
-/// Apply a DirReplace patch (flat GZ tarball) on one node: extract into the
-/// install dir, then restart + verify (GZ service).
+/// Apply a DirReplace patch on one node, then restart and verify.
 fn apply_dir_replace(
     d: &Runner,
     node: &str,
@@ -502,7 +478,7 @@ fn apply_zone_image(
     .map(|o| o.contains("PATCH_PLACED_OK"))
     .unwrap_or(false);
     if ok {
-        info!(d.log, "{node}: {} replaced ({dest}) - {}", comp.pkg, comp.note);
+        info!(d.log, "{node}: {} replaced ({dest}); {}", comp.pkg, comp.note);
     } else {
         warn!(d.log, "{node}: failed to replace {dest}");
     }
@@ -530,7 +506,7 @@ pub(crate) async fn cmd_rack_patch(
     };
     info!(
         d.log,
-        "patch plan: {} ({}/{}) @ {reference} -> {where_} [{}] - {}",
+        "patch plan: {} ({}/{}) @ {reference} -> {where_} [{}]; {}",
         comp.name,
         comp.repo,
         comp.pkg,
@@ -580,17 +556,13 @@ pub(crate) async fn cmd_rack_patch(
     Ok(())
 }
 
-// --- image patch (persist into a new @base) --------------------------------
-
-/// Locate `voxel-image/patch-image.sh` (mirrors `image::build_cp_script`).
+/// Locate voxel-image/patch-image.sh.
 fn patch_image_script() -> anyhow::Result<Utf8PathBuf> {
     locate_script("VOXEL_PATCH_IMAGE", "patch-image.sh")
 }
 
-/// Fold a component patch into a NEW pinned `@base` (boot-modify-capture via
-/// `patch-image.sh`) so it persists across relaunches. Slower than `rack patch`
-/// but durable. `src_image` is the image to patch; `out_image` the captured
-/// result (defaults to `<src>-<component>-<shortref>`).
+/// Fold a component patch into a new pinned @base via patch-image.sh so it
+/// persists across relaunches. out_image defaults to <src>-<component>-<ref>.
 pub(crate) fn cmd_image_patch(
     component: &str,
     reference: &str,
@@ -598,17 +570,14 @@ pub(crate) fn cmd_image_patch(
     out_image: Option<&str>,
 ) -> anyhow::Result<()> {
     let comp = lookup(component)?;
-    // Map the on-node shape to an in-image placement. Switch-zone services live
-    // INSIDE `/opt/oxide/switch.tar.gz` in the image (the switch zone isn't
-    // instantiated until RSS), so persisting them needs a switch.tar.gz repack -
-    // not done yet. propolis (zone image) and the GZ ddm land directly in the
-    // sled filesystem, so they overlay cleanly.
+    // Switch-zone services live inside /opt/oxide/switch.tar.gz in the image and
+    // would need a repack; propolis and the GZ ddm land in the sled filesystem.
     let (place_kind, dest): (&str, Option<&str>) = match comp.shape {
         Shape::ZoneImage { dest } => ("zone-image", Some(dest)),
         Shape::DirReplace { dir, .. } => ("dir-replace", Some(dir)),
         Shape::Overlay { .. } => {
             return Err(anyhow!(
-                "`image patch` for switch-zone service '{}' isn't supported yet - it lives inside \
+                "`image patch` for switch-zone service '{}' isn't supported yet; it lives inside \
                  /opt/oxide/switch.tar.gz in the image and needs a zone-image repack. Use \
                  `voxel rack patch {}` for a live (ephemeral) patch.",
                 comp.name,
@@ -641,8 +610,7 @@ pub(crate) fn cmd_image_patch(
     if let Some(d) = dest {
         cmd.env("DEST", d);
     }
-    // FALCON_DATASET is already exported by resolve_falcon_env; patch-image.sh +
-    // build-image.sh read it.
+    // FALCON_DATASET is exported by resolve_falcon_env for the scripts.
     let status = cmd.status().map_err(|e| anyhow!("run {}: {e}", script))?;
     if !status.success() {
         return Err(anyhow!("patch-image.sh failed"));

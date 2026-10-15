@@ -16,26 +16,18 @@ use voxel_config::{Network, VoxelConfig};
 
 const DEFAULT_REPO: &str = "https://github.com/oxidecomputer/omicron";
 const DEFAULT_POOL_SIZE: u32 = 16;
-/// Commtest's connectivity subcommand. Voxel only derives arguments and demands
-/// privileges for this one, so passthrough naming another subcommand is
-/// forwarded untouched.
+/// Commtest's connectivity subcommand, the only one voxel derives arguments
+/// and demands privileges for.
 const RUN_SUBCOMMAND: &str = "run";
-/// Group handed to commtest when `--traffic multicast`/`both` is selected but
-/// no explicit group is passed through. Commtest's own `--mcast-group` has no
-/// default (an empty list skips the multicast phase entirely), so voxel picks
-/// an administratively scoped group (RFC 2365) to make the phase run.
-///
-/// TODO: IPv4 only, since commtest rejects v6 groups during validation. Pick a
-/// v6 default once its own `validate_mcast` TODO to add the v6 pool buckets and
-/// a v6 arm in `test_mcast_connectivity` is discharged.
+/// Administratively scoped (RFC 2365) group passed when --traffic selects
+/// multicast without an explicit group. IPv4 only: commtest rejects v6 groups.
 const DEFAULT_MCAST_GROUP: &str = "239.1.1.1";
 const HELIOS_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
     -C link-arg=-R/usr/platform/oxide/lib/amd64 \
     -C link-arg=-Wl,-znocompstrtab --cfg tokio_unstable";
 
-/// Watch-facing run artifacts, anchored to the falcon workdir like the
-/// `.sp-ip-<node>` cache (`anchor_workdir` chdirs there before we run). A
-/// dashboard tails the transcript and labels its pane from the mode file.
+/// Run artifacts anchored to the falcon workdir; a dashboard tails the log and
+/// reads the mode file.
 const RUN_LOG: &str = ".falcon/commtest.log";
 const MODE_FILE: &str = ".falcon/commtest.mode";
 
@@ -150,17 +142,14 @@ pub(crate) fn run(
     Ok(())
 }
 
-/// Record the traffic mode for dashboards. The write is best-effort, since
-/// commtest still runs when the workdir is absent or unwritable.
+/// Record the traffic mode for dashboards, best effort.
 fn publish_mode(traffic: Traffic) {
     let _ = std::fs::create_dir_all(".falcon");
     let _ = std::fs::write(MODE_FILE, format!("{traffic}\n"));
 }
 
-/// Run commtest with both streams mirrored to `RUN_LOG` (truncated per run)
-/// while still reaching this terminal, so a dashboard can tail the live
-/// transcript. Both copies are joined after the child exits, so the transcript
-/// is complete before the exit status is reported.
+/// Run commtest with both streams mirrored to RUN_LOG while still reaching
+/// this terminal; the copies are joined before the status is reported.
 fn run_streamed(
     bin: &Utf8Path,
     api: &str,
@@ -196,11 +185,8 @@ fn join_tee(
     }
 }
 
-/// Copy `src` to `dst` (flushing per chunk, so progress lines render live) and
-/// mirror each chunk into `log` when present. Read and `dst` failures propagate
-/// so a truncated transcript cannot pass for a complete run, while mirroring
-/// into `log` stays best-effort. A broken downstream pipe ends the copy
-/// normally, since piping voxel into a pager is not an error.
+/// Copy src to dst, flushing per chunk, and mirror into log best effort. A
+/// broken downstream pipe ends the copy normally.
 fn tee(
     mut src: impl std::io::Read,
     mut dst: impl std::io::Write,
@@ -324,11 +310,8 @@ fn ensure_icmp_privilege() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reject a customized `[recovery_silo]` before commtest starts. Commtest signs
-/// in with fixed credentials (silo `recovery`, user `recovery`, password
-/// `oxide`, hardcoded since its introduction), so a customized silo otherwise
-/// surfaces as an authentication failure only after commtest's 15-attempt retry
-/// loop.
+/// Reject a customized [recovery_silo]: commtest signs in with fixed
+/// recovery/recovery/oxide credentials and would only fail after its retries.
 fn ensure_default_recovery_silo(cfg: &VoxelConfig) -> anyhow::Result<()> {
     if cfg.recovery_silo != voxel_config::RecoverySiloCfg::default() {
         bail!(
@@ -400,8 +383,7 @@ fn validate_repository(
     {
         bail!("{} exists but is not a bare Git repository", repository);
     }
-    // `remote get-url` applies the user's `url.<base>.insteadOf` rewrites and
-    // can false-mismatch the configured URL. Read the raw remote instead.
+    // remote get-url applies url.insteadOf rewrites; read the raw remote.
     let actual_remote =
         git_dir_output(repository, &["config", "--get", "remote.origin.url"])?;
     if actual_remote != expected_remote {
@@ -431,9 +413,8 @@ fn resolve_reference(
         if out.status.success() {
             let commit_id =
                 String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // Dedup so candidates pointing at the same commit (a branch and
-            // tag, or a hex-named ref and the commit it names) resolve
-            // unambiguously.
+            // Dedup so a branch and tag, or a hex ref and the commit it names,
+            // resolve unambiguously.
             if !matches.contains(&commit_id) {
                 matches.push(commit_id);
             }
@@ -466,9 +447,8 @@ fn reference_candidates(reference: &str) -> anyhow::Result<Vec<String>> {
     validate_refname(&branch)?;
     validate_refname(&tag)?;
     let mut candidates = vec![branch, tag];
-    // A hex string may also be an abbreviated commit ID. Named refs come
-    // first, matching git's own refname-over-object-ID precedence, and a ref
-    // and commit that resolve differently surface as ambiguous.
+    // A hex string may be an abbreviated commit. Named refs come first, matching
+    // git's precedence; a ref and commit that differ surface as ambiguous.
     if (4..=40).contains(&reference.len())
         && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -569,11 +549,8 @@ fn require_success(
     Ok(())
 }
 
-/// The checkout's cargo target directory.
-///
-/// This honors `CARGO_TARGET_DIR`, resolved against the checkout to match
-/// cargo's interpretation (the build runs with the checkout as its working
-/// directory), falling back to `<source>/target` otherwise.
+/// The checkout's cargo target directory, honoring CARGO_TARGET_DIR relative
+/// to the checkout as cargo does.
 fn target_dir(source: &Utf8Path) -> Utf8PathBuf {
     match std::env::var("CARGO_TARGET_DIR") {
         Ok(dir) => source.join(dir),
@@ -581,12 +558,8 @@ fn target_dir(source: &Utf8Path) -> Utf8PathBuf {
     }
 }
 
-/// Reproduce `voxel-image/build-cp.sh`'s build environment, so commtest links
-/// against the same Helios runtime as the image it tests.
-///
-/// Caller-supplied flags win out: cargo ignores `RUSTFLAGS` once
-/// `CARGO_ENCODED_RUSTFLAGS` is set, so either variable leaves the choice with
-/// the caller.
+/// Reproduce build-cp.sh's build environment so commtest links against the
+/// image's Helios runtime. Caller-supplied RUSTFLAGS win.
 fn apply_helios_build_env(cmd: &mut Command) {
     if cfg!(target_os = "illumos")
         && std::env::var_os("RUSTFLAGS").is_none()
@@ -607,22 +580,8 @@ fn apply_helios_build_env(cmd: &mut Command) {
     }
 }
 
-/// Pick the rack API base URL. Nexus's external addresses are allocated from
-/// the service pool at RSS time and can move between pool members, so probe
-/// the candidates for a live HTTP listener.
-///
-/// TLS-only racks (commission-driven setup, the launch default, uploads a
-/// self-signed certificate with DNS-only SANs) are refused rather than guessed
-/// at. Therefore, commtest's
-/// oxide client has no way to trust that certificate on a raw-IP URL, so
-/// handing it a `https://` base would spin its API wait until the 60 minute
-/// timeout.
-///
-/// # Errors
-///
-/// Returns an error when a candidate answers on 443 but none answer on 80.
-/// Falls back to plain HTTP on the first candidate when nothing answers at
-/// all (commtest itself waits for the API to come up).
+/// Pick the rack API base URL by probing the service pool for a live HTTP
+/// listener. A 443-only rack is refused, as commtest cannot trust its cert.
 fn derive_api(network: &Network) -> anyhow::Result<String> {
     let candidates = api_candidates(network);
     let live_on = |port: u16| {
@@ -651,12 +610,8 @@ fn derive_api(network: &Network) -> anyhow::Result<String> {
     })
 }
 
-/// Service-pool addresses in probe order.
-///
-/// Members external DNS has not claimed come first, since Nexus draws its
-/// external address from the same pool and lands on one of those. The DNS
-/// addresses follow as a fallback. The range is capped at 32 addresses so a
-/// misconfigured pool cannot stall the probe.
+/// Service-pool addresses in probe order: members external DNS has not claimed
+/// first, then the DNS addresses. Capped at 32.
 fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
     let Ok(first) = network.service_pool_first.parse::<Ipv4Addr>() else {
         return Vec::new();
@@ -672,8 +627,8 @@ fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
     rest.into_iter().chain(dns_members).collect()
 }
 
-/// Whether the checkout's commtest has the multicast phases, detected from its
-/// source so older unicast-only eras keep working without a probe run.
+/// Whether the checkout's commtest has the multicast phases, detected from
+/// source so older unicast-only eras need no probe run.
 fn supports_multicast(source: &Utf8Path) -> anyhow::Result<bool> {
     let source_file = source.join("end-to-end-tests/src/bin/commtest.rs");
     let text = std::fs::read_to_string(&source_file)
@@ -709,10 +664,8 @@ fn commtest_args_for(
     if has_begin && has_end {
         return Ok(args);
     }
-    // Deriving the missing half of a partial override would pair a caller's
-    // address with one computed from the service pool, yielding a range that
-    // either overlaps the service pool (reallocating Nexus's own address) or
-    // inverts outright.
+    // A partial override would pair a caller's address with a derived one and
+    // overlap the service pool or invert.
     if has_begin || has_end {
         bail!(
             "pass both --ip-pool-begin and --ip-pool-end, or neither. Voxel \
@@ -835,8 +788,7 @@ mod test {
     #[test]
     fn derives_voxel_defaults() {
         let network = Network::default().for_rack(0);
-        // `derive_api` probes the live host, so pin only the candidate order:
-        // non-DNS pool members (.22-.29) ahead of the DNS pair (.20/.21).
+        // derive_api probes the live host, so pin only the candidate order.
         let candidates = api_candidates(&network);
         assert_eq!(candidates.len(), 10);
         assert_eq!(candidates[0], "198.51.100.22".parse::<Ipv4Addr>().unwrap());
