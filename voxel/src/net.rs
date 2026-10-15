@@ -81,8 +81,7 @@ async fn serial_bounded_caps<T>(
     }
     if hard > soft {
         eprintln!(
-            "[voxel] {what}: no answer from the serial console after {}s. Waiting up to {}s \
-             rather than cancelling, since a cancelled exec wedges the console.",
+            "[voxel] {what}: no serial console answer after {}s; waiting up to {}s",
             soft.as_secs(),
             hard.as_secs()
         );

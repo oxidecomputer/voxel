@@ -2,8 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Gimlet (sled) bring-up—replaces `gimlet-launch.sh`. Runs in the voxel-cp
-//! helios guest. The control plane is already installed (`/opt/oxide`); this
+//! The control plane is already installed (`/opt/oxide`); this
 //! applies the per-launch / topology bits that can't be baked: ephemeral virtual
 //! hardware, the detected underlay NICs, the generated sled + RSS configs, the
 //! switch1 identity for the 2nd scrimlet, then activates the control plane (which
@@ -436,10 +435,11 @@ fn crash_dump() {
 }
 
 /// Scrimlets load the baked SoftNPU sidecar P4 program. Gimlets have no softnpu
-/// device, so `scadm propolis load-program` would fail there—gate on sled_mode.
+/// device, so `scadm propolis load-program` would fail there. The role comes
+/// from the `# voxel role:` marker voxel-config writes into the sled config.
 fn maybe_load_sidecar() {
     let scrimlet = fs::read_to_string(SLED_CFG)
-        .map(|s| s.contains(r#"sled_mode = "scrimlet""#))
+        .map(|s| s.contains("# voxel role: scrimlet"))
         .unwrap_or(false);
     if scrimlet {
         run(

@@ -34,15 +34,19 @@ drift surfaces at voxel compile time.
 
 ## Quickstart
 
+For a complete walkthrough, from preparing a Helios host through launching,
+accessing, and tearing down a rack, see the
+[operator guide](docs/operator-guide.adoc).
+
 1. `cargo build` builds voxel.
-2. `voxel image create 43bb5af` builds omicron (v21) and bakes `voxel-cp-43bb5af`
+2. `voxel image create d41a8c3a2aa5768255ad00545e53d3077b1b56ce` builds omicron (v21) and bakes `voxel-cp-d41a8c3a2aa5768255ad00545e53d3077b1b56ce`
    (30-45 min).
 3. `voxel image create-frr proto` bakes `voxel-frr-proto` (omicron-independent;
    build once, reuse for any commit).
 4. Configure:
 
 ```
-voxel config set image.cp voxel-cp-43bb5af
+voxel config set image.cp voxel-cp-d41a8c3a2aa5768255ad00545e53d3077b1b56ce
 voxel config set image.frr voxel-frr-proto
 ```
 
@@ -85,7 +89,7 @@ directly above the configured service pool.
 voxel commtest
 
 # A specific commit (older unicast-only versions are supported).
-voxel commtest 43bb5af --traffic unicast
+voxel commtest d41a8c3a2aa5768255ad00545e53d3077b1b56ce --traffic unicast
 
 # Latest origin/main.
 voxel commtest main --traffic unicast
@@ -99,7 +103,7 @@ voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
   --test-duration 5m --mcast-group 239.10.0.1
 
 # Cleanup resources created by that commit's commtest.
-voxel commtest 43bb5af -- cleanup
+voxel commtest d41a8c3a2aa5768255ad00545e53d3077b1b56ce -- cleanup
 ```
 
 `--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. Voxel

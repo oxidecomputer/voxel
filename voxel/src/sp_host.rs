@@ -512,7 +512,7 @@ async fn stream_to_file(
 pub(crate) fn emu_bin(rack: usize) -> anyhow::Result<camino::Utf8PathBuf> {
     let bin = fleet_dir(rack).join("sp-emu");
     if !bin.exists() {
-        bail!("no sp-emu at {bin} - is this a running --emu rack?");
+        bail!("no sp-emu at {bin}; is this a running --emu rack?");
     }
     Ok(bin)
 }

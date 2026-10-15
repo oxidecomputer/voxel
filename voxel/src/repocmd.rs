@@ -54,7 +54,7 @@ pub(crate) async fn cmd_repo_seed(
     // Targets can share bytes (e.g. identical slot a/b archives); the store
     // is sha-keyed, so stage and push each sha once.
     let targets: BTreeMap<String, String> =
-        t.target_members()?.into_iter().collect();
+        t.target_members().into_iter().collect();
     eprintln!(
         "[voxel] seeding {} distinct targets of {} ({})",
         targets.len(),
