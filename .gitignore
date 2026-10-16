@@ -8,7 +8,7 @@ cargo-bay.tgz
 core
 cargo-bay/
 sp-fleet/
-wicket-setup/
+rss-config/
 *.vdev
 .sidecar-lite/
 voxel-image/out/

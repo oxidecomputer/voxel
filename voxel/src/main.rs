@@ -35,7 +35,6 @@ mod isolated_external;
 mod multirack_join;
 mod net;
 mod network;
-mod patch;
 mod rack;
 mod repocmd;
 mod rss;
@@ -45,7 +44,6 @@ mod sp_host;
 mod topo;
 mod tufrepo;
 mod util;
-mod wicket_setup;
 
 #[derive(Parser)]
 #[command(
@@ -110,18 +108,6 @@ enum Cmd {
         #[arg(long, value_name = "DIR", value_parser = abs_path)]
         sp_firmware: Option<Utf8PathBuf>,
     },
-    /// (debug) Print the wicketd RSS config body the legacy wicketd path would
-    /// PUT, reshaped from a generated config-rss.toml (validates the mapping
-    /// offline). Launch drives setup through the commission API instead.
-    #[command(hide = true)]
-    WicketDryrun {
-        /// Path to a generated config-rss.toml.
-        #[arg(value_parser = abs_path)]
-        config_rss: Utf8PathBuf,
-        /// Per-rack sled count (the bootstrap slot set).
-        #[arg(default_value_t = 4)]
-        sleds: usize,
-    },
     /// (debug) Print the typed commission rack-setup config body as JSON.
     #[command(hide = true)]
     CommissionDryrun {
@@ -152,11 +138,6 @@ enum Cmd {
     Image {
         #[command(subcommand)]
         cmd: ImageCmd,
-    },
-    /// Operate on a running rack (surgical component patching).
-    Rack {
-        #[command(subcommand)]
-        cmd: RackCmd,
     },
     /// Inspect, configure, and validate the rack network.
     Network {
@@ -309,73 +290,11 @@ enum ImageCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Fold a component patch into the image's @base so it survives relaunches.
-    ///
-    /// Boot-modify-capture: boots the source image, places the artifact in-guest,
-    /// re-captures. The durable counterpart to `rack patch` (slower, ~minutes).
-    /// propolis + ddm-gz only for now (switch-zone services need a repack).
-    Patch {
-        /// Component to patch (e.g. propolis, ddm-gz).
-        component: String,
-        /// Git ref (commit) to patch to.
-        reference: String,
-        /// Source image to patch (default: the configured image.cp).
-        #[arg(long)]
-        image: Option<String>,
-        /// New image name (default: <src>-<component>-<shortref>).
-        #[arg(long)]
-        out: Option<String>,
-    },
     /// Build a `voxel-frr` customer-router image.
     CreateFrr {
         /// Image label; the image is named `voxel-frr-<version>`.
         #[arg(default_value = "proto")]
         version: String,
-    },
-    /// (build helper) Bake an image: boot a one-node builder, run the in-guest
-    /// agent's install role, capture the disk.
-    #[command(hide = true)]
-    Bake {
-        /// Registered image name (captured to `<dataset>/img/<name>@base`).
-        name: String,
-        /// Base image the builder boots.
-        #[arg(long, default_value = "helios-3.0")]
-        base: String,
-        /// Agent install role (`cp` | `frr`).
-        #[arg(long)]
-        role: Option<String>,
-        /// An in-guest command to run instead of an agent role
-        /// (boot-modify-capture, used by `image patch`). With neither, the
-        /// builder just boots, smoke-testing that the image comes up.
-        #[arg(long, conflicts_with = "role")]
-        exec: Option<String>,
-        /// Host dir mounted at `/opt/cargo-bay` in the guest.
-        #[arg(long, default_value = "./cargo-bay/vbuild")]
-        cargo_bay: Utf8PathBuf,
-        #[arg(long, default_value_t = 8)]
-        cores: u8,
-        #[arg(long, default_value_t = 16)]
-        mem_gb: u64,
-        #[arg(long, default_value_t = 100)]
-        disk_gb: u64,
-        /// falcon deployment name for the builder topology.
-        #[arg(long, default_value = "voxel_build")]
-        deploy: String,
-        /// Host link the builder reaches the package repos through (default:
-        /// falcon's default external interface).
-        #[arg(long)]
-        ext_interface: Option<String>,
-    },
-    /// (build helper) Render the build-time smf configs (mgs-sim, sp-sim,
-    /// sled-agent) into an omicron checkout.
-    #[command(hide = true)]
-    RenderSmf {
-        /// Path to the omicron checkout root.
-        #[arg(value_parser = abs_path)]
-        omicron_root: Utf8PathBuf,
-        /// Number of gimlet SPs to simulate (sp-sim).
-        #[arg(long, default_value_t = 4)]
-        gimlets: usize,
     },
 }
 
@@ -436,28 +355,6 @@ enum ExternalCmd {
 }
 
 #[derive(Subcommand)]
-enum RackCmd {
-    /// Swap a single component on the running rack at a ref, then restart it.
-    ///
-    /// Fetches the prebuilt artifact from buildomat, sha-verifies it, and places
-    /// it on the relevant nodes. Live + ephemeral (a clean relaunch reverts; see
-    /// `image patch` to persist). `--list` shows the patchable components.
-    Patch {
-        /// Component to patch (e.g. propolis, mgd, dendrite, lldp). Omit with
-        /// `--list` to see them all.
-        component: Option<String>,
-        /// Git ref (commit) to patch to - the buildomat image revision.
-        reference: Option<String>,
-        /// List the patchable components and exit.
-        #[arg(long)]
-        list: bool,
-        /// Print the plan (component, ref, target nodes) without applying it.
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand)]
 enum SpCmd {
     /// List the live SPs over MGS: type, serial, power, archive id.
     ///
@@ -508,20 +405,11 @@ enum SpCmd {
     },
     /// Check whether `launch --emu` is ready (artifacts present; no rack needed).
     Ready,
-    /// Flash a hubris `.zip` into an sp-emu slot-A flash file (offline).
-    Flash {
-        /// Hubris image archive (e.g. build-gimlet-c-image-default.zip).
-        #[arg(value_parser = abs_path)]
-        image: Utf8PathBuf,
-        /// Output flash file.
-        #[arg(value_parser = abs_path)]
-        out: Utf8PathBuf,
-    },
     /// Re-flash a live SP (or the shared RoT) and restart its sp-emu service.
     ///
-    /// The firmware counterpart to `rack patch`. `<image>` is a hubris `.zip`
-    /// for an SP, or a raw oxide-rot-1 image for target `rot` (restarts every RoT
-    /// bridge). Live + ephemeral (reverts on relaunch; bake via `image create`).
+    /// `<image>` is a hubris `.zip` for an SP, or a raw oxide-rot-1 image for
+    /// target `rot` (restarts every RoT bridge). Live + ephemeral (reverts on
+    /// relaunch; bake via `image create`).
     Reflash {
         /// Target: `sidecar` | `gN` | a port | `rot`.
         target: String,
@@ -572,11 +460,6 @@ enum SpCmd {
         cmd: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
-    },
-    /// Build the gimlet-c + sidecar-c-emu images from a hubris commit.
-    Build {
-        /// hubris git commit to build (v1 builds from the configured checkout).
-        commit: String,
     },
 }
 
@@ -835,9 +718,6 @@ async fn main() -> Result<(), Error> {
             };
             rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
         }
-        Cmd::WicketDryrun { config_rss, sleds } => {
-            wicket_setup::dryrun(config_rss, *sleds)
-        }
         Cmd::CommissionDryrun { rack } => {
             commission::dryrun(&load_config(&config_path)?, *rack)
         }
@@ -884,16 +764,6 @@ async fn main() -> Result<(), Error> {
         ),
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
-            ImageCmd::Patch { component, reference, image, out } => {
-                let cfg = load_config(&config_path)?;
-                let src = image.clone().unwrap_or_else(|| cfg.image.cp_image());
-                patch::cmd_image_patch(
-                    component,
-                    reference,
-                    &src,
-                    out.as_deref(),
-                )
-            }
             ImageCmd::Create { commit, src, from_tuf, sled_agent } => {
                 cpbuild::create(
                     commit.as_deref(),
@@ -911,37 +781,6 @@ async fn main() -> Result<(), Error> {
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                 )
-                .await
-            }
-            ImageCmd::Bake {
-                name,
-                base,
-                role,
-                exec,
-                cargo_bay,
-                cores,
-                mem_gb,
-                disk_gb,
-                deploy,
-                ext_interface,
-            } => {
-                let dataset = image::falcon_dataset();
-                imagebuild::bake(imagebuild::BakeOpts {
-                    base_image: base,
-                    role: role.as_deref(),
-                    exec: exec.as_deref(),
-                    cargo_bay,
-                    image_name: name,
-                    dataset: &dataset,
-                    deploy,
-                    disk_gb: *disk_gb,
-                    mem_gb: *mem_gb,
-                    cores: *cores,
-                    network: &imagebuild::BuilderNetwork {
-                        interface: ext_interface.clone(),
-                        static_address: None,
-                    },
-                })
                 .await
             }
             other => image::cmd_image(
@@ -993,29 +832,6 @@ async fn main() -> Result<(), Error> {
                     ExternalCmd::Check => {
                         isolated_external::check(&cfg.external)
                     }
-                }
-            }
-        },
-        Cmd::Rack { cmd } => match cmd {
-            RackCmd::Patch { component, reference, list, dry_run } => {
-                if *list {
-                    patch::list();
-                    Ok(())
-                } else {
-                    let component = component.as_deref().context(
-                        "missing component (try `voxel rack patch --list`)",
-                    )?;
-                    let reference = reference.as_deref().with_context(|| {
-                        format!("missing ref (usage: voxel rack patch {component} <ref>)")
-                    })?;
-                    patch::cmd_rack_patch(
-                        &load_config(&config_path)?,
-                        &cli.name,
-                        component,
-                        reference,
-                        *dry_run,
-                    )
-                    .await
                 }
             }
         },

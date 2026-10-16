@@ -13,11 +13,6 @@ use std::time::{Duration, Instant};
 
 use crate::rss::strip_ansi;
 
-/// The switch zone's root as seen from the sled global zone - prepend it to an
-/// in-zone path to reach the same file from the GZ (e.g. `{SWITCH_ZONE_ROOT}{p}`).
-/// Single source for the handful of GZ-rooted switch-zone paths voxel touches.
-pub(crate) const SWITCH_ZONE_ROOT: &str = "/zone/oxz_switch/root";
-
 /// Absolute path to `route`. Not all invoking shells carry /usr/sbin on PATH
 /// (commtest re-executes voxel under a fresh login), so spawn it absolutely.
 pub(crate) const ROUTE: &str = "/usr/sbin/route";
@@ -236,9 +231,8 @@ pub(crate) const PASSWORD_AUTH_OPTS: &[&str] = &[
     "ConnectTimeout=8",
 ];
 
-/// Materialize the SSH_ASKPASS helper that supplies the rack's empty root password
-/// (a script that prints a blank line), returning its path. `None` if it can't be
-/// written / made executable. Shared by `ssh_exec` and `scp_to`.
+/// Materialize the SSH_ASKPASS helper that supplies the rack's empty root
+/// password, returning its path. `None` if it can't be written.
 pub(crate) fn ensure_askpass() -> Option<camino::Utf8PathBuf> {
     let askpass = crate::util::temp_dir().join("voxel-empty-askpass.sh");
     if !askpass.exists() {
@@ -298,28 +292,6 @@ fn ssh_exec(ip: &str, remote: &str) -> Option<std::process::Output> {
         .arg(remote)
         .output()
         .ok()
-}
-
-/// `scp <local> root@<ip>:<remote>` non-interactively (empty root password, same
-/// pattern as [`ssh_capture`]). Returns whether it succeeded. Used to deliver
-/// `faux-mgs` into a switch zone for the `sp` operator commands.
-pub(crate) fn scp_to(ip: &str, local: &str, remote: &str) -> bool {
-    let askpass = match ensure_askpass() {
-        Some(p) => p,
-        None => return false,
-    };
-    std::process::Command::new("scp")
-        .env("SSH_ASKPASS", &askpass)
-        .env("SSH_ASKPASS_REQUIRE", "force")
-        .stdin(std::process::Stdio::null())
-        .args(EPHEMERAL_HOST_OPTS)
-        .args(PASSWORD_AUTH_OPTS)
-        .arg("-q") // no progress meter
-        .arg(local)
-        .arg(format!("root@{ip}:{remote}"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Confirm a rack's external network is actually reachable end-to-end after the

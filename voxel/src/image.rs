@@ -399,19 +399,8 @@ pub(crate) fn cmd_image(
             println!("removed {ds}");
             Ok(())
         }
-        // `image patch` needs the loaded config (for the default source image),
-        // so it's dispatched in `main` before delegating the rest here.
-        ImageCmd::Patch { .. } => {
-            bail!("internal: `image patch` is dispatched in main")
-        }
-        ImageCmd::Bake { .. } => {
-            bail!("internal: `image bake` is dispatched in main")
-        }
         ImageCmd::CreateFrr { .. } => {
             bail!("internal: `image create-frr` is dispatched in main")
-        }
-        ImageCmd::RenderSmf { omicron_root, gimlets } => {
-            render_smf(omicron_root, *gimlets)
         }
     }
 }

@@ -753,10 +753,6 @@ increasing the rack count.
   https://github.com/oxidecomputer/sp-emu[sp-emu], with rack setup driven
   through wicketd. See the "Emulated SPs and RoTs" section of the README and
   the `voxel sp` command family.
-- **Component patching**: `voxel rack patch` swaps individual control-plane
-  components (propolis, dendrite, MGD, and others) on a running rack without
-  rebuilding the image. `voxel image patch` bakes the change into the image
-  for persistence across relaunches.
 - **Network validation**: `voxel network validate` checks link states, BGP
   sessions, and routes on a running rack.
 - **TUF repository seeding**: `voxel repo seed` populates sled artifact

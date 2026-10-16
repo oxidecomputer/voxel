@@ -324,29 +324,6 @@ fn schema_from_image_props(
     Some((data_links?, disks?))
 }
 
-/// Copy the schema stamp from one image to another. Ok on an unstamped
-/// source; the destination then errors at launch like any unstamped image.
-pub(crate) fn copy_image_schema_props(
-    src_image: &str,
-    out_image: &str,
-) -> anyhow::Result<()> {
-    let Some((data_links, disks)) = schema_from_image_props(src_image) else {
-        return Ok(());
-    };
-    let ds = image_dataset(out_image);
-    let status = Command::new("zfs")
-        .arg("set")
-        .arg(format!("{PROP_DATA_LINKS}={}", data_links.as_str()))
-        .arg(format!("{PROP_DISKS}={}", disks.as_str()))
-        .arg(&ds)
-        .status()
-        .with_context(|| format!("zfs set schema props on {ds}"))?;
-    if !status.success() {
-        bail!("zfs set schema props on {ds} failed");
-    }
-    Ok(())
-}
-
 /// Pick the schema: the config override wins per field, then the image stamp,
 /// then the omicron checkout. No source at all is an error.
 fn choose_schema(
@@ -438,7 +415,7 @@ pub(crate) fn stage_config(
             .find(|s| s.rss && s.rack == rack)
             .ok_or_else(|| anyhow!("rack {rack} has no RSS sled"))?;
         let inspect_dir =
-            Utf8Path::new("wicket-setup").join(format!("rack{rack}"));
+            Utf8Path::new("rss-config").join(format!("rack{rack}"));
         let rss_dir = match (init_rss, rack) {
             (false, _) => inspect_dir,
             (true, 0) => {
@@ -876,8 +853,6 @@ mod tests {
         ]);
         assert_eq!(schema_from_image_props("schema-test-a"), Some(NEW));
         assert_eq!(schema_from_image_props("schema-test-b"), None);
-        copy_image_schema_props("schema-test-a", "schema-test-b").unwrap();
-        assert_eq!(schema_from_image_props("schema-test-b"), Some(NEW));
         for img in ["schema-test-a", "schema-test-b"] {
             zfs(&["destroy", &format!("{dataset}/img/{img}")]);
         }

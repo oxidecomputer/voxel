@@ -354,12 +354,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let network = builder_network(b.external)?;
     bake(BakeOpts {
         base_image: "helios-3.0",
-        role: Some("cp"),
-        exec: None,
+        role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
         dataset: b.dataset,
-        deploy: "voxel_build",
         disk_gb: 100,
         mem_gb: 16,
         cores: 8,
@@ -561,12 +559,10 @@ async fn create_cp_tuf(
     let network = builder_network(external)?;
     bake(BakeOpts {
         base_image: "helios-3.0",
-        role: Some("cp"),
-        exec: None,
+        role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
         dataset,
-        deploy: "voxel_build",
         disk_gb: 100,
         mem_gb: 16,
         cores: 8,

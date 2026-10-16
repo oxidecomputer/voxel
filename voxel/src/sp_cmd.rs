@@ -5,8 +5,8 @@
 //! `voxel sp` - manage and operate the rack's service processors.
 //!
 //! Two axes:
-//!  - **build/stage** the `sp-emu` artifacts (`ready`/`flash`/`build`) - voxel's
-//!    own emulator lifecycle; `pilot` has no equivalent.
+//!  - **check** the `sp-emu` artifacts are in place (`ready`) - voxel's own
+//!    emulator lifecycle; `pilot` has no equivalent.
 //!  - **operate** the live SPs over MGS, `pilot sp`-style (`ls`/`state`/`exec`),
 //!    by running `faux-mgs` (the same client `pilot` shells out to) inside the
 //!    switch zone against each SP's loopback MGS port. Needs a running `--emu`
@@ -33,8 +33,6 @@ pub(crate) async fn cmd_sp(
             ready(cfg);
             Ok(())
         }
-        SpCmd::Flash { image, out } => flash(cfg, image, out),
-        SpCmd::Build { commit } => build(commit),
         SpCmd::Ls { switch } => sp_ls(cfg, name, switch).await,
         SpCmd::Info { target, switch } => {
             print!("{}", sp_faux(cfg, name, switch, target, &["state"]).await?);
@@ -204,11 +202,11 @@ async fn sp_faux(
 }
 
 /// `voxel sp reflash <target> <image>` - re-flash a live SP (or the shared RoT)
-/// and restart its sp-emu service: the firmware counterpart to `voxel rack
-/// patch`. Flashes in-zone with the BAKED `sp-emu` (so it works on a
-/// self-contained image with no `[sp]` paths set), then verifies over MGS.
+/// and restart its sp-emu service. Flashes in-zone with the BAKED `sp-emu` (so
+/// it works on a self-contained image with no `[sp]` paths set), then verifies
+/// over MGS.
 /// Live + ephemeral - a clean relaunch reverts to the image; bake it via
-/// `build-cp.sh` to persist. `target == "rot"` swaps the shared raw
+/// `image create` to persist. `target == "rot"` swaps the shared raw
 /// `rot.flash` (every RoT bridge serves it) and restarts them all; otherwise
 /// it's a single SP.
 async fn sp_reflash(
@@ -783,7 +781,7 @@ fn field(out: &str, label: &str) -> String {
         .unwrap_or_default()
 }
 
-// --- artifact commands (was `Ls`, now `Ready`; flash/build unchanged) -------
+// --- artifact check (no rack needed) ---------------------------------------
 
 fn ready(cfg: &VoxelConfig) {
     println!(
@@ -808,51 +806,6 @@ fn ready(cfg: &VoxelConfig) {
             "no - see above; set [sp].emu_bin or put sp-emu on PATH"
         }
     );
-}
-
-fn flash(
-    cfg: &VoxelConfig,
-    image: &Utf8Path,
-    out: &Utf8Path,
-) -> anyhow::Result<()> {
-    let emu_bin = crate::sp_host::ensure_emu_bin(cfg)?;
-    if !image.exists() {
-        return Err(anyhow!("image not found: {}", image));
-    }
-    eprintln!("[voxel] flashing {} -> {}", image, out);
-    let status = std::process::Command::new(&emu_bin)
-        .env("SP_EMU_FLASH", out)
-        .args(["flash", "a"])
-        .arg(image)
-        .status()
-        .map_err(|e| anyhow!("run {emu_bin}: {e}"))?;
-    if !status.success() {
-        return Err(anyhow!("sp-emu flash failed"));
-    }
-    println!("flashed {}", out);
-    Ok(())
-}
-
-fn build(commit: &str) -> anyhow::Result<()> {
-    let script = build_sp_script()?;
-    eprintln!(
-        "[voxel] building sp-emu hubris images for {commit} via {}",
-        script
-    );
-    let status = std::process::Command::new("bash")
-        .arg(&script)
-        .arg(commit)
-        .status()
-        .map_err(|e| anyhow!("run {}: {e}", script))?;
-    if !status.success() {
-        return Err(anyhow!("build-sp.sh failed for {commit}"));
-    }
-    Ok(())
-}
-
-/// Locate `voxel-image/build-sp.sh` (mirrors `image::build_cp_script`).
-fn build_sp_script() -> anyhow::Result<Utf8PathBuf> {
-    crate::util::locate_script("VOXEL_BUILD_SP", "build-sp.sh")
 }
 
 #[cfg(test)]

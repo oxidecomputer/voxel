@@ -581,7 +581,7 @@ fn target_dir(source: &Utf8Path) -> Utf8PathBuf {
     }
 }
 
-/// Reproduce `voxel-image/build-cp.sh`'s build environment, so commtest links
+/// Reproduce `image create`'s omicron build environment, so commtest links
 /// against the same Helios runtime as the image it tests.
 ///
 /// Caller-supplied flags win out: cargo ignores `RUSTFLAGS` once

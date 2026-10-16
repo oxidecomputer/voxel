@@ -2,10 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `voxel image bake` - build an image by booting a one-node builder, running a
-//! step inside it, and capturing its disk as a registered falcon base image.
+//! Bake an image: boot a one-node builder, run the in-guest agent's install
+//! role, and capture its disk as a registered falcon base image.
 //!
-//! `image create`, `image create-frr` and `image patch` all build through here.
+//! `image create` and `image create-frr` both build through here.
 
 use crate::isolated_external;
 use anyhow::{Context, Result, bail};
@@ -15,29 +15,21 @@ use std::process::Command;
 use std::time::Duration;
 
 /// The builder node name, which fixes the falcon workdir layout
-/// (`.falcon/vbuild.pid`). The DEPLOYMENT name is a parameter instead, so
-/// `image patch` can run its boot-modify-capture under `voxel_patch` without
-/// colliding with an image build.
+/// (`.falcon/vbuild.pid`).
 const NODE: &str = "vbuild";
+/// The builder's falcon deployment name.
+const DEPLOY: &str = "voxel_build";
 
 pub(crate) struct BakeOpts<'a> {
-    /// Base image to boot: `helios-3.0`, `debian-13.2`, or an existing voxel
-    /// image when re-baking one (`image patch`).
+    /// Base image to boot: `helios-3.0` or `debian-13.2`.
     pub base_image: &'a str,
     /// Agent install role (`cp` / `frr`).
-    pub role: Option<&'a str>,
-    /// An arbitrary in-guest command to run instead of an agent role, for
-    /// boot-modify-capture (`image patch` places a component this way). With
-    /// neither `role` nor `exec` the builder just boots, which smoke-tests that
-    /// a captured image comes up with its payload intact.
-    pub exec: Option<&'a str>,
+    pub role: &'a str,
     /// Host dir mounted at `/opt/cargo-bay` in the guest.
     pub cargo_bay: &'a Utf8Path,
     /// Registered image name; captured to `<dataset>/img/<name>@base`.
     pub image_name: &'a str,
     pub dataset: &'a str,
-    /// falcon deployment name (`voxel_build`; `voxel_patch` for `image patch`).
-    pub deploy: &'a str,
     pub disk_gb: u64,
     pub mem_gb: u64,
     pub cores: u8,
@@ -101,7 +93,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     std::env::set_current_dir(&workspace)
         .with_context(|| format!("cd {workspace}"))?;
 
-    let mut d = Runner::new(o.deploy);
+    let mut d = Runner::new(DEPLOY);
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
     d.reserve(node, o.disk_gb as usize);
 
@@ -128,94 +120,73 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 
     eprintln!(
         "[voxel] booting builder {}, role {}; image -> {}/img/{}",
-        o.base_image,
-        o.role.unwrap_or("none"),
-        o.dataset,
-        o.image_name
+        o.base_image, o.role, o.dataset, o.image_name
     );
     d.launch().await.map_err(|e| anyhow::anyhow!("launch builder: {e}"))?;
 
-    // An agent role, or an arbitrary command, or neither (boot-only smoke test).
+    // p9kp copies file by file with no integrity check, so confirm the agent
+    // arrived whole before running it.
+    let want = std::fs::metadata(o.cargo_bay.join("voxel-init"))
+        .map(|m| m.len())
+        .with_context(|| format!("stat {}/voxel-init", o.cargo_bay))?;
+    let got = d
+        .exec(node, "wc -c < /opt/cargo-bay/voxel-init")
+        .await
+        .map_err(|e| anyhow::anyhow!("size voxel-init in guest: {e}"))?;
+    if got.trim() != want.to_string() {
+        bail!(
+            "cargo-bay copy incomplete in the builder: voxel-init is \
+             {want} bytes on the host, guest reports {:?}",
+            got.trim()
+        );
+    }
+
     // The cargo-bay arrives without the exec bit, so the agent is copied to
     // local disk before running.
-    if o.role.is_some() {
-        // p9kp copies file by file without any integrity checking. If
-        // `voxel-init` or some other cargo-bay artifact comes up short on
-        // bytes, report it.
-        let want = std::fs::metadata(o.cargo_bay.join("voxel-init"))
-            .map(|m| m.len())
-            .with_context(|| format!("stat {}/voxel-init", o.cargo_bay))?;
-        let got = d
-            .exec(node, "wc -c < /opt/cargo-bay/voxel-init")
-            .await
-            .map_err(|e| anyhow::anyhow!("size voxel-init in guest: {e}"))?;
-        if got.trim() != want.to_string() {
-            bail!(
-                "cargo-bay copy incomplete in the builder: voxel-init is \
-                 {want} bytes on the host, guest reports {:?}",
-                got.trim()
-            );
-        }
-    }
+    let label = format!("install --role {}", o.role);
+    let cmd = format!(
+        "cp /opt/cargo-bay/voxel-init /tmp/voxel-init && chmod +x /tmp/voxel-init && \
+         /tmp/voxel-init install --role {} 2>&1 | tee /tmp/install.log",
+        o.role
+    );
+    let console = d
+        .exec(node, &cmd)
+        .await
+        .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
 
-    let step = match (o.role, o.exec) {
-        (Some(role), _) => Some((
-            format!("install --role {role}"),
-            format!(
-                "cp /opt/cargo-bay/voxel-init /tmp/voxel-init && chmod +x /tmp/voxel-init && \
-                 /tmp/voxel-init install --role {role} 2>&1 | tee /tmp/install.log"
-            ),
-        )),
-        (None, Some(cmd)) => Some((format!("exec {cmd}"), cmd.to_string())),
-        (None, None) => None,
-    };
-    if let Some((label, cmd)) = step {
-        let console = d
-            .exec(node, &cmd)
-            .await
-            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
-
-        // falcon's exec does NOT propagate the guest command's exit code, so
-        // validate the marker's CONTENT - written only on a complete run.
-        let marker = d
-            .exec(node, "cat /var/voxel-image-ready")
+    // falcon's exec does NOT propagate the guest command's exit code, so
+    // validate the marker's CONTENT - written only on a complete run.
+    let marker =
+        d.exec(node, "cat /var/voxel-image-ready").await.unwrap_or_default();
+    if !marker.contains("version=") {
+        // Surface the guest's own log before teardown destroys it.
+        let tail = d
+            .exec(node, "tail -40 /tmp/install.log 2>/dev/null")
             .await
             .unwrap_or_default();
-        if !marker.contains("version=") {
-            // Surface the guest's own log before teardown destroys it.
-            let tail = d
-                .exec(node, "tail -40 /tmp/install.log 2>/dev/null")
-                .await
-                .unwrap_or_default();
-            let last: Vec<&str> = console.lines().rev().take(40).collect();
-            let console_tail =
-                last.into_iter().rev().collect::<Vec<_>>().join("\n");
-            if !console_tail.trim().is_empty() {
-                eprintln!(
-                    "[voxel] guest console tail:\n{}",
-                    console_tail.trim_end()
-                );
-            }
-            if tail.trim().is_empty() {
-                if o.role.is_some() {
-                    bail!(
-                        "{label} wrote no /tmp/install.log; the agent never \
-                         ran or died before producing output"
-                    );
-                }
-            } else {
-                eprintln!(
-                    "[voxel] guest install log tail:\n{}",
-                    tail.trim_end()
-                );
-            }
-            bail!("ready marker missing/empty; {label} did not complete");
+        let last: Vec<&str> = console.lines().rev().take(40).collect();
+        let console_tail =
+            last.into_iter().rev().collect::<Vec<_>>().join("\n");
+        if !console_tail.trim().is_empty() {
+            eprintln!(
+                "[voxel] guest console tail:\n{}",
+                console_tail.trim_end()
+            );
         }
-        eprintln!("[voxel] ready: {}", marker.trim());
+        if tail.trim().is_empty() {
+            bail!(
+                "{label} wrote no /tmp/install.log; the agent never \
+                 ran or died before producing output"
+            );
+        } else {
+            eprintln!("[voxel] guest install log tail:\n{}", tail.trim_end());
+        }
+        bail!("ready marker missing/empty; {label} did not complete");
     }
+    eprintln!("[voxel] ready: {}", marker.trim());
 
     quiesce(&d, node).await;
-    capture(o.dataset, o.image_name, o.deploy)?;
+    capture(o.dataset, o.image_name)?;
 
     eprintln!("[voxel] destroying builder topology");
     let _ = d.destroy();
@@ -283,12 +254,10 @@ pub(crate) async fn create_frr(
 
     bake(BakeOpts {
         base_image: "debian-13.2",
-        role: Some("frr"),
-        exec: None,
+        role: "frr",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
         dataset,
-        deploy: "voxel_build",
         disk_gb: 20,
         mem_gb: 16,
         cores: 8,
@@ -299,10 +268,9 @@ pub(crate) async fn create_frr(
     Ok(())
 }
 
-/// Resolve a rust toolchain binary. `image bake` runs under `pfexec` (zfs +
-/// falcon need it), which drops `~/.cargo/bin` from PATH - the shell scripts
-/// papered over this by prepending it. Prefer an explicit override, then the
-/// rustup install, then PATH.
+/// Resolve a rust toolchain binary. `image create` runs under `pfexec` (zfs +
+/// falcon need it), which drops `~/.cargo/bin` from PATH. Prefer an explicit
+/// override, then the rustup install, then PATH.
 pub(crate) fn toolchain_bin(name: &str) -> Utf8PathBuf {
     if let Ok(p) = std::env::var(name.to_uppercase()) {
         return Utf8PathBuf::from(p);
@@ -318,8 +286,8 @@ pub(crate) fn toolchain_bin(name: &str) -> Utf8PathBuf {
     Utf8PathBuf::from(name)
 }
 
-/// voxel's own source tree, derived the same way `locate_script` finds
-/// `voxel-image/`: next to the binary, else the cwd.
+/// voxel's own source tree: `VOXEL_REPO_ROOT`, else next to the binary, else
+/// the cwd.
 pub(crate) fn repo_root() -> Result<Utf8PathBuf> {
     if let Ok(root) = std::env::var("VOXEL_REPO_ROOT") {
         return Ok(Utf8PathBuf::from(root));
@@ -469,8 +437,8 @@ fn hyperstop(name: &str) {
 ///
 /// A FULL (not incremental) `zfs send` is self-contained, so the image carries
 /// no dependency on the base it was cloned from; only allocated blocks move.
-fn capture(dataset: &str, image_name: &str, deploy: &str) -> Result<()> {
-    let node = Dataset::new(format!("{dataset}/topo/{deploy}/{NODE}"))?;
+fn capture(dataset: &str, image_name: &str) -> Result<()> {
+    let node = Dataset::new(format!("{dataset}/topo/{DEPLOY}/{NODE}"))?;
     let zvol = format!("/dev/zvol/rdsk/{}", node.as_str());
     if !Utf8Path::new(&zvol).exists() {
         bail!("node zvol not found at {zvol}");
