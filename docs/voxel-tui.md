@@ -20,6 +20,13 @@ $ pfexec ./target/debug/voxel tui
 The TUI is the `voxel` crate's opt-in `tui` feature; a build without it has no
 `voxel tui` subcommand.
 
+Monitoring sends Nexus the API version of the omicron commit that Voxel pins
+(the omicron `rev` in `Cargo.toml`). Control-plane images built from that
+commit or any later one accept it. An image built from older omicron does not
+know that version, so the Oximeter-backed metrics stay unavailable and the TUI
+reports the mismatch. Running `voxel image create` without a commit builds the
+pinned commit.
+
 Logs are written to `<resolved workdir>/voxel-tui.log` and displayed in a
 bounded on-screen history. The TUI can launch and destroy Voxel deployments,
 and its session can attach to or detach from new or existing deployments. Use

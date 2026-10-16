@@ -175,11 +175,27 @@ pub(crate) struct NexusClient {
 
 type NexusError = oxide_client::Error<oxide_client::types::Error>;
 
-/// Summarizes a client error as the status Nexus returned, if any.
+/// Summarizes a client error as the status and message Nexus returned, if
+/// any.
 fn describe(error: &NexusError) -> String {
-    match error.status() {
-        Some(status) => format!("returned {status}"),
-        None => format!("failed: {error}"),
+    let oxide_client::Error::ErrorResponse(response) = error else {
+        return match error.status() {
+            Some(status) => format!("returned {status}"),
+            None => format!("failed: {error}"),
+        };
+    };
+    let described =
+        format!("returned {}: {}", response.status(), response.message);
+    // The generated client sends the Nexus API version of the omicron Voxel
+    // is pinned to, which a control plane built from older omicron rejects.
+    if response.message.contains("does not support this API version") {
+        format!(
+            "{described} (monitoring needs a control-plane image built at or \
+             after omicron {}, which Voxel is pinned to)",
+            env!("RACK_INIT_CONFIG_OMICRON_REV")
+        )
+    } else {
+        described
     }
 }
 
@@ -631,6 +647,43 @@ mod tests {
 
         config.recovery_silo.user_name = "operator".into();
         assert_eq!(RecoveryLogin::from_config(&config), None);
+    }
+
+    /// A control-plane image built from omicron older than Voxel's pin rejects
+    /// the client's API version. The error names the image as the cause, so
+    /// the operator sees more than a bare 400.
+    #[tokio::test]
+    async fn an_older_nexus_is_reported_as_an_image_mismatch() {
+        let (endpoint, _, server) = test_server(vec![TestResponse {
+            status: "400 Bad Request",
+            headers: "Content-Type: application/json\r\n",
+            body: r#"{"request_id":"test","message":"server does not support this API version: 2026081400.0.0"}"#,
+            delay: Duration::ZERO,
+        }])
+        .await;
+        let client = NexusClient::new(
+            vec![endpoint],
+            RecoveryLogin {
+                silo: "recovery".into(),
+                username: "recovery".into(),
+                password: "oxide".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        let error = client.ready(&CancellationToken::new()).await.unwrap_err();
+
+        server.await.unwrap();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("does not support this API version")
+                && error.contains(&format!(
+                    "built at or after omicron {}",
+                    env!("RACK_INIT_CONFIG_OMICRON_REV")
+                )),
+            "{error}"
+        );
     }
 
     #[tokio::test]
