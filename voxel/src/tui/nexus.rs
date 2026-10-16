@@ -138,6 +138,31 @@ pub(crate) struct NexusClient {
     timeout: Duration,
 }
 
+/// Resolves names through every one of a rack's external DNS servers at once
+/// and takes the first answer, so losing one server does not hide Nexus.
+/// Asking them in turn would not do: an unanswering server costs hickory about
+/// ten seconds, the whole of the collector's Nexus readiness budget.
+pub(crate) struct RackDns(Vec<CustomDnsResolver>);
+
+impl reqwest::dns::Resolve for RackDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let lookups = self
+            .0
+            .iter()
+            .map(|dns| {
+                let (resolver, name) =
+                    (dns.resolver().clone(), name.as_str().to_owned());
+                Box::pin(async move { resolver.lookup_ip(name).await })
+            })
+            .collect::<Vec<_>>();
+        Box::pin(async move {
+            let (ips, _) = futures::future::select_ok(lookups).await?;
+            Ok(Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)))
+                as reqwest::dns::Addrs)
+        })
+    }
+}
+
 type NexusError = oxide_client::Error<oxide_client::types::Error>;
 
 /// Summarizes a client error as the status and message Nexus returned, if
@@ -175,33 +200,34 @@ impl NexusClient {
         timeout: Duration,
     ) -> anyhow::Result<Self> {
         let network = config.network.for_rack(rack);
+        ensure!(
+            !network.external_dns_ips.is_empty(),
+            "rack has no external DNS address"
+        );
         let dns = network
             .external_dns_ips
-            .first()
-            .context("rack has no external DNS address")?;
-        let dns = SocketAddr::new(
-            dns.parse().with_context(|| format!("external DNS {dns}"))?,
-            53,
-        );
+            .iter()
+            .map(|dns| {
+                let ip = dns
+                    .parse()
+                    .with_context(|| format!("external DNS {dns}"))?;
+                CustomDnsResolver::new(SocketAddr::new(ip, 53))
+            })
+            .collect::<anyhow::Result<_>>()?;
         let name = nexus_name(config, rack);
         let endpoints = ["http", "https"]
             .into_iter()
             .map(|scheme| Url::parse(&format!("{scheme}://{name}")))
             .collect::<Result<_, _>>()
             .context("build Nexus endpoint")?;
-        Self::new(
-            endpoints,
-            Some(Arc::new(CustomDnsResolver::new(dns)?)),
-            login,
-            timeout,
-        )
+        Self::new(endpoints, Some(Arc::new(RackDns(dns))), login, timeout)
     }
 
     /// A client for `endpoints`, tried in order, resolving their names
     /// through `resolver` when one is given.
     pub(crate) fn new(
         endpoints: Vec<Url>,
-        resolver: Option<Arc<CustomDnsResolver>>,
+        resolver: Option<Arc<RackDns>>,
         login: RecoveryLogin,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
@@ -605,6 +631,64 @@ mod tests {
                     env!("RACK_INIT_CONFIG_OMICRON_REV")
                 )),
             "{error}"
+        );
+    }
+
+    /// A DNS response to `query` that answers an A question with `ip` and
+    /// any other question with no records.
+    fn answer(query: &[u8], ip: [u8; 4]) -> Vec<u8> {
+        let name_end = 12 + query[12..].iter().position(|&b| b == 0).unwrap();
+        let question_end = name_end + 1 + 4;
+        let is_a = query[name_end + 1..name_end + 3] == [0, 1];
+        let mut response = query[..2].to_vec();
+        response.extend([0x81, 0x80, 0, 1, 0, u8::from(is_a), 0, 0, 0, 0]);
+        response.extend(&query[12..question_end]);
+        if is_a {
+            response.extend([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+            response.extend(ip);
+        }
+        response
+    }
+
+    /// A rack has two external DNS servers. Nexus must stay reachable by name
+    /// while the first one is silent.
+    #[tokio::test]
+    async fn names_resolve_while_the_first_dns_server_is_silent() {
+        use reqwest::dns::Resolve;
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let answering =
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns = RackDns(
+            [&silent, &answering]
+                .into_iter()
+                .map(|server| {
+                    CustomDnsResolver::new(server.local_addr().unwrap())
+                        .unwrap()
+                })
+                .collect(),
+        );
+        tokio::spawn(async move {
+            let mut query = [0; 512];
+            loop {
+                let (len, peer) =
+                    answering.recv_from(&mut query).await.unwrap();
+                let response = answer(&query[..len], [192, 0, 2, 7]);
+                answering.send_to(&response, peer).await.unwrap();
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let addresses = dns
+            .resolve("recovery.sys.rack1.oxide.test".parse().unwrap())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        assert_eq!(addresses, [SocketAddr::from(([192, 0, 2, 7], 0))]);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "resolved after {:?}",
+            started.elapsed()
         );
     }
 }
