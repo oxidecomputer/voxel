@@ -305,8 +305,9 @@ enum NetworkCmd {
     Show,
     /// Bring up a switch port's link on a running rack (transient).
     ///
-    /// Creates (if needed) + enables the link via `swadm`; run on both ends. ⚠
-    /// Nexus reaps manual swadm links in ~30s - persistent config must use the API.
+    /// Creates (if needed) + enables the link via `swadm`; run on both ends.
+    /// Nexus reaps manual swadm links in ~30s; persistent config must use the
+    /// API.
     LinkUp {
         /// Switch: `switch0` | `switch1` | `switchN` | `rackR/switchS` | node `gN`.
         switch: String,
@@ -625,16 +626,14 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
         .or_else(|| cfg.and_then(|c| c.falcon.dataset.clone()))
         .or_else(|| std::env::var("FALCON_DATASET").ok());
     if let Some(d) = dataset {
-        // SAFETY: runs before the tokio runtime spawns any worker, while the
-        // process is still single-threaded, so no concurrent getenv (from
-        // Rust or C) can race the write.
+        // SAFETY: runs before tokio spawns any worker, while the process is
+        // still single-threaded. No concurrent getenv can race the write.
         unsafe {
             std::env::set_var("FALCON_DATASET", d);
         }
     }
-    // Resolve the build root first (cli > config > env), since the omicron source
-    // path is derived from it below. Export it as-is; apply the default only for
-    // our derive.
+    // Resolve the build root first (cli > config > env); the omicron source
+    // path below derives from it. Exported as-is, defaulted only for the derive.
     let build_root = cli
         .build_root
         .as_ref()
@@ -653,9 +652,8 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
             std::env::var("HOME").unwrap_or_else(|_| "/root".into())
         )
     });
-    // The omicron checkout the CP image was built from. Only the sled-agent
-    // schema detection reads it. Derived from the image's commit so it can't
-    // drift from `image.cp`; $VOXEL_OMICRON_SRC overrides.
+    // The omicron checkout the CP image was built from, derived from the image
+    // commit. Only schema detection reads it; $VOXEL_OMICRON_SRC overrides.
     let omicron_src = std::env::var("VOXEL_OMICRON_SRC").ok().or_else(|| {
         cfg.and_then(|c| c.image.cp_commit())
             .map(|commit| find_omicron_checkout(&build_root_eff, &commit))

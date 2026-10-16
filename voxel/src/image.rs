@@ -17,9 +17,8 @@ pub(crate) fn falcon_dataset() -> String {
     std::env::var("FALCON_DATASET").unwrap_or_else(|_| "rpool/falcon".into())
 }
 
-/// Fail before staging/booting if a configured image isn't present, with a
-/// message that points at how to get one - rather than the cryptic zfs clone
-/// error falcon throws mid-launch when it can't find `<dataset>/img/<name>@base`.
+/// Fail before staging if a configured image is absent, with a pointer to how
+/// to get one. falcon's own zfs clone error mid-launch is cryptic.
 /// A zvol's volsize in bytes.
 fn zvol_size(volume: &str) -> anyhow::Result<u64> {
     let out = std::process::Command::new("zfs")
@@ -77,12 +76,7 @@ pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
 }
 
 /// Render the build-time smf configs (mgs-sim, sp-sim, sled-agent) into an
-/// omicron checkout. Bakes switch0 for `gimlets` sleds with scrimlets at the
-/// first + last sled (the default topology's convention): the launch-time
-/// topology must keep scrimlets at those indices for the baked switch0 to match
-/// the generated switch1. One SP fleet drives both the MGS port table and
-/// sp-sim's side, so they agree by construction; baked images use the sim
-/// backend.
+/// omicron checkout. switch0 is baked with scrimlets at the first and last sled.
 pub(crate) fn render_smf(
     omicron_root: &Utf8Path,
     gimlets: usize,
@@ -124,10 +118,8 @@ pub(crate) fn cmd_image(
 ) -> anyhow::Result<()> {
     match cmd {
         ImageCmd::Ls => {
-            // Image bundles are falcon base images at <dataset>/img/<name>@base.
-            // One `zfs list` covers both the volumes (for size) and their @base
-            // snapshots (which mark a name as a real bundle); we join them into a
-            // table: image, location (dataset path), size, omicron commit.
+            // Bundles are falcon base images at <dataset>/img/<name>@base. One
+            // zfs list gives the volumes (size) and @base snapshots (bundles).
             let dataset = falcon_dataset();
             let img = format!("{dataset}/img");
             let out = std::process::Command::new("zfs")
@@ -183,9 +175,8 @@ pub(crate) fn cmd_image(
                     _ => {}
                 }
             }
-            // Order newest-first by creation. zfs's human `creation` string won't
-            // sort, so pull the numeric epoch (`-p`) in a cheap second query keyed
-            // by the same short names, and sort on that (name as the tiebreak).
+            // Newest first. zfs's human `creation` string does not sort; a
+            // second query pulls the numeric epoch (`-p`).
             let epochs: std::collections::HashMap<String, i64> = {
                 let mut m = std::collections::HashMap::new();
                 if let Ok(o) = std::process::Command::new("zfs")
