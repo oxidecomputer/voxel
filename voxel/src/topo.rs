@@ -182,7 +182,7 @@ pub(crate) fn build_topo(
 }
 
 /// Host-side staging root, one directory per node, mounted at /opt/cargo-bay.
-const CARGO_BAY: &str = "./cargo-bay";
+pub(crate) const CARGO_BAY: &str = "./cargo-bay";
 
 /// Host-side staging root for the emulated SP fleet, one directory per rack.
 const SP_FLEET_DIR: &str = "./sp-fleet";
