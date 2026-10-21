@@ -75,9 +75,10 @@ fn lldp(switch: &str, port_description: &str) -> LldpPortConfig {
 }
 
 /// One uplink port toward a single fabric router. Static mode uses the port's
-/// numbered /30 and a default route; Bgp mode an unnumbered eBGP peer.
-fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
-    let (routes, addresses, bgp_peers) = match mode {
+/// numbered /30 and a default route; Bgp mode an unnumbered eBGP peer. A link
+/// with address_only has only its address.
+fn uplink_port(p: &UplinkPort) -> Result<PortConfig> {
+    let (mut routes, addresses, mut bgp_peers) = match p.mode {
         RouterMode::Bgp => (
             vec![],
             vec![UplinkAddressConfig {
@@ -126,6 +127,10 @@ fn uplink_port(p: &UplinkPort, mode: RouterMode) -> Result<PortConfig> {
             vec![],
         ),
     };
+    if p.address_only {
+        routes.clear();
+        bgp_peers.clear();
+    }
     Ok(PortConfig {
         routes,
         addresses,
@@ -186,7 +191,7 @@ fn rack_network_config(
     let uplink_ports = cfg.uplink_ports(rack);
     let mut ports = Vec::new();
     for p in &uplink_ports {
-        ports.push(uplink_port(p, n.router_mode)?);
+        ports.push(uplink_port(p)?);
     }
     for (sw, port) in cfg.interconnect_ports(rack) {
         ports.push(interconnect_port(&sw, &port)?);
@@ -196,24 +201,26 @@ fn rack_network_config(
 
     // Static-mode uplinks are numbered /30s validated against this lot at
     // handoff; Bgp uplinks are unnumbered, so the lot is unused.
-    let (infra_ip_first, infra_ip_last): (IpAddr, IpAddr) = match n.router_mode
-    {
-        RouterMode::Static => {
-            let (f, l) = n
-                .infra_ip_range(uplink_ports.len())
-                .context("infra_ip_range from transit_prefix")?;
-            (IpAddr::V4(f), IpAddr::V4(l))
-        }
-        RouterMode::Bgp => ("::".parse()?, "::".parse()?),
+    let any_static = uplink_ports.iter().any(|p| p.mode == RouterMode::Static);
+    let (infra_ip_first, infra_ip_last): (IpAddr, IpAddr) = if any_static {
+        let (f, l) = n
+            .infra_ip_range(uplink_ports.len())
+            .context("infra_ip_range from transit_prefix")?;
+        (IpAddr::V4(f), IpAddr::V4(l))
+    } else {
+        ("::".parse()?, "::".parse()?)
     };
+    let default_bgp = uplink_ports
+        .iter()
+        .any(|p| p.mode == RouterMode::Bgp && !p.address_only);
 
     Ok(RackNetworkConfig {
         rack_subnet: n.rack_subnet.parse().context("rack_subnet")?,
         infra_ip_first,
         infra_ip_last,
         ports,
-        bgp: match n.router_mode {
-            RouterMode::Bgp => vec![BgpConfig {
+        bgp: if default_bgp {
+            vec![BgpConfig {
                 asn: n.bgp_asn,
                 originate: vec![
                     n.infra_prefix.parse().context("infra_prefix")?,
@@ -221,35 +228,36 @@ fn rack_network_config(
                 shaper: None,
                 checker: None,
                 max_paths: MaxPathConfig::default(),
-            }],
-            RouterMode::Static => vec![],
+            }]
+        } else {
+            vec![]
         },
-        // Static mode optionally tracks each uplink gateway with single-hop
-        // BFD. The sidecar's own /30 address is the listen/source; without it
+        // Static links optionally track their gateway with single-hop BFD.
+        // The sidecar's own /30 address is the listen/source; without it
         // mgd rejects the peer and time sync hangs.
-        bfd: match (n.router_mode, n.transit_bfd) {
-            (RouterMode::Static, true) => uplink_ports
-                .iter()
-                .map(|p| {
-                    Ok(BfdPeerConfig {
-                        local: Some(
-                            p.sidecar_addr
-                                .split('/')
-                                .next()
-                                .unwrap_or(&p.sidecar_addr)
-                                .parse()
-                                .context("bfd local")?,
-                        ),
-                        remote: p.gateway.parse().context("bfd gateway")?,
-                        detection_threshold: 3,
-                        required_rx: 1_000_000,
-                        mode: BfdMode::SingleHop,
-                        switch: switch_slot(&p.switch)?,
-                    })
+        bfd: uplink_ports
+            .iter()
+            .filter(|p| {
+                n.transit_bfd && p.mode == RouterMode::Static && !p.address_only
+            })
+            .map(|p| {
+                Ok(BfdPeerConfig {
+                    local: Some(
+                        p.sidecar_addr
+                            .split('/')
+                            .next()
+                            .unwrap_or(&p.sidecar_addr)
+                            .parse()
+                            .context("bfd local")?,
+                    ),
+                    remote: p.gateway.parse().context("bfd gateway")?,
+                    detection_threshold: 3,
+                    required_rx: 1_000_000,
+                    mode: BfdMode::SingleHop,
+                    switch: switch_slot(&p.switch)?,
                 })
-                .collect::<Result<Vec<_>>>()?,
-            _ => vec![],
-        },
+            })
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -309,6 +317,13 @@ pub fn request_from_config(
         .context("external_dns_ips")?;
 
     let silo = &cfg.recovery_silo;
+    let rack_network_config = rack_network_config(cfg, rack)?;
+    let routing = crate::routing_input::load(cfg, rack)?
+        .map(crate::routing_input::for_direct_rss)
+        .transpose()?;
+    if let Some(ref routing) = routing {
+        routing.validate(&rack_network_config)?;
+    }
     Ok(RackInitializeRequest {
         trust_quorum_peers: Some(trust_quorum_peers(cfg, rack)),
         bootstrap_discovery: BootstrapAddressDiscovery::OnlyThese {
@@ -334,7 +349,8 @@ pub fn request_from_config(
                 .parse()
                 .map_err(|e| anyhow::anyhow!("user_password_hash: {e}"))?,
         },
-        rack_network_config: rack_network_config(cfg, rack)?,
+        rack_network_config,
+        routing,
         allowed_source_ips: AllowedSourceIps::Any,
         external_jumbo_frames_opt_in_enabled: false,
     })
@@ -416,6 +432,49 @@ mod tests {
             RouterPeerType::Unnumbered(..)
         ));
         assert_eq!(net.infra_ip_first, "::".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn address_only_links_have_no_routing() {
+        let cfg = config(
+            1,
+            "router_mode = \"static\"\ntransit_bfd = true\n\n\
+             [[network.links]]\nswitch = \"switch1\"\nrouter = \"cr2\"\n\
+             mode = \"bgp\"\naddress_only = true\n\n\
+             [[network.links]]\nswitch = \"switch0\"\nrouter = \"cr2\"\n\
+             address_only = true",
+        );
+        let req = request_from_config(&cfg, 0).unwrap();
+        let net = &req.rack_network_config;
+        let port = |switch: SwitchSlot, name: &str| {
+            net.ports
+                .iter()
+                .find(|p| p.switch == switch && p.port == name)
+                .unwrap()
+        };
+        // switch1 to cr2: link-local address only, for a named unnumbered peer.
+        let p = port(SwitchSlot::Switch1, "qsfp1");
+        assert_eq!(p.addresses[0].address, UplinkAddress::AddrConf);
+        assert!(p.bgp_peers.is_empty() && p.routes.is_empty());
+        // switch0 to cr2: numbered /30 only, for named numbered peers.
+        let p = port(SwitchSlot::Switch0, "qsfp1");
+        assert!(matches!(p.addresses[0].address, UplinkAddress::Static { .. }));
+        assert!(p.bgp_peers.is_empty() && p.routes.is_empty());
+        // RSS keeps static routes and BFD on the cr1 links.
+        assert_eq!(port(SwitchSlot::Switch0, "qsfp0").routes.len(), 1);
+        assert_eq!(net.bfd.len(), 2);
+        assert!(net.bgp.is_empty(), "every unnumbered link is address-only");
+        assert_ne!(net.infra_ip_first, "::".parse::<IpAddr>().unwrap());
+
+        // A numbered link in an otherwise unnumbered rack still gets the lot.
+        let cfg = config(
+            1,
+            "router_mode = \"bgp\"\n\n[[network.links]]\nswitch = \"switch0\"\n\
+             router = \"cr2\"\nmode = \"static\"\naddress_only = true",
+        );
+        let net = request_from_config(&cfg, 0).unwrap().rack_network_config;
+        assert_eq!(net.bgp.len(), 1);
+        assert_ne!(net.infra_ip_first, "::".parse::<IpAddr>().unwrap());
     }
 
     #[test]

@@ -145,7 +145,8 @@ pub(crate) async fn resolve_external_ip(
     {
         return Ok(ip);
     }
-    node_external_ip(d, n, is_router).await
+    let router_iface = is_router.then(|| cfg.router_ext_iface(node));
+    node_external_ip(d, n, is_router, router_iface.as_deref()).await
 }
 
 /// A node's address in isolated mode's static numbering, None if it has none.
@@ -172,20 +173,25 @@ pub(crate) fn ce_static_ip(cfg: &voxel_config::VoxelConfig) -> Option<String> {
 }
 
 /// A node's external (host-LAN) IPv4 - the address `voxel route` points at and
-/// `voxel host`/`tp` SSH to. Every node's only non-loopback IPv4 is its host-LAN
-/// DHCP lease (the underlay/cr links are IPv6), so we just take the first one.
+/// `voxel host`/`tp` SSH to. Routers may also have numbered fabric addresses,
+/// so use their configured external NIC when it is known.
 /// Routers (Debian) report addresses via `ip`; sleds (Helios) via `ipadm`.
 pub(crate) async fn node_external_ip(
     d: &Runner,
     n: NodeRef,
     is_router: bool,
+    router_iface: Option<&str>,
 ) -> anyhow::Result<String> {
-    let cmd = if is_router {
-        "ip -4 -br addr show scope global 2>/dev/null"
-    } else {
-        "ipadm show-addr -p -o addr 2>/dev/null"
+    let cmd = match (is_router, router_iface) {
+        (true, Some(iface)) => {
+            format!("ip -4 -br addr show dev {iface} 2>/dev/null")
+        }
+        (true, None) => {
+            "ip -4 -br addr show scope global 2>/dev/null".to_string()
+        }
+        (false, _) => "ipadm show-addr -p -o addr 2>/dev/null".to_string(),
     };
-    let raw = d.exec(n, cmd).await.context("read external IP")?;
+    let raw = d.exec(n, &cmd).await.context("read external IP")?;
     let out = strip_ansi(&raw);
     out.split_whitespace()
         .filter_map(|t| t.split('/').next()) // drop any CIDR suffix
@@ -369,9 +375,10 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
 }
 
 /// (Re)point the host route for the rack's external network (`prefix`) at ce's
-/// current external IP. ce's host-facing NIC gets a fresh random MAC - and thus
-/// a fresh DHCP IP - every launch, so any static route goes stale; discovering
-/// it here keeps the external services reachable without a manual hunt. The
+/// current external IP. ce's host-facing NIC keeps a fixed MAC, but its DHCP
+/// address can still change between launches (an expired lease, or another
+/// server's answer), so any static route can go stale; discovering it here
+/// keeps the external services reachable without a manual hunt. The
 /// route is keyed by `prefix`, so racks with distinct external prefixes don't
 /// collide. With `apply == false` it just prints the command.
 /// The gateways currently routing `dest` (an IPv4 network address like
@@ -409,7 +416,7 @@ pub(crate) async fn set_external_route(
         Some(s) => s.to_string(),
         None => serial_bounded(
             "ce: reading its DHCP lease",
-            node_external_ip(d, ce, true),
+            node_external_ip(d, ce, true, None),
         )
         .await
         .context("ce")?,

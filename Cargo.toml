@@ -35,3 +35,13 @@ toml_edit = "0.25"
 # sprockets/trust quorum related deps
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d" }
 sprockets-tls-test-utils = { git = "https://github.com/oxidecomputer/sprockets.git", rev = "a233079e04d9688454486c452b694587a28c5257" }
+
+# Local 662 forward-port inputs for development; release pins need a fetchable revision.
+[patch."https://github.com/oxidecomputer/omicron"]
+rack-init-config = { path = "../omicron/dev-tools/rack-init-config" }
+wicketd-commission-types-versions = { path = "../omicron/wicketd-commission-types/versions" }
+wicketd-commission-client = { path = "../omicron/clients/wicketd-commission-client" }
+
+# Fixed MACs for external links (Runner::ext_link_mac), not yet upstream.
+[patch."https://github.com/oxidecomputer/falcon"]
+libfalcon = { path = "../falcon/lib" }

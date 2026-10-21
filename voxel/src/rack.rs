@@ -262,6 +262,9 @@ pub(crate) async fn cmd_launch(
                 );
                 let _ = teardown(&topo.runner, name);
                 tokio::time::sleep(Duration::from_secs(3)).await;
+                // teardown wipes the node disks; the next attempt needs them.
+                disks::create_zvols(&image::falcon_dataset(), name, &sleds)
+                    .context("recreating sled disks after failed boot")?;
                 attempt += 1;
             }
             Err(e) => bail!("launch failed after {attempt} attempts: {e}"),

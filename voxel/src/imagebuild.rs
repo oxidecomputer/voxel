@@ -89,9 +89,10 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
     d.reserve(node, o.disk_gb as usize);
 
+    let mac = Some(crate::topo::ext_mac(&d.deployment.name, NODE));
     match o.network.interface.as_deref() {
-        Some(ifx) => d.ext_link(ifx, node),
-        None => d.default_ext_link(node).map_err(|e| {
+        Some(ifx) => d.ext_link_mac(ifx, node, mac),
+        None => d.default_ext_link_mac(node, mac).map_err(|e| {
             anyhow::anyhow!("find default external interface: {e}")
         })?,
     }

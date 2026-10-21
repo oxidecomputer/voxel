@@ -5,6 +5,7 @@
 //! The configuration model behind voxel.toml; every per-node config renders from it.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::frr::{FrrNeighbor, FrrRouter, StaticUplink};
 
@@ -60,6 +61,9 @@ pub struct VoxelConfig {
     pub topology: Topology,
     pub image: Image,
     pub network: Network,
+    /// Optional named-routing TOML file for each rack, keyed by zero-based rack index.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routing_files: BTreeMap<usize, String>,
     pub recovery_silo: RecoverySiloCfg,
     pub falcon: Falcon,
     pub sp: SpCfg,
@@ -623,6 +627,25 @@ pub struct Network {
     pub transit_bfd: bool,
     /// Scrimlet uplink ports (one per switch toward the customer routers).
     pub uplinks: Vec<UplinkCfg>,
+    /// Per-link overrides of router_mode, and links that RSS configures with
+    /// an address only. Links without an entry follow router_mode.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<LinkCfg>,
+}
+
+/// One uplink between a switch and a customer router (cr*). Both ends follow
+/// `mode`. With `address_only = true`, RSS configures the link and its
+/// address but no BGP peer, route or BFD session on it, leaving its routing
+/// to be configured after rack setup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkCfg {
+    pub switch: String,
+    pub router: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RouterMode>,
+    #[serde(default)]
+    pub address_only: bool,
 }
 
 impl Default for Network {
@@ -647,6 +670,7 @@ impl Default for Network {
                 UplinkCfg::default_for("switch0", "uplink0"),
                 UplinkCfg::default_for("switch1", "uplink1"),
             ],
+            links: vec![],
         }
     }
 }
@@ -727,7 +751,22 @@ impl Network {
                     ..u.clone()
                 })
                 .collect(),
+            links: self.links.clone(),
         }
+    }
+
+    /// The mode of the link between switch `slot` and fabric router `router`,
+    /// and whether RSS configures only its address.
+    pub fn link(&self, slot: usize, router: &str) -> (RouterMode, bool) {
+        let switch = self.uplinks.get(slot).map(|u| u.switch.as_str());
+        let link = self
+            .links
+            .iter()
+            .find(|l| Some(l.switch.as_str()) == switch && l.router == router);
+        (
+            link.and_then(|l| l.mode).unwrap_or(self.router_mode),
+            link.is_some_and(|l| l.address_only),
+        )
     }
 
     /// Base address of transit_prefix (its .0). None if it doesn't parse.
@@ -792,6 +831,11 @@ pub struct UplinkPort {
     pub sidecar_addr: String,
     /// Static-mode router side (nexthop + BFD peer), bare addr.
     pub gateway: String,
+    /// This link's mode (router_mode unless overridden in links).
+    pub mode: RouterMode,
+    /// Whether RSS configures only this link's address (no peer, route or
+    /// BFD).
+    pub address_only: bool,
 }
 
 /// One scrimlet uplink port that peers (unnumbered) with a customer router.
@@ -842,6 +886,33 @@ impl Default for RecoverySiloCfg {
 // Generation: FRR router configs. The RSS config renders in rss_request.
 
 impl VoxelConfig {
+    /// Each [[network.links]] entry names an uplink switch and a fabric
+    /// router, at most once.
+    pub fn validate_links(&self) -> Result<(), String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for l in &self.network.links {
+            if !self.network.uplinks.iter().any(|u| u.switch == l.switch) {
+                return Err(format!(
+                    "network.links: no uplink on switch {:?}",
+                    l.switch
+                ));
+            }
+            if l.router == "ce" || !self.topology.routers.contains(&l.router) {
+                return Err(format!(
+                    "network.links: {:?} is not a fabric router",
+                    l.router
+                ));
+            }
+            if !seen.insert((&l.switch, &l.router)) {
+                return Err(format!(
+                    "network.links: {} to {} is listed twice",
+                    l.switch, l.router
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Routers other than ce.
     pub fn fabric_router_count(&self) -> usize {
         self.topology.routers.iter().filter(|r| r.as_str() != "ce").count()
@@ -859,13 +930,15 @@ impl VoxelConfig {
     /// router (qsfp{router}); static block = router * n_switches + switch.
     pub fn uplink_ports(&self, rack: usize) -> Vec<UplinkPort> {
         let net = self.network.for_rack(rack);
-        let n_cr = self.fabric_router_count();
         let n_sc = self.scrimlets_in_rack(rack);
+        let fabric =
+            self.topology.routers.iter().filter(|r| r.as_str() != "ce");
         let mut out = Vec::new();
         for (sc, u) in net.uplinks.iter().enumerate() {
-            for c in 0..n_cr {
+            for (c, router) in fabric.clone().enumerate() {
                 let (gateway, sidecar) =
                     net.transit_slash30_for(c, sc, n_sc).unwrap_or_default();
+                let (mode, address_only) = net.link(sc, router);
                 out.push(UplinkPort {
                     switch: u.switch.clone(),
                     switch_slot: sc,
@@ -877,6 +950,8 @@ impl VoxelConfig {
                     lldp: format!("{}-cr{}", u.lldp_port_description, c + 1),
                     sidecar_addr: format!("{sidecar}/30"),
                     gateway,
+                    mode,
+                    address_only,
                 });
             }
         }
@@ -970,44 +1045,28 @@ impl VoxelConfig {
                 cr_index += 1;
                 let ce_nb =
                     FrrNeighbor::new(format!("enp0s{FRR_IFACE_BASE}"), "to ce");
-                match self.network.router_mode {
-                    RouterMode::Bgp => {
-                        let mut neighbors = vec![ce_nb];
-                        for (k, (sname, rack, slot)) in
-                            scrimlets.iter().enumerate()
-                        {
-                            neighbors.push(FrrNeighbor::new(
-                                format!("enp0s{}", FRR_IFACE_BASE + 1 + k),
-                                format!("to {sname} (rack{rack} switch{slot})"),
-                            ));
-                        }
-                        FrrRouter {
-                            hostname: name.clone(),
-                            asn: TRANSIT_ASN_BASE + cr_index,
-                            neighbors,
-                            originate4: vec![],
-                            originate6: vec![],
-                            static_uplinks: vec![],
-                            track_bfd: false,
-                        }
-                    }
-                    // Numbered /30 to every scrimlet, block = router *
-                    // n_switches + slot; keeps eBGP to ce for redistribution.
-                    RouterMode::Static => {
-                        let c = (cr_index - 1) as usize;
-                        let mut static_uplinks = Vec::new();
-                        for (k, (_, rack, slot)) in scrimlets.iter().enumerate()
-                        {
-                            let net = self.network.for_rack(*rack);
+                // Per scrimlet link: unnumbered eBGP (Bgp), or a numbered /30
+                // with block = router * n_switches + slot (Static). A router
+                // with any Static link renders the static form, which keeps
+                // eBGP to ce for redistribution.
+                let c = (cr_index - 1) as usize;
+                let mut neighbors = vec![ce_nb];
+                let mut static_uplinks = Vec::new();
+                for (k, (sname, rack, slot)) in scrimlets.iter().enumerate() {
+                    let net = self.network.for_rack(*rack);
+                    let interface = format!("enp0s{}", FRR_IFACE_BASE + 1 + k);
+                    match net.link(*slot, name).0 {
+                        RouterMode::Bgp => neighbors.push(FrrNeighbor::new(
+                            interface,
+                            format!("to {sname} (rack{rack} switch{slot})"),
+                        )),
+                        RouterMode::Static => {
                             let n_sc = self.scrimlets_in_rack(*rack);
                             if let Some((gateway, sidecar)) =
                                 net.transit_slash30_for(c, *slot, n_sc)
                             {
                                 static_uplinks.push(StaticUplink {
-                                    interface: format!(
-                                        "enp0s{}",
-                                        FRR_IFACE_BASE + 1 + k
-                                    ),
+                                    interface,
                                     address: format!("{gateway}/30"),
                                     peer: sidecar,
                                     peer_asn: net.bgp_asn,
@@ -1015,16 +1074,17 @@ impl VoxelConfig {
                                 });
                             }
                         }
-                        FrrRouter {
-                            hostname: name.clone(),
-                            asn: TRANSIT_ASN_BASE + cr_index,
-                            neighbors: vec![ce_nb],
-                            originate4: vec![],
-                            originate6: vec![],
-                            static_uplinks,
-                            track_bfd: self.network.transit_bfd,
-                        }
                     }
+                }
+                FrrRouter {
+                    hostname: name.clone(),
+                    asn: TRANSIT_ASN_BASE + cr_index,
+                    neighbors,
+                    originate4: vec![],
+                    originate6: vec![],
+                    track_bfd: self.network.transit_bfd
+                        && !static_uplinks.is_empty(),
+                    static_uplinks,
                 }
             };
             out.push((name.clone(), router));
@@ -1573,6 +1633,71 @@ mod tests {
             cfg.to_frr().iter().find(|(n, _)| n == "cr1").unwrap().1.render();
         assert!(cr1b.contains("ip route 198.51.100.0/24 198.51.101.2 bfd"));
         assert!(cr1b.contains("peer 198.51.101.2"));
+    }
+
+    #[test]
+    fn links_override_mode_per_switch_and_router() {
+        let mut cfg = VoxelConfig::from_toml(indoc! {r#"
+            [network]
+            router_mode = "static"
+            transit_bfd = true
+
+            [[network.links]]
+            switch = "switch1"
+            router = "cr2"
+            mode = "bgp"
+            address_only = true
+
+            [[network.links]]
+            switch = "switch0"
+            router = "cr2"
+            address_only = true
+        "#})
+        .unwrap();
+        cfg.validate_links().unwrap();
+
+        // Sidecar side: each port carries its link's mode and owner.
+        let ports = cfg.uplink_ports(0);
+        let find = |sw: &str, port: &str| {
+            ports.iter().find(|p| p.switch == sw && p.port == port).unwrap()
+        };
+        let s0cr1 = find("switch0", "qsfp0");
+        assert_eq!(
+            (s0cr1.mode, s0cr1.address_only),
+            (RouterMode::Static, false)
+        );
+        let s0cr2 = find("switch0", "qsfp1");
+        assert_eq!(
+            (s0cr2.mode, s0cr2.address_only),
+            (RouterMode::Static, true)
+        );
+        let s1cr2 = find("switch1", "qsfp1");
+        assert_eq!((s1cr2.mode, s1cr2.address_only), (RouterMode::Bgp, true));
+
+        // Router side: cr2 numbers its switch0 link and peers switch1
+        // unnumbered; cr1 is unchanged.
+        let frr = cfg.to_frr();
+        let cr = |name: &str| {
+            frr.iter().find(|(n, _)| n == name).unwrap().1.render()
+        };
+        let cr2 = cr("cr2");
+        assert!(cr2.contains("ip address 198.51.101.9/30"));
+        assert!(!cr2.contains("198.51.101.13"));
+        assert!(cr2.contains("peer 198.51.101.10"));
+        assert!(cr2.contains("to g3 (rack0 switch1)"));
+        assert!(cr2.contains(" neighbor enp0s10 interface remote-as external"));
+        assert!(cr2.contains("  neighbor enp0s10 activate"));
+        let cr1 = cr("cr1");
+        assert!(cr1.contains("ip address 198.51.101.1/30"));
+        assert!(cr1.contains("ip address 198.51.101.5/30"));
+
+        cfg.network.links[0].router = "ce".into();
+        assert!(cfg.validate_links().is_err());
+        cfg.network.links[0].router = "cr3".into();
+        assert!(cfg.validate_links().is_err());
+        cfg.network.links[0].router = "cr2".into();
+        cfg.network.links[0].switch = "switch0".into();
+        assert!(cfg.validate_links().is_err(), "duplicate link");
     }
 
     #[test]

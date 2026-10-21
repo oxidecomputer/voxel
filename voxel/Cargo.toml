@@ -32,6 +32,7 @@ sled-agent-types.workspace = true
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 # Unpack TUF control-plane composites (GNU tar format; illumos tar rejects it).
 tar = "0.4"
 flate2 = "1"

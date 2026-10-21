@@ -21,16 +21,23 @@ pub(crate) async fn cmd_host_exec(
     command: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (_, n) = topo
+    let (n, is_router) = topo
         .sleds
         .iter()
         .find(|(s, _)| s.name == sled)
-        .with_context(|| format!("no such sled: {sled}"))?;
-    let ip = resolve_external_ip(cfg, &topo.runner, sled, *n, false)
+        .map(|(_, n)| (*n, false))
+        .or_else(|| {
+            topo.routers
+                .iter()
+                .find(|(r, _)| r == sled)
+                .map(|(_, n)| (*n, true))
+        })
+        .with_context(|| format!("no such node: {sled}"))?;
+    let ip = resolve_external_ip(cfg, &topo.runner, sled, n, is_router)
         .await
         .with_context(|| {
-            format!("is the rack up? (`voxel serial {sled}` for the console)")
-        })?;
+        format!("is the rack up? (`voxel serial {sled}` for the console)")
+    })?;
     let out = ssh_output(&ip, command).with_context(|| {
         format!("couldn't ssh root@{ip} ({sled}) - is the rack up?")
     })?;

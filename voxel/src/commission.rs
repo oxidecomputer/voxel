@@ -67,12 +67,9 @@ fn lldp(switch: &str, port_description: &str) -> types::LldpPortConfig {
 }
 
 /// One uplink port in wicket's user-specified form; same shape as the
-/// config-rss uplink (rss_request::uplink_port) per router mode.
-fn uplink_port(
-    p: &UplinkPort,
-    mode: RouterMode,
-) -> Result<types::UserSpecifiedPortConfig> {
-    let (routes, addresses, bgp_peers) = match mode {
+/// config-rss uplink (rss_request::uplink_port) per link mode.
+fn uplink_port(p: &UplinkPort) -> Result<types::UserSpecifiedPortConfig> {
+    let (mut routes, addresses, mut bgp_peers) = match p.mode {
         RouterMode::Bgp => (
             vec![],
             vec![types::UserSpecifiedUplinkAddressConfig {
@@ -121,6 +118,10 @@ fn uplink_port(
             vec![],
         ),
     };
+    if p.address_only {
+        routes.clear();
+        bgp_peers.clear();
+    }
     Ok(types::UserSpecifiedPortConfig::Uplink(types::UplinkPortConfig {
         routes,
         addresses,
@@ -176,22 +177,26 @@ pub(crate) fn rss_config(
         };
         Ok(())
     };
-    for p in cfg.uplink_ports(rack) {
-        insert(&p.switch, p.port.clone(), uplink_port(&p, n.router_mode)?)?;
+    let uplink_ports = cfg.uplink_ports(rack);
+    for p in &uplink_ports {
+        insert(&p.switch, p.port.clone(), uplink_port(p)?)?;
     }
     for (sw, port) in cfg.interconnect_ports(rack) {
         insert(&sw, port.clone(), interconnect_port(&sw, &port))?;
     }
 
-    let (infra_first, infra_last): (IpAddr, IpAddr) = match n.router_mode {
-        RouterMode::Static => {
-            let (f, l) = n
-                .infra_ip_range(cfg.uplink_ports(rack).len())
-                .context("infra_ip_range from transit_prefix")?;
-            (IpAddr::V4(f), IpAddr::V4(l))
-        }
-        RouterMode::Bgp => ("::".parse()?, "::".parse()?),
+    let any_static = uplink_ports.iter().any(|p| p.mode == RouterMode::Static);
+    let (infra_first, infra_last): (IpAddr, IpAddr) = if any_static {
+        let (f, l) = n
+            .infra_ip_range(uplink_ports.len())
+            .context("infra_ip_range from transit_prefix")?;
+        (IpAddr::V4(f), IpAddr::V4(l))
+    } else {
+        ("::".parse()?, "::".parse()?)
     };
+    let default_bgp = uplink_ports
+        .iter()
+        .any(|p| p.mode == RouterMode::Bgp && !p.address_only);
 
     let rack_network_config = types::UserSpecifiedRackNetworkConfig {
         rack_subnet_address: None,
@@ -199,8 +204,8 @@ pub(crate) fn rss_config(
         infra_ip_last: infra_last,
         switch0,
         switch1,
-        bgp: match n.router_mode {
-            RouterMode::Bgp => vec![types::BgpConfig {
+        bgp: if default_bgp {
+            vec![types::BgpConfig {
                 asn: n.bgp_asn,
                 originate: vec![
                     n.infra_prefix.parse().context("infra_prefix")?,
@@ -208,8 +213,9 @@ pub(crate) fn rss_config(
                 shaper: None,
                 checker: None,
                 max_paths: Default::default(),
-            }],
-            RouterMode::Static => vec![],
+            }]
+        } else {
+            vec![]
         },
     };
 
@@ -234,6 +240,7 @@ pub(crate) fn rss_config(
         external_dns_ips,
         external_dns_zone_name: n.dns_zone.clone(),
         rack_network_config,
+        routing: crate::routing_input::load(cfg, rack)?,
         allowed_source_ips: types::AllowedSourceIps::Any,
         external_jumbo_frames_opt_in_enabled: true,
     })
@@ -609,5 +616,28 @@ mod tests {
         };
         assert!(port.bgp_peers.is_empty());
         assert_eq!(port.routes.len(), 1);
+    }
+
+    #[test]
+    fn address_only_link_has_no_peer() {
+        let cfg = config(
+            "router_mode = \"bgp\"\n\n[[network.links]]\nswitch = \"switch1\"\n\
+             router = \"cr2\"\naddress_only = true",
+        );
+        let c = rss_config(&cfg, 0).unwrap();
+        let peers =
+            |ports: &BTreeMap<String, types::UserSpecifiedPortConfig>,
+             name: &str| {
+                let Some(types::UserSpecifiedPortConfig::Uplink(p)) =
+                    ports.get(name)
+                else {
+                    panic!("expected an uplink port config for {name}");
+                };
+                p.bgp_peers.len()
+            };
+        assert_eq!(peers(&c.rack_network_config.switch1, "qsfp1"), 0);
+        assert_eq!(peers(&c.rack_network_config.switch1, "qsfp0"), 1);
+        assert_eq!(peers(&c.rack_network_config.switch0, "qsfp1"), 1);
+        assert_eq!(c.rack_network_config.bgp.len(), 1);
     }
 }

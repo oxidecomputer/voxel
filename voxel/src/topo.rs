@@ -50,22 +50,44 @@ impl Topo {
 }
 
 /// Wire a node's external NIC: EXT_INTERFACE, then cfg_link, then falcon's
-/// default-route interface.
+/// default-route interface. The NIC gets a fixed MAC (see [`ext_mac`]).
 fn ext_interface(
     d: &mut Runner,
     n: NodeRef,
+    node: &str,
     cfg_link: Option<&str>,
 ) -> anyhow::Result<()> {
+    let mac = Some(ext_mac(&d.deployment.name, node));
     if let Ok(ifx) = std::env::var("EXT_INTERFACE") {
-        d.ext_link(&ifx, n);
+        d.ext_link_mac(&ifx, n, mac);
     } else if let Some(ifx) = cfg_link {
-        d.ext_link(ifx, n);
+        d.ext_link_mac(ifx, n, mac);
     } else {
-        d.default_ext_link(n).map_err(|e| {
+        d.default_ext_link_mac(n, mac).map_err(|e| {
             anyhow!("failed to find default external interface: {e}")
         })?;
     }
     Ok(())
+}
+
+/// A fixed, locally administered MAC for a node's external NIC, derived from
+/// this host's name and the deployment and node names. With a random MAC,
+/// every launch takes new DHCP leases on the LAN; they pile up until the
+/// server runs out and hands out addresses on another subnet.
+pub(crate) fn ext_mac(deployment: &str, node: &str) -> String {
+    let host = fs::read_to_string("/etc/nodename").unwrap_or_default();
+    mac_from_names(host.trim(), deployment, node)
+}
+
+fn mac_from_names(host: &str, deployment: &str, node: &str) -> String {
+    // FNV-1a, so the MAC stays the same across builds and Rust versions.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in [host, deployment, node].join("/").bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    let [.., a, b, c, d, e] = h.to_be_bytes();
+    format!("02:{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}")
 }
 
 /// SMBIOS type 1. Manufacturer a4x2 is what sled-hardware reads identity from;
@@ -130,7 +152,7 @@ pub(crate) fn build_topo(
         for (_, r) in &fabric_routers {
             d.link(ce, *r);
         }
-        ext_interface(&mut d, ce, ext_if)?;
+        ext_interface(&mut d, ce, "ce", ext_if)?;
     }
 
     // SoftNPU fabric: each sled links only its own rack's scrimlets, each fabric
@@ -148,13 +170,13 @@ pub(crate) fn build_topo(
         {
             d.softnpu_link(sc, *n, Some(new_mac()), None);
         }
-        ext_interface(&mut d, *n, ext_if)?;
+        ext_interface(&mut d, *n, &s.name, ext_if)?;
     }
-    for (_, n) in &fabric_routers {
+    for (r, n) in &fabric_routers {
         for sc in &all_scrimlets {
             d.softnpu_link(*sc, *n, Some(new_mac()), None);
         }
-        ext_interface(&mut d, *n, ext_if)?;
+        ext_interface(&mut d, *n, r, ext_if)?;
     }
 
     // Cross-rack sidecar interconnects, wired after the uplinks so dpd assigns
@@ -856,5 +878,22 @@ mod tests {
         for img in ["schema-test-a", "schema-test-b"] {
             zfs(&["destroy", &format!("{dataset}/img/{img}")]);
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::mac_from_names;
+
+    #[test]
+    fn ext_mac_is_stable_unique_and_locally_administered() {
+        let a = mac_from_names("sol", "poc662", "g0");
+        assert_eq!(a, mac_from_names("sol", "poc662", "g0"));
+        assert_ne!(a, mac_from_names("sol", "poc662", "g1"));
+        assert_ne!(a, mac_from_names("sol", "other", "g0"));
+        assert_ne!(a, mac_from_names("other", "poc662", "g0"));
+        // Unicast with the locally administered bit set.
+        assert!(a.starts_with("02:"));
+        assert_eq!(a.split(':').count(), 6);
     }
 }

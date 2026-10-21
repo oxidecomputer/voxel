@@ -37,6 +37,7 @@ mod net;
 mod network;
 mod rack;
 mod repocmd;
+mod routing_input;
 mod rss;
 mod rss_request;
 mod sp_cmd;
@@ -537,6 +538,28 @@ fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     let cfg = VoxelConfig::from_toml(&text)
         .with_context(|| format!("parse {}", path))?;
     cfg.topology.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    cfg.validate_links().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let mut cfg = cfg;
+    for (rack, file) in &mut cfg.routing_files {
+        anyhow::ensure!(
+            *rack < cfg.topology.racks(),
+            "routing file configured for nonexistent rack {rack}"
+        );
+        let selected = Utf8Path::new(file);
+        let resolved = if selected.is_absolute() {
+            selected.to_path_buf()
+        } else {
+            path.parent().unwrap_or(Utf8Path::new(".")).join(selected)
+        };
+        let canonical = std::fs::canonicalize(&resolved)
+            .with_context(|| format!("resolve routing file {resolved}"))?;
+        *file = Utf8PathBuf::try_from(canonical)
+            .map_err(|_| anyhow::anyhow!("routing file path is not UTF-8"))?
+            .to_string();
+    }
+    for rack in cfg.routing_files.keys() {
+        routing_input::load(&cfg, *rack)?;
+    }
     Ok(cfg)
 }
 
