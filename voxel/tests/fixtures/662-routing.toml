@@ -1,0 +1,26 @@
+# Use with Voxel network.router_mode = "static", transit_prefix = "198.51.101.0/24",
+# and transit_bfd = false. Default router settings remain in the legacy input.
+[routing]
+control_plane_router_configurations = [{ router_configuration = "initial-routing", priority = 100 }]
+recovery_silo_router_configurations = [{ router_configuration = "initial-routing", priority = 100 }]
+
+[[routing.announce_sets]]
+name = "initial-prefixes"
+description = "Service and instance external addresses"
+prefixes = ["198.51.100.0/24"]
+
+[[routing.router_configurations]]
+name = "initial-routing"
+description = "One RC on both switches, installed before service startup"
+
+[[routing.router_configurations.switches]]
+switch = "switch0"
+bgp_config = { asn = 65000, max_paths = 2, bgp_announce_set = "initial-prefixes" }
+routes = [{ name = "external-default", dst = "0.0.0.0/0", gw = "198.51.101.1" }]
+bgp_peers = [{ name = "cr1", peer = { type = "numbered", addr = "198.51.101.1", src_addr = "198.51.101.2" }, enforce_first_as = false }]
+
+[[routing.router_configurations.switches]]
+switch = "switch1"
+bgp_config = { asn = 65000, max_paths = 2, bgp_announce_set = "initial-prefixes" }
+routes = [{ name = "external-default", dst = "0.0.0.0/0", gw = "198.51.101.5" }]
+bgp_peers = [{ name = "cr1", peer = { type = "numbered", addr = "198.51.101.5", src_addr = "198.51.101.6" }, enforce_first_as = false }]

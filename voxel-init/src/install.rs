@@ -379,10 +379,12 @@ pub fn build_control_plane_image() -> Result<()> {
     }
 
     // --- pinned package deps (baked) ---
+    // The image's omicron/baseline service runs `pkg refresh` at boot and
+    // holds the image lock until it completes, which can take minutes.
     let mut attempt = 0;
     while !run("pkg", &["install", "tofino", "looker", "htop", "jq"]) {
         attempt += 1;
-        if attempt >= 25 {
+        if attempt >= 300 {
             bail!("pkg install failed after {attempt} attempts");
         }
         note(format!("pkg install attempt {attempt} failed; retrying"));

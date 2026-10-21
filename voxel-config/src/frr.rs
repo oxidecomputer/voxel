@@ -41,17 +41,20 @@ pub struct StaticUplink {
     pub address: String,
     /// Sidecar peer address, e.g. `198.51.101.2`.
     pub peer: String,
-    /// ASN to peer with at `peer` (the sidecar's rack ASN). The session never
-    /// establishes in static mode (sidecar runs no BGP), but bgpd's connect
-    /// retries keep softnpu's neighbor for this gateway resolved, which static
-    /// egress needs. Mirrors a4x2's router `frr-bgp.txt`.
+    /// ASN to peer with at `peer` (the sidecar's rack ASN). The rack's default
+    /// router runs no BGP on a static link, so the session establishes only if
+    /// a named router configuration peers from the sidecar address; either
+    /// way bgpd's connect retries keep softnpu's neighbor for this gateway
+    /// resolved, which static egress needs. Mirrors a4x2's router
+    /// `frr-bgp.txt`.
     pub peer_asn: u32,
     /// Rack prefix reached via `peer`, e.g. `198.51.100.0/24`.
     pub route: String,
 }
 
 /// A router's FRR config. `static_uplinks` empty renders unnumbered eBGP;
-/// non-empty renders static + BFD (eBGP neighbors, if any, are kept for `ce`).
+/// non-empty renders static + BFD, keeping the unnumbered eBGP neighbors (`ce`
+/// and any unnumbered scrimlet links) in the IPv4 address family only.
 #[derive(Debug, Clone)]
 pub struct FrrRouter {
     pub hostname: String,
@@ -90,7 +93,7 @@ impl FrrRouter {
         writeln!(o, "!")
     }
 
-    /// `interface`/`description` blocks for the unnumbered (ce) neighbors.
+    /// `interface`/`description` blocks for the unnumbered neighbors.
     fn write_neighbor_interfaces(
         &self,
         o: &mut impl fmt::Write,
@@ -104,7 +107,7 @@ impl FrrRouter {
     }
 
     /// `router bgp` open, `no ebgp-requires-policy`, and the unnumbered eBGP
-    /// neighbors (toward ce). Callers append numbered peers + address-families.
+    /// neighbors. Callers append numbered peers + address-families.
     fn write_bgp_open(&self, o: &mut impl fmt::Write) -> fmt::Result {
         writeln!(o, "router bgp {}", self.asn)?;
         writeln!(o, " no bgp ebgp-requires-policy")?;
