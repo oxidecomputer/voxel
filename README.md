@@ -20,7 +20,8 @@ generation.
 - **`voxel-image/`**: image build machinery (`voxel image create`) and the install
   scripts that bake a control-plane image from an omicron commit.
 
-See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference, there are a LOT of tuning knobs.
+See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference,
+there are a LOT of tuning knobs.
 
 ## Building
 
@@ -38,8 +39,8 @@ For a complete walkthrough, from preparing a Helios host through launching,
 accessing, and tearing down a rack, see the
 [operator guide](docs/operator-guide.adoc).
 
-> [!NOTE]
-> Whenever the command `voxel` is mentioned, the best way to use it is to access the debug build: `./target/debug/voxel <command>`
+> [!NOTE] Whenever the command `voxel` is mentioned, the best way to use it is
+> to access the debug build: `./target/debug/voxel <command>`
 
 1. `cargo build` builds voxel.
 2. `voxel image create` builds omicron with a pinned commit and bakes `voxel-cp-<HASH>`
