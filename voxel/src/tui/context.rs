@@ -8,8 +8,8 @@
 
 use anyhow::Context;
 use camino::Utf8PathBuf;
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use voxel_config::{VoxelConfig, config as vcfg};
 
 use super::operation::LogLevel;
@@ -27,6 +27,31 @@ pub(crate) struct CommandSpec {
     pub(crate) args: Vec<OsString>,
     pub(crate) current_dir: PathBuf,
     pub(crate) env: Vec<(OsString, OsString)>,
+}
+
+/// The global flags every `voxel` command the TUI runs takes, then
+/// `subcommand`. Launch, route and destroy use them, and so does resuming a
+/// detached session, so both run against the same deployment.
+pub(crate) fn voxel_arguments(
+    config_path: &Path,
+    workdir: &Path,
+    name: &str,
+    dataset: &str,
+    build_root: &Path,
+    subcommand: &str,
+) -> Vec<OsString> {
+    let flags: [(&str, &OsStr); 5] = [
+        ("--config", config_path.as_os_str()),
+        ("--workdir", workdir.as_os_str()),
+        ("--name", name.as_ref()),
+        ("--dataset", dataset.as_ref()),
+        ("--build-root", build_root.as_os_str()),
+    ];
+    flags
+        .into_iter()
+        .flat_map(|(flag, value)| [OsString::from(flag), value.to_owned()])
+        .chain([OsString::from(subcommand)])
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -135,21 +160,14 @@ impl TuiContext {
             PublicCommand::Route => "route",
             PublicCommand::Destroy => "destroy",
         };
-        let args = [
-            OsString::from("--config"),
-            self.config_path.as_os_str().to_owned(),
-            OsString::from("--workdir"),
-            self.workdir.as_os_str().to_owned(),
-            OsString::from("--name"),
-            OsString::from(&self.name),
-            OsString::from("--dataset"),
-            OsString::from(&self.dataset),
-            OsString::from("--build-root"),
-            self.build_root.as_os_str().to_owned(),
-            OsString::from(subcommand),
-        ]
-        .into_iter()
-        .collect();
+        let args = voxel_arguments(
+            self.config_path.as_std_path(),
+            self.workdir.as_std_path(),
+            &self.name,
+            &self.dataset,
+            self.build_root.as_std_path(),
+            subcommand,
+        );
 
         CommandSpec {
             program: self.executable.clone(),

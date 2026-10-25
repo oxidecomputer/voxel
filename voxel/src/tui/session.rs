@@ -73,21 +73,14 @@ impl DetachedSession {
     }
 
     fn arguments(&self) -> Vec<OsString> {
-        [
-            OsString::from("--config"),
-            self.config_path.as_os_str().to_owned(),
-            OsString::from("--workdir"),
-            self.workdir.as_os_str().to_owned(),
-            OsString::from("--name"),
-            OsString::from(&self.name),
-            OsString::from("--dataset"),
-            OsString::from(&self.dataset),
-            OsString::from("--build-root"),
-            self.build_root.as_os_str().to_owned(),
-            OsString::from("tui"),
-        ]
-        .into_iter()
-        .collect()
+        super::context::voxel_arguments(
+            &self.config_path,
+            &self.workdir,
+            &self.name,
+            &self.dataset,
+            &self.build_root,
+            "tui",
+        )
     }
 
     pub(crate) fn reattach_command(&self) -> anyhow::Result<String> {
