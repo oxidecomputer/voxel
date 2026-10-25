@@ -196,50 +196,38 @@ impl Lifecycle {
         let mut state = Self::default();
         ops.raw()?;
         state.raw = true;
-        if let Err(e) = ops.enter() {
-            let _ = state.restore(ops);
-            return Err(e);
-        }
-        state.alternate = true;
-        if let Err(e) = ops.hide() {
-            let _ = state.restore(ops);
-            return Err(e);
-        }
-        state.hidden = true;
-        if let Err(e) = ops.initialize() {
+        let result = (|| {
+            ops.enter()?;
+            state.alternate = true;
+            ops.hide()?;
+            state.hidden = true;
+            ops.initialize()
+        })();
+        if let Err(e) = result {
             let _ = state.restore(ops);
             return Err(e);
         }
         Ok(state)
     }
+    /// Undoes each completed stage in reverse, attempting every step even
+    /// after one fails, and returns the first error. A stage stays marked
+    /// done until undone, so a retry repeats only the steps that failed.
     fn restore(&mut self, ops: &mut impl LifecycleOps) -> io::Result<()> {
         let mut first = None;
-        if self.hidden {
-            match ops.show() {
-                Ok(()) => self.hidden = false,
-                Err(e) => first = Some(e),
-            }
-        }
-        if self.alternate {
-            match ops.leave() {
-                Ok(()) => self.alternate = false,
-                Err(e) => {
-                    if first.is_none() {
-                        first = Some(e);
+        let mut undo =
+            |done: &mut bool, step: &mut dyn FnMut() -> io::Result<()>| {
+                if *done {
+                    match step() {
+                        Ok(()) => *done = false,
+                        Err(e) => {
+                            first.get_or_insert(e);
+                        }
                     }
                 }
-            }
-        }
-        if self.raw {
-            match ops.disable() {
-                Ok(()) => self.raw = false,
-                Err(e) => {
-                    if first.is_none() {
-                        first = Some(e);
-                    }
-                }
-            }
-        }
+            };
+        undo(&mut self.hidden, &mut || ops.show());
+        undo(&mut self.alternate, &mut || ops.leave());
+        undo(&mut self.raw, &mut || ops.disable());
         first.map_or(Ok(()), Err)
     }
 }
