@@ -308,7 +308,16 @@ fn json_string_field(input: &str, key: &str) -> String {
         .to_string()
 }
 
-fn parse_rss_observation(body: &str) -> RssObservation {
+/// Asks a sled's bootstrap agent, over SSH, how rack setup is going.
+pub(crate) fn rss_probe_command(
+    bootstrap_addr: impl std::fmt::Display,
+) -> String {
+    format!(
+        "curl -s --max-time 5 http://[{bootstrap_addr}]:8080/rack-initialize 2>/dev/null"
+    )
+}
+
+pub(crate) fn parse_rss_observation(body: &str) -> RssObservation {
     if body.trim().is_empty() {
         return RssObservation::Unavailable;
     }
@@ -464,10 +473,7 @@ pub(crate) async fn collect(
         rss_sleds.iter().map(|sled| sled.rack).collect::<Vec<_>>();
     if any_live {
         for sled in rss_sleds {
-            let command = format!(
-                "curl -s --max-time 5 http://[{}]:8080/rack-initialize 2>/dev/null",
-                sled.bootstrap_addr()
-            );
+            let command = rss_probe_command(sled.bootstrap_addr());
             let target = NodeTarget::Sled { name: sled.name.clone() };
             let observation = match executor.execute(&target, &command).await {
                 Ok(body) => parse_rss_observation(&body),

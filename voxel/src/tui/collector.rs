@@ -25,7 +25,7 @@ use crate::tui::event::AppEvent;
 use crate::tui::nexus::{
     MetricType, NexusClient, OxqlQueryResult, RecoveryLogin, TimeseriesExt,
 };
-use crate::tui::reconcile::RssObservation;
+use crate::tui::reconcile::{parse_rss_observation, rss_probe_command};
 use crate::tui::telemetry::{
     BidirectionalErrors, BidirectionalRate, CounterSnapshot, HealthDiagnostic,
     OximeterExceptions, RackId, ResourceId, ResourceKind, ResourceTelemetry,
@@ -469,38 +469,6 @@ fn parse_oximeter_exceptions(
         }
     }
     Ok(exceptions)
-}
-
-fn json_string_field(input: &str, key: &str) -> String {
-    let pattern = format!("\"{key}\":\"");
-    input
-        .find(&pattern)
-        .and_then(|start| input[start + pattern.len()..].split('"').next())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn parse_rss_observation(body: &str) -> RssObservation {
-    if body.trim().is_empty() {
-        return RssObservation::Unavailable;
-    }
-    match json_string_field(body, "status").as_str() {
-        "initializing" => {
-            let step = body
-                .find("\"step\"")
-                .map(|start| json_string_field(&body[start..], "status"))
-                .filter(|step| !step.is_empty());
-            RssObservation::Initializing { step }
-        }
-        "initialized" => match json_string_field(body, "id") {
-            id if id.is_empty() => RssObservation::StaleInitialized,
-            id => RssObservation::Initialized { id },
-        },
-        "initialization_failed" => RssObservation::Failed {
-            message: json_string_field(body, "message"),
-        },
-        _ => RssObservation::UnknownResponse,
-    }
 }
 
 async fn ssh_capture_bounded(
@@ -1362,10 +1330,7 @@ impl<E: NodeExecutor> Collector<E> {
         at: Instant,
         cancel: &CancellationToken,
     ) -> AppEvent {
-        let command = format!(
-            "curl -s --max-time 5 http://[{}]:8080/rack-initialize 2>/dev/null",
-            rss.bootstrap_addr
-        );
+        let command = rss_probe_command(&rss.bootstrap_addr);
         match self.call(cancel, &rss.target, &command).await {
             Ok(body) if !body.trim().is_empty() => AppEvent::Rss {
                 rack: rss.rack,
