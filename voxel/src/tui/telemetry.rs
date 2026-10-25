@@ -1033,36 +1033,18 @@ mod tests {
         }
     }
 
-    /// What any one host-command parser returns, so every parser's cases
-    /// can share a single table.
-    #[derive(Debug, PartialEq)]
-    enum Parsed {
-        Links(BTreeMap<String, LinkCounters>),
-        ZoneVnics(Vec<ZoneInfo>),
-        Addresses(NodeAddresses),
-        ZoneList(ZoneDiagnostic),
-        ServiceState(Option<ServiceState>),
-        FailedServices(Vec<String>),
-        Ntp(NtpDiagnostic),
-    }
-
-    type Parser = fn(&str) -> Parsed;
-
-    fn links<const N: usize>(entries: [(&str, LinkCounters); N]) -> Parsed {
-        Parsed::Links(
-            entries.into_iter().map(|(name, c)| (name.to_owned(), c)).collect(),
-        )
+    fn links<const N: usize>(
+        entries: [(&str, LinkCounters); N],
+    ) -> BTreeMap<String, LinkCounters> {
+        entries.into_iter().map(|(name, c)| (name.to_owned(), c)).collect()
     }
 
     fn strings(list: &[&str]) -> Vec<String> {
         list.iter().map(|&s| s.to_owned()).collect()
     }
 
-    fn addresses(ipv4: &[&str], ipv6: &[&str]) -> Parsed {
-        Parsed::Addresses(NodeAddresses {
-            ipv4: strings(ipv4),
-            ipv6: strings(ipv6),
-        })
+    fn addresses(ipv4: &[&str], ipv6: &[&str]) -> NodeAddresses {
+        NodeAddresses { ipv4: strings(ipv4), ipv6: strings(ipv6) }
     }
 
     fn zone(name: &str, short_name: &str, vnics: &[&str]) -> ZoneInfo {
@@ -1073,17 +1055,14 @@ mod tests {
         }
     }
 
-    fn ntp(stratum: Option<u32>, synchronized: bool) -> Parsed {
-        Parsed::Ntp(NtpDiagnostic { stratum, synchronized: Some(synchronized) })
+    fn ntp(stratum: Option<u32>, synchronized: bool) -> NtpDiagnostic {
+        NtpDiagnostic { stratum, synchronized: Some(synchronized) }
     }
 
     #[test]
     fn host_command_output_parses() {
-        // (case, parser, command output, expected result)
-        let cases: [(&str, Parser, &str, Parsed); 12] = [
-            (
-                "kstat keeps only links whose counters all parse",
-                |s| Parsed::Links(parse_kstat_link_counters(s)),
+        assert_eq!(
+            parse_kstat_link_counters(
                 "0:link:vioif0:rbytes64\t1000\n\
                  0:link:vioif0:obytes64\t2000\n\
                  0:link:vioif0:ipackets64\t50\n\
@@ -1091,112 +1070,110 @@ mod tests {
                  0:link:bad:rbytes64\tnot-a-number\n\
                  0:link:bad:obytes64\t1\n\
                  0:link:bad:ipackets64\t1\n\
-                 0:link:bad:opackets64\t1\n",
-                links([("vioif0", counters(1000, 2000).with_packets(50, 60))]),
+                 0:link:bad:opackets64\t1\n"
             ),
-            (
-                "dladm groups vnics by zone and drops shared and malformed ones",
-                |s| Parsed::ZoneVnics(parse_dladm_zone_vnics(s)),
+            links([("vioif0", counters(1000, 2000).with_packets(50, 60))]),
+            "kstat keeps only links whose counters all parse"
+        );
+        assert_eq!(
+            parse_dladm_zone_vnics(
                 "vnic1:oxz_ntp_aabbccddeeff\n\
                  vnic1:oxz_ntp_aabbccddeeff\n\
                  vnic0:global\n\
                  shared:oxz_one_deadbeef0\n\
                  shared:oxz_two_deadbeef0\n\
                  :global\n\
-                 vnic2:oxz_bad:zone\n",
-                Parsed::ZoneVnics(vec![
-                    zone("global", "global", &["vnic0"]),
-                    zone("oxz_ntp_aabbccddeeff", "ntp", &["vnic1"]),
-                ]),
+                 vnic2:oxz_bad:zone\n"
             ),
-            (
-                "linux counters ignore extra columns and skip malformed rows",
-                |s| Parsed::Links(parse_linux_link_counters(s)),
+            vec![
+                zone("global", "global", &["vnic0"]),
+                zone("oxz_ntp_aabbccddeeff", "ntp", &["vnic1"]),
+            ],
+            "dladm groups vnics by zone and drops shared and malformed ones"
+        );
+        assert_eq!(
+            parse_linux_link_counters(
                 "eth1 10 20 1 2 ignored extra\n\
                  bad 1 nope 3 4 5\n\
-                 short 1\n",
-                links([("eth1", counters(10, 20).with_packets(1, 2))]),
+                 short 1\n"
             ),
-            (
-                "ipadm puts host LAN and underlay first and skips link-local",
-                |s| Parsed::Addresses(parse_ipadm_addresses(s)),
+            links([("eth1", counters(10, 20).with_packets(1, 2))]),
+            "linux counters ignore extra columns and skip malformed rows"
+        );
+        assert_eq!(
+            parse_ipadm_addresses(
                 "net0/v4:10.0.0.1/24\n\
                  vioif3/v4:192.168.68.122/22\n\
                  net0/v6:2001\\:db8\\:\\:2/64\n\
                  underlay0/sled6:fd00\\:1122\\:3344\\:101\\:\\:1/64\n\
                  vioif1/ll:fe80\\:\\:1/10\n\
-                 malformed\n",
-                addresses(
-                    &["192.168.68.122/22", "10.0.0.1/24"],
-                    &["fd00:1122:3344:101::1/64", "2001:db8::2/64"],
-                ),
+                 malformed\n"
             ),
-            (
-                "linux addresses skip bridges and invalid addresses",
-                |s| Parsed::Addresses(parse_linux_ip_addresses(s)),
+            addresses(
+                &["192.168.68.122/22", "10.0.0.1/24"],
+                &["fd00:1122:3344:101::1/64", "2001:db8::2/64"],
+            ),
+            "ipadm puts host LAN and underlay first and skips link-local"
+        );
+        assert_eq!(
+            parse_linux_ip_addresses(
                 "5: enp0s11    inet 192.168.68.108/22 scope global enp0s11\n\
                  5: enp0s11    inet6 2001:db8::1/64 scope global\n\
                  6: docker0    inet 172.17.0.1/16 scope global docker0\n\
-                 7: enp0s12    inet not-an-address scope global\n",
-                addresses(&["192.168.68.108/22"], &["2001:db8::1/64"]),
+                 7: enp0s12    inet not-an-address scope global\n"
             ),
-            (
-                "zone list is sorted, deduplicated and skips malformed names",
-                |s| Parsed::ZoneList(parse_zone_diagnostics(s)),
-                "global\noxz_switch\noxz_switch\noxz_ntp_deadbeef0\nbad zone\n",
-                Parsed::ZoneList(ZoneDiagnostic {
-                    zones: strings(&[
-                        "global",
-                        "oxz_ntp_deadbeef0",
-                        "oxz_switch",
-                    ]),
-                }),
+            addresses(&["192.168.68.108/22"], &["2001:db8::1/64"]),
+            "linux addresses skip bridges and invalid addresses"
+        );
+        assert_eq!(
+            parse_zone_diagnostics(
+                "global\noxz_switch\noxz_switch\noxz_ntp_deadbeef0\nbad zone\n"
             ),
-            (
-                "service state is trimmed",
-                |s| Parsed::ServiceState(parse_service_state(s)),
-                " online\n",
-                Parsed::ServiceState(Some(ServiceState::Online)),
-            ),
-            (
-                "service state rejects unknown states",
-                |s| Parsed::ServiceState(parse_service_state(s)),
-                "garbage",
-                Parsed::ServiceState(None),
-            ),
-            (
-                "failed services are sorted FMRI names without noise",
-                |s| Parsed::FailedServices(parse_failed_services(s)),
+            ZoneDiagnostic {
+                zones: strings(&["global", "oxz_ntp_deadbeef0", "oxz_switch"]),
+            },
+            "zone list is sorted, deduplicated and skips malformed names"
+        );
+        assert_eq!(
+            parse_service_state(" online\n"),
+            Some(ServiceState::Online),
+            "service state is trimmed"
+        );
+        assert_eq!(
+            parse_service_state("garbage"),
+            None,
+            "service state rejects unknown states"
+        );
+        assert_eq!(
+            parse_failed_services(
                 "svc:/oxide/sled-agent:default\n\
                  noise\n\
-                 svc:/network/dns/client:default\n",
-                Parsed::FailedServices(strings(&[
-                    "network/dns/client",
-                    "oxide/sled-agent",
-                ])),
+                 svc:/network/dns/client:default\n"
             ),
-            (
-                "chrony synchronised",
-                |s| Parsed::Ntp(parse_chrony_tracking(s)),
-                "Reference ID : A29FC87B\nStratum : 4\nLeap status : Normal\n",
-                ntp(Some(4), true),
+            strings(&["network/dns/client", "oxide/sled-agent"]),
+            "failed services are sorted FMRI names without noise"
+        );
+        assert_eq!(
+            parse_chrony_tracking(
+                "Reference ID : A29FC87B\nStratum : 4\nLeap status : Normal\n"
             ),
-            (
-                "chrony not synchronised",
-                |s| Parsed::Ntp(parse_chrony_tracking(s)),
-                "Stratum : 0\nLeap status : Not synchronised",
-                ntp(Some(0), false),
+            ntp(Some(4), true),
+            "chrony synchronised"
+        );
+        assert_eq!(
+            parse_chrony_tracking(
+                "Stratum : 0\nLeap status : Not synchronised"
             ),
-            (
-                "chrony malformed stratum",
-                |s| Parsed::Ntp(parse_chrony_tracking(s)),
-                "Stratum : nope\nmalformed\nLeap status : Unsynchronised",
-                ntp(None, false),
+            ntp(Some(0), false),
+            "chrony not synchronised"
+        );
+        assert_eq!(
+            parse_chrony_tracking(
+                "Stratum : nope\nmalformed\nLeap status : Unsynchronised"
             ),
-        ];
-        for (case, parse, output, expected) in cases {
-            assert_eq!(parse(output), expected, "{case}");
-        }
+            ntp(None, false),
+            "chrony malformed stratum"
+        );
     }
 
     #[test]
