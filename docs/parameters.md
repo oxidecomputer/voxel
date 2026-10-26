@@ -99,7 +99,7 @@ Runtime paths. Each unset value resolves via env then built-in default.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `dataset` | string | `$FALCON_DATASET`, else `rpool/falcon` | ZFS dataset. |
-| `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/` and `.falcon/` live under. Absolute. |
+| `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/`, `.falcon/` and `image-build/` (image builds: falcon dir, cargo-bays, download caches) live under. Absolute. |
 | `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkouts). |
 | `propolis_binary` | string | unset | `propolis-server` the host runs each node under. Unset leaves falcon's own binary, which it downloads on demand. Set it to run a locally built propolis, e.g. for a device-model fix that has not reached a release. Rack nodes only, as the image-build VM keeps falcon's binary. |
 
