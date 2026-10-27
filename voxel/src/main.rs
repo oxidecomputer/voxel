@@ -17,7 +17,7 @@
 //! startup that anchors voxel to its project root; the commands themselves live
 //! in the topic modules below.
 
-use anyhow::{Context, Error};
+use anyhow::{Context, Error, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use std::fs;
@@ -295,6 +295,16 @@ enum ImageCmd {
         /// Image label; the image is named `voxel-frr-<version>`.
         #[arg(default_value = "proto")]
         version: String,
+    },
+    /// Build a `voxel-builder` image: an omicron build host with git, rustup
+    /// and omicron's builder prerequisites.
+    CreateBuilder {
+        /// Image label; the image is named `voxel-builder-<version>`.
+        #[arg(default_value = "proto")]
+        version: String,
+        /// omicron rev to check out in the image (default: voxel's pinned rev).
+        #[arg(long)]
+        omicron: Option<String>,
     },
 }
 
@@ -778,6 +788,24 @@ async fn main() -> Result<(), Error> {
                     version,
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
+                )
+                .await
+            }
+            ImageCmd::CreateBuilder { version, omicron } => {
+                let rev = match omicron.as_deref() {
+                    Some(r) => r,
+                    None if !cpbuild::PINNED_OMICRON_REV.is_empty() => {
+                        cpbuild::PINNED_OMICRON_REV
+                    }
+                    None => {
+                        bail!("voxel has no pinned omicron; pass --omicron")
+                    }
+                };
+                imagebuild::create_builder(
+                    version,
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
+                    rev,
                 )
                 .await
             }

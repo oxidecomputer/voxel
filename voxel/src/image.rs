@@ -393,5 +393,8 @@ pub(crate) fn cmd_image(
         ImageCmd::CreateFrr { .. } => {
             bail!("internal: `image create-frr` is dispatched in main")
         }
+        ImageCmd::CreateBuilder { .. } => {
+            bail!("internal: `image create-builder` is dispatched in main")
+        }
     }
 }
