@@ -252,21 +252,21 @@ pub(crate) async fn create_builder(
     Ok(())
 }
 
-/// An empty `image-build/cargo-bay/<name>`. Root-owned leftovers from a pfexec
-/// run would fail every later write.
-pub(crate) fn fresh_cargo_bay(name: &str) -> Result<Utf8PathBuf> {
-    let cargo_bay = build_root()?.join("cargo-bay").join(name);
-    if cargo_bay.exists() {
-        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
-            format!(
-                "clear {cargo_bay} (owned by another user? \
-                 remove it with pfexec rm -rf)"
-            )
+/// An empty staging dir. Root-owned leftovers from a pfexec run would fail
+/// every later write.
+pub(crate) fn fresh_dir(dir: Utf8PathBuf) -> Result<Utf8PathBuf> {
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).with_context(|| {
+            format!("clear {dir} (owned by another user? remove it with pfexec rm -rf)")
         })?;
     }
-    std::fs::create_dir_all(&cargo_bay)
-        .with_context(|| format!("mkdir {cargo_bay}"))?;
-    Ok(cargo_bay)
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {dir}"))?;
+    Ok(dir)
+}
+
+/// An empty `image-build/cargo-bay/<name>`.
+pub(crate) fn fresh_cargo_bay(name: &str) -> Result<Utf8PathBuf> {
+    fresh_dir(build_root()?.join("cargo-bay").join(name))
 }
 
 /// Copy a prebuilt agent into the cargo-bay as `voxel-init`, executable.
@@ -363,7 +363,7 @@ pub(crate) fn build_root() -> Result<Utf8PathBuf> {
 
 /// Stage the builder's static address for an isolated-mode build, or clear a
 /// stale one. A leftover `builder-net` would override DHCP on a later LAN build.
-fn stage_builder_net(
+pub(crate) fn stage_builder_net(
     cargo_bay: &Utf8Path,
     explicit: Option<&str>,
 ) -> Result<()> {
@@ -392,29 +392,25 @@ async fn quiesce(d: &Runner, node: libfalcon::NodeRef) {
             "pkill -x devfsadmd 2>/dev/null; rm -f /etc/path_to_inst; sync; sync; (sleep 1; halt) &",
         )
         .await;
-    wait_for_propolis_exit(NODE, Duration::from_secs(25));
+    wait_for_propolis_exit(falcon_dir(), NODE, Duration::from_secs(25));
     eprintln!("[voxel] stopping hypervisor");
-    hyperstop(NODE);
+    hyperstop(falcon_dir(), NODE);
 }
 
 /// Give the halting guest time to flush. Propolis usually outlives the halt;
 /// reaching the timeout is the normal path and `hyperstop` follows either way.
-fn wait_for_propolis_exit(name: &str, timeout: Duration) {
-    let Some(pid) = read_pidfile(name) else {
+pub(crate) fn wait_for_propolis_exit(
+    dir: &Utf8Path,
+    name: &str,
+    timeout: Duration,
+) {
+    if read_pidfile(dir, name).is_none() {
         return;
-    };
+    }
     eprintln!("[voxel] flushing, up to {}s", timeout.as_secs());
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        // Signal 0 tests for existence without delivering anything.
-        let alive = Command::new("pfexec")
-            .args(["kill", "-0", &pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !alive {
+        if !propolis_alive(dir, name) {
             return;
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -433,9 +429,8 @@ fn falcon_dir() -> &'static Utf8Path {
 
 /// Read a node's propolis pid. Anything but a plain number is rejected: a
 /// stray pidfile must not become a `kill` of something unrelated.
-fn read_pidfile(name: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(falcon_dir().join(format!("{name}.pid")))
-        .ok()?;
+fn read_pidfile(dir: &Utf8Path, name: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join(format!("{name}.pid"))).ok()?;
     let pid = raw.trim();
     if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
         return None;
@@ -443,12 +438,26 @@ fn read_pidfile(name: &str) -> Option<String> {
     Some(pid.to_string())
 }
 
+/// Whether the node's propolis process from the pidfile is still running.
+pub(crate) fn propolis_alive(dir: &Utf8Path, name: &str) -> bool {
+    let Some(pid) = read_pidfile(dir, name) else {
+        return false;
+    };
+    // Signal 0 tests for existence without delivering anything.
+    Command::new("pfexec")
+        .args(["kill", "-0", &pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// falcon's `hyperstop`, which is private to its CLI: SIGKILL the propolis
 /// process from the pidfile, then destroy the bhyve VM by instance uuid.
-fn hyperstop(name: &str) {
-    let dir = falcon_dir();
+pub(crate) fn hyperstop(dir: &Utf8Path, name: &str) {
     let pidfile = dir.join(format!("{name}.pid"));
-    if let Some(pid) = read_pidfile(name) {
+    if let Some(pid) = read_pidfile(dir, name) {
         let _ = Command::new("pfexec")
             .args(["kill", "-9", &pid])
             .stderr(std::process::Stdio::null())

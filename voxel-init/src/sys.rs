@@ -7,6 +7,9 @@
 //! every step is visible and best-effort steps log a warning instead of
 //! aborting. Mirror that—`run`/`run_quiet` never panic and return success.
 
+use anyhow::Result;
+use camino::Utf8Path;
+use std::fs;
 use std::process::{Command, Stdio};
 
 /// Parsed `/opt/cargo-bay/external-net` (voxel-managed isolated segment). All
@@ -59,6 +62,9 @@ pub fn read_external_net() -> Option<ExternalNet> {
     }
     Some(ExternalNet { ip_cidr, gateway, dns, iface })
 }
+
+/// The host's per-node staging dir, mounted read-only in every guest.
+pub const CARGO_BAY: &str = "/opt/cargo-bay";
 
 /// A progress line (mirrors the scripts' `echo [tag] ...`).
 pub fn note(msg: impl AsRef<str>) {
@@ -135,4 +141,123 @@ pub fn capture(cmd: &str, args: &[&str]) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The static address staged as `builder-net` when the host built this image on
+/// an isolated external segment (no DHCP server to lease from).
+pub struct BuilderNet {
+    pub cidr: String,
+    pub gateway: String,
+}
+
+/// Read `<cidr> <gateway>` from the cargo-bay. `None` when the host used the
+/// default LAN path and the builder just DHCPs.
+pub fn builder_net() -> Option<BuilderNet> {
+    let text = fs::read_to_string(format!("{CARGO_BAY}/builder-net")).ok()?;
+    let mut parts = text.split_whitespace();
+    let cidr = parts.next()?.to_string();
+    let gateway = parts.next()?.to_string();
+    Some(BuilderNet { cidr, gateway })
+}
+
+/// Address the external NIC and wait for DNS. Static in isolated mode, DHCP
+/// on a LAN.
+pub fn bring_up_network() -> Result<()> {
+    // The builder has a single external NIC; find a vioif and address it.
+    let ext_if = std::env::var("EXT_IF")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            capture("dladm", &["show-phys", "-o", "link", "-p"]).and_then(|o| {
+                o.lines().find(|l| l.starts_with("vioif")).map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| "vioif0".into());
+    note(format!("using external interface {ext_if}"));
+    fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n")
+        .map_err(|e| anyhow::anyhow!("write /etc/resolv.conf: {e}"))?;
+
+    let addrobj = format!("{ext_if}/v4");
+    match builder_net() {
+        // Isolated mode: no DHCP server on the segment, use the staged address.
+        Some(net) => {
+            note(format!(
+                "static builder net: {} via {}",
+                net.cidr, net.gateway
+            ));
+            run(
+                "ipadm",
+                &["create-addr", "-T", "static", "-a", &net.cidr, &addrobj],
+            );
+            run("route", &["add", "default", &net.gateway]);
+        }
+        None => {
+            run("ipadm", &["create-addr", "-T", "dhcp", &addrobj]);
+            note("waiting for DHCP lease...");
+            for _ in 0..30 {
+                let leased = capture(
+                    "ipadm",
+                    &["show-addr", &addrobj, "-p", "-o", "addr"],
+                )
+                .is_some_and(|a| a.contains('/'));
+                if leased {
+                    break;
+                }
+                sleep2();
+            }
+        }
+    }
+    wait_for_dns("pkg.oxide.computer");
+
+    Ok(())
+}
+
+/// Poll until `host` resolves, up to 30s. Resolution lags the lease.
+pub fn wait_for_dns(host: &str) {
+    note("waiting for DNS...");
+    for _ in 0..15 {
+        if run_quiet("getent", &["hosts", host]) {
+            return;
+        }
+        sleep2();
+    }
+}
+
+pub fn sleep2() {
+    std::thread::sleep(std::time::Duration::from_secs(2));
+}
+
+/// Root login over ssh for `voxel host login` and `voxel builder login`.
+/// illumos sshd ships different defaults from debian's and needs its own
+/// config edits.
+pub fn setup_ssh() {
+    let authorized = format!("{CARGO_BAY}/root_authorized_keys");
+    if Utf8Path::new(&authorized).exists() {
+        let _ = fs::create_dir_all("/root/.ssh");
+        if let Ok(keys) = fs::read(&authorized) {
+            use std::io::Write;
+            match fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/root/.ssh/authorized_keys")
+            {
+                Ok(mut f) => {
+                    if let Err(e) = f.write_all(&keys) {
+                        warn(format!("authorized_keys: {e}"));
+                    }
+                }
+                Err(e) => warn(format!("authorized_keys: {e}")),
+            }
+        }
+    }
+    run("ssh-keygen", &["-A"]);
+    replace_in_file(
+        "/etc/ssh/sshd_config",
+        &[
+            ("#PasswordAuthentication no", "PasswordAuthentication yes"),
+            ("#PermitEmptyPasswords no", "PermitEmptyPasswords yes"),
+            ("PermitRootLogin without-password", "PermitRootLogin yes"),
+        ],
+    );
+    run("svcadm", &["restart", "svc:/network/ssh:default"]);
 }

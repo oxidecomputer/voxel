@@ -24,6 +24,7 @@ use std::fs;
 use voxel_config::VoxelConfig;
 
 mod access;
+mod builder;
 mod commission;
 mod commtest;
 mod config_cmd;
@@ -108,6 +109,12 @@ enum Cmd {
         /// release it is not running, so say so wherever that is claimed.
         #[arg(long, value_name = "DIR", value_parser = abs_path)]
         sp_firmware: Option<Utf8PathBuf>,
+    },
+    /// A persistent omicron build host: build cp images in-guest with no
+    /// toolchain on the host, and iterate on an omicron tree between builds.
+    Builder {
+        #[command(subcommand)]
+        cmd: BuilderCmd,
     },
     /// (debug) Print the typed commission rack-setup config body as JSON.
     #[command(hide = true)]
@@ -225,6 +232,62 @@ enum ConfigCmd {
     Load {
         #[arg(value_parser = abs_path)]
         file: Utf8PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum BuilderCmd {
+    /// Boot the builder. The first `up` creates its disk from the builder
+    /// image; later ones reuse the disk and everything on it.
+    Up {
+        /// Check out this omicron rev in the builder's checkout.
+        #[arg(long)]
+        omicron: Option<String>,
+        /// With --omicron: discard uncommitted changes in the checkout.
+        #[arg(long, requires = "omicron")]
+        force: bool,
+        /// Discard the existing disk and start from the builder image again.
+        #[arg(long)]
+        fresh: bool,
+        /// With --fresh: don't prompt for confirmation.
+        #[arg(long, requires = "fresh")]
+        yes: bool,
+    },
+    /// Halt the builder. The disk is kept unless --destroy.
+    Down {
+        /// Destroy the disk and its snapshots too.
+        #[arg(long)]
+        destroy: bool,
+        /// With --destroy: don't prompt for confirmation.
+        #[arg(long, requires = "destroy")]
+        yes: bool,
+    },
+    /// Show the builder's state, checkout and snapshots.
+    Status,
+    /// Open a root shell in the builder.
+    Login,
+    /// Push a local omicron checkout into the builder's (target/ and out/
+    /// are left alone).
+    Sync {
+        /// The omicron checkout to push.
+        #[arg(value_parser = abs_path)]
+        dir: Utf8PathBuf,
+    },
+    /// Build and package omicron in the builder, then bake `voxel-cp-<name>`.
+    Build {
+        /// Image label; the image is named `voxel-cp-<name>`.
+        #[arg(long)]
+        name: String,
+    },
+    /// Snapshot the builder disk.
+    Snap {
+        /// Snapshot label.
+        label: String,
+    },
+    /// Roll the builder disk back to a snapshot (requires down).
+    Restore {
+        /// Snapshot label.
+        label: String,
     },
 }
 
@@ -815,6 +878,23 @@ async fn main() -> Result<(), Error> {
                 cfg.as_ref().map(|c| c.image.cp_image()),
             ),
         },
+        Cmd::Builder { cmd } => {
+            let b = builder::Builder::new(load_config(&config_path)?)?;
+            match cmd {
+                BuilderCmd::Up { omicron, force, fresh, yes } => {
+                    b.up(omicron.as_deref(), *force, *fresh, *yes).await
+                }
+                BuilderCmd::Down { destroy, yes } => {
+                    b.down(*destroy, *yes).await
+                }
+                BuilderCmd::Status => b.status(),
+                BuilderCmd::Login => b.login(),
+                BuilderCmd::Sync { dir } => b.sync(dir),
+                BuilderCmd::Build { name } => b.build(name).await,
+                BuilderCmd::Snap { label } => b.snap(label).await,
+                BuilderCmd::Restore { label } => b.restore(label),
+            }
+        }
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::Show => network::show(&load_config(&config_path)?),
             NetworkCmd::LinkUp { switch, port, speed, fec } => {

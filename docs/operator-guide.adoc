@@ -367,6 +367,31 @@ builder instance boots from it and keeps its own Omicron build cache on its
 own disk, so you rebuild the image only to pick up newer prerequisites or a
 different Omicron checkout, not for every build.
 
+=== Building in the Builder
+
+The builder is a persistent guest booted from the builder image. Its disk
+keeps the Omicron checkout, the cargo caches and the target directory
+between sessions, so the first build is a full one and later builds are
+incremental. The Helios host needs no Rust toolchain or git for any of this.
+
+[source,sh]
+----
+pfexec voxel builder up                       # first up clones the disk from the builder image
+pfexec voxel builder up --omicron <rev>       # check out another Omicron rev
+pfexec voxel builder login                    # root shell in the builder
+pfexec voxel builder sync /path/to/omicron    # push a local tree into /work/omicron
+pfexec voxel builder build --name my-change   # build, package, bake voxel-cp-my-change
+pfexec voxel builder snap before-refactor     # checkpoint the disk: checkout, edits, caches
+pfexec voxel builder restore before-refactor  # roll back to it; later snapshots are discarded
+pfexec voxel builder status
+pfexec voxel builder down                     # halt, keep the disk
+pfexec voxel builder down --destroy           # halt and discard the disk (asks first)
+----
+
+Images from `builder build` are stamped with the Omicron commit they were
+built from and whether the tree had uncommitted changes; `voxel image ls`
+shows both. Sizing comes from the `[builder]` section of `voxel.toml`.
+
 === Configuring Images
 
 Point Voxel at the images you built:
