@@ -48,6 +48,7 @@ pub(crate) struct CpBuild<'a> {
     pub num_gimlets: usize,
     pub dataset: &'a str,
     pub external: Option<&'a voxel_config::External>,
+    pub propolis_binary: Option<&'a str>,
 }
 
 /// The omicron sha voxel's own rack-init-config dependency is pinned to. Empty while
@@ -64,6 +65,7 @@ pub(crate) async fn create(
     sled_agent: Option<&Utf8Path>,
     dataset: &str,
     external: Option<&voxel_config::External>,
+    propolis_binary: Option<&str>,
 ) -> Result<()> {
     if let Some(repo) = from_tuf {
         if src.is_some() {
@@ -101,6 +103,7 @@ pub(crate) async fn create(
             num_gimlets,
             dataset,
             external,
+            propolis_binary,
         )
         .await;
     }
@@ -159,6 +162,7 @@ pub(crate) async fn create(
         num_gimlets,
         dataset,
         external,
+        propolis_binary,
     })
     .await
 }
@@ -293,6 +297,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         external: b.external,
         schema_root: src,
         stamp: &stamp,
+        propolis_binary: b.propolis_binary,
     })
     .await
 }
@@ -394,6 +399,7 @@ pub(crate) struct CpBake<'a> {
     /// sled-hardware/src/lib.rs, for the sled schema stamp.
     pub schema_root: &'a Utf8Path,
     pub stamp: &'a CpStamp,
+    pub propolis_binary: Option<&'a str>,
 }
 
 pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
@@ -411,6 +417,7 @@ pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
         mem_gb: 16,
         cores: 8,
         network: &network,
+        propolis_binary: b.propolis_binary,
     })
     .await?;
 
@@ -473,6 +480,7 @@ async fn create_cp_tuf(
     num_gimlets: usize,
     dataset: &str,
     external: Option<&voxel_config::External>,
+    propolis_binary: Option<&str>,
 ) -> Result<()> {
     let root = build_root()?;
     let cargo_bay = fresh_cargo_bay("vbuild")?;
@@ -594,6 +602,7 @@ async fn create_cp_tuf(
         mem_gb: 16,
         cores: 8,
         network: &network,
+        propolis_binary,
     })
     .await?;
 

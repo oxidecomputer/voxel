@@ -39,6 +39,8 @@ pub(crate) struct BakeOpts<'a> {
     pub cores: u8,
     /// How the builder reaches the package repos.
     pub network: &'a BuilderNetwork,
+    /// propolis-server to run the builder under. None uses falcon's own.
+    pub propolis_binary: Option<&'a str>,
 }
 
 /// How the builder reaches the package repos.
@@ -90,6 +92,9 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         .with_context(|| format!("cd {workspace}"))?;
 
     let mut d = Runner::new(DEPLOY);
+    if let Some(bin) = o.propolis_binary {
+        d.set_propolis_binary(Some(bin.to_string()));
+    }
     let node = d.node(NODE, o.base_image, o.cores, gb(o.mem_gb));
     d.reserve(node, o.disk_gb as usize);
 
@@ -199,6 +204,7 @@ pub(crate) async fn create_frr(
     version: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
+    propolis_binary: Option<&str>,
 ) -> Result<()> {
     let network = builder_network(external)?;
     let image_name = format!("voxel-frr-{version}");
@@ -215,6 +221,7 @@ pub(crate) async fn create_frr(
         mem_gb: 16,
         cores: 8,
         network: &network,
+        propolis_binary,
     })
     .await?;
     println!("built image {image_name}");
@@ -228,6 +235,7 @@ pub(crate) async fn create_builder(
     dataset: &str,
     external: Option<&voxel_config::External>,
     omicron_rev: &str,
+    propolis_binary: Option<&str>,
 ) -> Result<()> {
     let network = builder_network(external)?;
     let image_name = format!("voxel-builder-{version}");
@@ -246,6 +254,7 @@ pub(crate) async fn create_builder(
         mem_gb: 16,
         cores: 8,
         network: &network,
+        propolis_binary,
     })
     .await?;
     println!("built image {image_name}");

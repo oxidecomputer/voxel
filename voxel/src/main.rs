@@ -844,6 +844,8 @@ async fn main() -> Result<(), Error> {
                     sled_agent.as_deref(),
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
+                    cfg.as_ref()
+                        .and_then(|c| c.falcon.propolis_binary.as_deref()),
                 )
                 .await
             }
@@ -852,6 +854,8 @@ async fn main() -> Result<(), Error> {
                     version,
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
+                    cfg.as_ref()
+                        .and_then(|c| c.falcon.propolis_binary.as_deref()),
                 )
                 .await
             }
@@ -870,6 +874,8 @@ async fn main() -> Result<(), Error> {
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                     rev,
+                    cfg.as_ref()
+                        .and_then(|c| c.falcon.propolis_binary.as_deref()),
                 )
                 .await
             }

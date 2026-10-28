@@ -243,8 +243,7 @@ pub struct Falcon {
     /// is set (`Runner::set_propolis_binary`), the equivalent of a4x2's
     /// `FALCON_PROPOLIS_BINARY`.
     ///
-    /// Applies to rack nodes only. The image-build VM keeps falcon's own
-    /// binary.
+    /// Applies to rack nodes and the image-build VM alike.
     pub propolis_binary: Option<String>,
 }
 

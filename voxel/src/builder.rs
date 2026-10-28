@@ -460,6 +460,7 @@ impl Builder {
             external: Some(&self.cfg.external),
             schema_root: &stub,
             stamp: &stamp,
+            propolis_binary: self.cfg.falcon.propolis_binary.as_deref(),
         })
         .await?;
         let mut state = self.read_state();
