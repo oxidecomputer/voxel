@@ -356,14 +356,14 @@ fn fetch_buildomat_bin(
 
 /// Retry and connect bounds for a fetch.
 #[derive(Clone, Copy)]
-struct Fetch {
+pub(crate) struct Fetch {
     attempts: u32,
     connect_timeout: Duration,
 }
 
 /// Buildomat fetch bounds: an unreachable host fails in under a minute
 /// rather than holding a launch in TCP retries.
-const FETCH: Fetch =
+pub(crate) const FETCH: Fetch =
     Fetch { attempts: 3, connect_timeout: Duration::from_secs(15) };
 
 fn http_client(f: Fetch) -> anyhow::Result<reqwest::Client> {
@@ -394,7 +394,7 @@ fn run_fetch<T: Send>(
 }
 
 /// GET a small text body, retried.
-fn fetch_text(url: &str, f: Fetch) -> anyhow::Result<String> {
+pub(crate) fn fetch_text(url: &str, f: Fetch) -> anyhow::Result<String> {
     run_fetch(async {
         let client = http_client(f)?;
         let mut last = None;
