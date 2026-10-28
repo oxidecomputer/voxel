@@ -74,8 +74,8 @@ per_attempt_timeout_millis = 2000
 # `SpIdentifier` for the sled on which this MGS is running. (The
 # `SpIdentifier::typ` value is implicitly `SpType::Sled`.)
 #
-# `allow_local_sled_sp_reset` determines whether MGS will accept a request to
-# perform an SP reset on its own local sled. This is dangerous during SP
+# `allow_local_sp_reset` determines whether MGS will accept a request to
+# perform an SP reset on its own local sled/switch. This is dangerous during SP
 # updates, because the "reset" operation involves a watchdog that requires MGS
 # to send a "disarm the watchdog" message _after_ the reset, which it can't do
 # if it just powered itself off. In production, we set this to `false` for both
@@ -134,7 +134,7 @@ fn switch0_config(fleet: &SpFleet, scrimlets: &[usize]) -> String {
         writeln!(o, "[[switch.location.description]]").unwrap();
         writeln!(o, "name = \"switch{sw}\"").unwrap();
         writeln!(o, "local_sled = {sled}").unwrap();
-        writeln!(o, "allow_local_sled_sp_reset = true").unwrap();
+        writeln!(o, "allow_local_sp_reset = true").unwrap();
         writeln!(o).unwrap();
     }
 
@@ -268,8 +268,8 @@ per_attempt_timeout_millis = 2000
 # `SpIdentifier` for the sled on which this MGS is running. (The
 # `SpIdentifier::typ` value is implicitly `SpType::Sled`.)
 #
-# `allow_local_sled_sp_reset` determines whether MGS will accept a request to
-# perform an SP reset on its own local sled. This is dangerous during SP
+# `allow_local_sp_reset` determines whether MGS will accept a request to
+# perform an SP reset on its own local sled/switch. This is dangerous during SP
 # updates, because the "reset" operation involves a watchdog that requires MGS
 # to send a "disarm the watchdog" message _after_ the reset, which it can't do
 # if it just powered itself off. In production, we set this to `false` for both
@@ -279,12 +279,12 @@ per_attempt_timeout_millis = 2000
 [[switch.location.description]]
 name = "switch0"
 local_sled = 0
-allow_local_sled_sp_reset = true
+allow_local_sp_reset = true
 
 [[switch.location.description]]
 name = "switch1"
 local_sled = 3
-allow_local_sled_sp_reset = true
+allow_local_sp_reset = true
 
 # `[[switch.location.determination]]` is a list of switch ports we should
 # contact in order to determine our location; each port defines a subset of
