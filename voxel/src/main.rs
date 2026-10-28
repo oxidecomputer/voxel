@@ -45,6 +45,7 @@ mod ssh_keys;
 mod topo;
 mod tufrepo;
 mod util;
+mod zfs;
 
 #[derive(Parser)]
 #[command(

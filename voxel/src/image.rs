@@ -368,25 +368,22 @@ pub(crate) fn cmd_image(
         }
         ImageCmd::Rm { name, yes } => {
             let dataset = falcon_dataset();
-            let ds = format!("{dataset}/img/{name}");
-            if !yes {
-                eprint!("destroy image {ds} and its @base snapshot? [y/N] ");
-                use std::io::Write as _;
-                std::io::stderr().flush().ok();
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line).ok();
-                if !matches!(line.trim(), "y" | "Y" | "yes") {
-                    println!("aborted");
-                    return Ok(());
-                }
+            let ds = crate::zfs::Dataset::new(format!("{dataset}/img/{name}"))?;
+            if !crate::zfs::exists(&ds) {
+                bail!("no such image: {name} (try `voxel image ls`)");
             }
-            let status = std::process::Command::new("zfs")
-                .args(["destroy", "-r", &ds])
-                .status()
-                .context("zfs destroy")?;
-            if !status.success() {
-                bail!("zfs destroy {ds} failed (in use, or no such image?)");
+            if !*yes
+                && !crate::util::confirm(&format!(
+                    "destroy image {} and its @base snapshot?",
+                    ds.as_str()
+                ))
+            {
+                println!("aborted");
+                return Ok(());
             }
+            crate::zfs::destroy_dataset_if_present(&ds)
+                .context("a running rack may still be cloned from it")?;
+            let ds = ds.as_str().to_string();
             println!("removed {ds}");
             Ok(())
         }
