@@ -226,6 +226,10 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
 /// Sled-agent config schema stamps on an image dataset.
 pub(crate) const PROP_DATA_LINKS: &str = "voxel:data-links-schema";
 pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
+/// The omicron commit a source-built image was built from.
+pub(crate) const PROP_OMICRON_COMMIT: &str = "voxel:omicron-commit";
+/// Whether that checkout carried uncommitted changes.
+pub(crate) const PROP_OMICRON_DIRTY: &str = "voxel:omicron-dirty";
 /// TUF system version stamped on a --from-tuf image.
 pub(crate) const PROP_TUF_VERSION: &str = "voxel:tuf-version";
 /// Firmware directory image create --from-tuf extracted from the same repo.
