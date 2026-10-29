@@ -112,7 +112,7 @@ fn memory_preflight(cfg: &VoxelConfig) -> anyhow::Result<()> {
 }
 
 /// The host's default-route interface, None without a default route.
-fn default_route_iface() -> Option<String> {
+pub(crate) fn default_route_iface() -> Option<String> {
     probe_out(crate::net::ROUTE, &["-n", "get", "default"])?
         .lines()
         .find_map(|l| l.trim().strip_prefix("interface:"))

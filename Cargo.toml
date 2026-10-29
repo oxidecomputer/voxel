@@ -16,11 +16,19 @@ wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/om
 wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
 # Unnumbered BGP peer type rack-init-config does not re-export yet.
 sled-agent-types = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
+# Nexus external API client for TUI monitoring.
+oxide-client = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 expectorate = "1.2.0"
+httptest = "0.16.4"
+tempfile = "3.27.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
 # tokio features (they're additive), so we don't need "full".
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+crossterm = "0.28"
+base64 = "0.22"
 libfalcon = { git = "https://github.com/oxidecomputer/falcon", rev = "6b1494b831bc18b588b0b591341f099e8f299533" }
 # Must be the rev libfalcon pins, so instance-spec component types unify.
 propolis-client = { git = "https://github.com/oxidecomputer/propolis", rev = "5e201ec4185ccb9182cc6ffcb09fadd9deee24ca" }
@@ -31,6 +39,7 @@ serde = "1"
 camino = { version = "1.2.2", features = ["serde1"] }
 indoc = "2.0.7"
 toml_edit = "0.25"
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "rustls"] }
 
 # sprockets/trust quorum related deps
 attest-mock = { git = "https://github.com/oxidecomputer/dice-util", rev = "4a39ef08d81e5177edee0bddb1146032aa21074d" }

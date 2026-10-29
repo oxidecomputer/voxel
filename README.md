@@ -21,13 +21,17 @@ generation.
   scripts that bake a control-plane image from an omicron commit.
 
 See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference,
-there are a LOT of tuning knobs.
+there are a LOT of tuning knobs. Terminal-interface operators should also see
+the [`voxel tui` guide](docs/voxel-tui.md).
 
 ## Building
 
 ```sh
 cargo build
 ```
+
+The `voxel tui` terminal interface is the opt-in `tui` cargo feature; build it
+with `cargo build -p voxel --features tui`.
 
 `voxel` links omicron's own RSS config types (the `rack-init-config` crate in
 omicron, pinned to a commit), so `config-rss.toml` is rendered in-process and schema

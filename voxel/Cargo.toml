@@ -10,8 +10,17 @@ edition = "2024"
 name = "voxel"
 path = "src/main.rs"
 
+[features]
+# `voxel tui`. Building without it leaves the CLI and drops the terminal UI's
+# dependencies.
+tui = ["dep:tokio-util", "dep:ratatui", "dep:crossterm", "dep:base64", "dep:chrono", "dep:oxide-client"]
+
 [dependencies]
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 libfalcon.workspace = true
 propolis-client.workspace = true
 anyhow.workspace = true
@@ -28,10 +37,12 @@ rack-init-config.workspace = true
 wicketd-commission-types-versions.workspace = true
 wicketd-commission-client.workspace = true
 sled-agent-types.workspace = true
+oxide-client = { workspace = true, optional = true }
 # Reshape the generated config-rss.toml into wicketd's RSS config JSON for
 # `launch --wicket-setup` (drive setup through wicketd).
 toml = "0.9"
 serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
 # Unpack TUF control-plane composites (GNU tar format; illumos tar rejects it).
 tar = "0.4"
 flate2 = "1"
@@ -39,12 +50,13 @@ flate2 = "1"
 # members stored or deflated; flate2's default backend (pulled in above)
 # serves the deflate path.
 zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest.workspace = true
 # Fetch prebuilt binaries (sp-emu, faux-mgs) from buildomat: sha256 verified
 # against the published digest, progress bar while streaming.
 sha2 = "0.10"
 indicatif = "0.18"
 libc = "0.2"
+chrono = { version = "0.4", features = ["serde"], optional = true }
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).
@@ -53,3 +65,5 @@ sprockets-tls-test-utils.workspace = true
 
 [dev-dependencies]
 expectorate.workspace = true
+httptest.workspace = true
+tempfile.workspace = true
