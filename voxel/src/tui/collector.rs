@@ -68,11 +68,12 @@ const ZFS_TOTAL_QUERY: &str = "get zfs_pool:bytes_total | last 1";
 /// event it counts, and Nexus rejects a query naming any timeseries that does
 /// not exist yet.
 fn oximeter_exception_queries() -> [String; 2] {
+    let minutes = OximeterExceptions::WINDOW.as_secs() / 60;
     [
         "oximeter_collector:failed_collections",
         "oximeter_collector:database_samples_dropped",
     ]
-    .map(|name| format!("get {name} | filter timestamp > @now() - 5m"))
+    .map(|name| format!("get {name} | filter timestamp > @now() - {minutes}m"))
 }
 
 fn oximeter_traffic_queries(
@@ -447,6 +448,22 @@ fn parse_zfs_headroom(
 fn parse_oximeter_exceptions(
     result: OxqlQueryResult,
 ) -> anyhow::Result<OximeterExceptions> {
+    // OxQL turns each counter's first sample in the window into a delta from
+    // the counter's start, which carries every event since the collector
+    // started. Only deltas that begin within the window are recent. The
+    // window is measured back from the newest sample, so the rack's clock
+    // decides it, not this host's.
+    let Some(newest) = result
+        .tables
+        .iter()
+        .flat_map(|table| &table.timeseries)
+        .flat_map(|series| &series.points.timestamps)
+        .max()
+    else {
+        return Ok(OximeterExceptions::default());
+    };
+    let window_start =
+        *newest - chrono::TimeDelta::from_std(OximeterExceptions::WINDOW)?;
     let mut exceptions = OximeterExceptions::default();
     for table in result.tables {
         let target = match table.name.as_str() {
@@ -467,8 +484,12 @@ fn parse_oximeter_exceptions(
                     .is_some_and(|v| v.metric_type == MetricType::Delta),
                 "Oximeter exception counter was not converted to deltas"
             );
-            for (_, _, value) in series.integer_points()? {
-                if let Some(value) = value {
+            for (start, _, value) in series.integer_points()? {
+                let start = start
+                    .context("Oximeter exception delta omitted start time")?;
+                if let Some(value) = value
+                    && start >= window_start
+                {
                     ensure!(value >= 0, "Oximeter exception delta is negative");
                     *target = target.saturating_add(value as u64);
                 }
@@ -2426,26 +2447,38 @@ mod tests {
             }]
         );
 
-        let tables = [
-            ("oximeter_collector:failed_collections", 2),
-            ("oximeter_collector:database_samples_dropped", 3),
-        ]
-        .into_iter()
-        .map(|(name, value)| {
+        // The failure counter has run for an hour, so its first delta in the
+        // window carries the 20 failures before it; only the 2 after count.
+        // The dropped-sample counter started within the window, so all of its
+        // 3 count.
+        let exceptions = |name, start_times: &[&str], timestamps, values| {
             table(
                 name,
                 vec![series(
                     &[("collector_port", FieldValue::U16(12223))],
                     points(
-                        Some(&["2026-08-17T00:00:00Z"]),
-                        &["2026-08-17T00:00:10Z"],
+                        Some(start_times),
+                        timestamps,
                         MetricType::Delta,
-                        ValueArray::Integer(vec![Some(value)]),
+                        ValueArray::Integer(values),
                     ),
                 )],
             )
-        })
-        .collect();
+        };
+        let tables = vec![
+            exceptions(
+                "oximeter_collector:failed_collections",
+                &["2026-08-16T23:00:00Z", "2026-08-17T00:00:10Z"],
+                &["2026-08-17T00:00:10Z", "2026-08-17T00:00:20Z"],
+                vec![Some(20), Some(2)],
+            ),
+            exceptions(
+                "oximeter_collector:database_samples_dropped",
+                &["2026-08-17T00:00:00Z"],
+                &["2026-08-17T00:00:10Z"],
+                vec![Some(3)],
+            ),
+        ];
         assert_eq!(
             parse_oximeter_exceptions(OxqlQueryResult { tables })
                 .expect("Oximeter exception deltas parse"),

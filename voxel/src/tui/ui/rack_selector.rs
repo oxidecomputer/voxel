@@ -15,7 +15,10 @@ use crate::{
     tui::reconcile::{RouteEvidence, RssObservation},
     tui::{
         App,
-        telemetry::{Freshness, HealthState, LatestSample, TrafficSeverity},
+        telemetry::{
+            Freshness, HealthState, LatestSample, OximeterExceptions,
+            TrafficSeverity,
+        },
     },
 };
 use ratatui::{
@@ -112,8 +115,10 @@ pub fn draw(
         .and_then(|sample| sample.good.as_ref())
         .map(|sample| {
             format!(
-                "Oximeter collection health: {} failures / {} dropped",
-                sample.value.failed_collections, sample.value.dropped_samples
+                "Oximeter collection health, last {}m: {} failures / {} dropped",
+                OximeterExceptions::WINDOW.as_secs() / 60,
+                sample.value.failed_collections,
+                sample.value.dropped_samples
             )
         })
         .unwrap_or_else(|| "Oximeter collection health unavailable".into());

@@ -280,6 +280,11 @@ pub struct OximeterExceptions {
     pub dropped_samples: u64,
 }
 
+impl OximeterExceptions {
+    /// The recent period the counts cover.
+    pub const WINDOW: Duration = Duration::from_secs(5 * 60);
+}
+
 impl Default for TrafficSample {
     fn default() -> Self {
         Self {
