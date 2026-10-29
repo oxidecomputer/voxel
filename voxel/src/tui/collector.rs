@@ -687,11 +687,6 @@ impl FalconExecutor {
         name: &str,
         command: &str,
     ) -> anyhow::Result<String> {
-        if self.resumed {
-            return Err(anyhow!(
-                "router telemetry is unavailable after resuming a TUI session"
-            ));
-        }
         let node = self
             .topo
             .node_ref(name)
