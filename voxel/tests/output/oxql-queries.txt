@@ -26,8 +26,8 @@ get zfs_pool:bytes_allocated | last 1
 # ZFS total
 get zfs_pool:bytes_total | last 1
 
-# oximeter exceptions
-{
-get oximeter_collector:failed_collections;
-get oximeter_collector:database_samples_dropped
-} | filter timestamp > @now() - 5m
+# oximeter failed collections
+get oximeter_collector:failed_collections | filter timestamp > @now() - 5m
+
+# oximeter dropped samples
+get oximeter_collector:database_samples_dropped | filter timestamp > @now() - 5m

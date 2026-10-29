@@ -165,6 +165,20 @@ impl reqwest::dns::Resolve for RackDns {
 
 type NexusError = oxide_client::Error<oxide_client::types::Error>;
 
+/// Nexus's answer to a query naming a timeseries that has no samples yet.
+/// Oximeter registers a timeseries with its first sample, so a counter of
+/// rare events does not exist until the first of them.
+#[derive(Debug)]
+pub(crate) struct MissingTimeseries(String);
+
+impl std::fmt::Display for MissingTimeseries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Nexus timeseries query {}", self.0)
+    }
+}
+
+impl std::error::Error for MissingTimeseries {}
+
 /// Summarizes a client error as the status and message Nexus returned, if
 /// any.
 fn describe(error: &NexusError) -> String {
@@ -378,8 +392,10 @@ impl NexusClient {
     }
 
     /// Runs an OxQL query, logging in again once if the session has expired
-    /// (Nexus ends sessions after 8 hours idle and 24 hours in all). Any other
-    /// failure forgets the endpoint, so the next call looks for Nexus anew.
+    /// (Nexus ends sessions after 8 hours idle and 24 hours in all). A query
+    /// naming a timeseries with no samples yet fails with `MissingTimeseries`,
+    /// an answer from a working Nexus; any other failure forgets the endpoint,
+    /// so the next call looks for Nexus anew.
     pub(crate) async fn query(
         &self,
         query: &str,
@@ -396,11 +412,22 @@ impl NexusClient {
             response = self.query_once(&endpoint, query, cancel).await;
         }
         let result = response.and_then(|response| {
-            response.map_err(|error| {
-                anyhow!("Nexus timeseries query {}", describe(&error))
+            response.map_err(|error| match &error {
+                oxide_client::Error::ErrorResponse(response)
+                    if response.status() == StatusCode::BAD_REQUEST
+                        && response
+                            .message
+                            .starts_with("Timeseries not found") =>
+                {
+                    MissingTimeseries(describe(&error)).into()
+                }
+                _ => anyhow!("Nexus timeseries query {}", describe(&error)),
             })
         });
-        if result.is_err() && !cancel.is_cancelled() {
+        if let Err(error) = &result
+            && !error.is::<MissingTimeseries>()
+            && !cancel.is_cancelled()
+        {
             *self.session.lock().await = None;
         }
         result
@@ -575,6 +602,28 @@ mod tests {
                 "{error:#}"
             );
             client.query(BYTES_SENT, &cancel).await.unwrap();
+        }
+
+        // A timeseries with no samples yet is its own answer from a working
+        // Nexus, so the session stays.
+        {
+            let server = Server::run();
+            server.expect(ping().respond_with(pong()));
+            server.expect(login().respond_with(session("kept")));
+            server.expect(
+                query_with_cookie("session=kept").times(2).respond_with(
+                    nexus_error(
+                        400,
+                        "Timeseries not found for: sled_data_link:bytes_sent",
+                    ),
+                ),
+            );
+            let client = client(vec![endpoint(&server)]);
+            for _ in 0..2 {
+                let error =
+                    client.query(BYTES_SENT, &cancel).await.unwrap_err();
+                assert!(error.is::<MissingTimeseries>(), "{error:#}");
+            }
         }
 
         // Unanswering addresses fail at the connect timeout. TEST-NET-1 is

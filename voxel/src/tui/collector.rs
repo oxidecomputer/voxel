@@ -23,7 +23,8 @@ use voxel_config::VoxelConfig;
 
 use crate::tui::event::AppEvent;
 use crate::tui::nexus::{
-    MetricType, NexusClient, OxqlQueryResult, RecoveryLogin, TimeseriesExt,
+    MetricType, MissingTimeseries, NexusClient, OxqlQueryResult, RecoveryLogin,
+    TimeseriesExt,
 };
 use crate::tui::reconcile::{parse_rss_observation, rss_probe_command};
 use crate::tui::telemetry::{
@@ -63,10 +64,16 @@ const ZONE_CPU_QUERY: &str = "get zone:cpu_nsec
     | last 1";
 const ZFS_ALLOCATED_QUERY: &str = "get zfs_pool:bytes_allocated | last 1";
 const ZFS_TOTAL_QUERY: &str = "get zfs_pool:bytes_total | last 1";
-const OXIMETER_EXCEPTIONS_QUERY: &str = r#"{
-get oximeter_collector:failed_collections;
-get oximeter_collector:database_samples_dropped
-} | filter timestamp > @now() - 5m"#;
+/// Asked one at a time: the collector registers each counter with the first
+/// event it counts, and Nexus rejects a query naming any timeseries that does
+/// not exist yet.
+fn oximeter_exception_queries() -> [String; 2] {
+    [
+        "oximeter_collector:failed_collections",
+        "oximeter_collector:database_samples_dropped",
+    ]
+    .map(|name| format!("get {name} | filter timestamp > @now() - 5m"))
+}
 
 fn oximeter_traffic_queries(
     rack: RackId,
@@ -1250,11 +1257,19 @@ impl<E: NodeExecutor> Collector<E> {
             }
         }));
         diagnostics.push(Box::pin(async {
-            match client
-                .query(OXIMETER_EXCEPTIONS_QUERY, cancel)
-                .await
-                .and_then(parse_oximeter_exceptions)
-            {
+            let exceptions = async {
+                let mut tables = Vec::new();
+                for query in oximeter_exception_queries() {
+                    match client.query(&query, cancel).await {
+                        Ok(result) => tables.extend(result.tables),
+                        // Nothing of this kind has been counted yet.
+                        Err(error) if error.is::<MissingTimeseries>() => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                parse_oximeter_exceptions(OxqlQueryResult { tables })
+            };
+            match exceptions.await {
                 Ok(exceptions) => {
                     AppEvent::OximeterExceptions { rack, at, exceptions }
                 }
@@ -2245,11 +2260,13 @@ mod tests {
             text.push_str(&query);
             text.push('\n');
         }
+        let [failed, dropped] = oximeter_exception_queries();
         for (label, query) in [
             ("zone CPU", ZONE_CPU_QUERY),
             ("ZFS allocated", ZFS_ALLOCATED_QUERY),
             ("ZFS total", ZFS_TOTAL_QUERY),
-            ("oximeter exceptions", OXIMETER_EXCEPTIONS_QUERY),
+            ("oximeter failed collections", failed.as_str()),
+            ("oximeter dropped samples", dropped.as_str()),
         ] {
             text.push_str(&format!("\n# {label}\n{query}\n"));
         }
