@@ -212,6 +212,9 @@ pub(crate) fn reduce(
     if !route_satisfied {
         warnings.push("required routes are not confirmed applied".into());
     }
+    let fully_up = running == evidence.topology.node_ids.len()
+        && initialized == required_rss_ids.len()
+        && route_satisfied;
 
     let state = if malformed_required_racks {
         ObservedDeploymentState::Unknown
@@ -224,6 +227,9 @@ pub(crate) fn reduce(
     } else if evidence.intent == LifecycleIntent::Destroy && live > 0 {
         ObservedDeploymentState::Stopping
     } else if evidence.intent == LifecycleIntent::Launch
+        // A launch that has brought everything up has finished starting, and
+        // nothing else reconciles again to say so.
+        && !fully_up
         && evidence.nodes.iter().any(|node| {
             matches!(node.state, NodeEvidence::Booting | NodeEvidence::Running)
         })
@@ -238,10 +244,7 @@ pub(crate) fn reduce(
                 )))
     {
         ObservedDeploymentState::Unknown
-    } else if running == evidence.topology.node_ids.len()
-        && initialized == required_rss_ids.len()
-        && route_satisfied
-    {
+    } else if fully_up {
         ObservedDeploymentState::Running
     } else {
         ObservedDeploymentState::Degraded
@@ -562,7 +565,7 @@ mod tests {
     #[test]
     fn reduce_applies_state_precedence_to_each_evidence_shape() {
         type Mutate = fn(&mut ReconciliationEvidence);
-        let cases: [(&str, Mutate, ObservedDeploymentState); 5] = [
+        let cases: [(&str, Mutate, ObservedDeploymentState); 6] = [
             (
                 "every node missing",
                 |evidence| {
@@ -580,6 +583,11 @@ mod tests {
                     evidence.nodes[0].state = NodeEvidence::Booting;
                 },
                 ObservedDeploymentState::Starting,
+            ),
+            (
+                "launch that brought everything up",
+                |evidence| evidence.intent = LifecycleIntent::Launch,
+                ObservedDeploymentState::Running,
             ),
             (
                 "destroy with a node still live",
