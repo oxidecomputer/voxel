@@ -6,14 +6,15 @@
 
 use super::{
     colors::*,
-    widgets::{overlay_area, popup_backdrop, popup_block},
+    popup::{Button, Popup, PopupLayout},
+    widgets::overlay_area,
 };
 use crate::tui::App;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 
 const GLOBAL: &[(&str, &str)] = &[
@@ -39,9 +40,9 @@ const MONITORING: &[(&str, &str)] = &[
     ("Enter / Esc", "Focus node details / back to the rack"),
 ];
 const DIALOGS: &[(&str, &str)] = &[
-    ("↑ / ↓", "Select option"),
+    ("← / →", "Select option"),
     ("Enter", "Confirm selection"),
-    ("y", "Copy fallback command"),
+    ("y", "Confirm; when leaving, copy the resume command"),
     ("n", "Reject"),
     ("Esc", "Close dialog"),
 ];
@@ -80,65 +81,49 @@ fn help_text() -> Text<'static> {
     Text::from(lines)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HelpMetrics {
-    total: usize,
-    capacity: usize,
-    max_scroll: usize,
+fn popup(header: String, scrolls: bool) -> Popup<'static> {
+    let button = |label, key| Button { label, key: Some(key), selected: false };
+    let scroll = scrolls.then(|| button("Scroll", "↑/↓"));
+    Popup {
+        header: Line::from(header),
+        body: help_text(),
+        buttons: scroll.into_iter().chain([button("Close", "Esc")]).collect(),
+    }
 }
 
-fn text_metrics(text: &Text<'_>, area: Rect) -> HelpMetrics {
-    let inner = Block::bordered().inner(area);
-    let capacity = usize::from(inner.height).max(1);
-    let total = Paragraph::new(text.clone())
+/// The help pop-up's layout, which neither its header nor its scroll button
+/// affects: the body is wider than either, and a button row is there anyway.
+fn layout(terminal: Rect) -> PopupLayout {
+    popup(String::new(), false).layout(overlay_area(terminal))
+}
+
+/// Body rows that fit, and how far the body can scroll.
+fn scroll_bounds(layout: &PopupLayout) -> (usize, usize) {
+    let capacity = usize::from(layout.body.height).max(1);
+    let total = Paragraph::new(help_text())
         .wrap(Wrap { trim: false })
-        .line_count(inner.width);
-    HelpMetrics { total, capacity, max_scroll: total.saturating_sub(capacity) }
-}
-
-fn help_metrics(area: Rect) -> HelpMetrics {
-    text_metrics(&help_text(), area)
-}
-
-pub(crate) fn help_area(root: Rect) -> Rect {
-    let horizontal_margin = if root.width >= 52 { 4 } else { 0 };
-    let vertical_margin = if root.height >= 12 { 2 } else { 0 };
-    let width = root.width.saturating_sub(horizontal_margin).min(76);
-    let height = root.height.saturating_sub(vertical_margin).min(18);
-    Rect::new(
-        root.x + root.width.saturating_sub(width) / 2,
-        root.y + root.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
+        .line_count(layout.body.width);
+    (capacity, total.saturating_sub(capacity))
 }
 
 pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = help_area(overlay_area(frame.area()));
-    // The application renderer returns its minimum-size fallback before Help.
-    // Keep direct helper draws for degenerate test/backend areas empty as well.
-    if area.width <= 2 || area.height <= 2 {
-        return;
-    }
-    popup_backdrop(frame, area);
-
-    let body = help_text();
-    let metrics = text_metrics(&body, area);
-    let start = app.session.help_scroll.min(metrics.max_scroll);
-    let end = (start + metrics.capacity).min(metrics.total);
-    let title = format!(
-        " Help {}-{} of {} ",
-        start.saturating_add(1).min(metrics.total),
-        end,
-        metrics.total
-    );
-    let block = popup_block(title);
-    frame.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .scroll((start as u16, 0))
-            .block(block),
-        area,
+    let layout = layout(frame.area());
+    let (capacity, max_scroll) = scroll_bounds(&layout);
+    let total = capacity + max_scroll;
+    let start = app.session.help_scroll.min(max_scroll);
+    let header = if max_scroll == 0 {
+        "Help".to_owned()
+    } else {
+        format!(
+            "Help {}-{} of {total}",
+            start + 1,
+            (start + capacity).min(total)
+        )
+    };
+    popup(header, max_scroll > 0).render(
+        frame,
+        overlay_area(frame.area()),
+        start as u16,
     );
 }
 
@@ -149,5 +134,5 @@ pub(crate) fn page_capacity(app: &App) -> usize {
         app.session.terminal.width,
         app.session.terminal.height,
     );
-    help_metrics(help_area(overlay_area(terminal))).capacity
+    scroll_bounds(&layout(terminal)).0
 }

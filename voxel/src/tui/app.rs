@@ -821,7 +821,19 @@ impl App {
                     self.session.confirmation = None;
                     vec![]
                 }
-                (_, Action::Scroll { delta, .. }) => {
+                // Options are buttons in a row, so ←/→ move between them as
+                // well as ↑/↓.
+                (
+                    _,
+                    action @ (Action::Scroll { .. }
+                    | Action::Left
+                    | Action::Right),
+                ) => {
+                    let delta = match action {
+                        Action::Scroll { delta, .. } => delta,
+                        Action::Left => -1,
+                        _ => 1,
+                    };
                     self.session.confirmation_selection = self
                         .session
                         .confirmation_selection
@@ -1794,10 +1806,10 @@ mod tests {
         }
     }
 
-    /// Chooses an open confirmation's affirmative option, which sits just
-    /// above the Back or Cancel option every dialog starts on.
+    /// Chooses an open confirmation's affirmative option, the button just
+    /// left of the Back or Cancel button every dialog starts on.
     fn confirm(app: &mut App) -> Vec<Effect> {
-        app.update(AppEvent::Action(Action::Scroll { delta: -1, page: false }));
+        app.update(AppEvent::Action(Action::Left));
         app.update(AppEvent::Action(Action::Activate))
     }
 

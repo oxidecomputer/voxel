@@ -10,7 +10,11 @@ use super::{
     deployment,
     renderer::{LayoutMode, MIN_HEIGHT, MIN_WIDTH, layout_mode},
 };
-use crate::tui::{app::App, event::View, telemetry::TrafficSeverity};
+use crate::tui::{
+    app::App,
+    event::{Confirmation, View},
+    telemetry::TrafficSeverity,
+};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
@@ -303,11 +307,18 @@ fn action_groups(app: &App, narrow: bool) -> Vec<ActionGroup> {
         ]
     };
     let contextual_navigation = if narrow { "Tab/⇧" } else { "Tab/S-Tab" };
-    if app.session.confirmation.is_some() {
+    if let Some(confirmation) = &app.session.confirmation {
         return vec![
-            group("↑/↓", "move"),
+            group("←/→", "move"),
             group("Enter", "select"),
-            group("y", "confirm"),
+            group(
+                "y",
+                if matches!(confirmation, Confirmation::Detach) {
+                    "copy command"
+                } else {
+                    "confirm"
+                },
+            ),
             group("n/Esc", "back"),
         ];
     }
@@ -483,15 +494,6 @@ pub(crate) fn popup_backdrop(frame: &mut ratatui::Frame<'_>, area: Rect) {
         .set_style(screen, Style::default().bg(TUI_BLACK).fg(TUI_GREY));
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(background()), area);
-}
-
-/// A pop-up's frame: rounded, dark green, with a bright green title.
-pub(crate) fn popup_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
-    rounded_block()
-        .title(title)
-        .border_style(line_style(true))
-        .title_style(header_style(true))
-        .style(background().fg(OX_OFF_WHITE))
 }
 
 pub(crate) fn primary_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {

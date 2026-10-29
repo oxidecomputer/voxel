@@ -6,15 +6,11 @@
 //! renders the per-rack receiver YAML an operator can copy into a collector.
 
 use crate::tui::{App, telemetry::RackId};
-use ratatui::{
-    layout::Rect,
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
-};
+use ratatui::text::{Line, Text};
 
-use super::widgets::{
-    header_style, help_function_style, help_key_style, overlay_area,
-    popup_backdrop, popup_block,
+use super::{
+    popup::{Button, Popup},
+    widgets::overlay_area,
 };
 
 pub const GUIDE_URL: &str =
@@ -56,44 +52,23 @@ pub(crate) fn receiver_yaml(app: &App) -> String {
 }
 
 pub fn draw(frame: &mut ratatui::Frame<'_>) {
-    let root = overlay_area(frame.area());
-    let width = root.width.min(92);
-    let height = root.height.min(26);
-    let area = Rect::new(
-        root.x + root.width.saturating_sub(width) / 2,
-        root.y + root.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-    if area.width <= 2 || area.height <= 2 {
-        return;
-    }
-    popup_backdrop(frame, area);
-    let body = vec![
-        Line::styled("Setting up External Monitoring", header_style(true)),
-        Line::default(),
-        Line::from(
-            "To monitor your Voxel deployment, copy the OpenTelemetry receiver",
-        ),
-        Line::from("YAML and follow the integration guide:"),
-        Line::from(GUIDE_URL),
-        Line::default(),
-        Line::from(vec![
-            Span::styled("Copy receiver YAML ", help_function_style()),
-            Span::styled("<s>", help_key_style()),
-            Span::raw("  "),
-            Span::styled("Copy guide URL ", help_function_style()),
-            Span::styled("<a>", help_key_style()),
-            Span::raw("  "),
-            Span::styled("Close ", help_function_style()),
-            Span::styled("<Esc>", help_key_style()),
+    let button = |label, key| Button { label, key: Some(key), selected: false };
+    Popup {
+        header: Line::from("Setting up External Monitoring"),
+        body: Text::from(vec![
+            Line::from(
+                "To monitor your Voxel deployment, copy the OpenTelemetry receiver",
+            ),
+            Line::from("YAML and follow the integration guide:"),
+            Line::from(GUIDE_URL),
         ]),
-    ];
-    let block = popup_block(" External monitoring ");
-    frame.render_widget(
-        Paragraph::new(body).wrap(Wrap { trim: false }).block(block),
-        area,
-    );
+        buttons: vec![
+            button("Copy receiver YAML", "s"),
+            button("Copy guide URL", "a"),
+            button("Close", "Esc"),
+        ],
+    }
+    .render(frame, overlay_area(frame.area()), 0);
 }
 
 #[cfg(test)]
