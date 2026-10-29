@@ -39,15 +39,22 @@ drift surfaces at voxel compile time.
 
 ## Quickstart
 
+For a complete walkthrough, from preparing a Helios host through launching,
+accessing, and tearing down a rack, see the
+[operator guide](docs/operator-guide.adoc).
+
+> [!NOTE] Whenever the command `voxel` is mentioned, the best way to use it is
+> to access the debug build: `./target/debug/voxel <command>`
+
 1. `cargo build` builds voxel.
-2. `voxel image create 43bb5af` builds omicron (v21) and bakes `voxel-cp-43bb5af`
+2. `voxel image create` builds omicron with a pinned commit and bakes `voxel-cp-<HASH>`
    (30-45 min).
 3. `voxel image create-frr proto` bakes `voxel-frr-proto` (omicron-independent;
    build once, reuse for any commit).
-4. Configure:
+4. Configure using the image name from step 2 (`voxel image ls` lists it):
 
 ```
-voxel config set image.cp voxel-cp-43bb5af
+voxel config set image.cp voxel-cp-<HASH>
 voxel config set image.frr voxel-frr-proto
 ```
 
@@ -56,11 +63,11 @@ voxel config set image.frr voxel-frr-proto
 A few notes: by default, this will all happen under $HOME. If you don't like that or need
 to improve performance by using a separate disk, there are some knobs set via `voxel config set`:
 
-* falcon.dataset: Location for built control plane snapshots, exported as
+* `falcon.dataset`: Location for built control plane snapshots, exported as
   `FALCON_DATASET`, with images and topo zvols under `<ds>/img/...`
-* falcon.build_root: Location where omicron will clone and compile for new images,
+* `falcon.build_root`: Location where omicron will clone and compile for new images,
   exported as `BUILD_ROOT`, holding the omicron checkout
-* falcon.workdir: Location where voxel will do its configuration and setup for new launches
+* `falcon.workdir`: Location where voxel will do its configuration and setup for new launches
 
 ## Privileges
 
@@ -90,7 +97,7 @@ directly above the configured service pool.
 voxel commtest
 
 # A specific commit (older unicast-only versions are supported).
-voxel commtest 43bb5af --traffic unicast
+voxel commtest d41a8c3a2aa5768255ad00545e53d3077b1b56ce --traffic unicast
 
 # Latest origin/main.
 voxel commtest main --traffic unicast
@@ -104,7 +111,7 @@ voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
   --test-duration 5m --mcast-group 239.10.0.1
 
 # Cleanup resources created by that commit's commtest.
-voxel commtest 43bb5af -- cleanup
+voxel commtest d41a8c3a2aa5768255ad00545e53d3077b1b56ce -- cleanup
 ```
 
 `--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. Voxel
@@ -219,8 +226,7 @@ Notes:
 
 By default voxel backs each SP with omicron's `sp-sim`. To run real SP and RoT
 firmware, voxel uses [sp-emu], which boots unmodified Hubris on emulated
-STM32H7 and LPC55 cores. sp-emu is a separate binary
-run inside the switch zone, not a Cargo dependency, so build it and point voxel at it.
+STM32H7 and LPC55 cores.
 
 1. Build sp-emu:
 
@@ -244,9 +250,11 @@ run inside the switch zone, not a Cargo dependency, so build it and point voxel 
    voxel launch --emu
    ```
 
-   `--emu` runs real SP and RoT firmware behind MGS and drives rack setup
-   through wicketd (the real operator flow) rather than the file-based
-   sled-agent auto-init.
+   `--emu` runs stock SP and RoT firmware behind MGS. Rack setup goes
+   through wicketd's commission API on every
+   launch, `--emu` or not; `launch --init-rss` is the sp-sim-only shortcut
+   that stages a config-rss.toml for sled-agent to initialize the rack
+   itself.
 
 The firmware itself comes from the image's own TUF repo: `image create
 --from-tuf` extracts the gimlet and sidecar SP archives, the RoT slot A image
@@ -254,7 +262,7 @@ and the RoT bootloader, and stamps their location on the image, so a rack
 cannot boot firmware that disagrees with the release it reports.
 
 To boot *different* firmware - which is how you give a firmware update
-something to do, or test a hubris change - name the images in `[sp]` and they
+something to do, or test a hubris change, name the images in `[sp]` and they
 win over the image's own:
 
 ```toml

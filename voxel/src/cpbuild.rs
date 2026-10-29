@@ -52,11 +52,8 @@ pub(crate) struct CpBuild<'a> {
 /// the dependency is a path dep. Set by build.rs from Cargo.lock.
 const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
 
-/// `voxel image create`: resolve where the omicron source is and what the image
-/// is called, then build. `--src <path>` builds that checkout as-is with
-/// `commit` reinterpreted as an optional image label; otherwise the commit names
-/// both the checkout under the build root and the image, defaulting to the
-/// omicron rev voxel itself is pinned to.
+/// `voxel image create`: resolve the omicron source and the image name, then
+/// build. With `--src` the checkout is built as-is and `commit` is the label.
 pub(crate) async fn create(
     commit: Option<&str>,
     src: Option<&Utf8Path>,
@@ -177,9 +174,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let root = repo_root()?;
     let voxel_image = root.join("voxel-image");
     let cargo_bay = voxel_image.join("cargo-bay/vbuild");
-    // Everything under vbuild is regenerated per run. Leftovers owned by
-    // another user (an earlier pfexec run) fail every later write; fail once
-    // here instead.
+    // vbuild is regenerated per run. Leftovers owned by another user (an
+    // earlier pfexec run) would fail every later write.
     if cargo_bay.exists() {
         std::fs::remove_dir_all(&cargo_bay).with_context(|| {
             format!(
@@ -274,8 +270,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     crate::image::render_smf(src, b.num_gimlets)?;
 
     // --- 5. package the control plane ----------------------------------------
-    // NB: `-p a4x2` is OMICRON's own package preset (a build target in its
-    // package-manifest), NOT the removed a4x2 testbed crate. Leave it as-is.
+    // `-p a4x2` is omicron's own package preset, not the retired testbed crate.
     eprintln!("[voxel] omicron-package target create -p a4x2");
     run(
         omicron_cmd(src, "./target/release/omicron-package")
@@ -302,6 +297,9 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "-a",
         "--no-owner",
         "--no-group",
+        // Symlinks would dangle in the bay once their targets fall
+        // outside the staged subset, aborting the guest's p9kp pull.
+        "-L",
         "tools",
         "out",
         "smf",
@@ -310,8 +308,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "target/release/xtask",
         "target/release/xtask-downloader",
     ]);
-    // out/ holds host-side downloads the image doesn't need; the zones are
-    // already unpacked in-guest from the tarballs we do keep.
+    // out/ holds host-side downloads and release-build residue the image does
+    // not need. The zones unpack in-guest from the tarballs that are kept.
     for ex in [
         "out/downloads",
         "out/clickhouse",
@@ -320,6 +318,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         "out/mgd",
         "out/transceiver-control",
         "out/console-assets",
+        "out/releng",
+        "out/versioned",
     ] {
         rsync.arg("--exclude").arg(ex);
     }
@@ -349,12 +349,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let network = builder_network(b.external)?;
     bake(BakeOpts {
         base_image: "helios-3.0",
-        role: Some("cp"),
-        exec: None,
+        role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
         dataset: b.dataset,
-        deploy: "voxel_build",
         disk_gb: 100,
         mem_gb: 16,
         cores: 8,
@@ -383,9 +381,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Fetch sidecar-lite's scadm + libsidecar_lite.so, via a rev-keyed cache, and
-/// stage them for the image. The builder VM may not reach buildomat.eng - only
-/// the host does - so this happens here rather than in-guest.
+/// Fetch sidecar-lite's scadm + libsidecar_lite.so via a rev-keyed cache and
+/// stage them for the image. Only the host reaches buildomat.
 fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
     let rev = std::env::var("SIDECAR_LITE_REV")
         .unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
@@ -472,9 +469,8 @@ async fn create_cp_tuf(
     let fw = t.extract_firmware_into(&fw_dir)?;
     eprintln!("[voxel] extracted SP/RoT firmware -> {fw_dir}");
 
-    // Ship the host artifacts in the image: at launch voxel-init seeds each
-    // M.2's boot image sibling from them so host phase 2 inventories at the
-    // repo's version; the phase 1 rom is staged for the SP QSPI seed.
+    // Ship the host artifacts: voxel-init seeds each M.2 boot image from them
+    // at launch, and the phase 1 rom seeds the SP QSPI.
     let host_dir = cargo_bay.join("host");
     std::fs::create_dir_all(&host_dir)
         .with_context(|| format!("mkdir {host_dir}"))?;
@@ -483,9 +479,8 @@ async fn create_cp_tuf(
     std::fs::copy(&phase1, host_dir.join("phase1-gimlet.rom"))
         .context("stage host phase 1 rom")?;
 
-    // The standard-image sled-agent hardwires scrimlet = tofino ASIC at
-    // compile time (bootstrap/pre_server.rs sled_mode_from_config); softnpu
-    // scrimlets need a switch-softnpu build staged over the phase 2 one.
+    // The phase 2 sled-agent detects softnpu scrimlets at runtime, so this is
+    // an override: a sled-agent package staged over the phase 2 one.
     if let Some(pkg) = sled_agent {
         let dir = cargo_bay.join("gz/sled-agent");
         std::fs::remove_dir_all(&dir)
@@ -505,12 +500,7 @@ async fn create_cp_tuf(
             cargo_bay.join("gz/sled-agent.xml"),
         )
         .context("stage the softnpu sled-agent SMF manifest")?;
-        eprintln!("[voxel] staged softnpu sled-agent from {pkg}");
-    } else {
-        eprintln!(
-            "[voxel] WARN: no --sled-agent; the phase 2 sled-agent cannot \
-             run softnpu scrimlets"
-        );
+        eprintln!("[voxel] staged sled-agent from {pkg}");
     }
 
     // --- 3. pinned single files from the omicron repo ------------------------
@@ -562,12 +552,10 @@ async fn create_cp_tuf(
     let network = builder_network(external)?;
     bake(BakeOpts {
         base_image: "helios-3.0",
-        role: Some("cp"),
-        exec: None,
+        role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
         dataset,
-        deploy: "voxel_build",
         disk_gb: 100,
         mem_gb: 16,
         cores: 8,
@@ -576,8 +564,8 @@ async fn create_cp_tuf(
     .await?;
 
     // --- 7. stamps -------------------------------------------------------------
-    // The schema markers live in two source files; fetch them into a
-    // checkout-shaped cache so the detector reads them as usual.
+    // Fetch the two schema-marker sources into a checkout-shaped cache for the
+    // detector.
     fetch_omicron_raw(&voxel_image, full_sha, "sled-agent/src/config.rs")?;
     fetch_omicron_raw(&voxel_image, full_sha, "sled-hardware/src/lib.rs")?;
     let schema_root = raw_cache(&voxel_image, full_sha);
@@ -617,9 +605,8 @@ async fn create_cp_tuf(
     Ok(())
 }
 
-/// The prebuilt voxel-init to bake: $VOXEL_INIT, else the binary next to this
-/// voxel executable. The workspace builds both together and shipped bundles
-/// carry both, so the sibling is fresh by construction.
+/// The prebuilt voxel-init to bake: $VOXEL_INIT, else the sibling of this
+/// executable. The workspace builds and ships both together.
 fn find_voxel_init() -> Result<Utf8PathBuf> {
     if let Ok(p) = std::env::var("VOXEL_INIT") {
         let p = Utf8PathBuf::from(p);
@@ -642,9 +629,8 @@ fn find_voxel_init() -> Result<Utf8PathBuf> {
     )
 }
 
-/// Mount the phase 2 pool (read only, renamed, under `mnt`) and copy its
-/// /opt/oxide plus the sled-agent SMF manifest into `dest`. Runs under
-/// pfexec, so lofi/zpool/mount are direct.
+/// Mount the phase 2 pool read-only under `mnt` and copy its /opt/oxide plus
+/// the sled-agent SMF manifest into `dest`. Runs under pfexec.
 fn stage_gz_from_phase2(
     payload: &Utf8Path,
     mnt: &Utf8Path,
@@ -678,8 +664,8 @@ fn stage_gz_from_phase2(
         }
     };
     let result = (|| -> Result<()> {
-        // The pool is named rpool inside the image; find its id on our lofi
-        // device and import it renamed so it cannot collide with the host's.
+        // The pool is named rpool inside the image. Import it by id from the
+        // lofi device, renamed, to keep it clear of the host's rpool.
         let scan = Command::new("zpool")
             .args(["import", "-d", "/dev/lofi"])
             .output()
@@ -754,7 +740,7 @@ fn stage_gz_from_phase2(
 
 const OMICRON_RAW_URL: &str =
     "https://raw.githubusercontent.com/oxidecomputer/omicron";
-const BUILDOMAT_URL: &str =
+pub(crate) const BUILDOMAT_URL: &str =
     "https://buildomat.eng.oxide.computer/public/file/oxidecomputer";
 
 fn raw_cache(voxel_image: &Utf8Path, sha: &str) -> Utf8PathBuf {
@@ -835,10 +821,8 @@ fn fetch_dendrite_softnpu(
     Ok(cached)
 }
 
-/// Rewrite the phase 2 switch zone for voxel: swap the tofino ASIC dendrite
-/// subtrees for the softnpu prebuilt's, and bake voxel's switch0 MGS config
-/// in place of the rack's. Everything else (mgs, wicketd, mgd, omdb) is kept
-/// as shipped.
+/// Rewrite the phase 2 switch zone for voxel: softnpu dendrite in place of the
+/// tofino subtrees, and voxel's switch0 MGS config. The rest stays as shipped.
 fn recompose_switch_zone(
     switch: &Utf8Path,
     dendrite: &Utf8Path,
@@ -913,11 +897,8 @@ fn copy_tar_entries<W: std::io::Write>(
     Ok(())
 }
 
-/// A command run inside the omicron checkout, with the PATH and RUSTFLAGS the
-/// omicron build needs. `install_builder_prerequisites.sh` ci-downloads
-/// cockroach/clickhouse/dpd into `out/` and then fails unless they are on PATH -
-/// a check that passes in an interactive dev shell but not a fresh one - so
-/// those go on up front.
+/// A command in the omicron checkout with the PATH and RUSTFLAGS its build
+/// needs. The ci-downloaded cockroach/clickhouse/dpd must be on PATH up front.
 fn omicron_cmd(src: &Utf8Path, program: &str) -> Command {
     let mut c = Command::new(program);
     c.current_dir(src);
