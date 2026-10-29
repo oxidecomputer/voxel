@@ -113,11 +113,7 @@ pub(crate) fn help_area(root: Rect) -> Rect {
     )
 }
 
-pub fn draw(
-    frame: &mut ratatui::Frame<'_>,
-    app: &App,
-    _mode: super::renderer::LayoutMode,
-) {
+pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = help_area(overlay_area(frame.area()));
     // The application renderer returns its minimum-size fallback before Help.
     // Keep direct helper draws for degenerate test/backend areas empty as well.

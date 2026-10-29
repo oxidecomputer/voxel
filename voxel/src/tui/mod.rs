@@ -286,7 +286,7 @@ pub(crate) async fn run(mut context: TuiContext) -> anyhow::Result<()> {
         Ok(ui::renderer::LoopExit::EventChannelClosed) => {
             primary.get_or_insert_with(|| "TUI event channel closed".into());
         }
-        Ok(ui::renderer::LoopExit::Cancelled { .. }) => {
+        Ok(ui::renderer::LoopExit::Cancelled) => {
             primary.get_or_insert_with(|| {
                 "TUI renderer cancelled unexpectedly".into()
             });

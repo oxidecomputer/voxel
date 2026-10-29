@@ -130,7 +130,7 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         super::external_monitoring::draw(frame);
     }
     if app.session.help_open {
-        super::help::draw(frame, app, root.mode);
+        super::help::draw(frame, app);
     }
     if app.session.confirmation.is_some() {
         super::confirm_dialog::draw(frame, app);

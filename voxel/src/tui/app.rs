@@ -815,7 +815,7 @@ impl App {
 
     fn action(&mut self, action: Action) -> Vec<Effect> {
         if let Some(confirmation) = self.session.confirmation.clone() {
-            let options = confirmation.options(self.can_cancel());
+            let options = confirmation.options();
             return match (confirmation.clone(), action) {
                 (_, Action::Close) => {
                     self.session.confirmation = None;
@@ -1203,7 +1203,7 @@ impl App {
     fn open_confirmation(&mut self, confirmation: Confirmation) {
         self.clipboard_copied = false;
         self.session.confirmation_selection =
-            confirmation.options(self.can_cancel()).len().saturating_sub(1);
+            confirmation.options().len().saturating_sub(1);
         self.session.confirmation = Some(confirmation);
     }
     fn activate_confirmation_option(
@@ -1211,7 +1211,7 @@ impl App {
         confirmation: Confirmation,
     ) -> Vec<Effect> {
         let action = confirmation
-            .options(self.can_cancel())
+            .options()
             .get(self.session.confirmation_selection)
             .map(|option| option.action)
             .unwrap_or(ConfirmationOptionAction::Reject);

@@ -78,7 +78,7 @@ fn visible_shortcuts(
 pub(crate) fn dialog_area(app: &App, overlay: Rect) -> Rect {
     let confirmation =
         app.session.confirmation.as_ref().expect("open confirmation");
-    let options = confirmation.options(app.can_cancel());
+    let options = confirmation.options();
     let dialog_body = body(app, confirmation);
     let content_width = dialog_body
         .lines
@@ -115,7 +115,7 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let Some(confirmation) = app.session.confirmation.as_ref() else {
         return;
     };
-    let options = confirmation.options(app.can_cancel());
+    let options = confirmation.options();
     let dialog_body = body(app, confirmation);
     let area = dialog_area(app, overlay_area(frame.area()));
     popup_backdrop(frame, area);

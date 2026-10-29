@@ -119,7 +119,7 @@ const FORCE_STOP_OPTIONS: &[ConfirmationOption] = &[
     ConfirmationOption { label: "Back", action: Reject },
 ];
 impl Confirmation {
-    pub fn options(&self, _can_cancel: bool) -> &'static [ConfirmationOption] {
+    pub fn options(&self) -> &'static [ConfirmationOption] {
         match self {
             Self::Launch => LAUNCH_OPTIONS,
             Self::Route => ROUTE_OPTIONS,

@@ -78,10 +78,10 @@ impl Renderer {
 #[derive(Debug, Eq, PartialEq)]
 pub enum LoopExit {
     ConfirmedExit,
-    Cancelled { unsent: Vec<Effect> },
+    Cancelled,
     EventChannelClosed,
     EffectChannelClosed { unsent: Vec<Effect> },
-    RenderFailed { kind: io::ErrorKind, message: String, unsent: Vec<Effect> },
+    RenderFailed { message: String },
 }
 
 fn forward_effects(
@@ -107,16 +107,12 @@ pub async fn run_loop<B: Backend>(
     cancel: CancellationToken,
 ) -> io::Result<LoopExit> {
     if let Err(error) = renderer.draw(terminal, app, true) {
-        return Ok(LoopExit::RenderFailed {
-            kind: error.kind(),
-            message: error.to_string(),
-            unsent: vec![],
-        });
+        return Ok(LoopExit::RenderFailed { message: error.to_string() });
     }
     loop {
         let event = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Ok(LoopExit::Cancelled { unsent: vec![] }),
+            _ = cancel.cancelled() => return Ok(LoopExit::Cancelled),
             event = events.recv() => match event {
                 Some(event) => event,
                 None => return Ok(LoopExit::EventChannelClosed),
@@ -137,11 +133,7 @@ pub async fn run_loop<B: Backend>(
             }
         }
         if let Err(error) = renderer.draw(terminal, app, force_draw) {
-            return Ok(LoopExit::RenderFailed {
-                kind: error.kind(),
-                message: error.to_string(),
-                unsent: forwarded,
-            });
+            return Ok(LoopExit::RenderFailed { message: error.to_string() });
         }
         let confirmed_exit =
             forwarded.iter().any(|effect| matches!(effect, Effect::Quit));
