@@ -38,7 +38,7 @@ flate2 = "1"
 # Read TUF repo zips in process (no unzip on the host). tufaceous writes
 # members stored or deflated; flate2's default backend (pulled in above)
 # serves the deflate path.
-zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Fetch prebuilt binaries (sp-emu, faux-mgs) from buildomat: sha256 verified
 # against the published digest, progress bar while streaming.
