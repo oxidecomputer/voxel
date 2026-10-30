@@ -177,7 +177,7 @@ fetch them, go to the
 https://github.com/oxidecomputer/voxel[voxel repository], click the green
 CI checkmark next to the last commit on `main`, find the buildomat job
 named `build`, and click **Details**. The build artifacts include `voxel`,
-`voxel-init`, and `sp-emu`.
+`voxel-init`, `voxel-init-linux` (the router image's agent), and `sp-emu`.
 
 === Configuration
 
@@ -326,8 +326,19 @@ as-is, which is useful for testing control-plane changes on a running rack.
 
 === Router Image
 
-The FRR router image only needs to be built once. The argument is an image
-label, it can be any name you choose:
+The FRR router image only needs to be built once. It stages a static Linux
+build of `voxel-init`, found next to the `voxel` binary as `voxel-init-linux`
+(what CI publishes) or in cargo's target directory. From a source checkout,
+cross-compile it first:
+
+[source,sh]
+----
+rustup target add x86_64-unknown-linux-musl
+RUSTFLAGS='-C linker=rust-lld -C link-self-contained=yes' \
+    cargo build --release -p voxel-init --target x86_64-unknown-linux-musl
+----
+
+The argument is an image label, it can be any name you choose:
 
 [source,sh]
 ----

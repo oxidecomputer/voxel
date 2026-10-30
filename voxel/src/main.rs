@@ -56,7 +56,7 @@ struct Cli {
     #[arg(long, global = true, env = "VOXEL_CONFIG", value_parser = abs_path)]
     config: Option<Utf8PathBuf>,
 
-    /// Project root that cargo-bay/ and .falcon/ live under.
+    /// Root that cargo-bay/, .falcon/ and image-build/ live under.
     #[arg(long, global = true, env = "VOXEL_WORKDIR", value_parser = abs_path)]
     workdir: Option<Utf8PathBuf>,
 
@@ -666,8 +666,8 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
     }
 }
 
-/// `chdir` to the project root so the CWD-relative `cargo-bay/` and `.falcon/`
-/// resolve correctly no matter where voxel was invoked from (e.g. `/usr/bin`).
+/// `chdir` to the project root. `cargo-bay/`, `.falcon/` and `image-build/`
+/// are CWD-relative and must resolve from any invocation directory.
 /// Root: `--workdir`/`$VOXEL_WORKDIR` > `[falcon].workdir` > the discovered
 /// `voxel.toml`'s directory. No-op if the chosen root isn't a directory.
 fn anchor_workdir(
