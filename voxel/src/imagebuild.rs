@@ -201,16 +201,8 @@ pub(crate) async fn create_frr(
 ) -> Result<()> {
     let network = builder_network(external)?;
     let image_name = format!("voxel-frr-{version}");
-    let cargo_bay = build_root()?.join("cargo-bay/vbuild-frr");
-    std::fs::create_dir_all(&cargo_bay)
-        .with_context(|| format!("mkdir {cargo_bay}"))?;
-    let agent_src = find_voxel_init(&ROUTER_INIT)?;
-    eprintln!("[voxel] staging voxel-init from {agent_src}");
-    let agent_dst = cargo_bay.join("voxel-init");
-    std::fs::copy(&agent_src, &agent_dst)
-        .with_context(|| format!("stage agent {agent_src}"))?;
-    // The 9p mount drops the exec bit in-guest; keep it host-side regardless.
-    let _ = Command::new("chmod").args(["+x"]).arg(&agent_dst).status();
+    let cargo_bay = fresh_cargo_bay("vbuild-frr")?;
+    stage_agent(&ROUTER_INIT, &cargo_bay)?;
 
     bake(BakeOpts {
         base_image: "debian-13.2",
@@ -225,6 +217,68 @@ pub(crate) async fn create_frr(
     })
     .await?;
     println!("built image {image_name}");
+    Ok(())
+}
+
+/// Build a `voxel-builder` image: a Helios guest with git, rustup, omicron's
+/// builder prerequisites and `omicron_rev` checked out under /work.
+pub(crate) async fn create_builder(
+    version: &str,
+    dataset: &str,
+    external: Option<&voxel_config::External>,
+    omicron_rev: &str,
+) -> Result<()> {
+    let network = builder_network(external)?;
+    let image_name = format!("voxel-builder-{version}");
+    let cargo_bay = fresh_cargo_bay("vbuild-builder")?;
+    stage_agent(&SLED_INIT, &cargo_bay)?;
+    std::fs::write(cargo_bay.join("omicron-rev"), format!("{omicron_rev}\n"))
+        .with_context(|| format!("stage omicron-rev into {cargo_bay}"))?;
+
+    bake(BakeOpts {
+        base_image: "helios-3.0",
+        role: "builder",
+        cargo_bay: &cargo_bay,
+        image_name: &image_name,
+        dataset,
+        disk_gb: 100,
+        mem_gb: 16,
+        cores: 8,
+        network: &network,
+    })
+    .await?;
+    println!("built image {image_name}");
+    Ok(())
+}
+
+/// An empty `image-build/cargo-bay/<name>`. Root-owned leftovers from a pfexec
+/// run would fail every later write.
+pub(crate) fn fresh_cargo_bay(name: &str) -> Result<Utf8PathBuf> {
+    let cargo_bay = build_root()?.join("cargo-bay").join(name);
+    if cargo_bay.exists() {
+        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
+            format!(
+                "clear {cargo_bay} (owned by another user? \
+                 remove it with pfexec rm -rf)"
+            )
+        })?;
+    }
+    std::fs::create_dir_all(&cargo_bay)
+        .with_context(|| format!("mkdir {cargo_bay}"))?;
+    Ok(cargo_bay)
+}
+
+/// Copy a prebuilt agent into the cargo-bay as `voxel-init`, executable.
+pub(crate) fn stage_agent(
+    agent: &Prebuilt,
+    cargo_bay: &Utf8Path,
+) -> Result<()> {
+    let src = find_voxel_init(agent)?;
+    eprintln!("[voxel] staging voxel-init from {src}");
+    let dst = cargo_bay.join("voxel-init");
+    std::fs::copy(&src, &dst)
+        .with_context(|| format!("stage {src} into the cargo-bay"))?;
+    let _ = Command::new("chmod").arg("+x").arg(&dst).status();
     Ok(())
 }
 

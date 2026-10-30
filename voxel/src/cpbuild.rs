@@ -19,7 +19,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 
 use crate::imagebuild::{
-    BakeOpts, SLED_INIT, bake, build_root, builder_network, find_voxel_init,
+    BakeOpts, SLED_INIT, bake, build_root, builder_network, fresh_cargo_bay,
+    stage_agent,
 };
 
 /// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
@@ -50,7 +51,8 @@ pub(crate) struct CpBuild<'a> {
 
 /// The omicron sha voxel's own rack-init-config dependency is pinned to. Empty while
 /// the dependency is a path dep. Set by build.rs from Cargo.lock.
-const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
+pub(crate) const PINNED_OMICRON_REV: &str =
+    env!("RACK_INIT_CONFIG_OMICRON_REV");
 
 /// `voxel image create`: resolve the omicron source and the image name, then
 /// build. With `--src` the checkout is built as-is and `commit` is the label.
@@ -172,17 +174,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         eprintln!("[voxel] warning: control-plane builds are Helios-only");
     }
     let root = build_root()?;
-    let cargo_bay = root.join("cargo-bay/vbuild");
-    // vbuild is regenerated per run. Leftovers owned by another user (an
-    // earlier pfexec run) would fail every later write.
-    if cargo_bay.exists() {
-        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
-            format!(
-                "clear {cargo_bay} (owned by another user? \
-                 remove it with pfexec rm -rf)"
-            )
-        })?;
-    }
+    let cargo_bay = fresh_cargo_bay("vbuild")?;
     let src = &b.omicron_src;
     let image_name = format!("voxel-cp-{}", b.label);
 
@@ -326,13 +318,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     run(&mut rsync, "rsync omicron -> cargo-bay")?;
 
     // --- 7b. stage the in-guest agent ----------------------------------------
-    // The prebuilt voxel-init from the same workspace build as voxel itself.
-    let agent_src = find_voxel_init(&SLED_INIT)?;
-    eprintln!("[voxel] staging voxel-init from {agent_src}");
-    let agent = cargo_bay.join("voxel-init");
-    std::fs::copy(&agent_src, &agent)
-        .with_context(|| format!("stage {agent_src} into the cargo-bay"))?;
-    let _ = Command::new("chmod").arg("+x").arg(&agent).status();
+    stage_agent(&SLED_INIT, &cargo_bay)?;
 
     // --- 8. bake -------------------------------------------------------------
     let network = builder_network(b.external)?;
@@ -410,15 +396,7 @@ async fn create_cp_tuf(
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
     let root = build_root()?;
-    let cargo_bay = root.join("cargo-bay/vbuild");
-    if cargo_bay.exists() {
-        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
-            format!(
-                "clear {cargo_bay} (owned by another user? \
-                 remove it with pfexec rm -rf)"
-            )
-        })?;
-    }
+    let cargo_bay = fresh_cargo_bay("vbuild")?;
     std::fs::create_dir_all(&cargo_bay)
         .with_context(|| format!("mkdir {cargo_bay}"))?;
     let image_name = format!("voxel-cp-{}-tuf", t.commit);
@@ -523,14 +501,7 @@ async fn create_cp_tuf(
 
     // --- 5. sidecar-lite + the agent ------------------------------------------
     fetch_sidecar(&root, &cargo_bay.join("sidecar"))?;
-    // TUF builds run no compiler: the agent is the prebuilt binary shipped
-    // (and workspace-built) alongside voxel itself.
-    let agent_src = find_voxel_init(&SLED_INIT)?;
-    eprintln!("[voxel] staging voxel-init from {agent_src}");
-    let agent = cargo_bay.join("voxel-init");
-    std::fs::copy(&agent_src, &agent)
-        .with_context(|| format!("stage {agent_src} into the cargo-bay"))?;
-    let _ = Command::new("chmod").arg("+x").arg(&agent).status();
+    stage_agent(&SLED_INIT, &cargo_bay)?;
 
     // --- 6. bake ---------------------------------------------------------------
     let network = builder_network(external)?;
