@@ -805,8 +805,11 @@ increasing the rack count.
 - **Emulated SPs and RoTs**: `voxel launch --emu` runs real Hubris firmware
   on emulated SP and RoT cores via
   https://github.com/oxidecomputer/sp-emu[sp-emu], with rack setup driven
-  through wicketd. See the "Emulated SPs and RoTs" section of the README and
-  the `voxel sp` command family.
+  through wicketd. Every image carries the firmware its Omicron commit pins:
+  a `--from-tuf` image takes it from the repo, a source-built image fetches
+  it from permslip during the build. `--sp-firmware` overrides either. See
+  the "Emulated SPs and RoTs" section of the README and the `voxel sp`
+  command family.
 - **Network validation**: `voxel network validate` checks link states, BGP
   sessions, and routes on a running rack.
 - **TUF repository seeding**: `voxel repo seed` populates sled artifact

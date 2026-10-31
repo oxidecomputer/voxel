@@ -36,6 +36,7 @@ mod isolated_external;
 mod multirack_join;
 mod net;
 mod network;
+mod permslip;
 mod rack;
 mod repocmd;
 mod rss;
