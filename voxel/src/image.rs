@@ -19,6 +19,52 @@ pub(crate) fn falcon_dataset() -> String {
 
 /// Fail before staging if a configured image is absent, with a pointer to how
 /// to get one. falcon's own zfs clone error mid-launch is cryptic.
+/// Each stamped image's short omicron commit, `+dirty` when the tree had
+/// uncommitted changes, keyed by image name.
+fn stamped_commits(
+    img: &str,
+    prefix: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut commits = std::collections::HashMap::new();
+    let mut dirty = std::collections::HashSet::new();
+    let Ok(out) = std::process::Command::new("zfs")
+        .args(["get", "-H", "-r", "-t", "volume", "-o", "name,property,value"])
+        .arg(format!(
+            "{},{}",
+            crate::topo::PROP_OMICRON_COMMIT,
+            crate::topo::PROP_OMICRON_DIRTY
+        ))
+        .arg(img)
+        .output()
+    else {
+        return commits;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut f = line.split('\t');
+        let (Some(name), Some(prop), Some(value)) =
+            (f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let Some(short) = name.strip_prefix(prefix) else { continue };
+        if value == "-" {
+            continue;
+        }
+        if prop == crate::topo::PROP_OMICRON_COMMIT {
+            let c: String = value.chars().take(9).collect();
+            commits.insert(short.to_string(), c);
+        } else if value == "true" {
+            dirty.insert(short.to_string());
+        }
+    }
+    for name in dirty {
+        if let Some(c) = commits.get_mut(&name) {
+            c.push_str("+dirty");
+        }
+    }
+    commits
+}
+
 /// A zvol's volsize in bytes.
 fn zvol_size(volume: &str) -> anyhow::Result<u64> {
     let out = std::process::Command::new("zfs")
@@ -77,6 +123,14 @@ pub(crate) fn head_short_sha(src: &Utf8Path) -> anyhow::Result<String> {
 
 /// Render the build-time smf configs (mgs-sim, sp-sim, sled-agent) into an
 /// omicron checkout. switch0 is baked with scrimlets at the first and last sled.
+/// The omicron files voxel overwrites in every build. They are tracked in
+/// omicron, and the provenance stamp ignores them.
+pub(crate) const RENDERED_SMF: [&str; 3] = [
+    "smf/mgs-sim/config.toml",
+    "smf/sp-sim/config.toml",
+    "smf/sled-agent/non-gimlet/config.toml",
+];
+
 pub(crate) fn render_smf(
     omicron_root: &Utf8Path,
     gimlets: usize,
@@ -88,14 +142,12 @@ pub(crate) fn render_smf(
         .with_context(|| {
         format!("read sled-agent config schema from {omicron_root}")
     })?;
+    let [mgs, sp_sim, sled_agent] = RENDERED_SMF;
     let writes = [
+        (mgs, voxel_config::mgs::switch_config(0, &fleet, &scrimlets)),
+        (sp_sim, fleet.sp_sim_config()),
         (
-            "smf/mgs-sim/config.toml",
-            voxel_config::mgs::switch_config(0, &fleet, &scrimlets),
-        ),
-        ("smf/sp-sim/config.toml", fleet.sp_sim_config()),
-        (
-            "smf/sled-agent/non-gimlet/config.toml",
+            sled_agent,
             voxel_config::sled::SledAgentConfig::new(
                 0, true, data_links, disks,
             )
@@ -216,8 +268,15 @@ pub(crate) fn cmd_image(
                 );
                 return Ok(());
             }
-            // Commit from the name: voxel-cp-<commit>[-<variant>] -> <commit>.
+            // Provenance comes from the stamped commit for source builds,
+            // with `+dirty` when the tree had local changes. Images without
+            // a stamp fall back to the commit in the name,
+            // voxel-cp-<commit>[-<variant>].
+            let stamps = stamped_commits(&img, &prefix);
             let commit_of = |name: &str| -> String {
+                if let Some(c) = stamps.get(name) {
+                    return c.clone();
+                }
                 name.strip_prefix("voxel-cp-")
                     .and_then(|s| s.split('-').next())
                     .filter(|s| !s.is_empty())

@@ -22,6 +22,7 @@ use crate::imagebuild::{
     BakeOpts, SLED_INIT, bake, build_root, builder_network, fresh_cargo_bay,
     stage_agent,
 };
+use crate::zfs;
 
 /// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
 const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
@@ -29,7 +30,7 @@ const SIDECAR_URL: &str = "https://buildomat.eng.oxide.computer/public/file/oxid
 
 /// Build flags matching the validated recipe for building omicron on Helios.
 /// pg_config (libpq) comes from /opt/ooce/bin, added to PATH below.
-const OMICRON_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
+pub(crate) const OMICRON_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
      -C link-arg=-R/usr/platform/oxide/lib/amd64 \
      -C link-arg=-Wl,-znocompstrtab --cfg tokio_unstable";
 
@@ -92,10 +93,7 @@ pub(crate) async fn create(
                 t.commit
             ),
         };
-        let num_gimlets = std::env::var("NUM_GIMLETS")
-            .ok()
-            .and_then(|g| g.parse().ok())
-            .unwrap_or(4);
+        let num_gimlets = num_gimlets();
         return create_cp_tuf(
             t,
             &full_sha,
@@ -152,10 +150,7 @@ pub(crate) async fn create(
             (commit, src, false)
         }
     };
-    let num_gimlets = std::env::var("NUM_GIMLETS")
-        .ok()
-        .and_then(|g| g.parse().ok())
-        .unwrap_or(4);
+    let num_gimlets = num_gimlets();
     create_cp(CpBuild {
         label: &label,
         omicron_src,
@@ -223,6 +218,9 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         )?;
     }
 
+    // Read before the build renders into the checkout.
+    let stamp = git_stamp(src)?;
+
     // --- 2. prerequisites + softnpu machinery --------------------------------
     eprintln!("[voxel] install_builder_prerequisites.sh -y");
     run(
@@ -283,50 +281,131 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("mkdir {stage}"))?;
     let mut rsync = omicron_cmd(src, "rsync");
-    // No owner/group: staging is content-only and chgrp fails for non-root.
-    rsync.args([
-        "-a",
-        "--no-owner",
-        "--no-group",
-        // Symlinks would dangle in the bay once their targets fall
-        // outside the staged subset, aborting the guest's p9kp pull.
-        "-L",
-        "tools",
-        "out",
-        "smf",
-        "package-manifest.toml",
-        "target/release/omicron-package",
-        "target/release/xtask",
-        "target/release/xtask-downloader",
-    ]);
-    // out/ holds host-side downloads and release-build residue the image does
-    // not need. The zones unpack in-guest from the tarballs that are kept.
-    for ex in [
-        "out/downloads",
-        "out/clickhouse",
-        "out/cockroachdb",
-        "out/dendrite-stub",
-        "out/mgd",
-        "out/transceiver-control",
-        "out/console-assets",
-        "out/releng",
-        "out/versioned",
-    ] {
-        rsync.arg("--exclude").arg(ex);
-    }
-    rsync.arg(format!("{stage}/"));
+    stage_rsync_args(&mut rsync);
+    rsync.args(STAGE_PATHS).arg(format!("{stage}/"));
     run(&mut rsync, "rsync omicron -> cargo-bay")?;
 
-    // --- 7b. stage the in-guest agent ----------------------------------------
-    stage_agent(&SLED_INIT, &cargo_bay)?;
+    bake_cp(CpBake {
+        root: &root,
+        cargo_bay: &cargo_bay,
+        image_name: &image_name,
+        dataset: b.dataset,
+        external: b.external,
+        schema_root: src,
+        stamp: &stamp,
+    })
+    .await
+}
 
-    // --- 8. bake -------------------------------------------------------------
+/// The sled-agent SP count baked into the build-time smf configs.
+pub(crate) fn num_gimlets() -> usize {
+    std::env::var("NUM_GIMLETS").ok().and_then(|g| g.parse().ok()).unwrap_or(4)
+}
+
+/// What a built omicron tree contributes to the image: the package tools,
+/// the packaged zones under out/, the smf configs and the tools scripts.
+pub(crate) const STAGE_PATHS: &[&str] = &[
+    "tools",
+    "out",
+    "smf",
+    "package-manifest.toml",
+    "target/release/omicron-package",
+    "target/release/xtask",
+    "target/release/xtask-downloader",
+];
+
+/// out/ entries the image does not need: host-side downloads and
+/// release-build residue. The zones unpack in-guest from the tarballs kept.
+pub(crate) const STAGE_EXCLUDES: &[&str] = &[
+    "out/downloads",
+    "out/clickhouse",
+    "out/cockroachdb",
+    "out/dendrite-stub",
+    "out/mgd",
+    "out/transceiver-control",
+    "out/console-assets",
+    "out/releng",
+    "out/versioned",
+];
+
+/// The rsync flags for staging. Content only, because chgrp fails for
+/// non-root. Symlinks resolved, because a link whose target falls outside
+/// the staged subset would dangle and abort the guest's p9kp pull. Plus the
+/// out/ excludes.
+pub(crate) fn stage_rsync_args(rsync: &mut Command) {
+    rsync.args(["-a", "--no-owner", "--no-group", "-L"]);
+    for ex in STAGE_EXCLUDES {
+        rsync.arg("--exclude").arg(ex);
+    }
+}
+
+/// The omicron commit an image was built from, and whether the tree had
+/// uncommitted changes. Stamped on the image as zfs properties.
+pub(crate) struct CpStamp {
+    pub commit: String,
+    pub dirty: bool,
+}
+
+/// Read the stamp from a local checkout.
+pub(crate) fn git_stamp(src: &Utf8Path) -> Result<CpStamp> {
+    let git = |args: &[&str]| -> Result<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(src)
+            // Under pfexec the checkout is usually owned by the invoking
+            // user, which git rejects as dubious ownership.
+            .arg("-c")
+            .arg(format!("safe.directory={src}"))
+            .args(args)
+            .output()
+            .with_context(|| format!("run git {} in {src}", args.join(" ")))?;
+        if !out.status.success() {
+            bail!(
+                "git {} in {src} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let mut status = vec!["status", "--porcelain", "--"];
+    let excludes = dirty_excludes();
+    status.extend(excludes.iter().map(String::as_str));
+    Ok(CpStamp {
+        commit: git(&["rev-parse", "HEAD"])?,
+        dirty: !git(&status)?.is_empty(),
+    })
+}
+
+/// git pathspecs that leave the files voxel renders out of the dirty check.
+pub(crate) fn dirty_excludes() -> Vec<String> {
+    crate::image::RENDERED_SMF.iter().map(|f| format!(":!{f}")).collect()
+}
+
+/// The tail every source-built cp image shares once its omicron tree is
+/// staged in the cargo-bay: sidecar, agent, bake, stamps.
+pub(crate) struct CpBake<'a> {
+    pub root: &'a Utf8Path,
+    pub cargo_bay: &'a Utf8Path,
+    pub image_name: &'a str,
+    pub dataset: &'a str,
+    pub external: Option<&'a voxel_config::External>,
+    /// A checkout, or a stub holding sled-agent/src/config.rs and
+    /// sled-hardware/src/lib.rs, for the sled schema stamp.
+    pub schema_root: &'a Utf8Path,
+    pub stamp: &'a CpStamp,
+}
+
+pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
+    fetch_sidecar(b.root, &b.cargo_bay.join("sidecar"))?;
+    stage_agent(&SLED_INIT, b.cargo_bay)?;
+
     let network = builder_network(b.external)?;
     bake(BakeOpts {
         base_image: "helios-3.0",
         role: "cp",
-        cargo_bay: &cargo_bay,
-        image_name: &image_name,
+        cargo_bay: b.cargo_bay,
+        image_name: b.image_name,
         dataset: b.dataset,
         disk_gb: 100,
         mem_gb: 16,
@@ -335,24 +414,24 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     })
     .await?;
 
-    // Stamp the sled-agent config schema on the image so launch reads it from
-    // the image itself instead of re-deriving it from a checkout.
-    let (data_links, disks) = crate::topo::schema_from_checkout(src)
-        .with_context(|| format!("read sled-agent config schema from {src}"))?;
-    run(
-        Command::new("zfs")
-            .arg("set")
-            .arg(format!(
-                "{}={}",
-                crate::topo::PROP_DATA_LINKS,
-                data_links.as_str()
-            ))
-            .arg(format!("{}={}", crate::topo::PROP_DISKS, disks.as_str()))
-            .arg(format!("{}/img/{image_name}", b.dataset)),
-        "zfs set sled schema on the image",
+    // Launch reads the sled schema and provenance from the image itself
+    // instead of re-deriving them from a checkout.
+    let (data_links, disks) = crate::topo::schema_from_checkout(b.schema_root)
+        .with_context(|| {
+            format!("read sled-agent config schema from {}", b.schema_root)
+        })?;
+    let dirty = b.stamp.dirty.to_string();
+    zfs::set(
+        &zfs::Dataset::new(format!("{}/img/{}", b.dataset, b.image_name))?,
+        &[
+            (crate::topo::PROP_DATA_LINKS, data_links.as_str()),
+            (crate::topo::PROP_DISKS, disks.as_str()),
+            (crate::topo::PROP_OMICRON_COMMIT, &b.stamp.commit),
+            (crate::topo::PROP_OMICRON_DIRTY, &dirty),
+        ],
     )?;
 
-    println!("built image {image_name}");
+    println!("built image {}", b.image_name);
     Ok(())
 }
 
@@ -527,23 +606,14 @@ async fn create_cp_tuf(
     let (data_links, disks) =
         crate::topo::schema_from_checkout(&schema_root)
             .context("derive sled schema from the pinned omicron sources")?;
-    run(
-        Command::new("zfs")
-            .arg("set")
-            .arg(format!(
-                "{}={}",
-                crate::topo::PROP_DATA_LINKS,
-                data_links.as_str()
-            ))
-            .arg(format!("{}={}", crate::topo::PROP_DISKS, disks.as_str()))
-            .arg(format!(
-                "{}={}",
-                crate::topo::PROP_TUF_VERSION,
-                t.system_version
-            ))
-            .arg(format!("{}={}", crate::topo::PROP_TUF_FW, fw_dir))
-            .arg(format!("{dataset}/img/{image_name}")),
-        "zfs set schema + tuf version + firmware on the image",
+    zfs::set(
+        &zfs::Dataset::new(format!("{dataset}/img/{image_name}"))?,
+        &[
+            (crate::topo::PROP_DATA_LINKS, data_links.as_str()),
+            (crate::topo::PROP_DISKS, disks.as_str()),
+            (crate::topo::PROP_TUF_VERSION, &t.system_version),
+            (crate::topo::PROP_TUF_FW, fw_dir.as_str()),
+        ],
     )?;
 
     println!("built image {image_name}");

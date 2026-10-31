@@ -111,6 +111,16 @@ pub(crate) fn snapshot(ds: &Dataset, name: &str) -> Result<()> {
     zfs(&["snapshot", ds.snapshot(name).as_str()])
 }
 
+/// `zfs set k=v ...` on a dataset.
+pub(crate) fn set(ds: &Dataset, props: &[(&str, &str)]) -> Result<()> {
+    let mut args = vec!["set"];
+    let kv: Vec<String> =
+        props.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    args.extend(kv.iter().map(String::as_str));
+    args.push(ds.as_str());
+    zfs(&args)
+}
+
 /// Stream a snapshot into a new dataset with a full send. The result carries
 /// no dependency on the base it was cloned from.
 pub(crate) fn send_recv(from: &Snapshot, to: &Dataset) -> Result<()> {
