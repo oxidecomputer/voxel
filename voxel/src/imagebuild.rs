@@ -10,6 +10,7 @@
 //! under `image-build/` in the anchored workdir, never in voxel's source tree.
 
 use crate::isolated_external;
+use crate::zfs::{self, Dataset};
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use libfalcon::{Runner, unit::gb};
@@ -480,130 +481,23 @@ fn capture(dataset: &str, image_name: &str) -> Result<()> {
     let image = Dataset::new(format!("{dataset}/img/{image_name}"))?;
     // Not `voxel-`-prefixed, so `image ls` never offers a half-streamed image.
     let staging = Dataset::new(format!("{dataset}/img/incoming-{image_name}"))?;
-    let replacing = exists(&image);
+    let replacing = zfs::exists(&image);
 
     if replacing {
         eprintln!("[voxel] overwriting voxel image {image_name}");
     }
     // Left behind by a capture that died mid-stream.
-    destroy_recursive_if_present(staging.as_str())?;
+    zfs::destroy_dataset_if_present(&staging)?;
     // Snapshot of the builder's own disk, which is torn down next.
-    destroy_recursive_if_present(&node.snapshot("base"))?;
+    zfs::destroy_snapshot_if_present(&node.snapshot("base"))?;
 
     eprintln!("[voxel] building temp image {}", staging.as_str());
-    snapshot(&node, "base")?;
-    send_recv(&node.snapshot("base"), &staging)?;
+    zfs::snapshot(&node, "base")?;
+    zfs::send_recv(&node.snapshot("base"), &staging)?;
 
     if replacing {
         eprintln!("[voxel] build complete, overwriting image {image_name}");
-        destroy_recursive_if_present(image.as_str())?;
+        zfs::destroy_dataset_if_present(&image)?;
     }
-    rename(&staging, &image)
-}
-
-fn exists(ds: &Dataset) -> bool {
-    zfs_exists(ds.as_str())
-}
-
-fn rename(from: &Dataset, to: &Dataset) -> Result<()> {
-    let status = Command::new("pfexec")
-        .args(["zfs", "rename", from.as_str(), to.as_str()])
-        .status()
-        .with_context(|| {
-            format!("run zfs rename {} {}", from.as_str(), to.as_str())
-        })?;
-    if !status.success() {
-        bail!("zfs rename {} -> {} failed", from.as_str(), to.as_str());
-    }
-    Ok(())
-}
-
-/// A zfs dataset voxel may operate on, validated on construction. These names
-/// feed `pfexec zfs destroy -r`; a truncated one would widen to the parent.
-struct Dataset(String);
-
-impl Dataset {
-    fn new(path: String) -> Result<Self> {
-        let components: Vec<&str> = path.split('/').collect();
-        if components.len() < 3
-            || components.iter().any(|c| c.is_empty())
-            || path.contains(|c: char| c.is_whitespace())
-            || path.contains('@')
-        {
-            bail!(
-                "refusing to operate on zfs dataset {path:?}: expected a \
-                 <pool>/<...>/<name> path with no empty components"
-            );
-        }
-        Ok(Self(path))
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    fn snapshot(&self, name: &str) -> String {
-        format!("{}@{name}", self.0)
-    }
-}
-
-/// `zfs destroy -r`, skipped when the target is absent. Absence is checked up
-/// front because zfs words it differently for datasets and snapshots.
-fn destroy_recursive_if_present(target: &str) -> Result<()> {
-    if !zfs_exists(target) {
-        return Ok(());
-    }
-    let out = Command::new("pfexec")
-        .args(["zfs", "destroy", "-r", target])
-        .output()
-        .with_context(|| format!("run zfs destroy -r {target}"))?;
-    if !out.status.success() {
-        bail!(
-            "zfs destroy -r {target} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Whether a dataset or snapshot is present.
-fn zfs_exists(name: &str) -> bool {
-    Command::new("zfs")
-        .args(["list", "-H", "-o", "name", name])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn snapshot(ds: &Dataset, name: &str) -> Result<()> {
-    let snap = ds.snapshot(name);
-    let status = Command::new("pfexec")
-        .args(["zfs", "snapshot", &snap])
-        .status()
-        .with_context(|| format!("run zfs snapshot {snap}"))?;
-    if !status.success() {
-        bail!("zfs snapshot {snap} failed");
-    }
-    Ok(())
-}
-
-/// Stream a snapshot into a new dataset with a full send. The result carries
-/// no dependency on the base it was cloned from.
-fn send_recv(from_snapshot: &str, to: &Dataset) -> Result<()> {
-    let send = Command::new("pfexec")
-        .args(["zfs", "send", from_snapshot])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .context("spawn zfs send")?;
-    let recv = Command::new("pfexec")
-        .args(["zfs", "recv", to.as_str()])
-        .stdin(send.stdout.ok_or_else(|| anyhow::anyhow!("zfs send stdout"))?)
-        .status()
-        .context("run zfs recv")?;
-    if !recv.success() {
-        bail!("zfs send {from_snapshot} | zfs recv {} failed", to.as_str());
-    }
-    Ok(())
+    zfs::rename(&staging, &image)
 }

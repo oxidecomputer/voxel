@@ -44,6 +44,7 @@ mod sp_host;
 mod topo;
 mod tufrepo;
 mod util;
+mod zfs;
 
 #[derive(Parser)]
 #[command(

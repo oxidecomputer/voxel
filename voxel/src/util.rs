@@ -17,3 +17,13 @@ pub(crate) fn shell_quote(s: &str) -> String {
 pub(crate) fn temp_dir() -> Utf8PathBuf {
     Utf8PathBuf::try_from(std::env::temp_dir()).expect("TMPDIR is not UTF-8")
 }
+
+/// Ask `<prompt> [y/N]` on stderr and read one line from stdin.
+pub(crate) fn confirm(prompt: &str) -> bool {
+    use std::io::Write as _;
+    eprint!("{prompt} [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
+    matches!(line.trim(), "y" | "Y" | "yes")
+}
