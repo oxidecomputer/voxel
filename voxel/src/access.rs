@@ -76,7 +76,7 @@ pub(crate) async fn cmd_serial(
 
 /// Hand the terminal to `ssh root@<ip>` (optionally running a remote command),
 /// replacing this process - the pilot/captain access pattern.
-fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
+pub(crate) fn ssh_exec(ip: &str, remote: Option<&str>) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut c = std::process::Command::new("ssh");
     c.args(crate::net::EPHEMERAL_HOST_OPTS);

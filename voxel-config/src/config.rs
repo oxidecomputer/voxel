@@ -67,6 +67,33 @@ pub struct VoxelConfig {
     /// doesn't grow a section the operator never set.
     #[serde(default, skip_serializing_if = "External::is_default")]
     pub external: External,
+    /// Omitted from serialized output while untouched, like `external`.
+    #[serde(default, skip_serializing_if = "Builder::is_default")]
+    pub builder: Builder,
+}
+
+/// `voxel builder`, the persistent omicron build host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Builder {
+    /// Full builder image name. None -> `voxel-builder-<image.version>`.
+    pub image: Option<String>,
+    pub memory_gb: u64,
+    pub cores: u8,
+    /// The builder disk's volsize. The omicron target dir lives on it.
+    pub disk_gb: u64,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self { image: None, memory_gb: 32, cores: 8, disk_gb: 80 }
+    }
+}
+
+impl Builder {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Provisioning mode for the nodes' external (host-LAN) links.
@@ -216,8 +243,7 @@ pub struct Falcon {
     /// is set (`Runner::set_propolis_binary`), the equivalent of a4x2's
     /// `FALCON_PROPOLIS_BINARY`.
     ///
-    /// Applies to rack nodes only. The image-build VM keeps falcon's own
-    /// binary.
+    /// Applies to rack nodes and the image-build VM alike.
     pub propolis_binary: Option<String>,
 }
 
@@ -246,6 +272,14 @@ impl VoxelConfig {
     /// Render this config as voxel.toml (what config show prints / seeds).
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).expect("VoxelConfig serializes")
+    }
+
+    /// The builder image a `voxel builder up` boots from.
+    pub fn builder_image(&self) -> String {
+        self.builder
+            .image
+            .clone()
+            .unwrap_or_else(|| format!("voxel-builder-{}", self.image.version))
     }
 
     /// The computed sled set.

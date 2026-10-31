@@ -250,6 +250,46 @@ pub(crate) fn ensure_askpass() -> Option<camino::Utf8PathBuf> {
     Some(askpass)
 }
 
+/// Run `ssh root@<ip> <remote>` with inherited stdio, for long commands the
+/// operator should watch. Fails on a nonzero remote exit.
+pub(crate) fn ssh_run(ip: &str, remote: &str) -> anyhow::Result<()> {
+    let askpass =
+        ensure_askpass().context("write the empty-password askpass helper")?;
+    let status = std::process::Command::new("ssh")
+        .env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .stdin(std::process::Stdio::null())
+        .args(EPHEMERAL_HOST_OPTS)
+        .args(PASSWORD_AUTH_OPTS)
+        .args(["-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"])
+        .arg(format!("root@{ip}"))
+        .arg(remote)
+        .status()
+        .context("run ssh")?;
+    if !status.success() {
+        anyhow::bail!("remote command on {ip} failed ({status})");
+    }
+    Ok(())
+}
+
+/// An `rsync` reaching root@<ip> over the same ssh options as [`ssh_run`].
+/// The caller adds the flags, sources and destination.
+pub(crate) fn rsync_over_ssh() -> anyhow::Result<std::process::Command> {
+    let askpass =
+        ensure_askpass().context("write the empty-password askpass helper")?;
+    let ssh = format!(
+        "ssh {} {}",
+        EPHEMERAL_HOST_OPTS.join(" "),
+        PASSWORD_AUTH_OPTS.join(" ")
+    );
+    let mut c = std::process::Command::new("rsync");
+    c.env("SSH_ASKPASS", &askpass)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .arg("-e")
+        .arg(ssh);
+    Ok(c)
+}
+
 pub(crate) fn ssh_capture(ip: &str, remote: &str) -> Option<String> {
     let out = ssh_exec(ip, remote)?;
     out.status

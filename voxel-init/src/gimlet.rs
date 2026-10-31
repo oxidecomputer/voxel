@@ -29,7 +29,7 @@ const PATCHED_CFG: &str = "/tmp/sled-config.toml";
 const TUF_MARKER: &str = "/opt/oxide/.voxel-tuf";
 
 pub fn bring_up() -> Result<()> {
-    setup_ssh();
+    crate::sys::setup_ssh();
     crash_dump();
     maybe_load_sidecar();
 
@@ -392,41 +392,6 @@ fn activate_native() {
     }
     run_quiet("svcadm", &["enable", "svc:/oxide/sled-agent:default"]);
     note("sled-agent activated");
-}
-
-/// SSH convenience for `voxel host login` (was the sourced `setup_ssh`
-/// function). illumos sshd defaults differ from debian's, hence the explicit
-/// config edits.
-fn setup_ssh() {
-    let authorized = format!("{CARGO_BAY}/root_authorized_keys");
-    if Utf8Path::new(&authorized).exists() {
-        let _ = fs::create_dir_all("/root/.ssh");
-        if let Ok(keys) = fs::read(&authorized) {
-            use std::io::Write;
-            match fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/root/.ssh/authorized_keys")
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&keys) {
-                        warn(format!("authorized_keys: {e}"));
-                    }
-                }
-                Err(e) => warn(format!("authorized_keys: {e}")),
-            }
-        }
-    }
-    run("ssh-keygen", &["-A"]);
-    replace_in_file(
-        "/etc/ssh/sshd_config",
-        &[
-            ("#PasswordAuthentication no", "PasswordAuthentication yes"),
-            ("#PermitEmptyPasswords no", "PermitEmptyPasswords yes"),
-            ("PermitRootLogin without-password", "PermitRootLogin yes"),
-        ],
-    );
-    run("svcadm", &["restart", "svc:/network/ssh:default"]);
 }
 
 fn crash_dump() {

@@ -11,6 +11,7 @@
 //! orchestration of OS commands, so the same source builds for both targets;
 //! only the role selected at runtime differs.
 
+mod builder;
 mod gimlet;
 mod install;
 mod router;
@@ -34,6 +35,8 @@ enum Cmd {
     Gimlet,
     /// Bring up a customer router/edge from a voxel-frr image (linux / debian).
     Router,
+    /// Bring up the omicron build host from a voxel-builder image (helios).
+    Builder,
     /// Image-BUILD-time install, run inside the builder guest by `image bake`.
     /// Installs baked software only; applies no topology configuration.
     Install {
@@ -68,6 +71,7 @@ fn main() {
     let result = match Cli::parse().cmd {
         Cmd::Gimlet => gimlet::bring_up(),
         Cmd::Router => router::bring_up(),
+        Cmd::Builder => builder::bring_up(),
         Cmd::Install { role } => match role {
             InstallRole::Cp => install::build_control_plane_image(),
             InstallRole::Frr => install::build_frr_image(),

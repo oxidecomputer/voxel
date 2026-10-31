@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The zfs operations voxel performs on image datasets, through pfexec.
+//! The zfs operations voxel performs on image and builder datasets, through
+//! pfexec.
 //! Dataset names are validated before they reach `destroy -r`.
 
 use anyhow::{Context, Result, bail};
@@ -119,6 +120,62 @@ pub(crate) fn set(ds: &Dataset, props: &[(&str, &str)]) -> Result<()> {
     args.extend(kv.iter().map(String::as_str));
     args.push(ds.as_str());
     zfs(&args)
+}
+
+/// `zfs clone -p`: `to` shares blocks with the snapshot until written.
+pub(crate) fn clone(from: &Snapshot, to: &Dataset) -> Result<()> {
+    zfs(&["clone", "-p", from.as_str(), to.as_str()])
+}
+
+/// Make a clone the owner of its origin's history. The origin becomes a
+/// clone of it and can then be destroyed.
+pub(crate) fn promote(ds: &Dataset) -> Result<()> {
+    zfs(&["promote", ds.as_str()])
+}
+
+/// `zfs rollback -r`: snapshots newer than the target are destroyed.
+pub(crate) fn rollback(snap: &Snapshot) -> Result<()> {
+    zfs(&["rollback", "-r", snap.as_str()])
+}
+
+/// The dataset's own snapshots as (name, creation), oldest first.
+pub(crate) fn snapshots(ds: &Dataset) -> Result<Vec<(String, String)>> {
+    let out = Command::new("zfs")
+        .args([
+            "list",
+            "-H",
+            "-d",
+            "1",
+            "-t",
+            "snapshot",
+            "-s",
+            "creation",
+            "-o",
+            "name,creation",
+        ])
+        .arg(ds.as_str())
+        .output()
+        .context("run zfs list -t snapshot")?;
+    if !out.status.success() {
+        bail!("zfs list snapshots of {} failed", ds.as_str());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (name, created) = l.split_once('\t')?;
+            Some((name.to_string(), created.to_string()))
+        })
+        .collect())
+}
+
+/// The snapshot a clone was made from, None for a dataset with no origin.
+pub(crate) fn origin(ds: &Dataset) -> Option<String> {
+    let out = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", "origin", ds.as_str()])
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && v != "-").then_some(v)
 }
 
 /// Stream a snapshot into a new dataset with a full send. The result carries
