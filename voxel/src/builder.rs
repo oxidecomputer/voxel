@@ -433,12 +433,15 @@ impl Builder {
         }
         let root = imagebuild::build_root()?;
         let cargo_bay = imagebuild::fresh_cargo_bay("vbuild")?;
-        // voxel-config renders the smf configs on the host, from the sled
-        // schema sources. Both round-trip through a checkout-shaped stub.
+        // voxel-config renders the smf configs on the host from the sled
+        // schema sources, and the bake tail reads the firmware pins. Both
+        // come through a checkout-shaped stub.
         let stub = imagebuild::fresh_dir(root.join("schema-stub"))?;
-        for (rel, file) in
-            [("sled-agent/src", "config.rs"), ("sled-hardware/src", "lib.rs")]
-        {
+        for (rel, file) in [
+            ("sled-agent/src", "config.rs"),
+            ("sled-hardware/src", "lib.rs"),
+            ("tools", "permslip_staging"),
+        ] {
             pull(&ip, &[&format!("{rel}/{file}")], &stub.join(rel), &[])?;
         }
         crate::image::render_smf(&stub, cpbuild::num_gimlets())?;
@@ -458,8 +461,9 @@ impl Builder {
             image_name: &image_name,
             dataset: &self.dataset,
             external: Some(&self.cfg.external),
-            schema_root: &stub,
+            checkout: &stub,
             stamp: &stamp,
+            propolis_binary: self.cfg.falcon.propolis_binary.as_deref(),
         })
         .await?;
         let mut state = self.read_state();

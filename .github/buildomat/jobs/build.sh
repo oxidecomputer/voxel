@@ -13,6 +13,8 @@
 #:   "/out/voxel-init-linux.sha256.txt",
 #:   "/out/sp-emu",
 #:   "/out/sp-emu.sha256.txt",
+#:   "/out/voxel.tar.gz",
+#:   "/out/voxel.tar.gz.sha256.txt",
 #: ]
 #:
 #: [[publish]]
@@ -54,6 +56,16 @@
 #: series = "release"
 #: name = "sp-emu.sha256.txt"
 #: from_output = "/out/sp-emu.sha256.txt"
+#:
+#: [[publish]]
+#: series = "release"
+#: name = "voxel.tar.gz"
+#: from_output = "/out/voxel.tar.gz"
+#:
+#: [[publish]]
+#: series = "release"
+#: name = "voxel.tar.gz.sha256.txt"
+#: from_output = "/out/voxel.tar.gz.sha256.txt"
 
 set -o errexit
 set -o pipefail
@@ -95,3 +107,11 @@ banner "digests"
 for b in voxel voxel-init voxel-init-linux; do
 	digest -a sha256 "/out/$b" > "/out/$b.sha256.txt"
 done
+
+# One archive with the four files a lab host needs. A fresh install is a
+# download, a digest check, and an extract. The individual files stay
+# published because voxel fetches a pinned sp-emu by name from this layout.
+banner "bundle"
+chmod 755 /out/voxel /out/voxel-init /out/voxel-init-linux /out/sp-emu
+(cd /out && tar czf voxel.tar.gz voxel voxel-init voxel-init-linux sp-emu)
+digest -a sha256 /out/voxel.tar.gz > /out/voxel.tar.gz.sha256.txt
