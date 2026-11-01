@@ -40,23 +40,13 @@ fn install_cp_omicron() -> Result<()> {
         ("XTASK_BIN", xtask.as_str()),
         ("XTASK_DOWNLOADER_BIN", xtask_dl.as_str()),
     ];
-    let mut attempt = 0;
-    while !crate::sys::run_env(
+    run_retrying(
         "./tools/install_runner_prerequisites.sh",
         &["-y"],
         &envs,
-    ) {
-        attempt += 1;
-        if attempt >= 5 {
-            bail!(
-                "install_runner_prerequisites failed after {attempt} attempts"
-            );
-        }
-        note(format!(
-            "prerequisites attempt {attempt} failed; retrying in 20s"
-        ));
-        std::thread::sleep(std::time::Duration::from_secs(20));
-    }
+        5,
+        20,
+    )?;
 
     note("unpacking control-plane zone artifacts into /opt/oxide ...");
     if !crate::sys::run_env("./omicron-package", &["--force", "unpack"], &envs)
@@ -124,23 +114,13 @@ fn install_cp_tuf() -> Result<()> {
     // The script's one xtask use is `download softnpu`, which only matters in
     // softnpu zone mode; voxel runs propolis mode. Satisfy the hook with true.
     let envs = [("XTASK_BIN", "/usr/bin/true")];
-    let mut attempt = 0;
-    while !crate::sys::run_env(
+    run_retrying(
         "/tmp/tools/install_runner_prerequisites.sh",
         &["-y"],
         &envs,
-    ) {
-        attempt += 1;
-        if attempt >= 5 {
-            bail!(
-                "install_runner_prerequisites failed after {attempt} attempts"
-            );
-        }
-        note(format!(
-            "prerequisites attempt {attempt} failed; retrying in 20s"
-        ));
-        std::thread::sleep(std::time::Duration::from_secs(20));
-    }
+        5,
+        20,
+    )?;
 
     note("staging TUF control-plane zones into /opt/oxide ...");
     let zones = format!("{CARGO_BAY}/zones");
@@ -311,21 +291,9 @@ fn sleep2() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 }
 
-/// Helios control-plane image: install pinned deps, unpack the control-plane
-/// zone artifacts, bake what launch needs. Applies NO topology configuration -
-/// config-rss injection, sprockets keys, SMBIOS identity and RSS all happen at
-/// launch.
-///
-/// Deliberately NOT baked, kept ephemeral or per-launch: `xtask
-/// virtual-hardware create` (per-node emulated U.2/M.2), `scadm propolis
-/// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet. Flashing
-/// hubris images is a runtime concern, so `voxel launch --emu` stages the fleet
-/// on the host per launch from the image's firmware (or `--sp-firmware`).
-pub fn build_control_plane_image() -> Result<()> {
-    let version =
-        std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
-
-    // --- networking: reach pkg.oxide.computer ---
+/// Address the external NIC and wait for DNS. Static in isolated mode, DHCP
+/// on a LAN.
+fn bring_up_network() -> Result<()> {
     // The builder has a single external NIC; find a vioif and address it.
     let ext_if = std::env::var("EXT_IF")
         .ok()
@@ -370,17 +338,58 @@ pub fn build_control_plane_image() -> Result<()> {
             }
         }
     }
+    wait_for_dns("pkg.oxide.computer");
+
+    Ok(())
+}
+
+/// Run a command, retrying `attempts` times `delay_secs` apart. The
+/// prerequisites scripts fail transiently on the pkg lock and on fetches.
+fn run_retrying(
+    cmd: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    attempts: u32,
+    delay_secs: u64,
+) -> Result<()> {
+    let mut attempt = 0;
+    while !crate::sys::run_env(cmd, args, envs) {
+        attempt += 1;
+        if attempt >= attempts {
+            bail!("{cmd} failed after {attempt} attempts");
+        }
+        note(format!(
+            "{cmd} attempt {attempt} failed; retrying in {delay_secs}s"
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+    }
+    Ok(())
+}
+
+/// Poll until `host` resolves, up to 30s. Resolution lags the lease.
+fn wait_for_dns(host: &str) {
     note("waiting for DNS...");
     for _ in 0..15 {
-        if run_quiet("getent", &["hosts", "pkg.oxide.computer"]) {
-            break;
+        if run_quiet("getent", &["hosts", host]) {
+            return;
         }
         sleep2();
     }
+}
 
-    // --- pinned package deps (baked) ---
+/// pkg install, retried past the lock pkg holds after boot. Exit 4 means the
+/// packages were already current.
+fn pkg_install(pkgs: &[&str]) -> Result<()> {
     let mut attempt = 0;
-    while !run("pkg", &["install", "tofino", "looker", "htop", "jq"]) {
+    loop {
+        let status = std::process::Command::new("pkg")
+            .arg("install")
+            .args(pkgs)
+            .status()
+            .map_err(|e| anyhow::anyhow!("run pkg install: {e}"))?;
+        if matches!(status.code(), Some(0) | Some(4)) {
+            return Ok(());
+        }
         attempt += 1;
         if attempt >= 25 {
             bail!("pkg install failed after {attempt} attempts");
@@ -388,6 +397,22 @@ pub fn build_control_plane_image() -> Result<()> {
         note(format!("pkg install attempt {attempt} failed; retrying"));
         sleep2();
     }
+}
+
+/// Helios control-plane image: install pinned deps, unpack the control-plane
+/// zone artifacts, bake what launch needs. Topology configuration (config-rss,
+/// sprockets keys, SMBIOS identity, RSS) is applied at launch, not here.
+///
+/// Per-launch, never baked: the emulated U.2/M.2 disks (xtask
+/// virtual-hardware), the sidecar P4 program (scadm propolis load-program),
+/// the rpool/dump zvol, and the emulated SP/RoT fleet, which `voxel launch
+/// --emu` stages on the host from the image's firmware or `--sp-firmware`.
+pub fn build_control_plane_image() -> Result<()> {
+    let version =
+        std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
+
+    bring_up_network()?;
+    pkg_install(&["tofino", "looker", "htop", "jq"])?;
 
     // TUF images stage prebuilt zones + GZ software; source builds stage the
     // whole omicron dir and unpack through omicron-package.
@@ -458,6 +483,115 @@ pub fn build_control_plane_image() -> Result<()> {
     ))
 }
 
+/// Omicron checkout, cargo home and rustup home, one tree on the instance's
+/// own disk.
+const WORK: &str = "/work";
+const OMICRON_REPO: &str = "https://github.com/oxidecomputer/omicron";
+
+/// Helios builder image: git, rustup, omicron's builder prerequisites and the
+/// staged omicron rev checked out under /work. No compile: the target dir
+/// belongs to the builder instance. No baked agent: voxel-init is staged per
+/// run to match the driving voxel binary.
+pub fn build_builder_image() -> Result<()> {
+    let version = std::env::var("VOXEL_BUILDER_VERSION")
+        .unwrap_or_else(|_| "unknown".into());
+    let rev_file = format!("{CARGO_BAY}/omicron-rev");
+    let rev = fs::read_to_string(&rev_file)
+        .map_err(|e| anyhow::anyhow!("read {rev_file}: {e}"))?
+        .trim()
+        .to_string();
+    if rev.is_empty() {
+        bail!("{rev_file} is empty");
+    }
+
+    bring_up_network()?;
+    pkg_install(&["git"])?;
+
+    fs::create_dir_all(WORK)
+        .map_err(|e| anyhow::anyhow!("mkdir {WORK}: {e}"))?;
+    // Toolchains and the cargo registry live under /work. PATH carries the
+    // out/ dirs the prerequisites script fills and then checks.
+    let omicron = format!("{WORK}/omicron");
+    let path = format!(
+        "{omicron}/out/cockroachdb/bin:{omicron}/out/clickhouse:\
+         {omicron}/out/dendrite-stub/bin:/work/cargo/bin:/opt/ooce/bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let envs = [
+        ("RUSTUP_HOME", "/work/rustup"),
+        ("CARGO_HOME", "/work/cargo"),
+        ("PATH", path.as_str()),
+    ];
+    fs::write(
+        format!("{WORK}/env.sh"),
+        "export RUSTUP_HOME=/work/rustup CARGO_HOME=/work/cargo\n\
+         export PATH=/work/omicron/out/cockroachdb/bin:/work/omicron/out/clickhouse:\
+         /work/omicron/out/dendrite-stub/bin:/work/cargo/bin:/opt/ooce/bin:$PATH\n",
+    )
+    .map_err(|e| anyhow::anyhow!("write {WORK}/env.sh: {e}"))?;
+    let profile = "/root/.profile";
+    let mut text = fs::read_to_string(profile).unwrap_or_default();
+    if !text.contains("/work/env.sh") {
+        text.push_str(". /work/env.sh\n");
+        fs::write(profile, text)
+            .map_err(|e| anyhow::anyhow!("write {profile}: {e}"))?;
+    }
+
+    note("installing rustup");
+    if !run(
+        "curl",
+        &[
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "-sSfL",
+            "https://sh.rustup.rs",
+            "-o",
+            "/tmp/rustup-init.sh",
+        ],
+    ) {
+        bail!("download the rustup installer");
+    }
+    if !crate::sys::run_env(
+        "sh",
+        &[
+            "/tmp/rustup-init.sh",
+            "-y",
+            "--profile",
+            "minimal",
+            "--no-modify-path",
+        ],
+        &envs,
+    ) {
+        bail!("install rustup");
+    }
+
+    note(format!("cloning omicron {rev} -> {omicron}"));
+    if !run("git", &["clone", OMICRON_REPO, &omicron]) {
+        bail!("clone omicron");
+    }
+    if !run("git", &["-C", &omicron, "checkout", "--quiet", &rev]) {
+        bail!("checkout omicron {rev}");
+    }
+    std::env::set_current_dir(&omicron)
+        .map_err(|e| anyhow::anyhow!("cd {omicron}: {e}"))?;
+
+    run_retrying(
+        "./tools/install_builder_prerequisites.sh",
+        &["-y"],
+        &envs,
+        8,
+        15,
+    )?;
+
+    let rustc = capture("sh", &["-c", ". /work/env.sh && rustc --version"])
+        .unwrap_or_else(|| "?".into());
+    mark_ready(&format!(
+        "voxel-builder version={version} omicron={rev} rustc={}",
+        rustc.trim()
+    ))
+}
+
 /// Debian router image: install + enable FRR, bake the agent, scrub the
 /// builder's DHCP identity. No topology config - `frr.conf` is generated per
 /// topology and pushed at launch.
@@ -495,13 +629,7 @@ pub fn build_frr_image() -> Result<()> {
     fs::remove_file("/etc/resolv.conf").ok();
     fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n")
         .map_err(|e| anyhow::anyhow!("write /etc/resolv.conf: {e}"))?;
-    note("waiting for DNS...");
-    for _ in 0..15 {
-        if run_quiet("getent", &["hosts", "deb.debian.org"]) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
+    wait_for_dns("deb.debian.org");
 
     // apt-daily timers race the apt lock and can wipe FRR state.
     run_quiet(
