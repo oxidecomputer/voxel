@@ -538,7 +538,7 @@ to the discovered IP.
 At default settings, the web console is at:
 
 ----
-http://recovery.sys.rack1.oxide.test
+https://recovery.sys.rack1.oxide.test
 ----
 
 Voxel does not provide TLS certificates by default, so Nexus serves the API and
@@ -570,7 +570,7 @@ host, or both), then authenticate it against your Voxel rack:
 
 [source,sh]
 ----
-oxide auth login --host http://recovery.sys.rack1.oxide.test
+oxide --insecure auth login --host https://recovery.sys.rack1.oxide.test
 ----
 
 This stores a session token for subsequent commands. If you are accessing Nexus
