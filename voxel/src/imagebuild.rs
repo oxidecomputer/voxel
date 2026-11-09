@@ -345,11 +345,16 @@ pub(crate) fn find_voxel_init(agent: &Prebuilt) -> Result<Utf8PathBuf> {
                 .context("non-utf8 voxel-init path");
         }
     }
+    let tried: Vec<String> = agent
+        .candidates
+        .iter()
+        .map(|rel| dir.join(rel).display().to_string())
+        .collect();
     bail!(
-        "no prebuilt voxel-init for the {} next to {}; build it with `{}` \
+        "no prebuilt voxel-init for the {} (looked for {}); build it with `{}` \
          or point ${} at one",
         agent.role,
-        exe.display(),
+        tried.join(", "),
         agent.build,
         agent.env
     )

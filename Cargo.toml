@@ -5,6 +5,7 @@ members = [
     "voxel-config",
     "voxel",
     "voxel-init",
+    "xtask",
 ]
 
 [workspace.dependencies]

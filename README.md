@@ -21,6 +21,38 @@ generation.
 See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference,
 there are a LOT of tuning knobs.
 
+## Installing from CI
+
+Every CI build of a commit publishes `voxel-up.sh` beside its artifacts. On a
+Helios host, from the directory to work in:
+
+```sh
+curl -sSfL https://buildomat.eng.oxide.computer/public/file/oxidecomputer/voxel/release/<sha>/voxel-up.sh | sh
+. .voxel/env
+```
+
+This installs `voxel`, `voxel-init`, `voxel-init-linux` and `sp-emu` in
+`./.voxel/bin` and writes `./.voxel/voxel.toml`. falcon's dataset goes on
+`fpool` if the host has one, else `rpool` (`VOXEL_POOL` overrides). Your
+`~/.config/voxel` is not touched. CI does not publish rack images; build those
+with `voxel image create-frr` and `voxel image create` as below.
+
+### Building the archive yourself
+
+`cargo xtask dist` builds exactly what CI publishes (CI runs this command),
+on a Helios host with rustup:
+
+```sh
+cargo xtask dist                     # writes out/dist/
+out/dist/voxel-up.sh --archive out/dist/voxel.tar.gz
+```
+
+`out/dist/` holds `voxel`, `voxel-init`, `voxel-init-linux` (static musl),
+the pinned `sp-emu`, `voxel.tar.gz` bundling all four, a `.sha256.txt` for
+each, and `voxel-up.sh`. `--archive` installs a local tarball instead of
+fetching one and checks it against `<archive>.sha256.txt` when that exists.
+Copy the tarball, its digest and the script to another host to install there.
+
 ## Building
 
 ```sh
