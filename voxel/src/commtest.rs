@@ -120,7 +120,12 @@ pub(crate) fn run(
     let rack_net = cfg.network.for_rack(rack - 1);
     let mut api = match api_override {
         Some(url) => Api { url: url.to_string(), resolve: None, ca: None },
-        None => derive_api(&rack_net, &cfg.recovery_silo.silo_name, rack - 1)?,
+        None => derive_api(
+            &rack_net,
+            &cfg.recovery_silo.silo_name,
+            rack - 1,
+            config_path,
+        )?,
     };
     api.url.truncate(api.url.trim_end_matches('/').len());
 
@@ -471,126 +476,66 @@ fn apply_helios_build_env(cmd: &mut Command) {
     }
 }
 
-/// Pick the rack API: its base URL, and for a TLS rack the name mapping and
-/// CA a client needs.
+/// The rack API, derived from the configuration alone: its base URL, the
+/// address its name resolves to, and the CA that issued its certificate.
 ///
-/// With the rack's CA (saved by a commission-driven launch, the default) the
-/// API is HTTPS on 443 only, reached by the silo's DNS name: Nexus picks its
-/// certificate from the TLS SNI name and refuses a handshake without one,
-/// which is every handshake to a bare IP. The name is looked up in the rack's
-/// own external DNS, so the host's resolver never has to know the zone.
+/// A launch sets the rack up through wicketd's commission API, which serves
+/// the API over TLS on 443 only, under a certificate from the per-rack CA the
+/// launch saves (`.falcon/rack<N>-ca.pem` in the workdir). Nexus picks its
+/// certificate from the TLS SNI name and refuses a handshake without one, so
+/// the API is reached by the silo's name, `<silo>.sys.<rack zone>`. That name
+/// is looked up in the rack's own external DNS, so the host's resolver never
+/// has to know the zone.
 ///
-/// Without the CA (an `--init-rss` rack), Nexus serves plain HTTP. Its
-/// external addresses come from the service pool, so probe the candidates
-/// for a live listener.
+/// Nothing is probed or guessed. A rack launched with `--init-rss` (plain
+/// HTTP, no CA) is not described by the configuration, so it takes `--api`.
 ///
 /// # Errors
 ///
-/// With the CA, when the rack's DNS does not answer for the silo name.
-/// Without it, when no candidate answers on 80: either a TLS rack launched
-/// before voxel kept its CA, or a rack that is down or unrouted. Each is
-/// named, rather than guessing a URL and leaving commtest to wait it out.
+/// When the rack's CA is missing, or its DNS has no address for the silo.
 fn derive_api(
     network: &Network,
     silo: &str,
     rack: usize,
+    config_path: &Utf8Path,
 ) -> anyhow::Result<Api> {
     let ca = crate::commission::rack_ca_path(rack);
-    if ca.is_file() {
-        let host = format!("{silo}.sys.{}", network.dns_zone);
-        let dns = network
-            .external_dns_ips
-            .first()
-            .context("no external DNS address for this rack")?;
-        let ip = crate::net::dig_a(dns, &host)
-            .context("`dig` is needed to look the rack API up in its DNS")?
-            .into_iter()
-            .next()
-            .with_context(|| {
-                format!(
-                    "the rack's DNS ({dns}) has no address for {host} yet; \
-                     is the rack up? (`voxel status`)"
-                )
-            })?;
-        // Absolute, for a child whose working directory may differ.
-        let ca = std::env::current_dir()
-            .ok()
-            .and_then(|d| Utf8PathBuf::try_from(d).ok())
-            .map(|d| d.join(&ca))
-            .unwrap_or(ca);
-        return Ok(Api {
-            url: format!("https://{host}"),
-            resolve: Some((host, ip)),
-            ca: Some(ca),
-        });
-    }
-    let abs_ca = std::env::current_dir()
+    // Absolute, for messages and for a child whose directory may differ.
+    let ca = std::env::current_dir()
         .ok()
         .and_then(|d| Utf8PathBuf::try_from(d).ok())
         .map(|d| d.join(&ca))
-        .unwrap_or_else(|| ca.clone());
-    eprintln!(
-        "[voxel] no rack CA at {abs_ca}; treating rack{} as a plain-HTTP \
-         (--init-rss) rack and probing the service pool",
-        rack + 1
-    );
-    let candidates = api_candidates(network);
-    let live_on = |port: u16| {
-        candidates.iter().copied().find(|&addr| {
-            std::net::TcpStream::connect_timeout(
-                &(addr, port).into(),
-                std::time::Duration::from_secs(1),
-            )
-            .is_ok()
-        })
-    };
-    if let Some(host) = live_on(80) {
-        eprintln!("[voxel] {host}:80 accepts connections; using http://{host}");
-        return Ok(Api {
-            url: format!("http://{host}"),
-            resolve: None,
-            ca: None,
-        });
-    }
-    let probed = format!(
-        "{} - {}",
-        candidates.first().map(ToString::to_string).unwrap_or_default(),
-        candidates.last().map(ToString::to_string).unwrap_or_default()
-    );
-    if let Some(host) = live_on(443) {
+        .unwrap_or(ca);
+    if !ca.is_file() {
         bail!(
-            "no rack CA at {abs_ca}, and the rack API answers on 443 only \
-             ({host}): this TLS rack was launched by a voxel that did not \
-             save its CA. Relaunch it with this voxel, pass --api, or launch \
-             with --init-rss for a plain-HTTP rack"
+            "rack{n} has no CA at {ca}. A launch saves it there, in the workdir \
+             of the configuration it ran with ({config_path} here). Either \
+             this rack was launched with a different configuration or \
+             workdir, or by a voxel that did not save the CA (relaunch it), \
+             or with --init-rss (plain HTTP: pass --api http://<nexus ip>)",
+            n = rack + 1
         );
     }
-    bail!(
-        "no rack CA at {abs_ca}, and nothing in the service pool ({probed}) \
-         accepts connections on port 80 or 443. Is the rack up and routed? \
-         (`voxel status`, `voxel route`)"
-    )
-}
-
-/// Service-pool addresses in probe order.
-///
-/// Members external DNS has not claimed come first, since Nexus draws its
-/// external address from the same pool and lands on one of those. The DNS
-/// addresses follow as a fallback. The range is capped at 32 addresses so a
-/// misconfigured pool cannot stall the probe.
-fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
-    let Ok(first) = network.service_pool_first.parse::<Ipv4Addr>() else {
-        return Vec::new();
-    };
-    let last = network.service_pool_last.parse::<Ipv4Addr>().unwrap_or(first);
-    let lo = u32::from(first);
-    let hi = u32::from(last).max(lo).min(lo.saturating_add(31));
-    let dns: Vec<&str> =
-        network.external_dns_ips.iter().map(String::as_str).collect();
-    let (rest, dns_members): (Vec<Ipv4Addr>, Vec<Ipv4Addr>) = (lo..=hi)
-        .map(Ipv4Addr::from)
-        .partition(|addr| !dns.contains(&addr.to_string().as_str()));
-    rest.into_iter().chain(dns_members).collect()
+    let host = format!("{silo}.sys.{}", network.dns_zone);
+    let dns = network
+        .external_dns_ips
+        .first()
+        .context("no external DNS address for this rack")?;
+    let ip = crate::net::dig_a(dns, &host)
+        .context("`dig` is needed to look the rack API up in its DNS")?
+        .into_iter()
+        .next()
+        .with_context(|| {
+            format!(
+                "the rack's DNS ({dns}) has no address for {host}; is the \
+                 rack up? (`voxel status`)"
+            )
+        })?;
+    Ok(Api {
+        url: format!("https://{host}"),
+        resolve: Some((host, ip)),
+        ca: Some(ca),
+    })
 }
 
 /// Whether the checkout's commtest has the multicast phases, detected from its
@@ -757,12 +702,6 @@ mod test {
     #[test]
     fn derives_voxel_defaults() {
         let network = Network::default().for_rack(0);
-        // `derive_api` probes the live host, so pin only the candidate order:
-        // non-DNS pool members (.22-.29) ahead of the DNS pair (.20/.21).
-        let candidates = api_candidates(&network);
-        assert_eq!(candidates.len(), 10);
-        assert_eq!(candidates[0], "198.51.100.22".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(candidates[8], "198.51.100.20".parse::<Ipv4Addr>().unwrap());
         assert_eq!(
             derive_pool(&network, 4).unwrap(),
             (

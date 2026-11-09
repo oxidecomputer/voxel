@@ -150,8 +150,14 @@ resolve on the host (voxel prints the `/etc/hosts` line when it does not).
 
 `--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. The
 multicast modes need `--source` with a checkout that supports them; voxel
-detects that from the source and refuses otherwise. `--api URL` overrides the
-derived API endpoint.
+detects that from the source and refuses otherwise.
+
+The API endpoint comes from the configuration alone: `https://<silo>.sys.<rack
+zone>`, resolved through the rack's DNS and trusted through the CA the launch
+saved in `.falcon/rack<N>-ca.pem` under the workdir. Nothing is probed. A rack
+launched with `--init-rss` serves plain HTTP with no CA, which the
+configuration does not record, so pass its endpoint with `--api
+http://<nexus ip>`.
 
 Voxel only injects the arguments commtest has no default for, so everything
 after `--` reaches it unchanged:
