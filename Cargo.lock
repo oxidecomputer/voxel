@@ -759,7 +759,7 @@ dependencies = [
 [[package]]
 name = "commtest"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=7b5097748b6d79aec3759774e590870a8e2f1aee#7b5097748b6d79aec3759774e590870a8e2f1aee"
+source = "git+https://github.com/oxidecomputer/omicron?rev=5ce2b2c132de306765c8aad0df9d1cd0d55d4021#5ce2b2c132de306765c8aad0df9d1cd0d55d4021"
 dependencies = [
  "anyhow",
  "clap",
@@ -3106,7 +3106,7 @@ dependencies = [
 [[package]]
 name = "omicron-uuid-kinds"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=77901ac4bb2d6e1ac6dd7380b3758129b73f69cd#77901ac4bb2d6e1ac6dd7380b3758129b73f69cd"
+source = "git+https://github.com/oxidecomputer/omicron?rev=5ce2b2c132de306765c8aad0df9d1cd0d55d4021#5ce2b2c132de306765c8aad0df9d1cd0d55d4021"
 dependencies = [
  "daft",
  "newtype-uuid",
@@ -3118,7 +3118,7 @@ dependencies = [
 [[package]]
 name = "omicron-uuid-kinds"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=7b5097748b6d79aec3759774e590870a8e2f1aee#7b5097748b6d79aec3759774e590870a8e2f1aee"
+source = "git+https://github.com/oxidecomputer/omicron?rev=77901ac4bb2d6e1ac6dd7380b3758129b73f69cd#77901ac4bb2d6e1ac6dd7380b3758129b73f69cd"
 dependencies = [
  "daft",
  "newtype-uuid",
@@ -3181,7 +3181,7 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 [[package]]
 name = "oxide-client"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/omicron?rev=7b5097748b6d79aec3759774e590870a8e2f1aee#7b5097748b6d79aec3759774e590870a8e2f1aee"
+source = "git+https://github.com/oxidecomputer/omicron?rev=5ce2b2c132de306765c8aad0df9d1cd0d55d4021#5ce2b2c132de306765c8aad0df9d1cd0d55d4021"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3190,7 +3190,7 @@ dependencies = [
  "hickory-resolver",
  "http",
  "hyper",
- "omicron-uuid-kinds 0.1.0 (git+https://github.com/oxidecomputer/omicron?rev=7b5097748b6d79aec3759774e590870a8e2f1aee)",
+ "omicron-uuid-kinds 0.1.0 (git+https://github.com/oxidecomputer/omicron?rev=5ce2b2c132de306765c8aad0df9d1cd0d55d4021)",
  "omicron-workspace-hack",
  "progenitor",
  "progenitor-client",

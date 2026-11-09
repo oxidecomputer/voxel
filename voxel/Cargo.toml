@@ -44,7 +44,7 @@ zip = { version = "4.6", default-features = false, features = ["deflate-flate2"]
 # workspace's pinned omicron rev: it is the first rev with commtest split out
 # (oxidecomputer/omicron branch ry/commtest-as-a-library). Repin to the
 # workspace rev once that rev includes it.
-commtest = { git = "https://github.com/oxidecomputer/omicron", rev = "7b5097748b6d79aec3759774e590870a8e2f1aee" }
+commtest = { git = "https://github.com/oxidecomputer/omicron", rev = "5ce2b2c132de306765c8aad0df9d1cd0d55d4021" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Fetch prebuilt binaries (sp-emu, faux-mgs) from buildomat: sha256 verified
 # against the published digest, progress bar while streaming.

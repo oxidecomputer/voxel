@@ -416,19 +416,24 @@ pub(crate) fn print_endpoints(cfg: &voxel_config::VoxelConfig) {
     let racks = cfg.topology.racks();
     let silo = &cfg.recovery_silo;
     let default_login = voxel_config::RecoverySiloCfg::default();
-    println!();
+    // Built whole and written once: line by line, it interleaves with the
+    // logger's own (asynchronous) output.
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out);
     for rack in 0..racks {
         let net = cfg.network.for_rack(rack);
         let dns: Vec<&str> =
             net.external_dns_ips.iter().map(String::as_str).collect();
-        println!("rack{} endpoints", rack + 1);
-        println!(
+        let _ = writeln!(out, "rack{} endpoints", rack + 1);
+        let _ = writeln!(
+            out,
             "  DNS zone     : {}  (network.dns_zone {:?} with the rack{} prefix)",
             net.dns_zone,
             cfg.network.dns_zone,
             rack + 1
         );
-        println!("  external DNS : {}", dns.join(", "));
+        let _ = writeln!(out, "  external DNS : {}", dns.join(", "));
         // Silos are cluster-wide: the recovery silo lives in rack 0's zone.
         if rack > 0 {
             continue;
@@ -442,36 +447,47 @@ pub(crate) fn print_endpoints(cfg: &voxel_config::VoxelConfig) {
                 .and_then(|d| camino::Utf8PathBuf::try_from(d).ok())
                 .map(|d| d.join(&ca))
                 .unwrap_or(ca);
-            println!("  console/API  : https://{host}");
-            println!("  CA           : {abs}");
-            println!(
+            let _ = writeln!(out, "  console/API  : https://{host}");
+            let _ = writeln!(out, "  CA           : {abs}");
+            let _ = writeln!(
+                out,
                 "  note         : TLS by name only (Nexus requires SNI); \
                  /etc/hosts or the rack DNS must resolve {host}"
             );
         } else {
-            println!("  console/API  : http://{host}");
+            let _ = writeln!(out, "  console/API  : http://{host}");
         }
         if let Some(dns_ip) = dns.first() {
             match dig_a(dns_ip, &host) {
                 Some(ips) if !ips.is_empty() => {
-                    println!("  Nexus        : {}", ips.join(", "))
+                    let _ =
+                        writeln!(out, "  Nexus        : {}", ips.join(", "));
                 }
-                Some(_) => println!(
-                    "  Nexus        : {host} does not resolve yet \
-                     (dig {host} @{dns_ip})"
-                ),
+                Some(_) => {
+                    let _ = writeln!(
+                        out,
+                        "  Nexus        : {host} does not resolve yet \
+                         (dig {host} @{dns_ip})"
+                    );
+                }
                 None => {}
             }
         }
         if silo.user_password_hash == default_login.user_password_hash {
-            println!("  login        : {} / oxide", silo.user_name);
+            let _ =
+                writeln!(out, "  login        : {} / oxide", silo.user_name);
         } else {
-            println!(
+            let _ = writeln!(
+                out,
                 "  login        : {} (password set by recovery_silo.user_password_hash)",
                 silo.user_name
             );
         }
     }
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.flush();
 }
 
 /// `dig +short <name> A @<dns_ip>`: the addresses, `Some(vec![])` if the server
