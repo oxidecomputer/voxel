@@ -6097,6 +6097,7 @@ version = "0.9.0"
 dependencies = [
  "anyhow",
  "attest-mock",
+ "base64 0.22.1",
  "blake3",
  "camino",
  "clap",

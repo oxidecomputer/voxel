@@ -49,6 +49,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Fetch prebuilt binaries (sp-emu, faux-mgs) from buildomat: sha256 verified
 # against the published digest, progress bar while streaming.
 sha2 = "0.10"
+# Decodes the in-toto payload of omicron's SP release attestation.
+base64 = "0.22"
 # permslip addresses firmware by blake3 hash; every fetched image is verified.
 blake3 = "1"
 indicatif = "0.18"
