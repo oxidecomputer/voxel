@@ -168,6 +168,16 @@ pub(crate) fn snapshots(ds: &Dataset) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+/// A property's local or inherited value; None when unset (`-`) or unreadable.
+pub(crate) fn get(ds: &Dataset, prop: &str) -> Option<String> {
+    let out = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", prop, ds.as_str()])
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && v != "-" && !v.is_empty()).then_some(v)
+}
+
 /// The snapshot a clone was made from, None for a dataset with no origin.
 pub(crate) fn origin(ds: &Dataset) -> Option<String> {
     let out = Command::new("zfs")

@@ -215,6 +215,11 @@ enum Cmd {
         #[arg(long)]
         allow_root: bool,
 
+        /// Build commtest in the voxel builder VM (`voxel builder up`) and
+        /// run it here. The default when this host has no git or cargo.
+        #[arg(long)]
+        builder: bool,
+
         /// Arguments passed to Omicron commtest (place them after `--`).
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -817,6 +822,7 @@ async fn main() -> Result<(), Error> {
             traffic,
             no_build,
             allow_root,
+            builder,
             args,
         } => commtest::run(
             &load_config(&config_path)?,
@@ -832,6 +838,7 @@ async fn main() -> Result<(), Error> {
                 traffic: *traffic,
                 no_build: *no_build,
                 allow_root: *allow_root,
+                builder: *builder,
                 passthrough: args,
             },
         ),

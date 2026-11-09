@@ -408,6 +408,78 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
     }
 }
 
+/// Print where a rack's external services are. Each rack's DNS zone is
+/// `rack<N>.<network.dns_zone>`, not the bare configured zone, and nothing
+/// else says so. The recovery silo's Nexus addresses are looked up through
+/// the rack's own DNS. A failed lookup is reported, not treated as an error.
+pub(crate) fn print_endpoints(cfg: &voxel_config::VoxelConfig) {
+    let racks = cfg.topology.racks();
+    let silo = &cfg.recovery_silo;
+    let default_login = voxel_config::RecoverySiloCfg::default();
+    println!();
+    for rack in 0..racks {
+        let net = cfg.network.for_rack(rack);
+        let dns: Vec<&str> =
+            net.external_dns_ips.iter().map(String::as_str).collect();
+        println!("rack{} endpoints", rack + 1);
+        println!(
+            "  DNS zone     : {}  (network.dns_zone {:?} with the rack{} prefix)",
+            net.dns_zone,
+            cfg.network.dns_zone,
+            rack + 1
+        );
+        println!("  external DNS : {}", dns.join(", "));
+        // Silos are cluster-wide: the recovery silo lives in rack 0's zone.
+        if rack > 0 {
+            continue;
+        }
+        let host = format!("{}.sys.{}", silo.silo_name, net.dns_zone);
+        println!("  console/API  : http://{host}");
+        if let Some(dns_ip) = dns.first() {
+            match dig_a(dns_ip, &host) {
+                Some(ips) if !ips.is_empty() => {
+                    println!("  Nexus        : {}", ips.join(", "))
+                }
+                Some(_) => println!(
+                    "  Nexus        : {host} does not resolve yet \
+                     (dig {host} @{dns_ip})"
+                ),
+                None => {}
+            }
+        }
+        if silo.user_password_hash == default_login.user_password_hash {
+            println!("  login        : {} / oxide", silo.user_name);
+        } else {
+            println!(
+                "  login        : {} (password set by recovery_silo.user_password_hash)",
+                silo.user_name
+            );
+        }
+    }
+}
+
+/// `dig +short <name> A @<dns_ip>`: the addresses, `Some(vec![])` if the server
+/// gave none, `None` if `dig` isn't installed.
+fn dig_a(dns_ip: &str, name: &str) -> Option<Vec<String>> {
+    let o = std::process::Command::new("dig")
+        .args(["+short", "+timeout=3", "+tries=1"])
+        .arg(format!("@{dns_ip}"))
+        .args([name, "A"])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return Some(Vec::new());
+    }
+    let mut ips: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.parse::<std::net::Ipv4Addr>().is_ok())
+        .map(str::to_string)
+        .collect();
+    ips.sort_by_key(|ip| ip.parse::<std::net::Ipv4Addr>().ok());
+    Some(ips)
+}
+
 /// (Re)point the host route for the rack's external network (`prefix`) at ce's
 /// current external IP. ce's host-facing NIC gets a fresh random MAC - and thus
 /// a fresh DHCP IP - every launch, so any static route goes stale; discovering

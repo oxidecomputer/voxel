@@ -75,6 +75,9 @@ pub(crate) struct Options<'a> {
     pub traffic: Traffic,
     pub no_build: bool,
     pub allow_root: bool,
+    /// Build in the voxel builder VM. Also chosen when the host has no
+    /// git or cargo.
+    pub builder: bool,
     pub passthrough: &'a [String],
 }
 
@@ -89,6 +92,7 @@ pub(crate) fn run(
         traffic,
         no_build,
         allow_root,
+        builder,
         passthrough,
     } = options;
     ensure_unprivileged(allow_root)?;
@@ -105,8 +109,45 @@ pub(crate) fn run(
     }
     ensure_default_recovery_silo(cfg)?;
     let rack_net = cfg.network.for_rack(rack - 1);
-    let source = resolve_source(cfg, source)?;
-    let bin = target_dir(&source).join("debug/commtest");
+    let use_builder = builder || {
+        let missing = missing_host_tools();
+        if !missing.is_empty() {
+            eprintln!(
+                "[voxel] no {} on this host; building commtest in the voxel \
+                 builder (--builder)",
+                missing.join(" or ")
+            );
+        }
+        !missing.is_empty()
+    };
+    // `source` is the tree commtest's arguments are derived from: the
+    // checkout itself on the host, or the files pulled back from the builder.
+    let (source, bin) = if use_builder {
+        build_in_builder(cfg, source, no_build)?
+    } else {
+        let source = resolve_source(cfg, source)?;
+        let bin = target_dir(&source).join("debug/commtest");
+        if !no_build {
+            eprintln!("[voxel] building Omicron commtest from {}", source);
+            let mut cargo = Command::new("cargo");
+            cargo.current_dir(&source).args([
+                "build",
+                "-p",
+                "end-to-end-tests",
+                "--bin",
+                "commtest",
+            ]);
+            apply_helios_build_env(&mut cargo);
+            require_success(cargo.status(), "cargo build commtest")?;
+        } else if !bin.is_file() {
+            bail!(
+                "{} does not exist; omit --no-build or build it with \
+                 `cargo build -p end-to-end-tests --bin commtest`",
+                bin
+            );
+        }
+        (source, bin)
+    };
     let mut api = match api_override {
         Some(api) => api.to_string(),
         None => derive_api(&rack_net)?,
@@ -120,26 +161,6 @@ pub(crate) fn run(
         passthrough,
         supports_multicast(&source)?,
     )?;
-
-    if !no_build {
-        eprintln!("[voxel] building Omicron commtest from {}", source);
-        let mut cargo = Command::new("cargo");
-        cargo.current_dir(&source).args([
-            "build",
-            "-p",
-            "end-to-end-tests",
-            "--bin",
-            "commtest",
-        ]);
-        apply_helios_build_env(&mut cargo);
-        require_success(cargo.status(), "cargo build commtest")?;
-    } else if !bin.is_file() {
-        bail!(
-            "{} does not exist; omit --no-build or build it with \
-             `cargo build -p end-to-end-tests --bin commtest`",
-            bin
-        );
-    }
 
     eprintln!("[voxel] running {} {api} {}", bin, args.join(" "));
     publish_mode(traffic);
@@ -234,17 +255,174 @@ fn resolve_source(
     match source {
         Source::Local(path) => validate_source(path),
         Source::Reference(r) => checkout(r),
-        Source::Image => {
-            let commit = cfg.image.cp_commit().with_context(|| {
-                format!(
-                    "configured image '{}' does not encode an Omicron commit; \
-                     pass one (`voxel commtest <commit> -- ...`) or use --source",
-                    cfg.image.cp_image()
-                )
-            })?;
-            checkout(&commit)
-        }
+        Source::Image => checkout(&image_commit(cfg)?),
     }
+}
+
+/// The Omicron commit the configured control-plane image was built from.
+///
+/// Source-built images (host or builder) carry the full commit as a zfs
+/// property, which is the only record when the name is a label such as
+/// `voxel-cp-proto`. Unstamped images fall back to `voxel-cp-<commit>`.
+fn image_commit(cfg: &VoxelConfig) -> anyhow::Result<String> {
+    let name = cfg.image.cp_image();
+    let ds = crate::zfs::Dataset::new(format!(
+        "{}/img/{name}",
+        crate::image::falcon_dataset()
+    ))?;
+    if let Some(commit) = crate::zfs::get(&ds, crate::topo::PROP_OMICRON_COMMIT)
+    {
+        if crate::zfs::get(&ds, crate::topo::PROP_OMICRON_DIRTY).as_deref()
+            == Some("true")
+        {
+            eprintln!(
+                "[voxel] warning: {name} was built from a tree with \
+                 uncommitted changes; commtest builds {} without them",
+                &commit[..commit.len().min(12)]
+            );
+        }
+        return Ok(commit);
+    }
+    cfg.image.cp_commit().with_context(|| {
+        format!(
+            "configured image '{name}' records no Omicron commit and its name \
+             does not encode one; pass one (`voxel commtest <commit> -- ...`) \
+             or use --source"
+        )
+    })
+}
+
+/// Host tools the host-side build needs, by name, that are not on PATH.
+/// `cargo` is also looked for where `apply_helios_build_env` puts it.
+fn missing_host_tools() -> Vec<&'static str> {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join(".cargo/bin"));
+    }
+    ["git", "cargo"]
+        .into_iter()
+        .filter(|tool| !dirs.iter().any(|d| d.join(tool).is_file()))
+        .collect()
+}
+
+/// Where commtest is built in the builder guest. Each commit gets a
+/// worktree of the builder's own checkout; one target dir is shared, so
+/// moving between commits rebuilds incrementally.
+const GUEST_ROOT: &str = "/work/commtest";
+const GUEST_OMICRON: &str = "/work/omicron";
+
+/// Build commtest in the voxel builder and pull the binary, plus the
+/// commtest source the argument derivation reads, into
+/// `<build_root>/commtest/builder/<commit>`. Returns that directory, shaped
+/// like a checkout for `supports_multicast`, and the binary.
+fn build_in_builder(
+    cfg: &VoxelConfig,
+    source: Source<'_>,
+    no_build: bool,
+) -> anyhow::Result<(Utf8PathBuf, Utf8PathBuf)> {
+    let builder = crate::builder::Builder::new(cfg.clone())?;
+    let ip = builder
+        .address()
+        .context("commtest builds in the voxel builder on this host")?;
+    let q = crate::util::shell_quote;
+
+    // The guest tree to build and the cache key it is pulled back under.
+    let (tree, key) = match source {
+        Source::Local(dir) => {
+            let dir = validate_source(dir)?;
+            let tree = format!("{GUEST_ROOT}/src/local");
+            eprintln!("[voxel] syncing {dir} -> builder:{tree}");
+            crate::net::ssh_run(&ip, &format!("mkdir -p {}", q(&tree)))?;
+            let mut rsync = crate::net::rsync_over_ssh()?;
+            rsync
+                .args(["-a", "--delete", "--exclude", "/target"])
+                .args(["--exclude", "/out"])
+                .arg(format!("{dir}/"))
+                .arg(format!("root@{ip}:{tree}/"));
+            require_success(rsync.status(), "rsync omicron to the builder")?;
+            (tree, "local".to_string())
+        }
+        Source::Reference(r) => guest_worktree(&ip, r)?,
+        Source::Image => guest_worktree(&ip, &image_commit(cfg)?)?,
+    };
+
+    let cache = build_root().join("commtest/builder").join(&key);
+    let bin = cache.join("commtest");
+    let guest_bin = format!("{GUEST_ROOT}/target/debug/commtest");
+    if no_build {
+        if !bin.is_file() {
+            bail!("{bin} does not exist; omit --no-build");
+        }
+        return Ok((cache, bin));
+    }
+
+    eprintln!("[voxel] building Omicron commtest in the builder ({tree})");
+    crate::net::ssh_run(
+        &ip,
+        &format!(
+            "set -e\n. /work/env.sh\ncd {}\n\
+             export CARGO_TARGET_DIR={GUEST_ROOT}/target RUSTFLAGS={}\n\
+             cargo build -p end-to-end-tests --bin commtest\n",
+            q(&tree),
+            q(HELIOS_RUSTFLAGS),
+        ),
+    )
+    .context("build commtest in the builder")?;
+
+    let src_dir = cache.join("end-to-end-tests/src/bin");
+    std::fs::create_dir_all(&src_dir)
+        .with_context(|| format!("mkdir {src_dir}"))?;
+    for (from, to) in [
+        (guest_bin, cache.clone()),
+        (format!("{tree}/end-to-end-tests/src/bin/commtest.rs"), src_dir),
+    ] {
+        let mut rsync = crate::net::rsync_over_ssh()?;
+        rsync.arg("-t").arg(format!("root@{ip}:{from}")).arg(format!("{to}/"));
+        require_success(rsync.status(), "rsync commtest from the builder")?;
+    }
+    Ok((cache, bin))
+}
+
+/// Resolve `reference` against the builder's fetched checkout and make sure
+/// a detached worktree of it exists. Branch names are taken from origin, so
+/// `main` means upstream main, not the checkout's local branch. Returns the
+/// worktree and the full commit.
+fn guest_worktree(
+    ip: &str,
+    reference: &str,
+) -> anyhow::Result<(String, String)> {
+    let q = crate::util::shell_quote;
+    let script = format!(
+        "set -e\n\
+         ref={ref}\n\
+         cd {GUEST_OMICRON}\n\
+         git fetch -q origin --tags >&2 || echo 'warning: git fetch failed' >&2\n\
+         sha=$(git rev-parse -q --verify \"origin/$ref^{{commit}}\" || \
+               git rev-parse -q --verify \"$ref^{{commit}}\") || {{\n\
+           echo \"omicron ref $ref not found in the builder\" >&2; exit 1; }}\n\
+         wt={GUEST_ROOT}/src/$sha\n\
+         if [ ! -d \"$wt\" ]; then\n\
+           mkdir -p {GUEST_ROOT}/src\n\
+           git worktree prune\n\
+           git worktree add -q --detach \"$wt\" \"$sha\" >&2\n\
+         fi\n\
+         echo \"$sha\"\n",
+        ref = q(reference),
+    );
+    let out = crate::net::ssh_output(ip, &script)
+        .context("reach the builder over ssh")?;
+    // ssh_output appends stderr to stdout. The script's only stdout line is
+    // the commit, and git's own output went to stderr.
+    let Some(sha) = out
+        .lines()
+        .map(str::trim)
+        .find(|l| l.len() == 40 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        bail!("resolve omicron {reference} in the builder: {}", out.trim());
+    };
+    Ok((format!("{GUEST_ROOT}/src/{sha}"), sha.to_string()))
 }
 
 fn validate_source(path: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {

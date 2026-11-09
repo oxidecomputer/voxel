@@ -573,8 +573,9 @@ configuration.
 
 With the route in place, the rack's external services are reachable by IP.
 The rack runs its own external DNS servers (at the `external_dns_ips`
-addresses in the service pool), which are authoritative for the configured
-DNS zone (`oxide.test` is the default). To resolve rack hostnames from your
+addresses in the service pool), which are authoritative for the rack's zone:
+`rack<N>.` prefixed to `network.dns_zone`, so `rack1.oxide.test` by default.
+A query for the bare `oxide.test` gets SERVFAIL. To resolve rack hostnames from your
 workstation, either forward that zone to the rack's DNS servers in your
 resolver configuration, or add entries to `/etc/hosts`. For example, if the
 DNS query above returned `198.51.100.23`:
@@ -585,9 +586,11 @@ DNS query above returned `198.51.100.23`:
 ----
 
 Use the address returned by the DNS query, which may differ from this example.
-`voxel status` reattaches to RSS progress; it does not report the Nexus
-address. Without DNS or `/etc/hosts` configuration, you can navigate directly
-to the discovered IP.
+`voxel launch` and `voxel status` finish by printing the rack's endpoints:
+the DNS zone, the external DNS servers, the console URL, the Nexus addresses
+the silo name resolves to, and the recovery login. Without DNS or
+`/etc/hosts` configuration, you can navigate directly to one of those Nexus
+addresses.
 
 At default settings, the web console is at:
 

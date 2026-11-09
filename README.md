@@ -148,6 +148,14 @@ voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
 voxel commtest d41a8c3a2aa5768255ad00545e53d3077b1b56ce -- cleanup
 ```
 
+On a host with no toolchain (no `git` or `cargo`, such as one installed with
+`voxel-up.sh`), or with `--builder`, voxel builds commtest in the voxel builder
+VM instead (`voxel builder up` first) and runs it on the host. Each commit gets
+a worktree of the builder's checkout under `/work/commtest`, sharing one target
+dir; `--source` is rsynced into the builder first. The image's commit comes from
+its build stamp, so an image named by label (`voxel-cp-proto`) resolves to the
+commit it was built from.
+
 `--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. Voxel
 detects whether the selected commit supports multicast and refuses the
 multicast modes on older, unicast-only versions. `--api URL` overrides the
