@@ -4,6 +4,10 @@
 
 //! Exposes the omicron sha voxel's git dependencies resolve to, and fails the
 //! build if the omicron deps pin different revs. Empty for path dependencies.
+//!
+//! The one exception is the `commtest` dependency in voxel/Cargo.toml, pinned
+//! on its own until the workspace rev includes it. Its rev (and the omicron
+//! crates it pulls in at that rev) is left out of the check.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -14,10 +18,17 @@ fn main() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let lock = manifest_dir.join("../Cargo.lock");
+    let manifest = manifest_dir.join("Cargo.toml");
     println!("cargo:rerun-if-changed={}", lock.display());
+    println!("cargo:rerun-if-changed={}", manifest.display());
     let text = fs::read_to_string(&lock)
         .unwrap_or_else(|e| panic!("read {}: {e}", lock.display()));
-    let revs = omicron_git_shas(&text);
+    let mut revs = omicron_git_shas(&text);
+    let manifest_text = fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+    if let Some(rev) = commtest_rev(&manifest_text) {
+        revs.remove(&rev);
+    }
     if revs.len() > 1 {
         panic!(
             "omicron git dependencies resolve to different revs: {revs:?}; \
@@ -28,6 +39,14 @@ fn main() {
     // an empty rev as "no pin known" and skips its mismatch warning.
     let rev = revs.into_iter().next().unwrap_or_default();
     println!("cargo:rustc-env=RACK_INIT_CONFIG_OMICRON_REV={rev}");
+}
+
+/// The `rev` of the `commtest = { git = ..., rev = ... }` line, if any.
+fn commtest_rev(manifest: &str) -> Option<String> {
+    let line =
+        manifest.lines().find(|l| l.trim_start().starts_with("commtest ="))?;
+    let rest = line.split("rev = \"").nth(1)?;
+    Some(rest.split('"').next()?.to_string())
 }
 
 /// Distinct git shas of omicron-sourced packages in a Cargo.lock.

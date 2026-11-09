@@ -179,18 +179,9 @@ enum Cmd {
     /// supplied, defaults to `run`; voxel supplies the rack API and a test IP
     /// pool unless those are explicitly overridden.
     Commtest {
-        /// Omicron commit/tag to test, or `main` for the latest upstream.
-        /// Omit to use the commit encoded in the configured control-plane image.
-        #[arg(value_name = "COMMIT")]
-        reference: Option<String>,
-
-        /// Use an existing Omicron checkout without fetching or changing it.
-        #[arg(
-            long,
-            value_name = "PATH",
-            conflicts_with = "reference",
-            value_parser = abs_path
-        )]
+        /// Build and run this Omicron checkout's commtest as-is instead of
+        /// the built-in one (for versions it lacks, such as multicast).
+        #[arg(long, value_name = "PATH", value_parser = abs_path)]
         source: Option<Utf8PathBuf>,
 
         /// Rack to target (1-based).
@@ -215,12 +206,22 @@ enum Cmd {
         #[arg(long)]
         allow_root: bool,
 
-        /// Build commtest in the voxel builder VM (`voxel builder up`) and
-        /// run it here. The default when this host has no git or cargo.
-        #[arg(long)]
-        builder: bool,
-
         /// Arguments passed to Omicron commtest (place them after `--`).
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// (internal) Omicron's commtest library, run by `voxel commtest` as a
+    /// child so its output can be mirrored. Arguments after `--` are
+    /// commtest's own.
+    #[command(hide = true)]
+    CommtestExec {
+        /// Resolve HOST to IP in commtest's HTTP clients instead of asking the
+        /// system resolver. The URL's port is kept.
+        #[arg(long, value_name = "HOST=IP")]
+        resolve: Option<String>,
+        /// PEM CA certificate commtest's HTTP clients trust for the API.
+        #[arg(long, value_name = "FILE")]
+        cacert: Option<Utf8PathBuf>,
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -815,33 +816,29 @@ async fn main() -> Result<(), Error> {
             rack::cmd_status(&load_config(&config_path)?, &cli.name).await
         }
         Cmd::Commtest {
-            reference,
             source,
             rack,
             api,
             traffic,
             no_build,
             allow_root,
-            builder,
             args,
         } => commtest::run(
             &load_config(&config_path)?,
             commtest::Options {
-                // clap rejects <COMMIT> together with --source (conflicts_with).
-                source: match (source.as_deref(), reference.as_deref()) {
-                    (Some(path), _) => commtest::Source::Local(path),
-                    (None, Some(r)) => commtest::Source::Reference(r),
-                    (None, None) => commtest::Source::Image,
-                },
+                config_path: &config_path,
+                source: source.as_deref(),
                 rack: *rack,
                 api_override: api.as_deref(),
                 traffic: *traffic,
                 no_build: *no_build,
                 allow_root: *allow_root,
-                builder: *builder,
                 passthrough: args,
             },
         ),
+        Cmd::CommtestExec { resolve, cacert, args } => {
+            commtest::exec(resolve.as_deref(), cacert.as_deref(), args).await
+        }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
             ImageCmd::Create { commit, src, from_tuf, sled_agent } => {

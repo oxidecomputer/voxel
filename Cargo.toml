@@ -11,7 +11,8 @@ members = [
 [workspace.dependencies]
 anyhow = "1.0.102"
 # The omicron commit voxel is pinned to. Bumping this rev is the new-omicron
-# motion; build.rs surfaces it to voxel image create. Keep all revs identical.
+# motion; build.rs surfaces it to voxel image create. Keep all revs identical
+# (except voxel's `commtest`, see voxel/Cargo.toml).
 rack-init-config = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
 wicketd-commission-types-versions = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }
 wicketd-commission-client = { git = "https://github.com/oxidecomputer/omicron", rev = "77901ac4bb2d6e1ac6dd7380b3758129b73f69cd" }

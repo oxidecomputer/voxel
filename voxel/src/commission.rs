@@ -7,6 +7,7 @@
 //! generated progenitor client over an ssh tunnel to its in-zone loopback.
 
 use anyhow::{Context, Result, anyhow, bail};
+use camino::{Utf8Path, Utf8PathBuf};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -291,7 +292,7 @@ pub(crate) async fn drive(
     }
 
     let net = cfg.network.for_rack(rack);
-    let (cert, key) = gen_cert(&net.dns_zone)?;
+    let (cert, key) = gen_cert(&net.dns_zone, &rack_ca_path(rack))?;
     client
         .post_rss_config_cert(&types::CertificatePem(cert))
         .await
@@ -504,31 +505,128 @@ fn free_local_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// Generate a self-signed TLS cert + key (PEM) for the recovery silo under
-/// `zone` via openssl; wicketd requires a pair before it runs RSS and
-/// validates it against the silo hostname (`*.sys.<zone>`).
-pub(crate) fn gen_cert(zone: &str) -> Result<(String, String)> {
-    let dir = crate::util::temp_dir();
-    let key = dir.join("voxel-commission-key.pem");
-    let cert = dir.join("voxel-commission-cert.pem");
+/// Where a launched rack's CA certificate is kept, relative to the anchored
+/// workdir. It lives in `.falcon/`, so teardown removes it with the rack.
+/// Clients such as commtest trust the rack's API through it.
+pub(crate) fn rack_ca_path(rack: usize) -> Utf8PathBuf {
+    Utf8PathBuf::from(format!(".falcon/rack{}-ca.pem", rack + 1))
+}
+
+/// Issue the rack's TLS cert + key (PEM) from a throwaway per-rack CA, whose
+/// certificate is written to `ca_out`. wicketd requires a pair before it runs
+/// RSS and validates it against the silo hostname (`*.sys.<zone>`).
+///
+/// A CA rather than a self-signed leaf, because rustls rejects a CA
+/// certificate presented as the server's own. No IP SANs: Nexus selects its
+/// certificate by SNI and refuses handshakes without one, so it is only ever
+/// reached by name.
+pub(crate) fn gen_cert(
+    zone: &str,
+    ca_out: &Utf8Path,
+) -> Result<(String, String)> {
+    let dir = crate::util::temp_dir()
+        .join(format!("voxel-commission-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {dir}"))?;
+    let path = |name: &str| dir.join(name);
+    let openssl = |args: &[&str], what: &str| -> Result<()> {
+        let out = Command::new("openssl")
+            .args(args)
+            .output()
+            .with_context(|| format!("run openssl to {what}"))?;
+        if !out.status.success() {
+            bail!(
+                "openssl {what} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+
     let san = format!("DNS:*.sys.{zone},DNS:*.{zone},DNS:{zone}");
-    let status = std::process::Command::new("openssl")
-        .args([
-            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+    std::fs::write(
+        path("leaf.ext"),
+        format!(
+            "basicConstraints = critical, CA:FALSE\n\
+             keyUsage = critical, digitalSignature, keyEncipherment\n\
+             extendedKeyUsage = serverAuth\n\
+             subjectAltName = {san}\n"
+        ),
+    )
+    .context("write the leaf extensions")?;
+
+    let (ca_key, ca_pem) = (path("ca.key"), path("ca.pem"));
+    let (key, csr, cert) =
+        (path("key.pem"), path("leaf.csr"), path("cert.pem"));
+    openssl(
+        &[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "3650",
             "-sha256",
-        ])
-        .arg("-keyout")
-        .arg(&key)
-        .arg("-out")
-        .arg(&cert)
-        .args(["-subj", &format!("/CN=*.sys.{zone}")])
-        .args(["-addext", &format!("subjectAltName={san}")])
-        .status()
-        .context("run openssl to generate the RSS cert")?;
-    if !status.success() {
-        bail!("openssl cert generation failed");
+            "-subj",
+            &format!("/CN=voxel {zone} CA"),
+            "-keyout",
+            ca_key.as_str(),
+            "-out",
+            ca_pem.as_str(),
+        ],
+        "generate the rack CA",
+    )?;
+    openssl(
+        &[
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            &format!("/CN=*.sys.{zone}"),
+            "-keyout",
+            key.as_str(),
+            "-out",
+            csr.as_str(),
+        ],
+        "generate the rack key",
+    )?;
+    openssl(
+        &[
+            "x509",
+            "-req",
+            "-in",
+            csr.as_str(),
+            "-CA",
+            ca_pem.as_str(),
+            "-CAkey",
+            ca_key.as_str(),
+            "-set_serial",
+            "1",
+            // The most Apple's verifier accepts for a server certificate,
+            // even under a private CA. A lab rack never lives that long.
+            "-days",
+            "397",
+            "-sha256",
+            "-extfile",
+            path("leaf.ext").as_str(),
+            "-out",
+            cert.as_str(),
+        ],
+        "sign the rack certificate",
+    )?;
+
+    if let Some(parent) = ca_out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir {parent}"))?;
     }
-    Ok((std::fs::read_to_string(&cert)?, std::fs::read_to_string(&key)?))
+    std::fs::copy(&ca_pem, ca_out)
+        .with_context(|| format!("save the rack CA to {ca_out}"))?;
+    let pair =
+        (std::fs::read_to_string(&cert)?, std::fs::read_to_string(&key)?);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(pair)
 }
 
 /// Hidden `voxel commission-dryrun`: print the typed rack-setup config body

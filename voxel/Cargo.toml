@@ -40,6 +40,11 @@ flate2 = "1"
 # members stored or deflated; flate2's default backend (pulled in above)
 # serves the deflate path.
 zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
+# Omicron's rack connectivity test, as a library. Deliberately NOT the
+# workspace's pinned omicron rev: it is the first rev with commtest split out
+# (oxidecomputer/omicron branch ry/commtest-as-a-library). Repin to the
+# workspace rev once that rev includes it.
+commtest = { git = "https://github.com/oxidecomputer/omicron", rev = "7b5097748b6d79aec3759774e590870a8e2f1aee" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Fetch prebuilt binaries (sp-emu, faux-mgs) from buildomat: sha256 verified
 # against the published digest, progress bar while streaming.

@@ -434,7 +434,23 @@ pub(crate) fn print_endpoints(cfg: &voxel_config::VoxelConfig) {
             continue;
         }
         let host = format!("{}.sys.{}", silo.silo_name, net.dns_zone);
-        println!("  console/API  : http://{host}");
+        // A commission-driven launch serves TLS only, from the rack's CA.
+        let ca = crate::commission::rack_ca_path(rack);
+        if ca.is_file() {
+            let abs = std::env::current_dir()
+                .ok()
+                .and_then(|d| camino::Utf8PathBuf::try_from(d).ok())
+                .map(|d| d.join(&ca))
+                .unwrap_or(ca);
+            println!("  console/API  : https://{host}");
+            println!("  CA           : {abs}");
+            println!(
+                "  note         : TLS by name only (Nexus requires SNI); \
+                 /etc/hosts or the rack DNS must resolve {host}"
+            );
+        } else {
+            println!("  console/API  : http://{host}");
+        }
         if let Some(dns_ip) = dns.first() {
             match dig_a(dns_ip, &host) {
                 Some(ips) if !ips.is_empty() => {
@@ -460,7 +476,7 @@ pub(crate) fn print_endpoints(cfg: &voxel_config::VoxelConfig) {
 
 /// `dig +short <name> A @<dns_ip>`: the addresses, `Some(vec![])` if the server
 /// gave none, `None` if `dig` isn't installed.
-fn dig_a(dns_ip: &str, name: &str) -> Option<Vec<String>> {
+pub(crate) fn dig_a(dns_ip: &str, name: &str) -> Option<Vec<String>> {
     let o = std::process::Command::new("dig")
         .args(["+short", "+timeout=3", "+tries=1"])
         .arg(format!("@{dns_ip}"))

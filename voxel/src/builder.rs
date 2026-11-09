@@ -385,11 +385,6 @@ impl Builder {
         Ok(())
     }
 
-    /// The running builder's address, for callers that drive it over ssh.
-    pub(crate) fn address(&self) -> Result<String> {
-        self.require_up()
-    }
-
     pub(crate) fn login(&self) -> Result<()> {
         let ip = self.require_up()?;
         eprintln!("[voxel] ssh root@{ip} (builder)");
