@@ -487,9 +487,9 @@ fn apply_helios_build_env(cmd: &mut Command) {
 /// # Errors
 ///
 /// With the CA, when the rack's DNS does not answer for the silo name.
-/// Without it, when a candidate answers on 443 but none on 80: a TLS rack
-/// launched before voxel kept its CA. Falls back to the first candidate when
-/// nothing answers at all (commtest itself waits for the API to come up).
+/// Without it, when no candidate answers on 80: either a TLS rack launched
+/// before voxel kept its CA, or a rack that is down or unrouted. Each is
+/// named, rather than guessing a URL and leaving commtest to wait it out.
 fn derive_api(
     network: &Network,
     silo: &str,
@@ -524,6 +524,16 @@ fn derive_api(
             ca: Some(ca),
         });
     }
+    let abs_ca = std::env::current_dir()
+        .ok()
+        .and_then(|d| Utf8PathBuf::try_from(d).ok())
+        .map(|d| d.join(&ca))
+        .unwrap_or_else(|| ca.clone());
+    eprintln!(
+        "[voxel] no rack CA at {abs_ca}; treating rack{} as a plain-HTTP \
+         (--init-rss) rack and probing the service pool",
+        rack + 1
+    );
     let candidates = api_candidates(network);
     let live_on = |port: u16| {
         candidates.iter().copied().find(|&addr| {
@@ -534,26 +544,32 @@ fn derive_api(
             .is_ok()
         })
     };
-    let http = |host: String| Api {
-        url: format!("http://{host}"),
-        resolve: None,
-        ca: None,
-    };
     if let Some(host) = live_on(80) {
-        return Ok(http(host.to_string()));
+        eprintln!("[voxel] {host}:80 accepts connections; using http://{host}");
+        return Ok(Api {
+            url: format!("http://{host}"),
+            resolve: None,
+            ca: None,
+        });
     }
+    let probed = format!(
+        "{} - {}",
+        candidates.first().map(ToString::to_string).unwrap_or_default(),
+        candidates.last().map(ToString::to_string).unwrap_or_default()
+    );
     if let Some(host) = live_on(443) {
         bail!(
-            "the rack API at {host} answers on 443 only, and this rack has no \
-             saved CA ({ca}) for commtest to trust its certificate; relaunch \
-             with this voxel, pass --api with an endpoint commtest can \
-             reach, or launch with --init-rss for a plain-HTTP rack"
+            "no rack CA at {abs_ca}, and the rack API answers on 443 only \
+             ({host}): this TLS rack was launched by a voxel that did not \
+             save its CA. Relaunch it with this voxel, pass --api, or launch \
+             with --init-rss for a plain-HTTP rack"
         );
     }
-    Ok(http(match candidates.first() {
-        Some(host) => host.to_string(),
-        None => network.service_pool_first.clone(),
-    }))
+    bail!(
+        "no rack CA at {abs_ca}, and nothing in the service pool ({probed}) \
+         accepts connections on port 80 or 443. Is the rack up and routed? \
+         (`voxel status`, `voxel route`)"
+    )
 }
 
 /// Service-pool addresses in probe order.
