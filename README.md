@@ -112,10 +112,10 @@ Voxel commands need different privileges:
 - `voxel network external ...` runs unprivileged. Voxel escalates each
   mutating host command through `pfexec` itself, and `--dry-run` prints those
   as `+ pfexec ...` lines.
-- `voxel commtest` runs as your login user, with the `net_icmpaccess`
-  privilege described below. It refuses effective uid 0 so a root run cannot
-  leave root-owned reports (or `--source` build output). `--allow-root`
-  overrides that where a per-user grant is impractical.
+- `voxel commtest` needs raw ICMP sockets: run it as root, or as a user with
+  the `net_icmpaccess` privilege described below. With `--source` it refuses
+  to *build* the checkout as root, since root-owned build output would break
+  your next build there; build it as yourself and pass `--no-build`.
 
 ## omicron commtest
 

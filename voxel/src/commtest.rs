@@ -74,7 +74,6 @@ pub(crate) struct Options<'a> {
     pub api_override: Option<&'a str>,
     pub traffic: Traffic,
     pub no_build: bool,
-    pub allow_root: bool,
     pub passthrough: &'a [String],
 }
 
@@ -99,10 +98,8 @@ pub(crate) fn run(
         api_override,
         traffic,
         no_build,
-        allow_root,
         passthrough,
     } = options;
-    ensure_unprivileged(allow_root)?;
     if passthrough.is_empty()
         || passthrough.iter().any(|arg| arg == RUN_SUBCOMMAND)
     {
@@ -172,6 +169,7 @@ pub(crate) fn run(
     let source = validate_source(source)?;
     let bin = target_dir(&source).join("debug/commtest");
     if !no_build {
+        refuse_root_build(&source)?;
         eprintln!("[voxel] building Omicron commtest from {}", source);
         let mut cargo = Command::new("cargo");
         cargo.current_dir(&source).args([
@@ -357,20 +355,17 @@ fn validate_source(path: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
     Ok(path)
 }
 
-fn ensure_unprivileged(allow_root: bool) -> anyhow::Result<()> {
+/// A root `cargo build` in a checkout leaves root-owned build output that
+/// breaks the owner's next build there, so build it as its owner instead.
+/// Running commtest as root is fine; only the build is refused.
+fn refuse_root_build(source: &Utf8Path) -> anyhow::Result<()> {
     // SAFETY: geteuid(2) has no preconditions and does not dereference memory.
     if unsafe { libc::geteuid() } == 0 {
-        if allow_root {
-            eprintln!(
-                "[voxel] warning: running as root; the files commtest writes \
-                 (its report, and a --source build) will be root-owned and may \
-                 break later unprivileged runs"
-            );
-            return Ok(());
-        }
         bail!(
-            "`voxel commtest` must not run with effective uid 0; run it as your \
-             login user with the net_icmpaccess privilege, or pass --allow-root"
+            "refusing to build {source} as root: the build output would be \
+             root-owned and break your next build there. Build it as yourself \
+             (`cargo build -p end-to-end-tests --bin commtest` in {source}), \
+             then rerun with --no-build"
         );
     }
     Ok(())
@@ -400,7 +395,7 @@ fn ensure_icmp_privilege() -> anyhow::Result<()> {
         bail!(
             "`voxel commtest` needs net_icmpaccess in the effective privilege \
              set. Grant it to this user and start a new login session, verifying \
-             with `ppriv $$`, or run under `pfexec` with --allow-root."
+             with `ppriv $$`, or run it under `pfexec`."
         );
     }
     Ok(())

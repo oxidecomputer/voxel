@@ -200,12 +200,6 @@ enum Cmd {
         #[arg(long)]
         no_build: bool,
 
-        /// Permit running with effective uid 0. Build artifacts and reports
-        /// under the build root become root-owned, which later unprivileged
-        /// runs may trip over.
-        #[arg(long)]
-        allow_root: bool,
-
         /// Arguments passed to Omicron commtest (place them after `--`).
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -815,27 +809,20 @@ async fn main() -> Result<(), Error> {
         Cmd::Status => {
             rack::cmd_status(&load_config(&config_path)?, &cli.name).await
         }
-        Cmd::Commtest {
-            source,
-            rack,
-            api,
-            traffic,
-            no_build,
-            allow_root,
-            args,
-        } => commtest::run(
-            &load_config(&config_path)?,
-            commtest::Options {
-                config_path: &config_path,
-                source: source.as_deref(),
-                rack: *rack,
-                api_override: api.as_deref(),
-                traffic: *traffic,
-                no_build: *no_build,
-                allow_root: *allow_root,
-                passthrough: args,
-            },
-        ),
+        Cmd::Commtest { source, rack, api, traffic, no_build, args } => {
+            commtest::run(
+                &load_config(&config_path)?,
+                commtest::Options {
+                    config_path: &config_path,
+                    source: source.as_deref(),
+                    rack: *rack,
+                    api_override: api.as_deref(),
+                    traffic: *traffic,
+                    no_build: *no_build,
+                    passthrough: args,
+                },
+            )
+        }
         Cmd::CommtestExec { resolve, cacert, args } => {
             commtest::exec(resolve.as_deref(), cacert.as_deref(), args).await
         }
