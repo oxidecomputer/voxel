@@ -120,12 +120,7 @@ pub(crate) fn run(
     let rack_net = cfg.network.for_rack(rack - 1);
     let mut api = match api_override {
         Some(url) => Api { url: url.to_string(), resolve: None, ca: None },
-        None => derive_api(
-            &rack_net,
-            &cfg.recovery_silo.silo_name,
-            rack - 1,
-            config_path,
-        )?,
+        None => derive_api(&rack_net, &cfg.recovery_silo.silo_name, rack - 1)?,
     };
     api.url.truncate(api.url.trim_end_matches('/').len());
 
@@ -497,7 +492,6 @@ fn derive_api(
     network: &Network,
     silo: &str,
     rack: usize,
-    config_path: &Utf8Path,
 ) -> anyhow::Result<Api> {
     let ca = crate::commission::rack_ca_path(rack);
     // Absolute, for messages and for a child whose directory may differ.
@@ -508,10 +502,8 @@ fn derive_api(
         .unwrap_or(ca);
     if !ca.is_file() {
         bail!(
-            "rack{n} has no CA at {ca}. A launch saves it there, in the workdir \
-             of the configuration it ran with ({config_path} here). Either \
-             this rack was launched with a different configuration or \
-             workdir, or by a voxel that did not save the CA (relaunch it), \
+            "rack{n} has no CA at {ca}, where a launch saves it. The rack \
+             was launched by a voxel that did not save its CA (relaunch it), \
              or with --init-rss (plain HTTP: pass --api http://<nexus ip>)",
             n = rack + 1
         );

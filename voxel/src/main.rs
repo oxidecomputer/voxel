@@ -744,18 +744,34 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
 /// `chdir` to the project root. `cargo-bay/`, `.falcon/` and `image-build/`
 /// are CWD-relative and must resolve from any invocation directory.
 /// Root: `--workdir`/`$VOXEL_WORKDIR` > `[falcon].workdir` > the discovered
-/// `voxel.toml`'s directory. No-op if the chosen root isn't a directory.
+/// `voxel.toml`'s directory.
+///
+/// An explicit workdir (flag, env or config) that is not a directory is an
+/// error. Falling back to the invocation directory would scatter a rack's
+/// state wherever voxel happened to be run. Only the implicit config-dir
+/// default is skipped when absent.
 fn anchor_workdir(
     cli: &Cli,
     cfg: Option<&VoxelConfig>,
     config_path: &Utf8Path,
 ) -> anyhow::Result<()> {
-    let root = cli
-        .workdir
-        .clone()
-        .or_else(|| {
-            cfg.and_then(|c| c.falcon.workdir.clone()).map(Utf8PathBuf::from)
-        })
+    let explicit =
+        cli.workdir.clone().map(|p| (p, "--workdir/$VOXEL_WORKDIR")).or_else(
+            || {
+                cfg.and_then(|c| c.falcon.workdir.clone())
+                    .map(|p| (Utf8PathBuf::from(p), "falcon.workdir"))
+            },
+        );
+    if let Some((root, source)) = &explicit
+        && !root.is_dir()
+    {
+        bail!(
+            "workdir {root} (from {source}) does not exist; create it \
+             (`mkdir -p {root}`) or point {source} at an existing directory"
+        );
+    }
+    let root = explicit
+        .map(|(p, _)| p)
         .or_else(|| config_path.parent().map(Utf8Path::to_path_buf));
     if let Some(root) = root
         && root.is_dir()
@@ -779,7 +795,12 @@ async fn main() -> Result<(), Error> {
         Err(_) => None,
     };
     resolve_falcon_env(&cli, cfg.as_ref());
-    anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
+    // `voxel config` stays usable with a bad workdir, so it can be fixed.
+    if let Err(e) = anchor_workdir(&cli, cfg.as_ref(), &config_path)
+        && !matches!(cli.cmd, Cmd::Config { .. })
+    {
+        return Err(e);
+    }
     match &cli.cmd {
         Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
             let opts = rack::LaunchOpts {
