@@ -83,6 +83,21 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         bail!("cargo-bay {} not found", o.cargo_bay);
     }
 
+    // Replacing an image destroys it at the end, which zfs refuses while
+    // clones of it exist (a builder disk, or a rack's nodes). Find out now,
+    // not after the whole build.
+    let image = Dataset::new(format!("{}/img/{}", o.dataset, o.image_name))?;
+    let clones = zfs::dependent_clones(&image)?;
+    if !clones.is_empty() {
+        bail!(
+            "cannot replace {}: it has dependent clones ({}). Remove them \
+             first (`voxel builder down --destroy` for a builder disk, \
+             `voxel destroy` for a rack), or build under a new name",
+            image.as_str(),
+            clones.join(", ")
+        );
+    }
+
     stage_builder_net(o.cargo_bay, o.network.static_address.as_deref())?;
 
     // The builder must not share a falcon workspace with a running rack:

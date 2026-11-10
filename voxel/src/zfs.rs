@@ -168,6 +168,33 @@ pub(crate) fn snapshots(ds: &Dataset) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+/// Clones of `ds`'s snapshots, which block destroying it. Empty when `ds` does
+/// not exist.
+pub(crate) fn dependent_clones(ds: &Dataset) -> Result<Vec<String>> {
+    if !exists(ds) {
+        return Ok(Vec::new());
+    }
+    let out = Command::new("zfs")
+        .args(["get", "-H", "-r", "-t", "snapshot", "-o", "value", "clones"])
+        .arg(ds.as_str())
+        .output()
+        .with_context(|| format!("zfs get clones {}", ds.as_str()))?;
+    if !out.status.success() {
+        bail!(
+            "zfs get clones {}: {}",
+            ds.as_str(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .flat_map(|l| l.split(','))
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && *c != "-")
+        .map(str::to_string)
+        .collect())
+}
+
 /// The snapshot a clone was made from, None for a dataset with no origin.
 pub(crate) fn origin(ds: &Dataset) -> Option<String> {
     let out = Command::new("zfs")
