@@ -23,9 +23,11 @@ use std::time::Duration;
 const NODE: &str = "vbuild";
 /// The builder's falcon deployment name.
 const DEPLOY: &str = "voxel_build";
+/// Falcon base image for the illumos images (builder and voxel-cp).
+pub(crate) const HELIOS_BASE: &str = "helios-3.1";
 
 pub(crate) struct BakeOpts<'a> {
-    /// Base image to boot: `helios-3.0` or `debian-13.2`.
+    /// Base image to boot: [`HELIOS_BASE`] or `debian-13.2`.
     pub base_image: &'a str,
     /// Agent install role (`cp` / `frr`).
     pub role: &'a str,
@@ -83,6 +85,21 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         bail!("cargo-bay {} not found", o.cargo_bay);
     }
 
+    // Replacing an image destroys it at the end, which zfs refuses while
+    // clones of it exist (a builder disk, or a rack's nodes). Find out now,
+    // not after the whole build.
+    let image = Dataset::new(format!("{}/img/{}", o.dataset, o.image_name))?;
+    let clones = zfs::dependent_clones(&image)?;
+    if !clones.is_empty() {
+        bail!(
+            "cannot replace {}: it has dependent clones ({}). Remove them \
+             first (`voxel builder down --destroy` for a builder disk, \
+             `voxel destroy` for a rack), or build under a new name",
+            image.as_str(),
+            clones.join(", ")
+        );
+    }
+
     stage_builder_net(o.cargo_bay, o.network.static_address.as_deref())?;
 
     // The builder must not share a falcon workspace with a running rack:
@@ -90,6 +107,9 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     let workspace = build_root()?;
     std::env::set_current_dir(&workspace)
         .with_context(|| format!("cd {workspace}"))?;
+    if clear_stale_builder(o.dataset, &workspace)? {
+        eprintln!("[voxel] leftover builder cleared");
+    }
 
     let mut d = Runner::new(DEPLOY);
     if let Some(bin) = o.propolis_binary {
@@ -245,7 +265,7 @@ pub(crate) async fn create_builder(
         .with_context(|| format!("stage omicron-rev into {cargo_bay}"))?;
 
     bake(BakeOpts {
-        base_image: "helios-3.0",
+        base_image: HELIOS_BASE,
         role: "builder",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
@@ -345,11 +365,16 @@ pub(crate) fn find_voxel_init(agent: &Prebuilt) -> Result<Utf8PathBuf> {
                 .context("non-utf8 voxel-init path");
         }
     }
+    let tried: Vec<String> = agent
+        .candidates
+        .iter()
+        .map(|rel| dir.join(rel).display().to_string())
+        .collect();
     bail!(
-        "no prebuilt voxel-init for the {} next to {}; build it with `{}` \
+        "no prebuilt voxel-init for the {} (looked for {}); build it with `{}` \
          or point ${} at one",
         agent.role,
-        exe.display(),
+        tried.join(", "),
         agent.build,
         agent.env
     )
@@ -389,6 +414,89 @@ pub(crate) fn stage_builder_net(
         }
     }
     Ok(())
+}
+
+/// `voxel image clean`: tear down a leftover image-build VM.
+pub(crate) fn clean(dataset: &str) -> Result<()> {
+    let workspace = build_root()?;
+    std::env::set_current_dir(&workspace)
+        .with_context(|| format!("cd {workspace}"))?;
+    if !clear_stale_builder(dataset, &workspace)? {
+        eprintln!("[voxel] no leftover image-build VM");
+    }
+    Ok(())
+}
+
+/// A bake killed before its teardown (SIGHUP from a dropped ssh session, say)
+/// leaves its propolis running and its disk at `topo/voxel_build`. The next
+/// bake would then talk to, or boot from, the old builder's half-done state,
+/// so clear all of it first.
+fn clear_stale_builder(dataset: &str, workspace: &Utf8Path) -> Result<bool> {
+    let topo = Dataset::new(format!("{dataset}/topo/{DEPLOY}"))?;
+    let vnic = format!("{DEPLOY}_{NODE}_vn_vnic0");
+    let orphans = workspace_propolis(workspace);
+    let have_vnic = Command::new("dladm")
+        .args(["show-vnic", &vnic])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let have_pidfile = read_pidfile(falcon_dir(), NODE).is_some();
+    if orphans.is_empty() && !have_vnic && !have_pidfile && !zfs::exists(&topo)
+    {
+        return Ok(false);
+    }
+
+    eprintln!("[voxel] clearing a leftover builder from an interrupted run");
+    hyperstop(falcon_dir(), NODE);
+    for pid in &orphans {
+        eprintln!("[voxel] killing orphaned builder propolis (pid {pid})");
+        let _ = Command::new("pfexec").args(["kill", "-9", pid]).status();
+    }
+    // The zvol stays busy until the killed propolis is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !workspace_propolis(workspace).is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if have_vnic {
+        let _ = Command::new("pfexec")
+            .args(["dladm", "delete-vnic", &vnic])
+            .status();
+    }
+    zfs::destroy_dataset_if_present(&topo).with_context(|| {
+        format!(
+            "destroy the leftover builder disk {}; if it is busy, a \
+             propolis-server from the interrupted run may still be up \
+             (`pgrep -fl propolis-server`)",
+            topo.as_str()
+        )
+    })?;
+    Ok(true)
+}
+
+/// propolis-server processes running in the builder workspace. falcon starts
+/// them with that as their cwd, and a rack's nodes run from another workdir,
+/// so this finds the builder's even when its pidfile is gone.
+fn workspace_propolis(workspace: &Utf8Path) -> Vec<String> {
+    let want = std::fs::canonicalize(workspace).ok();
+    let Ok(out) =
+        Command::new("pgrep").args(["-x", "propolis-server"]).output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|pid| !pid.is_empty())
+        .filter(|pid| {
+            let cwd = std::fs::read_link(format!("/proc/{pid}/path/cwd")).ok();
+            cwd.is_some() && cwd.as_deref() == want.as_deref()
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Clear the device-instance map (nodes booted from the image otherwise

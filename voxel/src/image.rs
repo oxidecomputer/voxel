@@ -452,5 +452,8 @@ pub(crate) fn cmd_image(
         ImageCmd::CreateBuilder { .. } => {
             bail!("internal: `image create-builder` is dispatched in main")
         }
+        ImageCmd::Clean => {
+            bail!("internal: `image clean` is dispatched in main")
+        }
     }
 }

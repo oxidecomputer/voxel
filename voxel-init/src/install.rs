@@ -485,9 +485,26 @@ pub fn build_builder_image() -> Result<()> {
         bail!("install rustup");
     }
 
-    note(format!("cloning omicron {rev} -> {omicron}"));
-    if !run("git", &["clone", OMICRON_REPO, &omicron]) {
-        bail!("clone omicron");
+    // A rerun on a disk that already has a checkout (or a clone cut off
+    // midway) reuses or replaces it rather than failing on the clone.
+    let have_checkout = run("git", &["-C", &omicron, "rev-parse", "--git-dir"]);
+    if have_checkout {
+        note(format!(
+            "updating existing omicron checkout at {omicron} for {rev}"
+        ));
+        if !run("git", &["-C", &omicron, "fetch", "--quiet", "origin"]) {
+            bail!("fetch omicron");
+        }
+    } else {
+        if fs::metadata(&omicron).is_ok() {
+            note(format!("removing incomplete {omicron}"));
+            fs::remove_dir_all(&omicron)
+                .map_err(|e| anyhow::anyhow!("remove {omicron}: {e}"))?;
+        }
+        note(format!("cloning omicron {rev} -> {omicron}"));
+        if !run("git", &["clone", OMICRON_REPO, &omicron]) {
+            bail!("clone omicron");
+        }
     }
     if !run("git", &["-C", &omicron, "checkout", "--quiet", &rev]) {
         bail!("checkout omicron {rev}");

@@ -36,16 +36,36 @@ pub fn bring_up() -> Result<()> {
     Ok(())
 }
 
+/// Files `voxel builder build` renders into the checkout on every build
+/// (voxel's `image::RENDERED_SMF`). They are voxel's, not the user's, so they
+/// don't make the tree dirty and are reset before switching revs.
+const RENDERED_SMF: [&str; 3] = [
+    "smf/mgs-sim/config.toml",
+    "smf/sp-sim/config.toml",
+    "smf/sled-agent/non-gimlet/config.toml",
+];
+
 /// Switch the checkout to `rev`. Refused on a dirty tree unless the host
 /// staged `omicron-force`.
 fn checkout(rev: &str) -> Result<()> {
-    let dirty = capture("git", &["-C", SRC, "status", "--porcelain"])
-        .is_some_and(|s| !s.is_empty());
+    let mut status = vec!["-C", SRC, "status", "--porcelain", "--", "."];
+    let excludes: Vec<String> =
+        RENDERED_SMF.iter().map(|f| format!(":!{f}")).collect();
+    status.extend(excludes.iter().map(String::as_str));
+    let changes = capture("git", &status).unwrap_or_default();
+    let dirty = !changes.trim().is_empty();
+    reset_rendered()?;
     let force = fs::metadata(format!("{CARGO_BAY}/omicron-force")).is_ok();
     if dirty && !force {
+        let lines: Vec<&str> = changes.lines().collect();
+        let mut shown =
+            lines.iter().take(20).copied().collect::<Vec<_>>().join("\n");
+        if lines.len() > 20 {
+            shown.push_str(&format!("\n... and {} more", lines.len() - 20));
+        }
         bail!(
-            "the omicron checkout has uncommitted changes; pass --force to \
-             discard them or sync them out first"
+            "the omicron checkout in {SRC} has uncommitted changes:\n{shown}\n\
+             pass --force to discard them, or sync them out first"
         );
     }
     note(format!("checking out omicron {rev}"));
@@ -56,6 +76,25 @@ fn checkout(rev: &str) -> Result<()> {
     }
     if !run("git", &["-C", SRC, "checkout", "-q", rev]) {
         bail!("checkout omicron {rev}");
+    }
+    Ok(())
+}
+
+/// Put the rendered files back as the checkout has them: tracked ones from
+/// the index, untracked ones removed. The next build renders them again.
+fn reset_rendered() -> Result<()> {
+    for rel in RENDERED_SMF {
+        let tracked = run_quiet(
+            "git",
+            &["-C", SRC, "ls-files", "--error-unmatch", "--", rel],
+        );
+        if tracked {
+            if !run("git", &["-C", SRC, "checkout", "-q", "--", rel]) {
+                bail!("reset {SRC}/{rel}");
+            }
+        } else {
+            let _ = fs::remove_file(format!("{SRC}/{rel}"));
+        }
     }
     Ok(())
 }

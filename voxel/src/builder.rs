@@ -139,6 +139,10 @@ impl Builder {
         self.read_state().get(key)?.as_str().map(str::to_string)
     }
 
+    pub(crate) fn is_up(&self) -> Result<bool> {
+        Ok(self.state()? == State::Up)
+    }
+
     /// The builder's address. Fails unless the builder is up.
     fn require_up(&self) -> Result<String> {
         if self.state()? != State::Up {
@@ -443,6 +447,20 @@ impl Builder {
             ("tools", "permslip_staging"),
         ] {
             pull(&ip, &[&format!("{rel}/{file}")], &stub.join(rel), &[])?;
+        }
+        // The SP release pin, from omicron#10760 onwards. Older checkouts
+        // have none and take their SP images from permslip_staging.
+        let sp_release = crate::permslip::SP_RELEASE_FILE;
+        if net::ssh_capture(&ip, &format!("test -f {GUEST_SRC}/{sp_release}"))
+            .is_some()
+        {
+            let rel = Utf8Path::new(sp_release);
+            pull(
+                &ip,
+                &[sp_release],
+                &stub.join(rel.parent().expect("SP_RELEASE_FILE has a dir")),
+                &[],
+            )?;
         }
         crate::image::render_smf(&stub, cpbuild::num_gimlets())?;
         push(&stub.join("smf"), &ip, &format!("{GUEST_SRC}/smf"))?;

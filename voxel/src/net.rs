@@ -408,6 +408,110 @@ fn dig_soa(dns_ip: &str, zone: &str) -> Option<bool> {
     }
 }
 
+/// Print where a rack's external services are. Each rack's DNS zone is
+/// `rack<N>.<network.dns_zone>`, not the bare configured zone, and nothing
+/// else says so. The recovery silo's Nexus addresses are looked up through
+/// the rack's own DNS. A failed lookup is reported, not treated as an error.
+pub(crate) fn print_endpoints(cfg: &voxel_config::VoxelConfig) {
+    let racks = cfg.topology.racks();
+    let silo = &cfg.recovery_silo;
+    let default_login = voxel_config::RecoverySiloCfg::default();
+    // Built whole and written once: line by line, it interleaves with the
+    // logger's own (asynchronous) output.
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out);
+    for rack in 0..racks {
+        let net = cfg.network.for_rack(rack);
+        let dns: Vec<&str> =
+            net.external_dns_ips.iter().map(String::as_str).collect();
+        let _ = writeln!(out, "rack{} endpoints", rack + 1);
+        let _ = writeln!(
+            out,
+            "  DNS zone     : {}  (network.dns_zone {:?} with the rack{} prefix)",
+            net.dns_zone,
+            cfg.network.dns_zone,
+            rack + 1
+        );
+        let _ = writeln!(out, "  external DNS : {}", dns.join(", "));
+        // Silos are cluster-wide: the recovery silo lives in rack 0's zone.
+        if rack > 0 {
+            continue;
+        }
+        let host = format!("{}.sys.{}", silo.silo_name, net.dns_zone);
+        // A commission-driven launch serves TLS only, from the rack's CA.
+        let ca = crate::commission::rack_ca_path(rack);
+        if ca.is_file() {
+            let abs = std::env::current_dir()
+                .ok()
+                .and_then(|d| camino::Utf8PathBuf::try_from(d).ok())
+                .map(|d| d.join(&ca))
+                .unwrap_or(ca);
+            let _ = writeln!(out, "  console/API  : https://{host}");
+            let _ = writeln!(out, "  CA           : {abs}");
+            let _ = writeln!(
+                out,
+                "  note         : TLS by name only (Nexus requires SNI); \
+                 /etc/hosts or the rack DNS must resolve {host}"
+            );
+        } else {
+            let _ = writeln!(out, "  console/API  : http://{host}");
+        }
+        if let Some(dns_ip) = dns.first() {
+            match dig_a(dns_ip, &host) {
+                Some(ips) if !ips.is_empty() => {
+                    let _ =
+                        writeln!(out, "  Nexus        : {}", ips.join(", "));
+                }
+                Some(_) => {
+                    let _ = writeln!(
+                        out,
+                        "  Nexus        : {host} does not resolve yet \
+                         (dig {host} @{dns_ip})"
+                    );
+                }
+                None => {}
+            }
+        }
+        if silo.user_password_hash == default_login.user_password_hash {
+            let _ =
+                writeln!(out, "  login        : {} / oxide", silo.user_name);
+        } else {
+            let _ = writeln!(
+                out,
+                "  login        : {} (password set by recovery_silo.user_password_hash)",
+                silo.user_name
+            );
+        }
+    }
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// `dig +short <name> A @<dns_ip>`: the addresses, `Some(vec![])` if the server
+/// gave none, `None` if `dig` isn't installed.
+pub(crate) fn dig_a(dns_ip: &str, name: &str) -> Option<Vec<String>> {
+    let o = std::process::Command::new("dig")
+        .args(["+short", "+timeout=3", "+tries=1"])
+        .arg(format!("@{dns_ip}"))
+        .args([name, "A"])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return Some(Vec::new());
+    }
+    let mut ips: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.parse::<std::net::Ipv4Addr>().is_ok())
+        .map(str::to_string)
+        .collect();
+    ips.sort_by_key(|ip| ip.parse::<std::net::Ipv4Addr>().ok());
+    Some(ips)
+}
+
 /// (Re)point the host route for the rack's external network (`prefix`) at ce's
 /// current external IP. ce's host-facing NIC gets a fresh random MAC - and thus
 /// a fresh DHCP IP - every launch, so any static route goes stale; discovering

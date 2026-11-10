@@ -21,6 +21,50 @@ generation.
 See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference,
 there are a LOT of tuning knobs.
 
+## Installing from CI
+
+Every CI build of a commit publishes `voxel-up.sh` beside its artifacts. On a
+Helios host, from the directory to work in:
+
+```sh
+curl -sSfL https://buildomat.eng.oxide.computer/public/file/oxidecomputer/voxel/release/<sha>/voxel-up.sh | sh
+. .voxel/env
+```
+
+This installs `voxel`, `voxel-init`, `voxel-init-linux` and `sp-emu` in
+`./.voxel/bin` and writes `./.voxel/voxel.toml`. falcon's dataset goes on
+`fpool` if the host has one, else `rpool` (`VOXEL_POOL` overrides). Your
+`~/.config/voxel` is not touched. CI does not publish rack images. To build
+them and bring up a rack for an omicron commit in one go:
+
+```sh
+voxel heading 5ce2b2c            # print the plan: what exists, what will run
+voxel heading 5ce2b2c engage     # make it so
+```
+
+`engage` builds whatever is missing: the frr and builder images, and
+`voxel-cp-<sha>` in the builder. It then points `image.cp` at that image and
+runs `launch --emu`, `status` and `commtest`. Finished steps are skipped, so
+rerunning `engage` after a failure picks up where it stopped, and a heading
+for a new commit reuses the frr and builder images. A rack already up on a
+different image stops it; `voxel destroy` first.
+
+### Building the archive yourself
+
+`cargo xtask dist` builds exactly what CI publishes (CI runs this command),
+on a Helios host with rustup:
+
+```sh
+cargo xtask dist                     # writes out/dist/
+out/dist/voxel-up.sh --archive out/dist/voxel.tar.gz
+```
+
+`out/dist/` holds `voxel`, `voxel-init`, `voxel-init-linux` (static musl),
+the pinned `sp-emu`, `voxel.tar.gz` bundling all four, a `.sha256.txt` for
+each, and `voxel-up.sh`. `--archive` installs a local tarball instead of
+fetching one and checks it against `<archive>.sha256.txt` when that exists.
+Copy the tarball, its digest and the script to another host to install there.
+
 ## Building
 
 ```sh
@@ -80,47 +124,52 @@ Voxel commands need different privileges:
 - `voxel network external ...` runs unprivileged. Voxel escalates each
   mutating host command through `pfexec` itself, and `--dry-run` prints those
   as `+ pfexec ...` lines.
-- `voxel commtest` runs as your login user, with the `net_icmpaccess`
-  privilege described below. It refuses effective uid 0 so a root run cannot
-  leave root-owned files in the build worktrees and reports. `--allow-root`
-  overrides that where a per-user grant is impractical, at the cost of
-  root-owned artifacts under the build root.
+- `voxel commtest` needs raw ICMP sockets: run it as root, or as a user with
+  the `net_icmpaccess` privilege described below. With `--source` it refuses
+  to *build* the checkout as root, since root-owned build output would break
+  your next build there; build it as yourself and pass `--no-build`.
 
 ## omicron commtest
 
-`voxel commtest` builds and runs omicron's `commtest` binary against a launched
-rack. The source is the omicron checkout matching the configured control-plane
-image, an explicit commit or tag, or the latest upstream `main`. Voxel derives
-the selected rack's Nexus API address and takes a test IP pool from the range
-directly above the configured service pool.
+`voxel commtest` runs omicron's rack connectivity test against a launched rack.
+By default it runs omicron's `commtest` library, linked into voxel, so it needs
+no toolchain on the host. On a default (TLS) rack voxel hands it HTTP clients
+that resolve the recovery silo's name through the rack's own DNS and trust the
+rack's CA, so the host needs no `/etc/hosts` entry either. Voxel derives the API endpoint and takes a test IP
+pool from the range directly above the configured service pool.
 
 ```sh
-# Configured image's omicron commit (unicast is the default).
+# Unicast connectivity, with voxel's built-in commtest.
 voxel commtest
-
-# A specific commit (older unicast-only versions are supported).
-voxel commtest d41a8c3a2aa5768255ad00545e53d3077b1b56ce --traffic unicast
-
-# Latest origin/main.
-voxel commtest main --traffic unicast
 
 # Run both phases from a local multicast-capable checkout, unmodified.
 voxel commtest --source /oxide/workspace/omicron --traffic both
 
-# Pass commit-specific commtest arguments after `--` (the default multicast
-# group is 239.1.1.1 when no --mcast-group is supplied).
+# Pass commtest arguments after `--` (the default multicast group is
+# 239.1.1.1 when no --mcast-group is supplied).
 voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
   --test-duration 5m --mcast-group 239.10.0.1
 
-# Cleanup resources created by that commit's commtest.
-voxel commtest d41a8c3a2aa5768255ad00545e53d3077b1b56ce -- cleanup
+# Clean up the resources commtest created.
+voxel commtest -- cleanup
 ```
 
-`--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. Voxel
-detects whether the selected commit supports multicast and refuses the
-multicast modes on older, unicast-only versions. `--api URL` overrides the
-derived Nexus API address, and `--no-build` runs an existing
-`<omicron>/target/debug/commtest`.
+`--source` builds and runs that checkout's own commtest, for versions the
+built-in one lacks (today, the multicast phases); it needs `cargo` on the host,
+and because upstream commtest uses the system resolver, the silo name must
+resolve on the host (voxel prints the `/etc/hosts` line when it does not).
+`--no-build` reuses `<omicron>/target/debug/commtest`.
+
+`--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. The
+multicast modes need `--source` with a checkout that supports them; voxel
+detects that from the source and refuses otherwise.
+
+The API endpoint comes from the configuration alone: `https://<silo>.sys.<rack
+zone>`, resolved through the rack's DNS and trusted through the CA the launch
+saved in `.falcon/rack<N>-ca.pem` under the workdir. Nothing is probed. A rack
+launched with `--init-rss` serves plain HTTP with no CA, which the
+configuration does not record, so pass its endpoint with `--api
+http://<nexus ip>`.
 
 Voxel only injects the arguments commtest has no default for, so everything
 after `--` reaches it unchanged:
@@ -147,12 +196,6 @@ pfexec usermod -K defaultpriv=basic,net_icmpaccess "$USER"
 
 Start a new login session afterward and confirm that `ppriv $$` lists
 `net_icmpaccess` in the effective set.
-
-Voxel keeps its omicron mirror under `$BUILD_ROOT/commtest` (or
-`~/voxel-builds/commtest`) and checks each commit out into a detached
-[Git worktree][Git worktrees], so the checkouts, Cargo output, and commtest
-reports stay owned by the invoking user. `--source` builds the given checkout
-in place, without fetching or changing its Git state.
 
 ## Isolated external network (optional)
 
@@ -284,4 +327,3 @@ on sp-emu without rebaking.
 [falcon]: https://github.com/oxidecomputer/falcon
 [how-to-run external networking]: https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc#external-networking
 [sp-emu]: https://github.com/oxidecomputer/sp-emu
-[Git worktrees]: https://git-scm.com/docs/git-worktree

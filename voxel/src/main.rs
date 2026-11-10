@@ -30,6 +30,7 @@ mod commtest;
 mod config_cmd;
 mod cpbuild;
 mod disks;
+mod heading;
 mod image;
 mod imagebuild;
 mod isolated_external;
@@ -111,6 +112,16 @@ enum Cmd {
         #[arg(long, value_name = "DIR", value_parser = abs_path)]
         sp_firmware: Option<Utf8PathBuf>,
     },
+    /// Set course for omicron REV: build whatever images are missing (frr,
+    /// builder, `voxel-cp-<rev>` in the builder), point `image.cp` at it,
+    /// `launch --emu`, `status` and `commtest`. Steps already done are
+    /// skipped. Without `engage`, print the plan.
+    Heading {
+        /// omicron commit sha.
+        rev: String,
+        #[command(subcommand)]
+        engage: Option<HeadingCmd>,
+    },
     /// A persistent omicron build host: build cp images in-guest with no
     /// toolchain on the host, and iterate on an omicron tree between builds.
     Builder {
@@ -179,18 +190,9 @@ enum Cmd {
     /// supplied, defaults to `run`; voxel supplies the rack API and a test IP
     /// pool unless those are explicitly overridden.
     Commtest {
-        /// Omicron commit/tag to test, or `main` for the latest upstream.
-        /// Omit to use the commit encoded in the configured control-plane image.
-        #[arg(value_name = "COMMIT")]
-        reference: Option<String>,
-
-        /// Use an existing Omicron checkout without fetching or changing it.
-        #[arg(
-            long,
-            value_name = "PATH",
-            conflicts_with = "reference",
-            value_parser = abs_path
-        )]
+        /// Build and run this Omicron checkout's commtest as-is instead of
+        /// the built-in one (for versions it lacks, such as multicast).
+        #[arg(long, value_name = "PATH", value_parser = abs_path)]
         source: Option<Utf8PathBuf>,
 
         /// Rack to target (1-based).
@@ -209,16 +211,31 @@ enum Cmd {
         #[arg(long)]
         no_build: bool,
 
-        /// Permit running with effective uid 0. Build artifacts and reports
-        /// under the build root become root-owned, which later unprivileged
-        /// runs may trip over.
-        #[arg(long)]
-        allow_root: bool,
-
         /// Arguments passed to Omicron commtest (place them after `--`).
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// (internal) Omicron's commtest library, run by `voxel commtest` as a
+    /// child so its output can be mirrored. Arguments after `--` are
+    /// commtest's own.
+    #[command(hide = true)]
+    CommtestExec {
+        /// Resolve HOST to IP in commtest's HTTP clients instead of asking the
+        /// system resolver. The URL's port is kept.
+        #[arg(long, value_name = "HOST=IP")]
+        resolve: Option<String>,
+        /// PEM CA certificate commtest's HTTP clients trust for the API.
+        #[arg(long, value_name = "FILE")]
+        cacert: Option<Utf8PathBuf>,
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HeadingCmd {
+    /// Make it so.
+    Engage,
 }
 
 #[derive(Subcommand)]
@@ -355,6 +372,10 @@ enum ImageCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Tear down a leftover image-build VM (from a `create*` run that was
+    /// killed before cleaning up): its propolis, vnic and disk. Built images
+    /// are not touched. The next `create*` also does this on its own.
+    Clean,
     /// Build a `voxel-frr` customer-router image.
     CreateFrr {
         /// Image label; the image is named `voxel-frr-<version>`.
@@ -744,18 +765,34 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
 /// `chdir` to the project root. `cargo-bay/`, `.falcon/` and `image-build/`
 /// are CWD-relative and must resolve from any invocation directory.
 /// Root: `--workdir`/`$VOXEL_WORKDIR` > `[falcon].workdir` > the discovered
-/// `voxel.toml`'s directory. No-op if the chosen root isn't a directory.
+/// `voxel.toml`'s directory.
+///
+/// An explicit workdir (flag, env or config) that is not a directory is an
+/// error. Falling back to the invocation directory would scatter a rack's
+/// state wherever voxel happened to be run. Only the implicit config-dir
+/// default is skipped when absent.
 fn anchor_workdir(
     cli: &Cli,
     cfg: Option<&VoxelConfig>,
     config_path: &Utf8Path,
 ) -> anyhow::Result<()> {
-    let root = cli
-        .workdir
-        .clone()
-        .or_else(|| {
-            cfg.and_then(|c| c.falcon.workdir.clone()).map(Utf8PathBuf::from)
-        })
+    let explicit =
+        cli.workdir.clone().map(|p| (p, "--workdir/$VOXEL_WORKDIR")).or_else(
+            || {
+                cfg.and_then(|c| c.falcon.workdir.clone())
+                    .map(|p| (Utf8PathBuf::from(p), "falcon.workdir"))
+            },
+        );
+    if let Some((root, source)) = &explicit
+        && !root.is_dir()
+    {
+        bail!(
+            "workdir {root} (from {source}) does not exist; create it \
+             (`mkdir -p {root}`) or point {source} at an existing directory"
+        );
+    }
+    let root = explicit
+        .map(|(p, _)| p)
         .or_else(|| config_path.parent().map(Utf8Path::to_path_buf));
     if let Some(root) = root
         && root.is_dir()
@@ -779,7 +816,12 @@ async fn main() -> Result<(), Error> {
         Err(_) => None,
     };
     resolve_falcon_env(&cli, cfg.as_ref());
-    anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
+    // `voxel config` stays usable with a bad workdir, so it can be fixed.
+    if let Err(e) = anchor_workdir(&cli, cfg.as_ref(), &config_path)
+        && !matches!(cli.cmd, Cmd::Config { .. })
+    {
+        return Err(e);
+    }
     match &cli.cmd {
         Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
             let opts = rack::LaunchOpts {
@@ -790,6 +832,15 @@ async fn main() -> Result<(), Error> {
                 sp_firmware: sp_firmware.as_deref(),
             };
             rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
+        }
+        Cmd::Heading { rev, engage } => {
+            heading::run(heading::Opts {
+                config_path: &config_path,
+                name: &cli.name,
+                rev,
+                engage: engage.is_some(),
+            })
+            .await
         }
         Cmd::CommissionDryrun { rack } => {
             commission::dryrun(&load_config(&config_path)?, *rack)
@@ -809,32 +860,23 @@ async fn main() -> Result<(), Error> {
         Cmd::Status => {
             rack::cmd_status(&load_config(&config_path)?, &cli.name).await
         }
-        Cmd::Commtest {
-            reference,
-            source,
-            rack,
-            api,
-            traffic,
-            no_build,
-            allow_root,
-            args,
-        } => commtest::run(
-            &load_config(&config_path)?,
-            commtest::Options {
-                // clap rejects <COMMIT> together with --source (conflicts_with).
-                source: match (source.as_deref(), reference.as_deref()) {
-                    (Some(path), _) => commtest::Source::Local(path),
-                    (None, Some(r)) => commtest::Source::Reference(r),
-                    (None, None) => commtest::Source::Image,
+        Cmd::Commtest { source, rack, api, traffic, no_build, args } => {
+            commtest::run(
+                &load_config(&config_path)?,
+                commtest::Options {
+                    config_path: &config_path,
+                    source: source.as_deref(),
+                    rack: *rack,
+                    api_override: api.as_deref(),
+                    traffic: *traffic,
+                    no_build: *no_build,
+                    passthrough: args,
                 },
-                rack: *rack,
-                api_override: api.as_deref(),
-                traffic: *traffic,
-                no_build: *no_build,
-                allow_root: *allow_root,
-                passthrough: args,
-            },
-        ),
+            )
+        }
+        Cmd::CommtestExec { resolve, cacert, args } => {
+            commtest::exec(resolve.as_deref(), cacert.as_deref(), args).await
+        }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
             ImageCmd::Create { commit, src, from_tuf, sled_agent } => {
@@ -860,6 +902,7 @@ async fn main() -> Result<(), Error> {
                 )
                 .await
             }
+            ImageCmd::Clean => imagebuild::clean(&image::falcon_dataset()),
             ImageCmd::CreateBuilder { version, omicron } => {
                 let rev = match omicron.as_deref() {
                     Some(r) => r,
@@ -1013,6 +1056,23 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::find_omicron_checkout;
+
+    #[test]
+    fn heading_parses_rev_then_engage() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "voxel", "heading", "5ce2b2c", "engage",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            super::Cmd::Heading { ref rev, engage: Some(super::HeadingCmd::Engage) }
+                if rev == "5ce2b2c"
+        ));
+        let cli = super::Cli::try_parse_from(["voxel", "heading", "5ce2b2c"])
+            .unwrap();
+        assert!(matches!(cli.cmd, super::Cmd::Heading { engage: None, .. }));
+    }
 
     #[test]
     fn checkout_lookup_matches_short_and_full_shas() {

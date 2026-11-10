@@ -573,8 +573,9 @@ configuration.
 
 With the route in place, the rack's external services are reachable by IP.
 The rack runs its own external DNS servers (at the `external_dns_ips`
-addresses in the service pool), which are authoritative for the configured
-DNS zone (`oxide.test` is the default). To resolve rack hostnames from your
+addresses in the service pool), which are authoritative for the rack's zone:
+`rack<N>.` prefixed to `network.dns_zone`, so `rack1.oxide.test` by default.
+A query for the bare `oxide.test` gets SERVFAIL. To resolve rack hostnames from your
 workstation, either forward that zone to the rack's DNS servers in your
 resolver configuration, or add entries to `/etc/hosts`. For example, if the
 DNS query above returned `198.51.100.23`:
@@ -585,21 +586,37 @@ DNS query above returned `198.51.100.23`:
 ----
 
 Use the address returned by the DNS query, which may differ from this example.
-`voxel status` reattaches to RSS progress; it does not report the Nexus
-address. Without DNS or `/etc/hosts` configuration, you can navigate directly
-to the discovered IP.
+`voxel launch` and `voxel status` finish by printing the rack's endpoints:
+the DNS zone, the external DNS servers, the console URL, the Nexus addresses
+the silo name resolves to, and the recovery login. Use one of those Nexus
+addresses for the `/etc/hosts` entry. Browsing to the address itself does not
+work on a default (TLS) rack; see below.
 
 At default settings, the web console is at:
 
 ----
-http://recovery.sys.rack1.oxide.test
+https://recovery.sys.rack1.oxide.test
 ----
 
-Voxel does not provide TLS certificates by default, so Nexus serves the API and
-console over HTTP on port 80. To use HTTPS, provide a certificate during rack
-setup as described in Omicron's
-https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run.adoc[how-to-run
-guide].
+A default launch sets the rack up through wicketd's commission API, which
+requires a TLS certificate, so Nexus serves the API and console over HTTPS on
+port 443 only. Voxel issues that certificate from a per-rack CA it generates at
+launch and keeps at `.falcon/rack<N>-ca.pem` in the workdir (removed with the
+rack).
+
+Nexus is reachable over TLS by name only. It picks its certificate from the
+TLS SNI name and refuses a handshake without one, and clients send no SNI to
+a bare IP (`curl https://198.51.100.23` fails with `tlsv1 alert access
+denied`). So the silo name must resolve, through `/etc/hosts` or the rack's
+DNS as above:
+
+[source,sh]
+----
+curl --cacert .falcon/rack1-ca.pem https://recovery.sys.rack1.oxide.test/v1/ping
+----
+
+`voxel commtest` passes the CA to commtest itself. A rack launched with
+`--init-rss` has no certificate and serves plain HTTP on port 80.
 
 The default recovery silo credentials are:
 
@@ -624,12 +641,14 @@ host, or both), then authenticate it against your Voxel rack:
 
 [source,sh]
 ----
-oxide auth login --host http://recovery.sys.rack1.oxide.test
+oxide auth login --host https://recovery.sys.rack1.oxide.test
 ----
 
-This stores a session token for subsequent commands. If you are accessing Nexus
-by IP rather than hostname, substitute the address returned by the DNS query
-above (for example, `http://198.51.100.23`).
+This stores a session token for subsequent commands. Use the hostname, not an
+IP (see above); the name must resolve on the machine you run it on. The CLI
+must trust the rack's CA
+(`.falcon/rack1-ca.pem`); add it to the trust store of the machine you run it
+on. On an `--init-rss` rack, use `http://` instead.
 
 NOTE: If you are running the Oxide CLI from a workstation rather than the
 Helios host, the rack's service addresses are not directly reachable until you
@@ -701,20 +720,26 @@ Start a new login session afterward, then run the test:
 voxel commtest
 ----
 
-This builds and runs the test matched to the control-plane image's Omicron
-version. You can also specify the traffic type:
+This runs Omicron's unicast `commtest`, linked into voxel as a library. It needs no
+toolchain on the host, and it reaches the rack's API by name through the rack's
+own DNS and CA, so it needs no `/etc/hosts` entry.
+
+The multicast phases are not in the built-in test yet. Run them from an Omicron
+checkout that has them; voxel builds that checkout's `commtest` (so the host
+needs `cargo`) and runs it:
 
 [source,sh]
 ----
-# Unicast only (the default).
-voxel commtest --traffic unicast
-
 # Multicast only.
-voxel commtest --traffic multicast
+voxel commtest --source /path/to/omicron --traffic multicast
 
 # Both phases.
-voxel commtest --traffic both
+voxel commtest --source /path/to/omicron --traffic both
 ----
+
+An Omicron-built `commtest` uses the system resolver, so with `--source` the
+silo name must resolve on the host; voxel prints the `/etc/hosts` line to add
+when it does not.
 
 === The Web Console
 
@@ -722,10 +747,11 @@ The Oxide web console is served by Nexus at the rack's external address. Once
 you have DNS configured (see <<Reaching the Rack from Another Device>>), open:
 
 ----
-http://recovery.sys.rack1.oxide.test
+https://recovery.sys.rack1.oxide.test
 ----
 
-Log in with the default recovery silo credentials (`recovery` / `oxide`).
+Your browser will warn about the certificate unless it trusts the rack's CA
+(`.falcon/rack1-ca.pem`). Log in with the default recovery silo credentials (`recovery` / `oxide`).
 
 The console provides a graphical interface for the same operations available
 through the API: creating projects, managing networking, viewing sled
