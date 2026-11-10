@@ -423,7 +423,7 @@ pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
 
     let network = builder_network(b.external)?;
     bake(BakeOpts {
-        base_image: "helios-3.0",
+        base_image: crate::imagebuild::HELIOS_BASE,
         role: "cp",
         cargo_bay: b.cargo_bay,
         image_name: b.image_name,
@@ -612,7 +612,7 @@ async fn create_cp_tuf(
     // --- 6. bake ---------------------------------------------------------------
     let network = builder_network(external)?;
     bake(BakeOpts {
-        base_image: "helios-3.0",
+        base_image: crate::imagebuild::HELIOS_BASE,
         role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,

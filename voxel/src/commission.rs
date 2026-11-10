@@ -265,9 +265,12 @@ pub(crate) async fn drive(
             break;
         }
         if Instant::now() >= deadline {
+            let detail = bootstrap_detail(&client)
+                .await
+                .unwrap_or_else(|e| format!("  (could not read it: {e:#})"));
             bail!(
                 "bootstrap sleds not ready within 300s \
-                 (have {have:?}, want {want:?})"
+                 (have {have:?}, want {want:?}). wicketd's view:\n{detail}"
             );
         }
         tokio::time::sleep(Duration::from_secs(8)).await;
@@ -335,6 +338,47 @@ pub(crate) async fn drive(
 /// The bootstrap-sled slots whose bootstrap IP the API already knows. A slot
 /// can be listed before its advertisement lands (state ip null), and wicketd
 /// rejects rack setup until every configured sled has an IP.
+/// wicketd's whole bootstrap picture, one line per sled and peer: a slot is
+/// ready only when its SP's baseboard matches a discovered bootstrap peer, so
+/// a slot without an address next to an unmatched peer means the two report
+/// different baseboards, and no peer at all means it was never discovered.
+async fn bootstrap_detail(client: &Client) -> Result<String> {
+    let resp = client
+        .get_bootstrap_sleds()
+        .await
+        .map_err(|e| anyhow!("get bootstrap sleds: {e}"))?
+        .into_inner();
+    let mut out = String::new();
+    for s in resp.sleds.iter() {
+        let line = match &s.state {
+            inventory::BootstrapSledState::Read { baseboard, ip } => format!(
+                "SP baseboard {}/{}, bootstrap address {}",
+                baseboard.part_number,
+                baseboard.serial_number,
+                ip.map_or("none (no matching peer)".to_string(), |ip| ip
+                    .to_string())
+            ),
+            inventory::BootstrapSledState::NotRead => {
+                "SP present, not read yet".to_string()
+            }
+            inventory::BootstrapSledState::Error { error } => {
+                format!("SP read failed: {error:?}")
+            }
+        };
+        out.push_str(&format!("  slot {}: {line}\n", s.id.slot));
+    }
+    for p in resp.unmatched_peers.iter() {
+        out.push_str(&format!(
+            "  unmatched peer {}: baseboard {}/{}\n",
+            p.ip, p.baseboard.part_number, p.baseboard.serial_number
+        ));
+    }
+    for p in resp.unidentified_peers.iter() {
+        out.push_str(&format!("  unidentified peer: {p:?}\n"));
+    }
+    Ok(out)
+}
+
 async fn ready_slots(client: &Client) -> Result<BTreeSet<u16>> {
     let resp = client
         .get_bootstrap_sleds()
