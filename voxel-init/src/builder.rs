@@ -52,13 +52,20 @@ fn checkout(rev: &str) -> Result<()> {
     let excludes: Vec<String> =
         RENDERED_SMF.iter().map(|f| format!(":!{f}")).collect();
     status.extend(excludes.iter().map(String::as_str));
-    let dirty = capture("git", &status).is_some_and(|s| !s.is_empty());
+    let changes = capture("git", &status).unwrap_or_default();
+    let dirty = !changes.trim().is_empty();
     reset_rendered()?;
     let force = fs::metadata(format!("{CARGO_BAY}/omicron-force")).is_ok();
     if dirty && !force {
+        let lines: Vec<&str> = changes.lines().collect();
+        let mut shown =
+            lines.iter().take(20).copied().collect::<Vec<_>>().join("\n");
+        if lines.len() > 20 {
+            shown.push_str(&format!("\n... and {} more", lines.len() - 20));
+        }
         bail!(
-            "the omicron checkout has uncommitted changes; pass --force to \
-             discard them or sync them out first"
+            "the omicron checkout in {SRC} has uncommitted changes:\n{shown}\n\
+             pass --force to discard them, or sync them out first"
         );
     }
     note(format!("checking out omicron {rev}"));

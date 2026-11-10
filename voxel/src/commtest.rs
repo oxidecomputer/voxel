@@ -557,6 +557,7 @@ fn commtest_args_for(
     }
 
     apply_traffic(source, traffic, supports_multicast, &mut args)?;
+    apply_loss_tolerance(&mut args)?;
 
     let has_begin = args
         .iter()
@@ -637,6 +638,48 @@ fn apply_traffic(
     Ok(())
 }
 
+/// commtest's run defaults, for sizing the loss tolerance.
+const DEFAULT_TEST_DURATION: &str = "100s";
+const DEFAULT_PACKET_RATE: u64 = 10;
+/// Share of each probe's ICMP packets that may be lost. commtest's own
+/// default is zero, which an emulated rack's software switch can't promise.
+const LOSS_TOLERANCE_PCT: u64 = 5;
+
+/// Add `--icmp-loss-tolerance` (a packet count) as 5% of the packets the run
+/// sends, unless the caller set it.
+fn apply_loss_tolerance(args: &mut Vec<String>) -> anyhow::Result<()> {
+    if has_arg(args, "--icmp-loss-tolerance") {
+        return Ok(());
+    }
+    let duration =
+        arg_value(args, "--test-duration").unwrap_or(DEFAULT_TEST_DURATION);
+    let duration = humantime::parse_duration(duration)
+        .with_context(|| format!("parse --test-duration {duration:?}"))?;
+    let rate = match arg_value(args, "--packet-rate") {
+        Some(r) => r
+            .parse::<u64>()
+            .with_context(|| format!("parse --packet-rate {r:?}"))?,
+        None => DEFAULT_PACKET_RATE,
+    };
+    let packets = duration.as_secs() * rate;
+    let tolerance = packets * LOSS_TOLERANCE_PCT / 100;
+    args.push("--icmp-loss-tolerance".into());
+    args.push(tolerance.to_string());
+    Ok(())
+}
+
+/// The value of `--name value` or `--name=value`.
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let eq = format!("{name}=");
+    args.iter().enumerate().find_map(|(i, a)| {
+        if a == name {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            a.strip_prefix(&eq)
+        }
+    })
+}
+
 fn has_arg(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name || a.starts_with(&format!("{name}=")))
 }
@@ -713,11 +756,33 @@ mod test {
             .unwrap(),
             [
                 "run",
+                "--icmp-loss-tolerance",
+                "50",
                 "--ip-pool-begin",
                 "198.51.100.30",
                 "--ip-pool-end",
                 "198.51.100.45"
             ]
+        );
+    }
+
+    #[test]
+    fn loss_tolerance_scales_and_yields() {
+        let tolerance = |extra: &[&str]| {
+            let mut args = vec!["run".to_string()];
+            args.extend(extra.iter().map(|a| a.to_string()));
+            apply_loss_tolerance(&mut args).unwrap();
+            arg_value(&args, "--icmp-loss-tolerance").map(str::to_string)
+        };
+        assert_eq!(tolerance(&[]).as_deref(), Some("50"));
+        assert_eq!(
+            tolerance(&["--test-duration", "10m", "--packet-rate=20"])
+                .as_deref(),
+            Some("600")
+        );
+        assert_eq!(
+            tolerance(&["--icmp-loss-tolerance", "3"]).as_deref(),
+            Some("3")
         );
     }
 
@@ -733,6 +798,8 @@ mod test {
             "203.0.113.20".into(),
             "--test-duration".into(),
             "5s".into(),
+            "--icmp-loss-tolerance".into(),
+            "0".into(),
         ];
         assert_eq!(
             commtest_args_for(

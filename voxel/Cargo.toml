@@ -17,6 +17,7 @@ propolis-client.workspace = true
 anyhow.workspace = true
 slog.workspace = true
 futures.workspace = true
+humantime = "2.4"
 clap.workspace = true
 camino.workspace = true
 indoc.workspace = true
