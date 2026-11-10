@@ -34,8 +34,20 @@ curl -sSfL https://buildomat.eng.oxide.computer/public/file/oxidecomputer/voxel/
 This installs `voxel`, `voxel-init`, `voxel-init-linux` and `sp-emu` in
 `./.voxel/bin` and writes `./.voxel/voxel.toml`. falcon's dataset goes on
 `fpool` if the host has one, else `rpool` (`VOXEL_POOL` overrides). Your
-`~/.config/voxel` is not touched. CI does not publish rack images; build those
-with `voxel image create-frr` and `voxel image create` as below.
+`~/.config/voxel` is not touched. CI does not publish rack images. To build
+them and bring up a rack for an omicron commit in one go:
+
+```sh
+voxel heading 5ce2b2c            # print the plan: what exists, what will run
+voxel heading 5ce2b2c engage     # make it so
+```
+
+`engage` builds whatever is missing: the frr and builder images, and
+`voxel-cp-<sha>` in the builder. It then points `image.cp` at that image and
+runs `launch --emu`, `status` and `commtest`. Finished steps are skipped, so
+rerunning `engage` after a failure picks up where it stopped, and a heading
+for a new commit reuses the frr and builder images. A rack already up on a
+different image stops it; `voxel destroy` first.
 
 ### Building the archive yourself
 

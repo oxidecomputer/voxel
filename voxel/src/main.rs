@@ -30,6 +30,7 @@ mod commtest;
 mod config_cmd;
 mod cpbuild;
 mod disks;
+mod heading;
 mod image;
 mod imagebuild;
 mod isolated_external;
@@ -110,6 +111,16 @@ enum Cmd {
         /// release it is not running, so say so wherever that is claimed.
         #[arg(long, value_name = "DIR", value_parser = abs_path)]
         sp_firmware: Option<Utf8PathBuf>,
+    },
+    /// Set course for omicron REV: build whatever images are missing (frr,
+    /// builder, `voxel-cp-<rev>` in the builder), point `image.cp` at it,
+    /// `launch --emu`, `status` and `commtest`. Steps already done are
+    /// skipped. Without `engage`, print the plan.
+    Heading {
+        /// omicron commit sha.
+        rev: String,
+        #[command(subcommand)]
+        engage: Option<HeadingCmd>,
     },
     /// A persistent omicron build host: build cp images in-guest with no
     /// toolchain on the host, and iterate on an omicron tree between builds.
@@ -219,6 +230,12 @@ enum Cmd {
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum HeadingCmd {
+    /// Make it so.
+    Engage,
 }
 
 #[derive(Subcommand)]
@@ -816,6 +833,15 @@ async fn main() -> Result<(), Error> {
             };
             rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
         }
+        Cmd::Heading { rev, engage } => {
+            heading::run(heading::Opts {
+                config_path: &config_path,
+                name: &cli.name,
+                rev,
+                engage: engage.is_some(),
+            })
+            .await
+        }
         Cmd::CommissionDryrun { rack } => {
             commission::dryrun(&load_config(&config_path)?, *rack)
         }
@@ -1030,6 +1056,23 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::find_omicron_checkout;
+
+    #[test]
+    fn heading_parses_rev_then_engage() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "voxel", "heading", "5ce2b2c", "engage",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            super::Cmd::Heading { ref rev, engage: Some(super::HeadingCmd::Engage) }
+                if rev == "5ce2b2c"
+        ));
+        let cli = super::Cli::try_parse_from(["voxel", "heading", "5ce2b2c"])
+            .unwrap();
+        assert!(matches!(cli.cmd, super::Cmd::Heading { engage: None, .. }));
+    }
 
     #[test]
     fn checkout_lookup_matches_short_and_full_shas() {

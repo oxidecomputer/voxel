@@ -139,6 +139,10 @@ impl Builder {
         self.read_state().get(key)?.as_str().map(str::to_string)
     }
 
+    pub(crate) fn is_up(&self) -> Result<bool> {
+        Ok(self.state()? == State::Up)
+    }
+
     /// The builder's address. Fails unless the builder is up.
     fn require_up(&self) -> Result<String> {
         if self.state()? != State::Up {
