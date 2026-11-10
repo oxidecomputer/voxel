@@ -107,6 +107,9 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     let workspace = build_root()?;
     std::env::set_current_dir(&workspace)
         .with_context(|| format!("cd {workspace}"))?;
+    if clear_stale_builder(o.dataset, &workspace)? {
+        eprintln!("[voxel] leftover builder cleared");
+    }
 
     let mut d = Runner::new(DEPLOY);
     if let Some(bin) = o.propolis_binary {
@@ -411,6 +414,89 @@ pub(crate) fn stage_builder_net(
         }
     }
     Ok(())
+}
+
+/// `voxel image clean`: tear down a leftover image-build VM.
+pub(crate) fn clean(dataset: &str) -> Result<()> {
+    let workspace = build_root()?;
+    std::env::set_current_dir(&workspace)
+        .with_context(|| format!("cd {workspace}"))?;
+    if !clear_stale_builder(dataset, &workspace)? {
+        eprintln!("[voxel] no leftover image-build VM");
+    }
+    Ok(())
+}
+
+/// A bake killed before its teardown (SIGHUP from a dropped ssh session, say)
+/// leaves its propolis running and its disk at `topo/voxel_build`. The next
+/// bake would then talk to, or boot from, the old builder's half-done state,
+/// so clear all of it first.
+fn clear_stale_builder(dataset: &str, workspace: &Utf8Path) -> Result<bool> {
+    let topo = Dataset::new(format!("{dataset}/topo/{DEPLOY}"))?;
+    let vnic = format!("{DEPLOY}_{NODE}_vn_vnic0");
+    let orphans = workspace_propolis(workspace);
+    let have_vnic = Command::new("dladm")
+        .args(["show-vnic", &vnic])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let have_pidfile = read_pidfile(falcon_dir(), NODE).is_some();
+    if orphans.is_empty() && !have_vnic && !have_pidfile && !zfs::exists(&topo)
+    {
+        return Ok(false);
+    }
+
+    eprintln!("[voxel] clearing a leftover builder from an interrupted run");
+    hyperstop(falcon_dir(), NODE);
+    for pid in &orphans {
+        eprintln!("[voxel] killing orphaned builder propolis (pid {pid})");
+        let _ = Command::new("pfexec").args(["kill", "-9", pid]).status();
+    }
+    // The zvol stays busy until the killed propolis is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !workspace_propolis(workspace).is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if have_vnic {
+        let _ = Command::new("pfexec")
+            .args(["dladm", "delete-vnic", &vnic])
+            .status();
+    }
+    zfs::destroy_dataset_if_present(&topo).with_context(|| {
+        format!(
+            "destroy the leftover builder disk {}; if it is busy, a \
+             propolis-server from the interrupted run may still be up \
+             (`pgrep -fl propolis-server`)",
+            topo.as_str()
+        )
+    })?;
+    Ok(true)
+}
+
+/// propolis-server processes running in the builder workspace. falcon starts
+/// them with that as their cwd, and a rack's nodes run from another workdir,
+/// so this finds the builder's even when its pidfile is gone.
+fn workspace_propolis(workspace: &Utf8Path) -> Vec<String> {
+    let want = std::fs::canonicalize(workspace).ok();
+    let Ok(out) =
+        Command::new("pgrep").args(["-x", "propolis-server"]).output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|pid| !pid.is_empty())
+        .filter(|pid| {
+            let cwd = std::fs::read_link(format!("/proc/{pid}/path/cwd")).ok();
+            cwd.is_some() && cwd.as_deref() == want.as_deref()
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Clear the device-instance map (nodes booted from the image otherwise

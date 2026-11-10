@@ -355,6 +355,10 @@ enum ImageCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Tear down a leftover image-build VM (from a `create*` run that was
+    /// killed before cleaning up): its propolis, vnic and disk. Built images
+    /// are not touched. The next `create*` also does this on its own.
+    Clean,
     /// Build a `voxel-frr` customer-router image.
     CreateFrr {
         /// Image label; the image is named `voxel-frr-<version>`.
@@ -872,6 +876,7 @@ async fn main() -> Result<(), Error> {
                 )
                 .await
             }
+            ImageCmd::Clean => imagebuild::clean(&image::falcon_dataset()),
             ImageCmd::CreateBuilder { version, omicron } => {
                 let rev = match omicron.as_deref() {
                     Some(r) => r,
