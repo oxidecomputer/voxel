@@ -39,6 +39,10 @@ impl Topo {
             })
     }
 
+    pub(crate) fn is_router(&self, name: &str) -> bool {
+        self.routers.iter().any(|(r, _)| r == name)
+    }
+
     /// Each rack's RSS node (its first bootstrap sled), in rack order.
     pub(crate) fn rss_sleds(&self) -> Vec<&(SledDesc, NodeRef)> {
         let mut seen = BTreeSet::new();
