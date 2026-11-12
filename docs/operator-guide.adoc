@@ -545,7 +545,7 @@ to the discovered IP.
 At default settings, the web console is at:
 
 ----
-http://recovery.sys.rack1.oxide.test
+https://recovery.sys.rack1.oxide.test
 ----
 
 Voxel does not provide TLS certificates by default, so Nexus serves the API and
@@ -577,7 +577,7 @@ host, or both), then authenticate it against your Voxel rack:
 
 [source,sh]
 ----
-oxide auth login --host http://recovery.sys.rack1.oxide.test
+oxide --insecure auth login --host https://recovery.sys.rack1.oxide.test
 ----
 
 This stores a session token for subsequent commands. If you are accessing Nexus
@@ -760,10 +760,6 @@ increasing the rack count.
   https://github.com/oxidecomputer/sp-emu[sp-emu], with rack setup driven
   through wicketd. See the "Emulated SPs and RoTs" section of the README and
   the `voxel sp` command family.
-- **Component patching**: `voxel rack patch` swaps individual control-plane
-  components (propolis, dendrite, MGD, and others) on a running rack without
-  rebuilding the image. `voxel image patch` bakes the change into the image
-  for persistence across relaunches.
 - **Network validation**: `voxel network validate` checks link states, BGP
   sessions, and routes on a running rack.
 - **TUF repository seeding**: `voxel repo seed` populates sled artifact
