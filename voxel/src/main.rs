@@ -41,6 +41,7 @@ mod rss;
 mod rss_request;
 mod sp_cmd;
 mod sp_host;
+mod ssh_keys;
 mod topo;
 mod tufrepo;
 mod util;

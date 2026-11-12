@@ -455,6 +455,13 @@ To log into a sled's global zone directly:
 pfexec voxel host login g0
 ----
 
+`ssh root@<address>` works here too (from any tool, e.g., TRAMP, scp, rsync).
+At launch, voxel stages your SSH public key (the first of
+`~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, or `id_rsa.pub`) into every sled and
+router, and `voxel host ls` prints their set of external addresses. Set
+`falcon.ssh_pubkey` explicitly to use a different key/path, or to `""` to stage
+none at all; see `docs/parameters.md`.
+
 To connect to a specific control-plane zone (e.g., a switch zone), use the
 technician port command:
 
