@@ -473,14 +473,15 @@ enum HostCmd {
         #[arg(default_value = "g0")]
         node: String,
     },
-    /// Run a command in a sled's global zone: `voxel host exec -c "svcs -x" g1`.
+    /// Run a command in a sled's global zone or on a router:
+    /// `voxel host exec -c "svcs -x" g1`.
     Exec {
         /// Command to run (quote multi-word commands).
         #[arg(short = 'c', long = "command")]
         command: String,
-        /// Target sled (g0, g1, ...).
+        /// Target sled or router (g0, g1, ..., cr1, ...).
         #[arg(default_value = "g0")]
-        sled: String,
+        node: String,
     },
 }
 
@@ -849,11 +850,11 @@ async fn main() -> Result<(), Error> {
                 )
                 .await
             }
-            HostCmd::Exec { command, sled } => {
+            HostCmd::Exec { command, node } => {
                 access::cmd_host_exec(
                     &load_config(&config_path)?,
                     &cli.name,
-                    sled,
+                    node,
                     command,
                 )
                 .await

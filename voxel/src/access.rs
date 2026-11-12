@@ -12,27 +12,34 @@ use voxel_config::{SledDesc, VoxelConfig};
 use crate::net::{ZLOGIN, resolve_external_ip, ssh_output, zlogin};
 use crate::topo::{Topo, build_topo};
 
-/// `voxel host exec -c "<cmd>" <sled>` - run a command in a sled's global zone
-/// over ssh (the non-interactive `host login`) and print its output.
+/// Return the address `host login` and `host exec` SSH to.
+async fn host_ip(
+    cfg: &VoxelConfig,
+    topo: &Topo,
+    node: &str,
+) -> anyhow::Result<String> {
+    let n =
+        topo.node_ref(node).with_context(|| format!("no such node: {node}"))?;
+    resolve_external_ip(cfg, &topo.runner, node, n, topo.is_router(node))
+        .await
+        .with_context(|| {
+            format!("is the rack up? (`voxel serial {node}` for the console)")
+        })
+}
+
+/// `voxel host exec -c "<cmd>" <node>` - run a command in a sled's global zone
+/// or on a router over ssh (the non-interactive `host login`) and print its
+/// output.
 pub(crate) async fn cmd_host_exec(
     cfg: &VoxelConfig,
     name: &str,
-    sled: &str,
+    node: &str,
     command: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    let (_, n) = topo
-        .sleds
-        .iter()
-        .find(|(s, _)| s.name == sled)
-        .with_context(|| format!("no such sled: {sled}"))?;
-    let ip = resolve_external_ip(cfg, &topo.runner, sled, *n, false)
-        .await
-        .with_context(|| {
-            format!("is the rack up? (`voxel serial {sled}` for the console)")
-        })?;
+    let ip = host_ip(cfg, &topo, node).await?;
     let out = ssh_output(&ip, command).with_context(|| {
-        format!("couldn't ssh root@{ip} ({sled}) - is the rack up?")
+        format!("couldn't ssh root@{ip} ({node}) - is the rack up?")
     })?;
     print!("{out}");
     Ok(())
@@ -113,28 +120,10 @@ pub(crate) async fn cmd_host_login(
     node: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    // Routers accept the same root SSH login (the FRR image bakes in sshd with
-    // the operator key), so `host login` covers them too.
-    let (n, is_router) = topo
-        .sleds
-        .iter()
-        .find(|(s, _)| s.name == node)
-        .map(|(_, n)| (*n, false))
-        .or_else(|| {
-            topo.routers
-                .iter()
-                .find(|(r, _)| r == node)
-                .map(|(_, n)| (*n, true))
-        })
-        .with_context(|| format!("no such node: {node}"))?;
-    let ip = resolve_external_ip(cfg, &topo.runner, node, n, is_router)
-        .await
-        .with_context(|| {
-        format!("is the rack up? (`voxel serial {node}` for the console)")
-    })?;
+    let ip = host_ip(cfg, &topo, node).await?;
     eprintln!(
         "[voxel] ssh root@{ip}  ({node} {})",
-        if is_router { "router" } else { "global zone" }
+        if topo.is_router(node) { "router" } else { "global zone" }
     );
     ssh_exec(&ip, None)
 }
@@ -235,4 +224,45 @@ pub(crate) async fn cmd_tp_login(
     })?;
     eprintln!("[voxel] ssh root@{ip} -> {ZLOGIN}  ({} {switch})", s.name);
     ssh_exec(&ip, Some(ZLOGIN))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libfalcon::Runner;
+    use voxel_config::config::ExternalMode;
+
+    #[tokio::test]
+    async fn host_ip_finds_sleds_and_routers() {
+        let mut cfg = VoxelConfig::default();
+        cfg.external.mode = ExternalMode::Isolated;
+
+        let mut runner = Runner::new("test");
+        let sleds = cfg
+            .sleds()
+            .into_iter()
+            .map(|s| {
+                let n = runner.node(&s.name, "img", 1, 1);
+                (s, n)
+            })
+            .collect();
+        let routers = cfg
+            .topology
+            .routers
+            .iter()
+            .map(|r| (r.clone(), runner.node(r, "img", 1, 1)))
+            .collect();
+        let topo = Topo { runner, sleds, routers };
+
+        for (s, _) in &topo.sleds {
+            assert!(host_ip(&cfg, &topo, &s.name).await.is_ok());
+            assert!(!topo.is_router(&s.name));
+        }
+        for (r, _) in &topo.routers {
+            assert!(host_ip(&cfg, &topo, r).await.is_ok());
+            assert!(topo.is_router(r));
+        }
+
+        assert!(host_ip(&cfg, &topo, "other_node").await.is_err());
+    }
 }
