@@ -12,6 +12,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use crate::rss::strip_ansi;
+use crate::util::shell_quote;
 
 /// Absolute path to `route`. Not all invoking shells carry /usr/sbin on PATH
 /// (commtest re-executes voxel under a fresh login), so spawn it absolutely.
@@ -26,6 +27,12 @@ pub(crate) const ZLOGIN: &str = "zlogin oxz_switch";
 /// redirections / quoting around the result).
 pub(crate) fn zlogin(cmd: &str) -> String {
     format!("{ZLOGIN} {cmd}")
+}
+
+/// Like [`zlogin`], but quoted so that the command is entirely interpreted in
+/// the switch zone, including `|`, `;`, `&&`, `*` and `>`.
+pub(crate) fn quoted_zlogin(cmd: &str) -> String {
+    zlogin(&shell_quote(cmd))
 }
 
 /// Soft bound on a serial-console resolution. The exec itself completes in a
@@ -470,4 +477,58 @@ pub(crate) async fn set_external_route(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camino::Utf8Path;
+    use std::fs;
+
+    #[test]
+    fn quoted_zlogin_quotes_the_command() {
+        assert_eq!(quoted_zlogin("a | b"), zlogin("'a | b'"));
+        assert_eq!(quoted_zlogin("echo 'x'"), zlogin(r"'echo '\''x'\'''"));
+    }
+
+    /// Runs `quoted_zlogin(command)` in a shell in `sled`, with a `zlogin`
+    /// that moves to `zone`. The folders stand in for different zones in this
+    /// case.
+    fn run_quoted_zlogin(dir: &Utf8Path, command: &str) -> String {
+        let script = format!(
+            r#"zlogin() {{ shift; (cd ../zone && sh -c "$*"); }}; {}"#,
+            quoted_zlogin(command)
+        );
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .current_dir(dir.join("sled"))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn quoted_zlogin_runs_the_whole_command_in_the_zone() {
+        let dir = crate::util::temp_dir().join("voxel-quoted-zlogin");
+        let _ = fs::remove_dir_all(&dir);
+        for d in ["sled", "zone"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+            fs::write(dir.join(d).join(format!("in-{d}")), "").unwrap();
+        }
+
+        // What follows a `|`, `;` or `&&` runs in the zone.
+        for command in ["true | ls", "true; ls", "true && ls"] {
+            assert_eq!(
+                run_quoted_zlogin(&dir, command),
+                "in-zone",
+                "{command}"
+            );
+        }
+        // `*` matches the zone's files.
+        assert_eq!(run_quoted_zlogin(&dir, "echo *"), "in-zone");
+        // `>` writes in the zone.
+        run_quoted_zlogin(&dir, "true > out");
+        assert!(dir.join("zone/out").exists());
+        assert!(!dir.join("sled/out").exists());
+    }
 }
