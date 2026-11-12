@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use libfalcon::{NodeRef, cli::console};
 use voxel_config::{SledDesc, VoxelConfig};
 
-use crate::net::{ZLOGIN, resolve_external_ip, ssh_output, zlogin};
+use crate::net::{ZLOGIN, quoted_zlogin, resolve_external_ip, ssh_output};
 use crate::topo::{Topo, build_topo};
 
 /// Return the address `host login` and `host exec` SSH to.
@@ -61,7 +61,7 @@ pub(crate) async fn cmd_tp_exec(
         .with_context(|| {
         format!("is the rack up? (`voxel serial {}` for the console)", s.name)
     })?;
-    let out = ssh_output(&ip, &zlogin(command)).with_context(|| {
+    let out = ssh_output(&ip, &quoted_zlogin(command)).with_context(|| {
         format!("couldn't reach oxz_switch on {} ({switch})", s.name)
     })?;
     print!("{out}");
