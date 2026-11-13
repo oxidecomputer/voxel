@@ -123,8 +123,19 @@ pub(crate) fn create_zvols(
                 .args(["destroy", &vol])
                 .output();
             let size = format!("{}G", disk.size_gb);
+            // Disabling synchronous writes helps us init the rack more
+            // smoothly without saturating the host's disk.
             let out = std::process::Command::new("zfs")
-                .args(["create", "-p", "-s", "-V", &size, &vol])
+                .args([
+                    "create",
+                    "-p",
+                    "-s",
+                    "-o",
+                    "sync=disabled",
+                    "-V",
+                    &size,
+                    &vol,
+                ])
                 .output()
                 .with_context(|| format!("zfs create {vol}"))?;
             if !out.status.success() {
