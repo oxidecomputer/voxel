@@ -5,13 +5,16 @@
 //! Bake an image: boot a one-node builder, run the in-guest agent's install
 //! role, and capture its disk as a registered falcon base image.
 //!
-//! `image create` and `image create-frr` both build through here.
+//! `image create` and `image create-frr` both build through here. Everything
+//! host-side (the builder's falcon dir, cargo-bays, download caches) lives
+//! under `image-build/` in the anchored workdir, never in voxel's source tree.
 
 use crate::isolated_external;
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use libfalcon::{Runner, unit::gb};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// The builder node name, which fixes the falcon workdir layout
@@ -81,7 +84,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 
     // The builder must not share a falcon workspace with a running rack:
     // teardown removes `.falcon/`, which holds the rack's pid files.
-    let workspace = repo_root()?.join("voxel-image");
+    let workspace = build_root()?;
     std::env::set_current_dir(&workspace)
         .with_context(|| format!("cd {workspace}"))?;
 
@@ -189,54 +192,24 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The musl target the Debian router guest needs. Static, so the router gets one
-/// self-contained binary with no glibc or dynamic-linking dependency.
-const FRR_TARGET: &str = "x86_64-unknown-linux-musl";
-
-/// Build a `voxel-frr` router image: cross-compile the agent for the Debian
-/// guest on the host (voxel's last host toolchain dependency), stage it, bake.
+/// Build a `voxel-frr` router image: stage the prebuilt static agent for the
+/// Debian guest, then bake.
 pub(crate) async fn create_frr(
     version: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
-    let root = repo_root()?;
     let network = builder_network(external)?;
     let image_name = format!("voxel-frr-{version}");
-    let cargo_bay = root.join("voxel-image/cargo-bay/vbuild-frr");
-
-    eprintln!("[voxel] cross-compiling voxel-init for {FRR_TARGET} (static)");
-    // Best-effort: already-installed targets exit nonzero on some rustup versions.
-    let _ = Command::new(toolchain_bin("rustup"))
-        .args(["target", "add", FRR_TARGET])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let built = Command::new(toolchain_bin("cargo"))
-        .current_dir(&root)
-        .args([
-            "build",
-            "-p",
-            "voxel-init",
-            "--release",
-            "--target",
-            FRR_TARGET,
-        ])
-        .env("RUSTFLAGS", "-C linker=rust-lld -C link-self-contained=yes")
-        .status()
-        .context("run cargo build -p voxel-init")?;
-    if !built.success() {
-        bail!("cross-compiling voxel-init for {FRR_TARGET} failed");
-    }
-
+    let cargo_bay = build_root()?.join("cargo-bay/vbuild-frr");
     std::fs::create_dir_all(&cargo_bay)
         .with_context(|| format!("mkdir {cargo_bay}"))?;
-    let agent_src =
-        root.join(format!("target/{FRR_TARGET}/release/voxel-init"));
+    let agent_src = find_voxel_init(&ROUTER_INIT)?;
+    eprintln!("[voxel] staging voxel-init from {agent_src}");
     let agent_dst = cargo_bay.join("voxel-init");
     std::fs::copy(&agent_src, &agent_dst)
         .with_context(|| format!("stage agent {agent_src}"))?;
-    // The 9p mount drops the exec bit in-guest anyway, but keep it host-side.
+    // The 9p mount drops the exec bit in-guest; keep it host-side regardless.
     let _ = Command::new("chmod").args(["+x"]).arg(&agent_dst).status();
 
     bake(BakeOpts {
@@ -255,40 +228,82 @@ pub(crate) async fn create_frr(
     Ok(())
 }
 
-/// Resolve a rust toolchain binary: explicit override, then the rustup install
-/// (pfexec drops `~/.cargo/bin` from PATH), then PATH.
-pub(crate) fn toolchain_bin(name: &str) -> Utf8PathBuf {
-    if let Ok(p) = std::env::var(name.to_uppercase()) {
-        return Utf8PathBuf::from(p);
-    }
-    for home in
-        [std::env::var("HOME").ok(), Some("/root".into())].into_iter().flatten()
-    {
-        let candidate = Utf8PathBuf::from(home).join(".cargo/bin").join(name);
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    Utf8PathBuf::from(name)
+/// A prebuilt in-guest agent and where to look for it.
+pub(crate) struct Prebuilt {
+    /// Which image it goes into, for messages.
+    pub role: &'static str,
+    /// Environment variable naming the binary outright.
+    pub env: &'static str,
+    /// Paths relative to the voxel binary, tried in order.
+    pub candidates: &'static [&'static str],
+    /// The cargo command that produces it from a source checkout.
+    pub build: &'static str,
 }
 
-/// voxel's own source tree: `VOXEL_REPO_ROOT`, else next to the binary, else
-/// the cwd.
-pub(crate) fn repo_root() -> Result<Utf8PathBuf> {
-    if let Ok(root) = std::env::var("VOXEL_REPO_ROOT") {
-        return Ok(Utf8PathBuf::from(root));
+/// The native illumos agent for the sled image. A workspace build puts it
+/// next to voxel: the baked agent is always the launching binary's era.
+pub(crate) const SLED_INIT: Prebuilt = Prebuilt {
+    role: "sled image",
+    env: "VOXEL_INIT",
+    candidates: &["voxel-init"],
+    build: "cargo build --release -p voxel-init",
+};
+
+/// The static musl agent for the Debian router image. CI publishes it as
+/// `voxel-init-linux`; a source checkout cross-compiles it on the host.
+pub(crate) const ROUTER_INIT: Prebuilt = Prebuilt {
+    role: "router image",
+    env: "VOXEL_INIT_LINUX",
+    candidates: &[
+        "voxel-init-linux",
+        "../x86_64-unknown-linux-musl/release/voxel-init",
+    ],
+    build: "RUSTFLAGS='-C linker=rust-lld -C link-self-contained=yes' \
+            cargo build --release -p voxel-init --target x86_64-unknown-linux-musl",
+};
+
+/// Locate a prebuilt agent: the environment override, then next to the voxel
+/// binary as the CI bundle lays it out, then cargo's own target layout.
+pub(crate) fn find_voxel_init(agent: &Prebuilt) -> Result<Utf8PathBuf> {
+    if let Ok(p) = std::env::var(agent.env) {
+        let p = Utf8PathBuf::from(p);
+        if !p.exists() {
+            bail!("${}={p} does not exist", agent.env);
+        }
+        return Ok(p);
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-        && let Ok(candidate) = Utf8PathBuf::try_from(dir.join("../.."))
-        && candidate.join("voxel-image").exists()
-    {
-        return Ok(candidate);
+    let exe = std::env::current_exe().context("resolve the voxel binary")?;
+    let dir = exe.parent().context("the voxel binary has a parent dir")?;
+    for rel in agent.candidates {
+        let candidate = dir.join(rel);
+        if candidate.exists() {
+            return Utf8PathBuf::try_from(candidate)
+                .context("non-utf8 voxel-init path");
+        }
     }
-    if Utf8Path::new("voxel-image").exists() {
-        return Ok(Utf8PathBuf::from("."));
+    bail!(
+        "no prebuilt voxel-init for the {} next to {}; build it with `{}` \
+         or point ${} at one",
+        agent.role,
+        exe.display(),
+        agent.build,
+        agent.env
+    )
+}
+
+/// The host-side image build workspace, `image-build/` under the anchored
+/// workdir. Fixed on first use: `bake` cds into it.
+pub(crate) fn build_root() -> Result<Utf8PathBuf> {
+    static ROOT: OnceLock<Utf8PathBuf> = OnceLock::new();
+    if let Some(root) = ROOT.get() {
+        return Ok(root.clone());
     }
-    bail!("can't find voxel's source tree - set VOXEL_REPO_ROOT")
+    let cwd = std::env::current_dir().context("current dir")?;
+    let root = Utf8PathBuf::try_from(cwd)
+        .context("non-utf8 working directory")?
+        .join("image-build");
+    std::fs::create_dir_all(&root).with_context(|| format!("mkdir {root}"))?;
+    Ok(ROOT.get_or_init(|| root).clone())
 }
 
 /// Stage the builder's static address for an isolated-mode build, or clear a

@@ -19,7 +19,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
 
 use crate::imagebuild::{
-    BakeOpts, bake, builder_network, repo_root, toolchain_bin,
+    BakeOpts, SLED_INIT, bake, build_root, builder_network, find_voxel_init,
 };
 
 /// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
@@ -171,9 +171,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         // Belt and braces: the omicron build and falcon are Helios-only.
         eprintln!("[voxel] warning: control-plane builds are Helios-only");
     }
-    let root = repo_root()?;
-    let voxel_image = root.join("voxel-image");
-    let cargo_bay = voxel_image.join("cargo-bay/vbuild");
+    let root = build_root()?;
+    let cargo_bay = root.join("cargo-bay/vbuild");
     // vbuild is regenerated per run. Leftovers owned by another user (an
     // earlier pfexec run) would fail every later write.
     if cargo_bay.exists() {
@@ -284,7 +283,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     )?;
 
     // --- 6. fetch the SoftNPU sidecar ----------------------------------------
-    fetch_sidecar(&voxel_image, &cargo_bay.join("sidecar"))?;
+    fetch_sidecar(&root, &cargo_bay.join("sidecar"))?;
 
     // --- 7. stage the curated omicron dir into the builder cargo-bay ---------
     let stage = cargo_bay.join("omicron");
@@ -326,23 +325,13 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     rsync.arg(format!("{stage}/"));
     run(&mut rsync, "rsync omicron -> cargo-bay")?;
 
-    // --- 7b. build + stage the in-guest agent --------------------------------
-    // Native illumos build: this box is the gimlet's OS.
-    eprintln!(
-        "[voxel] building voxel-init (native illumos) for the gimlet image"
-    );
-    run(
-        Command::new(toolchain_bin("cargo")).current_dir(&root).args([
-            "build",
-            "-p",
-            "voxel-init",
-            "--release",
-        ]),
-        "cargo build voxel-init",
-    )?;
+    // --- 7b. stage the in-guest agent ----------------------------------------
+    // The prebuilt voxel-init from the same workspace build as voxel itself.
+    let agent_src = find_voxel_init(&SLED_INIT)?;
+    eprintln!("[voxel] staging voxel-init from {agent_src}");
     let agent = cargo_bay.join("voxel-init");
-    std::fs::copy(root.join("target/release/voxel-init"), &agent)
-        .context("stage voxel-init into the cargo-bay")?;
+    std::fs::copy(&agent_src, &agent)
+        .with_context(|| format!("stage {agent_src} into the cargo-bay"))?;
     let _ = Command::new("chmod").arg("+x").arg(&agent).status();
 
     // --- 8. bake -------------------------------------------------------------
@@ -383,10 +372,10 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 
 /// Fetch sidecar-lite's scadm + libsidecar_lite.so via a rev-keyed cache and
 /// stage them for the image. Only the host reaches buildomat.
-fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
+fn fetch_sidecar(build_root: &Utf8Path, dest: &Utf8Path) -> Result<()> {
     let rev = std::env::var("SIDECAR_LITE_REV")
         .unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
-    let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
+    let cache = build_root.join(format!(".sidecar-lite/{rev}"));
     std::fs::create_dir_all(&cache)
         .with_context(|| format!("mkdir {cache}"))?;
     std::fs::create_dir_all(dest).with_context(|| format!("mkdir {dest}"))?;
@@ -420,9 +409,8 @@ async fn create_cp_tuf(
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
-    let root = repo_root()?;
-    let voxel_image = root.join("voxel-image");
-    let cargo_bay = voxel_image.join("cargo-bay/vbuild");
+    let root = build_root()?;
+    let cargo_bay = root.join("cargo-bay/vbuild");
     if cargo_bay.exists() {
         std::fs::remove_dir_all(&cargo_bay).with_context(|| {
             format!(
@@ -442,7 +430,7 @@ async fn create_cp_tuf(
     eprintln!("[voxel] extracted {n} measurement corpus artifacts");
 
     // --- 2. global-zone software from the host phase 2 payload ---------------
-    let host_cache = voxel_image.join(".tuf-host");
+    let host_cache = root.join(".tuf-host");
     std::fs::create_dir_all(&host_cache)
         .with_context(|| format!("mkdir {host_cache}"))?;
     let key: String = t.host_sha().chars().take(12).collect();
@@ -465,7 +453,7 @@ async fn create_cp_tuf(
 
     // Emulated-fleet firmware, so the SPs a launch flashes come from the same
     // release as the zones rather than from hand-staged files.
-    let fw_dir = voxel_image.join(format!(".tuf-fw/{key}"));
+    let fw_dir = root.join(format!(".tuf-fw/{key}"));
     let fw = t.extract_firmware_into(&fw_dir)?;
     eprintln!("[voxel] extracted SP/RoT firmware -> {fw_dir}");
 
@@ -504,8 +492,7 @@ async fn create_cp_tuf(
     }
 
     // --- 3. pinned single files from the omicron repo ------------------------
-    let manifest =
-        fetch_omicron_raw(&voxel_image, full_sha, "package-manifest.toml")?;
+    let manifest = fetch_omicron_raw(&root, full_sha, "package-manifest.toml")?;
     // The prerequisites script calls sibling tools scripts; stage its closure.
     const RUNNER_TOOLS: [&str; 4] = [
         "install_runner_prerequisites.sh",
@@ -517,17 +504,14 @@ async fn create_cp_tuf(
     std::fs::create_dir_all(&tools)
         .with_context(|| format!("mkdir {tools}"))?;
     for name in RUNNER_TOOLS {
-        let fetched = fetch_omicron_raw(
-            &voxel_image,
-            full_sha,
-            &format!("tools/{name}"),
-        )?;
+        let fetched =
+            fetch_omicron_raw(&root, full_sha, &format!("tools/{name}"))?;
         std::fs::copy(&fetched, tools.join(name))
             .with_context(|| format!("stage tools/{name}"))?;
     }
 
     // --- 4. softnpu dendrite over the repo's ASIC switch zone ----------------
-    let dendrite = fetch_dendrite_softnpu(&voxel_image, &manifest)?;
+    let dendrite = fetch_dendrite_softnpu(&root, &manifest)?;
     let scrimlets = [0usize, num_gimlets.saturating_sub(1)];
     let fleet = voxel_config::sp::SpFleet::sim(num_gimlets);
     let mgs_config = voxel_config::mgs::switch_config(0, &fleet, &scrimlets);
@@ -538,10 +522,10 @@ async fn create_cp_tuf(
     )?;
 
     // --- 5. sidecar-lite + the agent ------------------------------------------
-    fetch_sidecar(&voxel_image, &cargo_bay.join("sidecar"))?;
+    fetch_sidecar(&root, &cargo_bay.join("sidecar"))?;
     // TUF builds run no compiler: the agent is the prebuilt binary shipped
     // (and workspace-built) alongside voxel itself.
-    let agent_src = find_voxel_init()?;
+    let agent_src = find_voxel_init(&SLED_INIT)?;
     eprintln!("[voxel] staging voxel-init from {agent_src}");
     let agent = cargo_bay.join("voxel-init");
     std::fs::copy(&agent_src, &agent)
@@ -566,9 +550,9 @@ async fn create_cp_tuf(
     // --- 7. stamps -------------------------------------------------------------
     // Fetch the two schema-marker sources into a checkout-shaped cache for the
     // detector.
-    fetch_omicron_raw(&voxel_image, full_sha, "sled-agent/src/config.rs")?;
-    fetch_omicron_raw(&voxel_image, full_sha, "sled-hardware/src/lib.rs")?;
-    let schema_root = raw_cache(&voxel_image, full_sha);
+    fetch_omicron_raw(&root, full_sha, "sled-agent/src/config.rs")?;
+    fetch_omicron_raw(&root, full_sha, "sled-hardware/src/lib.rs")?;
+    let schema_root = raw_cache(&root, full_sha);
     let (data_links, disks) =
         crate::topo::schema_from_checkout(&schema_root)
             .context("derive sled schema from the pinned omicron sources")?;
@@ -603,30 +587,6 @@ async fn create_cp_tuf(
         fw.gimlet, fw.sidecar, fw.rot_a, fw.bootleby
     );
     Ok(())
-}
-
-/// The prebuilt voxel-init to bake: $VOXEL_INIT, else the sibling of this
-/// executable. The workspace builds and ships both together.
-fn find_voxel_init() -> Result<Utf8PathBuf> {
-    if let Ok(p) = std::env::var("VOXEL_INIT") {
-        let p = Utf8PathBuf::from(p);
-        if !p.exists() {
-            bail!("$VOXEL_INIT={p} does not exist");
-        }
-        return Ok(p);
-    }
-    let exe = std::env::current_exe().context("resolve the voxel binary")?;
-    if let Some(dir) = exe.parent() {
-        let sibling = dir.join("voxel-init");
-        if sibling.exists() {
-            return Utf8PathBuf::try_from(sibling)
-                .context("non-utf8 voxel-init path");
-        }
-    }
-    bail!(
-        "no voxel-init next to the voxel binary; build it \
-         (cargo build --release -p voxel-init) or set $VOXEL_INIT"
-    )
 }
 
 /// Mount the phase 2 pool read-only under `mnt` and copy its /opt/oxide plus
@@ -743,18 +703,18 @@ const OMICRON_RAW_URL: &str =
 pub(crate) const BUILDOMAT_URL: &str =
     "https://buildomat.eng.oxide.computer/public/file/oxidecomputer";
 
-fn raw_cache(voxel_image: &Utf8Path, sha: &str) -> Utf8PathBuf {
-    voxel_image.join(format!(".omicron-raw/{sha}"))
+fn raw_cache(build_root: &Utf8Path, sha: &str) -> Utf8PathBuf {
+    build_root.join(format!(".omicron-raw/{sha}"))
 }
 
 /// Fetch one file from the omicron repo at the pinned sha, via a sha-keyed
 /// cache. This is the only omicron source access in a TUF image build.
 fn fetch_omicron_raw(
-    voxel_image: &Utf8Path,
+    build_root: &Utf8Path,
     sha: &str,
     rel: &str,
 ) -> Result<Utf8PathBuf> {
-    let cached = raw_cache(voxel_image, sha).join(rel);
+    let cached = raw_cache(build_root, sha).join(rel);
     if cached.exists() {
         return Ok(cached);
     }
@@ -774,7 +734,7 @@ fn fetch_omicron_raw(
 /// Fetch the prebuilt softnpu dendrite zone the pinned package-manifest names
 /// (repo dendrite, source.commit + sha256), via a rev-keyed cache.
 fn fetch_dendrite_softnpu(
-    voxel_image: &Utf8Path,
+    build_root: &Utf8Path,
     manifest: &Utf8Path,
 ) -> Result<Utf8PathBuf> {
     let text = std::fs::read_to_string(manifest)
@@ -793,7 +753,7 @@ fn fetch_dendrite_softnpu(
         get("commit").context("dendrite-softnpu has no source.commit")?;
     let sha256 =
         get("sha256").context("dendrite-softnpu has no source.sha256")?;
-    let cached = voxel_image
+    let cached = build_root
         .join(format!(".dendrite-softnpu/{commit}/dendrite-softnpu.tar.gz"));
     if !cached.exists() {
         let dir = cached.parent().context("cache path has a parent")?;
@@ -924,4 +884,21 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
         bail!("{what} failed");
     }
     Ok(())
+}
+
+/// Resolve a rust toolchain binary: explicit override, then the rustup install
+/// (pfexec drops `~/.cargo/bin` from PATH), then PATH.
+fn toolchain_bin(name: &str) -> Utf8PathBuf {
+    if let Ok(p) = std::env::var(name.to_uppercase()) {
+        return Utf8PathBuf::from(p);
+    }
+    for home in
+        [std::env::var("HOME").ok(), Some("/root".into())].into_iter().flatten()
+    {
+        let candidate = Utf8PathBuf::from(home).join(".cargo/bin").join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    Utf8PathBuf::from(name)
 }

@@ -17,8 +17,6 @@ generation.
   config generation (sled-agent, RSS, FRR, MGS/SP-sim).
 - **`voxel-init/`**: the in-guest bring-up agent baked into the images (gimlet/router
   roles).
-- **`voxel-image/`**: image build machinery (`voxel image create`) and the install
-  scripts that bake a control-plane image from an omicron commit.
 
 See [`docs/parameters.md`](docs/parameters.md) for the `voxel.toml` reference,
 there are a LOT of tuning knobs.
@@ -46,7 +44,15 @@ accessing, and tearing down a rack, see the
 2. `voxel image create` builds omicron with a pinned commit and bakes `voxel-cp-<HASH>`
    (30-45 min).
 3. `voxel image create-frr proto` bakes `voxel-frr-proto` (omicron-independent;
-   build once, reuse for any commit).
+   build once, reuse for any commit). It stages the static Linux `voxel-init`,
+   which CI publishes as `voxel-init-linux` next to `voxel`. From a checkout,
+   cross-compile it once first:
+
+   ```sh
+   rustup target add x86_64-unknown-linux-musl
+   RUSTFLAGS='-C linker=rust-lld -C link-self-contained=yes' \
+       cargo build --release -p voxel-init --target x86_64-unknown-linux-musl
+   ```
 4. Configure using the image name from step 2 (`voxel image ls` lists it):
 
 ```
