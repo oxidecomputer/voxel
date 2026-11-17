@@ -194,7 +194,12 @@ pub(crate) fn rss_config(
     };
 
     let rack_network_config = types::UserSpecifiedRackNetworkConfig {
-        rack_subnet_address: None,
+        rack_subnet_address: Some(
+            n.rack_subnet
+                .parse::<oxnet::Ipv6Net>()
+                .context("rack_subnet")?
+                .addr(),
+        ),
         infra_ip_first: infra_first,
         infra_ip_last: infra_last,
         switch0,
