@@ -1,0 +1,33 @@
+# traffic, rack 0 with sleds 2FAKE000 and 2FAKE001
+get sled_data_link:bytes_received | filter sled_serial == "2FAKE000" | last 1
+get sled_data_link:bytes_sent | filter sled_serial == "2FAKE000" | last 1
+get sled_data_link:packets_received | filter sled_serial == "2FAKE000" | last 1
+get sled_data_link:packets_sent | filter sled_serial == "2FAKE000" | last 1
+get sled_data_link:errors_received | filter sled_serial == "2FAKE000" | last 1
+get sled_data_link:errors_sent | filter sled_serial == "2FAKE000" | last 1
+get sled_data_link:bytes_received | filter sled_serial == "2FAKE001" | last 1
+get sled_data_link:bytes_sent | filter sled_serial == "2FAKE001" | last 1
+get sled_data_link:packets_received | filter sled_serial == "2FAKE001" | last 1
+get sled_data_link:packets_sent | filter sled_serial == "2FAKE001" | last 1
+get sled_data_link:errors_received | filter sled_serial == "2FAKE001" | last 1
+get sled_data_link:errors_sent | filter sled_serial == "2FAKE001" | last 1
+
+# zone CPU
+get zone:cpu_nsec
+    | filter timestamp > @now() - 2m
+    | align mean_within(10s)
+    | group_by [sled_serial, zone_name, zone_type, state], sum
+    | filter datum >= 0.0
+    | last 1
+
+# ZFS allocated
+get zfs_pool:bytes_allocated | last 1
+
+# ZFS total
+get zfs_pool:bytes_total | last 1
+
+# oximeter failed collections
+get oximeter_collector:failed_collections | filter timestamp > @now() - 5m
+
+# oximeter dropped samples
+get oximeter_collector:database_samples_dropped | filter timestamp > @now() - 5m
