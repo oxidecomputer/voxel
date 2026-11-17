@@ -166,7 +166,7 @@ fn interconnect_port(switch: &str, port: &str) -> Result<PortConfig> {
 }
 
 /// The baseboards of `rack`'s bootstrap sleds.
-fn trust_quorum_peers(cfg: &VoxelConfig, rack: usize) -> Vec<BaseboardId> {
+fn trust_quorum_peers(cfg: &VoxelConfig, rack: usize) -> BTreeSet<BaseboardId> {
     cfg.sleds()
         .iter()
         .filter(|s| s.rss && s.rack == rack)
@@ -261,7 +261,9 @@ pub fn multirack_join_request(
     rack: usize,
 ) -> Result<MultirackJoinRequest> {
     Ok(MultirackJoinRequest {
-        trust_quorum_peers: trust_quorum_peers(cfg, rack).into_iter().collect(),
+        trust_quorum_peers: trust_quorum_peers(cfg, rack)
+            .try_into()
+            .context("trust quorum peers")?,
         rack_network_config: rack_network_config(cfg, rack)?,
     })
 }
@@ -310,7 +312,11 @@ pub fn request_from_config(
 
     let silo = &cfg.recovery_silo;
     Ok(RackInitializeRequest {
-        trust_quorum_peers: Some(trust_quorum_peers(cfg, rack)),
+        trust_quorum_peers: Some(
+            trust_quorum_peers(cfg, rack)
+                .try_into()
+                .context("trust quorum peers")?,
+        ),
         bootstrap_discovery: BootstrapAddressDiscovery::OnlyThese {
             addrs: bootstrap_addrs,
         },
@@ -461,7 +467,7 @@ mod tests {
         let rss = request_from_config(&cfg, 1).unwrap();
         // The join is configured from the same per-rack derivation RSS uses.
         assert_eq!(join.rack_network_config, rss.rack_network_config);
-        assert_eq!(join.trust_quorum_peers.len(), 3);
+        assert_eq!(join.trust_quorum_peers.num_members(), 3);
         // The interconnect ports are the reason the config is published at all:
         // allow_ddm_traffic is what makes dendrite give them a link-local.
         let ddm = join
