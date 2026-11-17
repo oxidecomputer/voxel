@@ -245,13 +245,14 @@ pub(crate) async fn cmd_launch(
     if opts.emu {
         sp_host::up_all(cfg, opts.emu)?;
     }
-    disks::create_zvols(&image::falcon_dataset(), name, &sleds)
-        .context("creating sled disks")?;
-
     // A failed all-VMs-at-once boot (falcon's cargo-bay mount times out under
     // the RAM spike) is torn down and retried from a fresh topology.
     let mut attempt = 1;
     let topo = loop {
+        // Create the zvols on each loop iteration, since teardown's zfs destroy
+        // -r of the topo dataset removes them.
+        disks::create_zvols(&image::falcon_dataset(), name, &sleds)
+            .context("creating sled disks")?;
         let mut topo = build_topo(cfg, name)?;
         match topo.runner.launch().await {
             Ok(()) => break topo,
