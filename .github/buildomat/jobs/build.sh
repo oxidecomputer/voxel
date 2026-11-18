@@ -51,6 +51,9 @@ banner "check"
 cargo fmt -- --check
 cargo clippy --all-targets -- --deny warnings
 
+banner "test"
+cargo test
+
 banner "build"
 ptime -m cargo build --release
 
