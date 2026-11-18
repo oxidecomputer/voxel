@@ -19,9 +19,11 @@ use std::time::Duration;
 const NODE: &str = "vbuild";
 /// The builder's falcon deployment name.
 const DEPLOY: &str = "voxel_build";
+/// Falcon base image for the illumos images (builder and voxel-cp).
+pub(crate) const HELIOS_BASE: &str = "helios-3.1";
 
 pub(crate) struct BakeOpts<'a> {
-    /// Base image to boot: `helios-3.0` or `debian-13.2`.
+    /// Base image to boot: [`HELIOS_BASE`] or `debian-13.2`.
     pub base_image: &'a str,
     /// Agent install role (`cp` / `frr`).
     pub role: &'a str,
