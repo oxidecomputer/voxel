@@ -5,7 +5,7 @@
 
 == Introduction
 
-Voxel (Virtual Oxide Emulation Lab) stands up a complete virtual Oxide rack on
+Voxel (Virtual Oxide Emulation Lab) stands up a virtual Oxide rack on
 a single machine. It deploys the full Oxide control plane,
 https://github.com/oxidecomputer/omicron[Omicron], across a set of
 interconnected virtual machines defined and launched by
@@ -13,30 +13,23 @@ https://github.com/oxidecomputer/falcon[Falcon] (a Rust API for creating
 network topologies), with
 https://github.com/oxidecomputer/softnpu[SoftNPU] emulating the switch ASIC
 (standing in for the Tofino-based hardware switch) and FRR routers providing
-the customer-edge network. The result is a practical way to gain insight into
-the Oxide rack's networking and service topologies without physical hardware.
+the customer-edge network.
 
-A running Voxel rack gives you hands-on access to the same interfaces that an
-Oxide rack exposes: the web console, the Oxide API, telemetry via Oximeter, and
+A running Voxel rack exposes the same interfaces as an
+Oxide rack: the web console, the Oxide API, telemetry via Oximeter, and
 the full networking stack with BGP or static routing.
 
-Because the compute sleds are themselves propolis VMs, the Oxide hypervisor
-cannot nest. Instead of launching full virtual machine instances on the
-emulated sleds, workloads take the form of probes — faux-instances realized
-as https://illumos.org/man/7/zones[zones] that attach to the rack's networking
-without requiring a nested VMM. This is a constraint of emulation, not of the
-platform itself.
+Because the compute sleds are themselves propolis VMs, they cannot run
+nested VMs. Workloads use probes: faux-instances implemented as
+https://illumos.org/man/7/zones[zones] that attach to the rack's networking.
 
-This guide walks through standing up a Voxel rack from bare metal and
-introduces the things you can do with it once it's running. Building the
-control-plane image takes 30-45 minutes, after that, launching a rack takes a
-few minutes.
+Building the control-plane image takes 30-45 minutes. Launching a rack from
+those images takes a few minutes.
 
 == Hardware Requirements
 
-Voxel runs on bare metal, not in a VM, because it cannot nest its own
-hypervisor. An AMD or Intel system with sufficient memory and
-fast storage is all that's needed.
+Voxel requires a bare-metal AMD or Intel system because it cannot nest its
+hypervisor. Memory and storage requirements are listed below.
 
 === Baseline
 
@@ -182,7 +175,7 @@ named `build`, and click **Details**. The build artifacts include `voxel`,
 === Configuration
 
 Voxel reads its configuration from `~/.config/voxel/voxel.toml` (falling back
-to `/etc/voxel/voxel.toml`). Every field has a sensible default; an empty or
+to `/etc/voxel/voxel.toml`). Every field has a default; an empty or
 absent file is valid. Override individual settings with `voxel config set`:
 
 [source,sh]
@@ -219,9 +212,9 @@ generated on the fly at launch. A single image pair serves any topology.
 === Version Compatibility
 
 The control-plane image must match the Omicron commit pinned by the Voxel
-checkout. This is a strict compatibility requirement: RSS configuration
-schemas change across Omicron commits, and an image from another release may
-build and boot but fail during rack initialization. Find the expected commit in
+checkout. RSS configuration schemas change across Omicron commits, and an
+image from another release may build and boot but fail during rack
+initialization. Find the expected commit in
 the Omicron dependency `rev` fields in the workspace `Cargo.toml`. For a tagged
 Omicron release, you can also copy the full commit SHA from the tag on GitHub.
 Older Omicron releases can require an older Voxel release.
@@ -267,9 +260,9 @@ archive, you can build without compiling Omicron from source:
 pfexec voxel image create --from-tuf /path/to/repo.zip
 ----
 
-This extracts the pre-built zones directly from the release artifacts and is
-significantly faster. The TUF repository must be from the same exact Omicron
-commit in `Cargo.toml`.
+This extracts the pre-built zones from the release artifacts and takes less
+time than a source build. The TUF repository must be from the Omicron commit
+in `Cargo.toml`.
 
 WARNING: The TUF repository's phase-2 sled-agent targets production switch
 hardware. The command above builds a usable Voxel image, but its scrimlet sleds
@@ -321,13 +314,13 @@ from a local checkout:
 pfexec voxel image create --src /path/to/omicron
 ----
 
-This skips the clone and checkout steps and builds your working-tree edits
-as-is, which is useful for testing control-plane changes on a running rack.
+This skips the clone and checkout steps and includes your working-tree edits
+in the image.
 
 === Router Image
 
 The FRR router image only needs to be built once. The argument is an image
-label, it can be any name you choose:
+label; choose any name:
 
 [source,sh]
 ----
@@ -463,8 +456,8 @@ technician port command:
 pfexec voxel tp login switch0
 ----
 
-These are useful for inspecting zone state, checking service logs, and
-debugging control-plane behavior on individual sleds.
+From these shells, you can inspect zone state and service logs when debugging
+the control plane on a sled.
 
 == Accessing the Rack
 
@@ -557,9 +550,7 @@ The default recovery silo credentials are:
 
 == Exploring the Oxide Stack
 
-With a running rack and network access configured, you have a live Oxide
-control plane to work with. This section introduces the primary interfaces and
-some of the things you can do with them.
+The following commands use a running rack with network access configured.
 
 === Setting Up the Oxide CLI
 
@@ -597,17 +588,16 @@ oxide project list
 oxide sled list
 ----
 
-Because the emulated sleds cannot nest VMs, workload testing uses probes —
-lightweight network endpoints that attach to a VPC without requiring a
-hypervisor. Probes are useful for exercising the networking stack, validating
-API workflows, and testing automation against the Oxide API.
+Workload testing uses probes because the emulated sleds cannot nest VMs.
+Probes are lightweight network endpoints attached to a VPC. They can exercise
+the networking stack and support tests of API workflows and automation.
 
 === Telemetry with Oximeter
 
 The Oxide control plane includes https://github.com/oxidecomputer/omicron/tree/main/oximeter[Oximeter],
 a metrics collection and storage system backed by ClickHouse. On a running
-Voxel rack, Oximeter is active and collecting telemetry from control-plane
-services — the same telemetry pipeline that runs on production hardware.
+Voxel rack, Oximeter collects telemetry from control-plane services through
+the same pipeline used on production hardware.
 
 You can query collected metrics through the Oxide CLI's timeseries interface,
 which talks to Oximeter through the Nexus API. See the
@@ -616,24 +606,21 @@ for available metrics. The `oxide experimental
 timeseries query` and `oxide experimental timeseries dashboard` commands accept
 an OxQL query.
 
-This provides visibility into the metrics that omicron services produce:
-resource utilization, network counters, service health, and more. The web
-console also surfaces a subset of these metrics in its dashboard views.
+These metrics include resource utilization, network counters, and service
+health. The web console also displays a subset in its dashboards.
 
 === Running Workloads
 
-Workloads on a Voxel rack take the form of probes — network-attached zones
-that the control plane creates on the emulated sleds, standing in for full VM
-instances where nested virtualization is unavailable. Each probe attaches a
-network endpoint to a VPC, which can then send and receive traffic through the
-rack's data plane.
+The control plane creates probes as network-attached zones on the emulated
+sleds. Each probe has a VPC network endpoint that can send and receive traffic
+through the rack's data plane.
 
 Voxel wraps Omicron's end-to-end connectivity test, `commtest`. It creates
 probes on the rack and sends unicast traffic between them. The multicast
 phase sends from the host instead, through the configured FRR routers and a
 switch to each subscribed probe (member).
 
-NOTE: `voxel network multicast up` must be run first. See
+NOTE: For the multicast phase, run `voxel network multicast up` first. See
 link:multicast.md[multicast.md] for the setup and the API walkthrough.
 
 Before running `commtest`, grant your account the `net_icmpaccess` privilege
@@ -760,7 +747,7 @@ increasing the rack count.
 - **Network validation**: `voxel network validate` checks link states, BGP
   sessions, and routes on a running rack.
 - **TUF repository seeding**: `voxel repo seed` populates sled artifact
-  stores from a TUF repo, accelerating update convergence.
+  stores from a TUF repo to speed up update convergence.
 - **link:multirack-quicktest.md[Multi-rack DDM quick test]**: a walkthrough
   of DDM prefix propagation across interconnected racks.
 - **link:multicast.md[Multicast]**: host routes, static mroutes on the fabric

@@ -59,8 +59,8 @@ voxel network multicast down
 
 Run the `up` command following every launch, since the mroutes live in the
 router VMs. Without `--group`, `up` and commtest both use `239.1.1.1` by
-default. A static-LAN rack swaps in `host_ip` for the sources; see
-[Sending traffic](#sending-traffic).
+default. In `lan` mode, use the host's address on the external link for the
+sources; see [Sending traffic](#sending-traffic).
 
 The rest of this document is long form: what each step installs, the API
 calls if done by hand, and how to read back state information in the rack.
@@ -86,9 +86,6 @@ calls if done by hand, and how to read back state information in the rack.
   configuration directly. A DHCP `lan` setup requires Falcon console lookup
   over the running nodes. All of this plumbing lives in [`multicast.rs`];
   the run wrapper that invokes this setup lives in [`commtest.rs`].
-- The Propolis dependencies in Omicron must resolve to `zl/voxel` at
-  [`6fc51e60`].
-  Propolis uses the `zl/multicast` SoftNPU branch for this setup.
 - A control-plane image whose Omicron carries multicast. If `voxel commtest
   --traffic multi` detects an older, unicast-only commit, the run will fail
   before building. This detection inspects the `--source` checkout,
@@ -96,32 +93,30 @@ calls if done by hand, and how to read back state information in the rack.
 - The commtest privilege setup documented in [README's Privileges section]; a
   run needs `net_icmpaccess` in the effective set and refuses uid 0.
 
-### Dependencies
+### TODO: Dependencies
 
-`Cargo.toml` pins voxel's Omicron dependencies to
-[`b09b97af`](https://github.com/oxidecomputer/omicron/commit/b09b97af0395a1b7501b7432321f3a2d07b61faf).
+`Cargo.toml` pins Voxel's Omicron dependencies to [`41645034`]. A default
+`voxel image create` builds that revision. The packaged service revisions below
+come from that Omicron commit's `package-manifest.toml`; `sidecar-lite` is
+selected by Voxel's `pins.toml`.
 
-Voxel pins the Omicron commit passed to `voxel image create` and the
-sidecar-lite artifact fetched by the build (via `pins.toml`). The maghemite
-and dendrite rows come in through Omicron's own pins (`package-manifest.toml`
-and `tools/`); they have to agree with Omicron's opte revision, since `ddmd`
+Keep Maghemite and Dendrite compatible with Omicron's OPTE revision: `ddmd`
 programs OPTE's boundary table through the xde ioctl API.
 
-| Repository | Branch / rev | PR |
+| Repository | Revision | PR |
 | --- | --- | --- |
-| `propolis` | `zl/voxel`, [`6fc51e60`] | |
-| `omicron` | `zl/mcast-build`, [`b09b97af`](https://github.com/oxidecomputer/omicron/commit/b09b97af0395a1b7501b7432321f3a2d07b61faf) | [#11128](https://github.com/oxidecomputer/omicron/pull/11128) |
-| `maghemite` | `zl/ddm-mcast`, [`5c703453`](https://github.com/oxidecomputer/maghemite/commit/5c703453939ea2e331522d043518d1476a2b34de) | |
-| `dendrite` | `multicast-e2e`, [`bd56a746`](https://github.com/oxidecomputer/dendrite/commit/bd56a7466dde92efd6c90161ea0b15790b4150eb) | |
-| `sidecar-lite` | `zl/multicast`, [`ff2aac07`](https://github.com/oxidecomputer/sidecar-lite/commit/ff2aac077ab15f70794192f4c7f65707712e9ac0) | [#152](https://github.com/oxidecomputer/sidecar-lite/pull/152) |
+| `propolis` | [`7c298670`] | [#1262](https://github.com/oxidecomputer/propolis/pull/1262) |
+| `omicron` | [`41645034`] | [#11128](https://github.com/oxidecomputer/omicron/pull/11128) |
+| `maghemite` | [`c02f1674`](https://github.com/oxidecomputer/maghemite/commit/c02f16749b8d29ff749fa745d4118577cddc44c6) | |
+| `dendrite` | [`28789d60`](https://github.com/oxidecomputer/dendrite/commit/28789d607071cc52a60304f5e6bce52fec3d5597) | |
+| `sidecar-lite` | [`4d57f3a1`](https://github.com/oxidecomputer/sidecar-lite/commit/4d57f3a1fac7e5ed2a63ab5bc54b9b18b7b2cf73) | |
+| `opte` | [`104a6845`](https://github.com/oxidecomputer/opte/commit/104a684534c928cb6af6c0845640ba31b239885f) | [#1108](https://github.com/oxidecomputer/opte/pull/1108) |
+| `propolis` (host) | [`7c298670`](https://github.com/oxidecomputer/propolis/commit/7c298670530922c53ae3f35cd853c0c82229d1ca) | [#1262](https://github.com/oxidecomputer/propolis/pull/1262) |
 
-The `propolis` row is the `propolis-server` the host runs for the rack nodes
-(`falcon.propolis_binary`) and the one Omicron packages into the image. Voxel's
-own `propolis-client` crate in `Cargo.toml` follows libfalcon's propolis pin
-instead. The instance-spec types must match libfalcon's.
-
-These are all prototype branches. **TODO**: reset the pins to their default
-branches after the prototype changes are merged.
+The `propolis` row is the server packaged into the control-plane image. The
+host server for the rack VMs is selected separately with
+`falcon.propolis_binary`. Voxel's own `propolis-client` follows libfalcon at
+[`5e201ec4`]; the host server's instance-spec types must match that client.
 
 For a local test run, build the control-plane image from the local Omicron
 checkout like so:
@@ -129,11 +124,6 @@ checkout like so:
 ```sh
 pfexec voxel image create --src /oxide/workspace/omicron
 ```
-
-The `propolis-server` binary can also be built locally (from the local
-`zl/voxel` checkout currently) and set as `falcon.propolis_binary` in
-`voxel.toml`. Voxel will then use the local server for the rack nodes while the
-image supplies the control-plane install.
 
 ## API walkthrough
 
@@ -225,11 +215,11 @@ oxide --insecure --resolve "$HOST:443:$NEXUS_IP" api /v1/multicast-groups | jq
 
 ## IP pools
 
-An IP pool structure carries a `pool_type` discriminator, `unicast`
+An IP pool has a `pool_type` discriminator, `unicast`
 (the default) or `multicast`, and one IP version (`ip_version`, `v4` or `v6`).
 The `assignment` field is either `silos` (the default) or `system_services`.
-The rack's own `oxide-service-pool-v4` carries the latter value from RSS
-onward. Multicast pools are further constrained:
+The rack's own `oxide-service-pool-v4` uses `system_services` from RSS onward.
+Multicast pools are further constrained:
 
 - Every range in the pool must be entirely Any-Source Multicast (ASM) or
   entirely Source-Specific Multicast (SSM), never both. SSM is `232.0.0.0/8`
@@ -800,23 +790,26 @@ environment (state stored in `.falcon/`).
 Static addressing, including a static `lan`, retrieves router addresses
 from configuration. DHCP `lan` reads them from the running routers over
 the Falcon console. If address resolution fails, `check` reports the error;
-`down` stops right after host-route cleanup. A dry-run skips unresolved routers
-and prints cleanup for the rest of them.
+`down` stops right after host-route cleanup, whereas a `down --dry-run`
+disregards unresolved routers and prints cleanup for the resolved ones.
 
-The `check` command prints the host checksum setting, then the environment's
-host routes, then each router's PIM state with one mroute line per group.
+The checksum setting and host routes are printed first. A
+`host source for GROUP` line then shows the address selected by the host route
+and checks it against the recorded source. The router checks follow from this,
+displaying one PIM line per router and an mroute line per group.
 An mroute line compares the live
 `(S,G)` entry against the expected incoming interface and outgoing links. What
 follows the `->` symbol is the expected outgoing set, and `none` means the
 router should have no entry. Failures are prefixed with `MISSING:`
-and the run exits non-zero. The run below is from a static `lan` rack
-configuration, where the gateway is set to `192.168.1.54`. An isolated-mode
-rack would show the `ce` address from [Host routes](#host-routes) instead:
+and the run exits non-zero. For a static `lan` rack with CE `192.168.1.54` and
+sending host `192.168.1.199`, the output includes:
 
 ```
 ok:      host checksum offload disabled
 ok:      host route 239.100.0.1 -> 192.168.1.54
 ok:      host route 239.100.0.2 -> 192.168.1.54
+ok:      host source for 239.100.0.1 -> 192.168.1.199
+ok:      host source for 239.100.0.2 -> 192.168.1.199
 ok:      pim on cr1:enp0s11
 ok:      mroute on cr1:239.100.0.1 -> enp0s9
 ok:      mroute on cr1:239.100.0.2 -> enp0s9
@@ -828,22 +821,23 @@ check: PASS
 
 ### Sending traffic
 
-`SRC` must be the host's own address on the external segment. In isolated
-mode and in the static LAN example below, this is `[external].host_ip`.
-With DHCP addressing, `host_ip` names the LAN's existing gateway, and we
-read `SRC` from the host's external interface.
+`SRC` must be the host's own address on the external segment. In isolated mode,
+this is `[external].host_ip`. In either static or DHCP `lan` mode, that setting
+is the nodes' gateway and may differ from the sender. Use the address printed
+by `voxel network multicast check` as `host source for GROUP`.
 
 `voxel commtest` configures its API resources before sending traffic. It reuses
 existing pools and the `classone` project. Existing probes are reused when
 they have the requested memberships; otherwise they are recreated.
 
-*Note*: every member of a non-deny group must reply within the configured
-tolerance, and no member may reply more often than it was asked. `commtest`
-(*TODO*: current prototype omicron code) assumes single-copy delivery (one
-request, at most one reply per member, singly-homed), so a group steered into
-both switches (`cr1:switch0,cr2:switch1`) fails the run with duplicate
-replies. Those duplicates are correct for two-path delivery; `commtest` needs
-an update.
+*Note*: all members of a non-deny group must return at least one response.
+`--icmp-loss-tolerance` limits lost ICMP packets per member per group (Voxel's
+default is `500`). A membership subscriber must not return more replies than
+the number of requests sent by the host. `commtest` temporarily assumes
+single-copy delivery (one request, at most one reply per member,
+singly-homed). A group with traffic steered into both switches
+(`cr1:switch0,cr2:switch1`) fails the run with duplicate replies, even when
+both paths deliver correctly.
 
 `--mcast-deny-group` covers the negative case from [Join forms](#join-forms):
 the source list excludes the host, and the run expects no packets. Deny groups
@@ -866,12 +860,9 @@ voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
 The deny source should be any address that's not the host's. This example uses
 `172.30.199.198`.
 
-Those source addresses belong to the isolated segment. In `lan` mode, the
-sender is the host on the LAN itself. We take addresses from the
-`[external]` configuration: the actual source is `host_ip`, and the deny
-source is any other address on `subnet` that's not assigned to the sender. With
-the static LAN configured here (`subnet = 192.168.1.0/24` +
-`host_ip = 192.168.1.199`), we can run the following:
+In `lan` mode, substitute the sending host's external address for the allowed
+sources. This example uses `192.168.1.199` on that link and `192.168.1.198`
+for the deny source:
 
 ```sh
 voxel network multicast up --group 239.100.0.1 --group 239.100.0.2 \
@@ -997,11 +988,13 @@ done
 - guest membership snooping and querying from IGMP or MLD reports.
 
 [775]: https://code.oxide.computer/c/illumos-gate/+/775
-[`6fc51e60`]: https://github.com/oxidecomputer/propolis/commit/6fc51e6042d38f70ee6db4afd7365911abcc45c1
+[`41645034`]: https://github.com/oxidecomputer/omicron/commit/41645034ff180922d19ba0746e6fe250cf5b9c00
+[`7c298670`]: https://github.com/oxidecomputer/propolis/commit/7c298670530922c53ae3f35cd853c0c82229d1ca
+[`5e201ec4`]: https://github.com/oxidecomputer/propolis/commit/5e201ec4185ccb9182cc6ffcb09fadd9deee24ca
 [`multicast.rs`]: ../voxel/src/multicast.rs
 [`commtest.rs`]: ../voxel/src/commtest.rs
-[multicast-to-physical table]: https://github.com/oxidecomputer/opte/blob/0525f2f95588760133b7d5ebc8548e1ccdfbb353/lib/oxide-vpc/src/engine/overlay.rs#L250-L268
-[omdb]: https://github.com/oxidecomputer/omicron/tree/b09b97af0395a1b7501b7432321f3a2d07b61faf/dev-tools/omdb
+[multicast-to-physical table]: https://github.com/oxidecomputer/opte/blob/931e2ccba7b17d7d98148cf8b36c56d18b256e6b/lib/oxide-vpc/src/engine/overlay.rs#L345-L369
+[omdb]: https://github.com/oxidecomputer/omicron/tree/41645034ff180922d19ba0746e6fe250cf5b9c00/dev-tools/omdb
 [README]: ../README.md
 [README's Privileges section]: ../README.md#privileges
 [RFC 1112]: https://datatracker.ietf.org/doc/html/rfc1112

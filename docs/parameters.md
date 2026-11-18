@@ -24,7 +24,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 | `scrimlets` | list | `[]` | Switch-zone sleds. Empty auto-derives first + last sled. Honored only for single-rack. |
 | `rss_sleds` | int | `0` | Sleds in RSS/trust quorum. `0` auto-derives all sleds. |
 | `routers` | list | `["ce", "cr1", "cr2"]` | Customer routers (boot the frr image). `ce` is the edge; `cr*` are transit. |
-| `sled_memory_gb` | int | `8` | Per-sled guest RAM. Gates how many sleds fit in physical RAM. |
+| `sled_memory_gb` | int | `8` | Per-sled guest RAM. Determines how many sleds fit in physical RAM. |
 | `router_memory_gb` | int | `4` | Per-router guest RAM. |
 | `ce_external_ip` | string | unset | Static host-LAN address for `ce`. Unset means `ce` DHCPs and voxel reads the lease over serial. In isolated mode keep it outside the static node range (see `[external]`). |
 
@@ -32,8 +32,8 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. A non-default `version` also stops an unset `cp` from following the associated pin. |
-| `cp` | string | unset | Full cp image name. Overrides `version`. Unset follows the workspace's omicron pin (`voxel-cp-<pin>`, the image a commitless `voxel image create` bakes), but only while `version` keeps its default. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
+| `version` | string | `"proto"` | Shorthand suffix for both images (`voxel-cp-<version>`, `voxel-frr-<version>`). Ignored when `cp`/`frr` are set. With a non-default `version` and an unset `cp`, the control-plane image uses this suffix instead of the workspace pin. |
+| `cp` | string | unset | Full cp image name. Overrides `version`. Unset follows the workspace's omicron pin (`voxel-cp-<pin>`, the image `voxel image create` bakes when no commit is given), but only while `version` is at its default. Keep the `voxel-cp-<commit>` form so the matching omicron checkout is found. |
 | `frr` | string | unset | Full frr image name. Overrides `version`. |
 | `data_links_schema` | enum | unset | `list` or `tagged`. Unset auto-detects from the image. |
 | `disks_schema` | enum | unset | `vdevs`, `external_disks`, or `hardcoded` (omicron#10948). Unset auto-detects from the image. |
@@ -73,12 +73,12 @@ Each block fans out to every fabric router: `cr1` on `qsfp0`, `cr2` on
 
 ### [network.multicast]
 
-The static customer tree carrying externally sourced multicast toward the rack.
+The static customer tree for externally sourced multicast ingress to the rack.
 Every launch renders the PIM VIFs and enables `pimd` on the fabric routers.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `delivery` | enum | `"single"` | Delivery for unsteered groups. `single` takes one path: the first forwarding router toward `switch0`. `all` asks for every switch from every forwarding router, which `up` will reject on a rack with more than one switch (i.e., one outgoing path per router, since FRR withdraws a static mroute just by (S,G)). To reach several switches, use `--steer` to take one router per switch, e.g. `--steer GROUP=cr1:switch0,cr2:switch1`. |
+| `delivery` | enum | `"single"` | Delivery for unsteered groups. `single` takes one path: the first forwarding router toward `switch0`. `all` selects every switch from every forwarding router. On a rack with more than one switch, `up` rejects `all`: FRR withdraws a static mroute by `(S,G)`, so each router can have at most one outgoing path. To reach several switches, use `--steer` with one router per switch, e.g. `--steer GROUP=cr1:switch0,cr2:switch1`. |
 
 ## [external]
 

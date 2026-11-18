@@ -7,7 +7,7 @@ Voxel emulates an Oxide rack's control plane:
 [Omicron] software on [falcon]-managed propolis VMs, with
 SoftNPU switches and FRR routers. Pick a platform version and a topology
 (sled count, multi-rack, BGP/static) and launch. It succeeds the `a4x2`
-testbed topology, reworked around a first-class CLI and on-the-fly config
+testbed topology, with a CLI and on-the-fly config
 generation.
 
 ## Layout
@@ -20,9 +20,9 @@ generation.
 - **`voxel-image/`**: image build machinery (`voxel image create`) and the
   install scripts that bake a control-plane image from an omicron commit.
 
-See [parameters] for the `voxel.toml` reference and its many tuning knobs.
+See [parameters] for the `voxel.toml` reference.
 See [multicast] for the multicast API (pools, groups, members, probes, omdb)
-and the host plumbing that carries externally sourced multicast into a rack.
+and the host setup for externally sourced multicast ingress.
 
 ## Building
 
@@ -57,11 +57,27 @@ accessing, and tearing down a rack, see the
    ```
 
    An unset `image.cp` follows the workspace pin (the image
-   a commitless `voxel image create` bakes). A repin needs no configuration
+   `voxel image create` bakes when no commit is given). A repin needs no configuration
    edit. Set it only when selecting a different image:
    `voxel config set image.cp voxel-cp-43bb5af`.
 
 5. `pfexec voxel launch`
+
+Omicron pins OPTE in `tools/opte_version` and installs it as the
+`driver/network/opte` package. A new OPTE build can require a newer Helios
+kernel than the one in falcon's default guest image, `helios-3.0`. In that
+case, `install_opte.sh` installs an older OPTE and the bake stops with an
+"opte API mismatch" error.
+
+To update the base image before baking, run:
+
+```
+pfexec voxel image create-base helios-3.0-20261118
+pfexec voxel image create --base-image helios-3.0-20261118
+```
+
+`create-base` boots `helios-3.0`, runs `pkg update` and captures the result as
+a new base image. Reuse it for later builds until you want a newer Helios.
 
 A few notes: by default, this will all happen under $HOME. If you don't like that or need
 to improve performance by using a separate disk, there are some knobs set via `voxel config set`:
@@ -145,8 +161,8 @@ image that predates probe multicast silently drops a probe's
 two commits aligned. `--api URL` overrides the derived Nexus API address, and
 `--no-build` runs an existing `<omicron>/target/debug/commtest`.
 
-Voxel injects the arguments commtest has no usable default for, so everything
-after `--` reaches it unchanged:
+Voxel supplies arguments for which commtest has no usable default. It passes
+everything after `--` through unchanged:
 
 - `--ip-pool-begin` and `--ip-pool-end` override the derived pool. Pass both;
   voxel rejects one passed on its own, because pairing a caller's
@@ -192,8 +208,8 @@ test that is not the default-route network (e.g., a lab segment on a second
 NIC), you can pin this link with `voxel config set external.link igb1`
 (`$EXT_INTERFACE` overrides both).
 
-A LAN that does not serve DHCP takes
-`voxel config set external.addressing static`, which stages each node's
+For a LAN without DHCP, set
+`voxel config set external.addressing static`. Voxel stages each node's
 address from `[external].ip_start` instead of leasing one. `subnet` and
 `host_ip` become the LAN's values. This is still
 [option 1][how-to-run external networking]: the network exists, and voxel only
@@ -263,26 +279,26 @@ Notes:
 
 ## Multicast host plumbing (optional)
 
-This is scaffolding for the emulated environment only. A real rack sits
+This setup is specific to the emulated environment. A real rack sits
 behind a customer network that already routes multicast (either
 configured as static multicast routes, or via PIM upstream with IGMP toward
-hosts). This means that an externally sourced group reaches the rack's uplinks
-on its own, and then the rack takes it from there. Voxel's customer network is
-a few FRR boxes carrying unicast BGP, so the host has to stand in for that
-"customer network" upstream. Per [RFD 488], the rack signals nothing upstream
+hosts). That network forwards externally sourced multicast to the rack's
+uplinks. Voxel uses FRR routers with unicast BGP for the customer network and
+requires the host setup below for multicast ingress. Per [RFD 488], the rack
+signals nothing upstream
 by design in v1: assignment is static and API-driven, with IGMP host-proxying
 ([RFC 4605]) proposed atop it. The [multicast] doc records a production
 equivalent of each component below.
 
-Standing in for it needs three things the rack cannot arrange itself:
+The host and fabric routers need:
 
 - a host route pointing the group at the customer-edge router.
 - static PIM VIFs on the fabric routers. The rack-facing links are passive
   because a sidecar answers no PIM Hello ([RFC 7761]). Each link gets a
   multicast forwarding interface, and because the rack-facing links are
-  (BGP-)unnumbered and PIM needs an IPv4 address to build one, voxel numbers
+  (BGP-)unnumbered and PIM needs an IPv4 address to create a VIF, voxel numbers
   them with `/32`s from `192.0.2.0/24` (unique per router and link). The
-  generated `frr.conf` carries all of this.
+  generated `frr.conf` includes these settings.
 - a static multicast route on each selected fabric router selecting its
   rack-facing links, with the host as the source. Receiver state never
   changes the path.
@@ -291,7 +307,8 @@ Standing in for it needs three things the rack cannot arrange itself:
 `voxel network multicast up` applies `dohwcksum=0` and adds
 `set ip:dohwcksum = 0` to `/etc/system.d/voxel`, a setting that survives reboot.
 Otherwise, the looped-back multicast packet arrives with a zero checksum and
-gets dropped at the receiver router's IP stack.
+gets dropped at the receiver router's IP stack. The `down` command keeps the
+checksum offload disabled.
 
 ```
 voxel network multicast up      # host route + mroutes (--dry-run to preview)
@@ -321,17 +338,16 @@ Notes:
   first forwarding router toward `switch0`. `--steer` allows for other paths,
   but only one switch per router at most (FRR withdraws a static mroute just by
   `(S,G)`); see [multicast] for the valid options.
-- The static mroute names the sender, which keeps it source-specific.
-  This source is always the host.
+- Each static mroute includes the host's source address.
 - `voxel commtest --traffic multicast` (and `both`) are rejected at startup
   when any of the necessary plumbing items are missing or if no selected path
   enters the target rack.
-- The `check` command covers the host route, the PIM interface, and each
-  router's live `(S,G)` (source, group) assignment. Proving that delivery
-  is working past the switch needs a member in the group to exist. The rack side
-  of things (e.g., pools, groups, members, probes) is documented in the
-  [multicast] doc. Test it with a probe joined to the group and
-  `ping -s <group>` from the host.
+- The `check` command compares the host route and selected source with the
+  recorded state. It also checks PIM and each router's live `(S,G)` assignment.
+  To verify delivery past the switch, join a member to the group.
+  The rack-side setup (e.g., pools, groups, members, probes) is
+  documented in the [multicast] doc. Test it with a probe joined to the group and
+  `pfexec ping -s -t 16 <group>` from the host.
 
 ## Emulated SPs and RoTs (sp-emu, optional)
 
