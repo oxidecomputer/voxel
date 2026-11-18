@@ -17,8 +17,8 @@ use crate::isolated_external::{
     DryRun, link_mtu, probe_out, up as external_up,
 };
 use crate::net::{
-    ce_static_ip, default_route_iface, set_external_route, static_external_ip,
-    wait_external_reachable,
+    ce_static_ip, clear_external_route, default_route_iface,
+    set_external_route, static_external_ip, wait_external_reachable,
 };
 use crate::rss::watch_rss;
 use crate::topo::{
@@ -433,6 +433,14 @@ pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
     sp_host::down_all(cfg);
     let topo = build_topo(cfg, name)?;
     teardown(&topo.runner, name)?;
+
+    // A launch only routes rack 0's external prefix through to ce, which is a
+    // gateway that goes away after teardown.
+    let prefix = cfg.network.for_rack(0).infra_prefix;
+    if let Err(e) = clear_external_route(&prefix) {
+        eprintln!("[voxel] WARN: clear external route {prefix}: {e}");
+    }
+
     _mcast_lock.remove_state_record(name)?;
     Ok(())
 }

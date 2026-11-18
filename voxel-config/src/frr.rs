@@ -81,17 +81,16 @@ pub fn pim_link_addr(
     format!("{a}.{b}.{c}.{}/32", router * links_per_router + link + 1)
 }
 
-/// The prefix list naming the range pimd treats as source-specific.
+/// The prefix-list name for the range pimd treats as source-specific.
 pub const SSM_PREFIX_LIST: &str = "voxel-ssm";
 
 /// The configuration declaring the SSM range, one vtysh command per element.
 ///
 /// This is shared between the rendered `frr.conf` and
-/// `voxel network multicast up`, which reasserts on every run.
+/// `voxel network multicast up`, which reapplies this configuration on each run.
 ///
-/// A missing [`SSM_PREFIX_LIST`], or one without a matching entry,
-/// treats no group as source-specific. In that case, everything falls back to
-/// ASM.
+/// If [`SSM_PREFIX_LIST`] is missing or has no matching entry, pimd classifies
+/// the group as ASM.
 ///
 /// The local network control block (224.0.0.0/24, RFC 5771) stays outside
 /// the emulated SSM range, as the 224.0.0.0/4 permit is an emulation artifact
@@ -119,9 +118,9 @@ pub fn ssm_range_cmds() -> [String; 5] {
     ]
 }
 
-/// An interface that PIM holds a passive multicast VIF on.
+/// An interface configured with a passive multicast VIF.
 ///
-/// `address` is `Some` only when the interface carries no IPv4 address
+/// `address` is `Some` only when the interface has no IPv4 address
 /// (unnumbered BGP ~ RFC 5549). The `/32` comes from [`pim_link_addr`].
 ///
 /// Every VIF is passive. Nothing on the other end of any link speaks PIM.
@@ -144,7 +143,7 @@ pub struct FrrRouter {
     /// Static mode: BFD-track the routes (`ip route ... bfd` + `bfd`/`peer`
     /// blocks). Off renders plain static routes (the a4x2 default).
     pub track_bfd: bool,
-    /// Links carrying a multicast VIF.
+    /// Interfaces configured with a multicast VIF.
     ///
     /// This is empty on a router that forwards no multicast.
     pub pim: Vec<PimIface>,
@@ -190,8 +189,8 @@ impl FrrRouter {
 
     /// Treat 224.0.0.0/4 as source-specific (except 224.0.0.0/24).
     ///
-    /// Voxel's assignments name a sender, making every entry an `(S,G)`, but
-    /// pimd judges that by address range.
+    /// Voxel's assignments include a source address in each `(S,G)` entry.
+    /// pimd classifies groups as ASM or SSM by address range.
     ///
     /// For ASM groups, pimd can add the register VIF and receive packet
     /// copies from the kernel. Without a rendezvous point, those copies are
@@ -210,7 +209,7 @@ impl FrrRouter {
         writeln!(o, "!")
     }
 
-    /// This configures PIM on the links an externally sourced group crosses.
+    /// Configure PIM on the interfaces used for external multicast ingress.
     ///
     /// `voxel network multicast up` adds the per-group assignments at runtime,
     /// since the groups are not known at launch.

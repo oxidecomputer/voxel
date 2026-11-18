@@ -243,6 +243,8 @@ pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
 pub(crate) const PROP_TUF_VERSION: &str = "voxel:tuf-version";
 /// Firmware directory image create --from-tuf extracted from the same repo.
 pub(crate) const PROP_TUF_FW: &str = "voxel:tuf-fw";
+/// Base image used by the builder.
+pub(crate) const PROP_BASE_IMAGE: &str = "voxel:base-image";
 
 fn image_dataset(image: &str) -> String {
     format!("{}/img/{image}", falcon_dataset())

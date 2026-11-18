@@ -209,18 +209,19 @@ pub(crate) fn default_route_iface() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// The host's own address on the external segment. This is the source
-/// address on multicast sent from the host toward the rack.
+/// The host's external-segment IPv4 address used for multicast previews.
+///
+/// Actual multicast source addresses are resolved per group from host routes.
 ///
 /// Only isolated mode can answer this from config because voxel builds that
 /// segment and puts `[external] host_ip` on its own VNIC. In `lan` mode,
-/// `host_ip` names the LAN's existing gateway.
+/// `host_ip` is the LAN's existing gateway address.
 ///
 /// # Errors
 ///
 /// This fails when:
 /// - the link cannot be identified
-/// - the link holds no IPv4 address.
+/// - the link has no IPv4 address.
 pub(crate) fn host_external_ip(
     cfg: &voxel_config::VoxelConfig,
 ) -> anyhow::Result<String> {
@@ -266,8 +267,8 @@ pub(crate) fn host_external_ip(
 ///
 /// A sled's only non-loopback IPv4 address is its host-LAN address
 /// (the underlay/cr links are IPv6). The first address in the listing wins
-/// out. Routers also carry the PIM `/32`s, which is why router callers
-/// can pass an `iface` to scope the listing to the external NIC.
+/// out. Routers also have PIM `/32` addresses, so router callers can pass an
+/// `iface` to restrict the listing to the external NIC.
 ///
 /// Routers (Debian) report addresses via `ip`; sleds (Helios) via `ipadm`.
 pub(crate) async fn node_external_ip(
@@ -547,6 +548,29 @@ pub(crate) fn route_gateways(dest: &str) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+pub(crate) fn clear_external_route(prefix: &str) -> anyhow::Result<()> {
+    let dest = prefix.split('/').next().unwrap_or(prefix);
+    for gw in route_gateways(dest)? {
+        let _ = std::process::Command::new(ROUTE)
+            .args(["delete", prefix, &gw])
+            .output();
+    }
+    for _ in 0..8 {
+        let out =
+            std::process::Command::new(ROUTE).args(["delete", prefix]).output();
+        let gone = match out {
+            Ok(o) => {
+                String::from_utf8_lossy(&o.stdout).contains("not in table")
+            }
+            Err(_) => true,
+        };
+        if gone {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// (Re)point the host route for the rack's external network (`prefix`) at ce's
 /// current external IP. Every launch, ce's host-facing NIC gets a fresh random
 /// MAC and a fresh DHCP IP.
@@ -587,24 +611,7 @@ pub(crate) async fn set_external_route(
     // successful add), so we key off printed output and re-read the table to
     // confirm the final state.
     let dest = prefix.split('/').next().unwrap_or(prefix);
-    for gw in route_gateways(dest)? {
-        let _ = std::process::Command::new(ROUTE)
-            .args(["delete", prefix, &gw])
-            .output();
-    }
-    for _ in 0..8 {
-        let out =
-            std::process::Command::new(ROUTE).args(["delete", prefix]).output();
-        let gone = match out {
-            Ok(o) => {
-                String::from_utf8_lossy(&o.stdout).contains("not in table")
-            }
-            Err(_) => true,
-        };
-        if gone {
-            break;
-        }
-    }
+    clear_external_route(prefix)?;
     let add = std::process::Command::new(ROUTE)
         .args(["add", prefix, &ip])
         .output()

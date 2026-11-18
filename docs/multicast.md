@@ -5,21 +5,24 @@ a group, and group members. The operator creates the pool. Nexus implicitly
 creates a group when the first member joins an address covered by the pool and
 removes it after the last member leaves.
 
+Each external multicast group maps to an IPv6 multicast address in
+our internal, admin-scoped `ff04::/64` block. Switches use this address to
+replicate traffic to the member sleds.
+
 Traffic here originates on the **host**. `commtest` tests the
 external-to-underlay ingress path, moving packets from host through switch to
 sled for each subscribing member. This document does not cover the
 guest-sourced egress path (or OPTE's sled-side nexthop selection). A probe's
-echo reply is always unicast; the guest does not originate multicast traffic.
+echo reply is always unicast.
 
-A guest may emit an IGMPv3 or MLDv2 membership report while joining a group.
+A guest VM may emit an IGMPv3 or MLDv2 membership report while joining a group.
 The report does not cause forwarding:
 
 1. A report goes to the protocol's link-local address (`224.0.0.22`,
    `ff02::16`) and never to the group that's being joined.
 2. OPTE only encapsulates destinations in its [multicast-to-physical table],
    which holds the admin-scoped underlay addresses of the materialized groups.
-3. OPTE denies the report outright, so sled-side nexthop selection never
-   encounters it.
+3. OPTE drops the report before sled-side nexthop selection.
 
 Forwarding follows the API subscription alone. [RFD 488]'s dynamic group
 identification (IGMP snooping and querying) proposes a system for handling
@@ -71,13 +74,15 @@ calls if done by hand, and how to read back state information in the rack.
 - For `commtest`, launch the rack with `--init-rss`. The default,
   commission-driven launch is HTTPS-only, using a self-signed certificate
   that commtest's HTTP client cannot validate.
-- Multicast configured through `[network.multicast]` in `voxel.toml`.
-  The default delivery path is the first forwarding router toward `switch0`.
+- See [parameters.md](parameters.md) for the `[network.multicast]` settings
+  in `voxel.toml`. The default delivery path is the first forwarding router
+  toward `switch0`.
 - A Helios build with the updated **host viona kernel module** containing the
   MAC-filter table updates from stlouis#986, Gerrit change [775] on
   illumos-gate (merged into `stlouis` at commit `5ffff4b8`). Check the
   loaded host module with
-  `pfexec mdb -ke 'viona_ioc_set_mac_filters::nm'`.
+  `pfexec mdb -ke 'viona_ioc_set_mac_filters::nm'`. The output must include
+  `viona_ioc_set_mac_filters`.
 - The host-side setup described in more detail below (routes, PIM, group
   assignments). `voxel network multicast up` installs this setup for whichever
   `[external]` mode is set; `voxel commtest` won't run the multicast phase(s)
@@ -86,7 +91,7 @@ calls if done by hand, and how to read back state information in the rack.
   configuration directly. A DHCP `lan` setup requires Falcon console lookup
   over the running nodes. All of this plumbing lives in [`multicast.rs`];
   the run wrapper that invokes this setup lives in [`commtest.rs`].
-- A control-plane image whose Omicron carries multicast. If `voxel commtest
+- A control-plane image whose Omicron version supports multicast. If `voxel commtest
   --traffic multi` detects an older, unicast-only commit, the run will fail
   before building. This detection inspects the `--source` checkout,
   not the commit baked into the running rack's image.
@@ -161,6 +166,9 @@ for ip in $(seq 22 29); do
         && echo "198.51.100.$ip"
 done
 ```
+
+Exit `g0` after the loop. Run the following `oxide` commands on a host with
+the CLI installed and a route to Nexus.
 
 Voxel probes the same service pool for `commtest`'s `--api`, trying external
 DNS addresses last. It accepts any HTTP status line from `GET /v1/ping` on
@@ -337,9 +345,8 @@ the group, and Nexus reaps it after the last member leaves. An explicit
 address selects the linked multicast pool covering it, whereas a new name
 allocates from a linked default multicast pool. The `multicast_reconciler`
 [RPW][rpw] (reliable persistent workflow) drives these transitions and the
-associated switch programming. In the notation below, the `(S,G)` tuple names
-sender S for a group G (source-specific). `(*,G)` accepts any sender (a source
-wildcard).
+associated switch programming. In `(S,G)`, S is the sender and G is the group
+(source-specific). `(*,G)` accepts any sender (a source wildcard).
 
 ```
   ip pool   pool_type = multicast, one ip_version, ASM xor SSM
@@ -423,7 +430,7 @@ For any source-filtered join event, the list must include whatever sends the
 verification traffic; otherwise, the dataplane will drop it. This is also the
 recipe for the negative deny case, `commtest --mcast-deny-group GROUP@SRC`,
 which supplies a source that's not the actual sender and asserts that no packet
-arrives at the guest. The examples below set the `SRC` to the isolated-mode
+arrives at the probe. The examples below set the `SRC` to the isolated-mode
 default, i.e., `172.30.199.199`. For another setup, use the address described
 under [Sending traffic](#sending-traffic).
 
@@ -488,8 +495,8 @@ oxide experimental instance multicast-group list --project classone \
 
 ### Probes
 
-A probe needs no guest. It is pinned to a sled and answers echo
-requests sent to its joined groups, so a normal `ping` can show delivery.
+A probe runs in a zone on its assigned sled, without a guest VM. It answers
+echo requests sent to its joined groups, so a normal `ping` can show delivery.
 Memberships are fixed at creation. To change them, recreate the probe.
 
 ```sh
@@ -525,7 +532,7 @@ describes what the `parent_id` refers to.
 
 ## Control-plane verification
 
-We can read multicast state via [omdb][omdb] running in the switch zone:
+From the rack host, read multicast state with [omdb][omdb] inside `switch0`:
 
 ```sh
 voxel tp login switch0
@@ -570,9 +577,11 @@ Its report counts groups created ("Creating" to "Active"), groups deleted,
 groups verified on the switches, members processed and deleted, and empty
 groups marked for deletion/reaping.
 
+Exit the switch zone before continuing with the host commands below.
+
 ## Topology management
 
-The remaining setup carries traffic from the host into the rack.
+The setup below routes traffic from the host into the rack.
 
 `voxel network multicast up` installs the components documented below, and it
 must be run after `voxel launch`. The command resolves the `ce` address and
@@ -589,16 +598,18 @@ Any re-run of `up` will replace the route gateway.
 The routers speak unicast BGP through FRR and run `pimd` with every relevant
 interface passive (no PIM adjacencies). The host needs an explicit route per
 group address pointed at the customer edge (`ce`). This applies to SSM groups
-as well because the host route still names the group address, and the source
-matters to both the join event and the static `(S,G)` mroute.
+as well: the host route uses the group address. The source is specified in
+both the join event and the static `(S,G)` mroute.
 
 `ce`'s address maps to `[topology].ce_external_ip` when set. Otherwise,
 static external addressing supplies the address, with voxel numbering
 node addresses deterministically from `[external].ip_start`: first by sled and
 then by routers in `[topology].routers` order. The stock four-sled
 `ce, cr1, cr2` topology places `ce` at `172.30.199.14`. DHCP `lan` mode
-is the sole case that reads a lease from a running node, which can be run
-manually with `voxel host login ce` and `ip -4 -br addr show scope global`.
+is the only mode that reads a lease from a running node. To look up that
+address manually, run `voxel host login ce` and
+`ip -4 -br addr show scope global`. Exit `ce` after reading the address to
+return to the rack host.
 
 The `voxel network multicast up` command installs these routes. The commands
 below document the manual version. A stale route to a dead customer
@@ -613,28 +624,29 @@ for group in 239.100.0.1 239.100.0.2 232.100.0.1; do
 done
 ```
 
-The route table is the Helios host's, so no Falcon environment owns it. Given
-this, voxel records each group's gateway in
-`.falcon/multicast-<hex environment name>.json` and treats that record as
-its claim on the route.
+The Helios host's route table is shared across Falcon environments. Voxel
+records each group's gateway in
+`.falcon/multicast-<hex environment name>.json` to track the routes installed
+by this environment.
 
 ### Static router assignments
 
-Host routes put the frames on the external segment, for which every fabric
-router has an external NIC, and each `cr*` receives the frame on this segment.
-Voxel installs `(S,G)` state on each `cr*` to forward it over the configured
+A host route through `ce` selects the external segment. Every fabric router
+has an external NIC on that segment and receives the multicast frames there.
+Voxel installs `(S,G)` state on each `cr*` to forward them over the configured
 rack-facing links.
 
 In v1 of [RFD 488], group membership is API-driven only, i.e., no IGMP or PIM
 requests sent toward the customer network. Host proxying is left to a later
 stage there. The static assignment setup remains the source of all forwarding
-state, with the control plane programming the rack and DDM carrying
+state, with the control plane programming the rack and DDM propagating
 replication state through to dpd and the switch(es). A legit customer network in
-front of a real rack would set similar state on its own gear. The external NAT
-entry accepts a group at either available uplink; the customer network still
-has to get the traffic there.
+front of a real rack would set similar state on its own gear. The rack's
+external NAT entry maps the external group address to its IPv6 underlay
+address. Both switches have this entry, so traffic can enter at either
+uplink. The customer network must route it there.
 
-Three pieces carry a group into the rack.
+Static forwarding into the rack requires:
 
 - `pimd` lets FRR hold the static `(S,G)` entries. Every interface in this path
   is passive, meaning no PIM adjacencies; voxel **does not** model customer
@@ -662,16 +674,16 @@ Three pieces carry a group into the rack.
   pimd (`pim_oil.c`, `mroute_vif_index >= 0`) and take the daemon down. Put the
   address on first.
 
-- The static assignment names the sender, which is always the host, no matter
-  the source given beside the group in `--mcast-group GROUP@SRC`. In
+- The static assignment uses the host's source address, regardless of the
+  source given beside the group in `--mcast-group GROUP@SRC`. In
   commtest's deny-group case, that source is not on the wire at all, and an
   mroute keyed on it would let the deny test pass without ever reaching the
   dataplane. Because the sender is known, `(S,G)` needs no rendezvous point or
   shared multicast tree.
 
-In a customer network, each router decides for itself which rack-facing links
-can carry a group. `[network.multicast] delivery` is the default for a group
-that is not steered; the `--steer` parameter names complete paths per group.
+In a customer network, each router decides which rack-facing links
+can forward a group's traffic. `[network.multicast] delivery` is the default
+for a group that is not steered; `--steer` selects complete paths per group.
 
 Falcon's link order determines router NIC names. In the stock single-rack,
 four-sled topology, `cr1` has:
@@ -707,9 +719,10 @@ static mroute by `(S,G)` and ignores the interface in `no ip mroute`. With
 two paths on one router, a narrowing would remove the wrong one. `up` rejects
 such a selection before touching the routers.
 
-The commands below show only the `cr1` part of this update for a static LAN
-whose sender is `192.168.1.199`. `up` derives the sender and also updates the
-other fabric routers. The blanket `no` commands are safe:
+The commands below run inside `cr1` for a static LAN whose sender is
+`192.168.1.199`. From the rack host, enter `cr1` with `voxel host login cr1`.
+`up` derives the sender and also updates the other fabric routers.
+The blanket `no` commands are safe:
 
 ```sh
 SENDER=192.168.1.199
@@ -721,6 +734,8 @@ vtysh -c 'configure terminal' \
     -c 'interface enp0s11' \
     -c "ip mroute enp0s9 239.100.0.1 $SENDER" -c 'exit'
 ```
+
+Exit `cr1` to return to the rack host.
 
 A group without recorded state or an explicit `--steer` uses the configured
 `delivery`. `single`, the default, selects the first forwarding router's path
@@ -734,8 +749,8 @@ switch numbers, LLDP labels, and router interface names:
 | Form | Selects |
 |------|---------|
 | `switch0` | switch slot 0 on every forwarding router |
-| `uplink0` | the switch slot named by `[network.uplinks].lldp_port_description` |
-| `uplink0-cr1` | one path named by the emitted LLDP label |
+| `uplink0` | the switch slot with this `[network.uplinks].lldp_port_description` |
+| `uplink0-cr1` | one path selected by the emitted LLDP label |
 | `enp0s9` | that interface on every forwarding router that has it |
 | `cr1:switch0`, `cr1:uplink0`, `cr1:enp0s9` | one router and one switch |
 | `all` | every router-switch pair; rejected once a rack has more than one switch |
@@ -744,12 +759,12 @@ switch numbers, LLDP labels, and router interface names:
 `switch<N>` is how an operator should reason about traffic steering; `check`
 prints the interface names that a selection actually resolves to. LLDP labels
 come from the "customer-side" link configuration. Voxel adds the router suffix
-(see `uplink_ports` in `config.rs`), and `uplink0-cr1` names a complete path.
+(see `uplink_ports` in `config.rs`), and `uplink0-cr1` selects a complete path.
 The `--steer` flag maps an LLDP description to a single switch slot. The
 description can be reused for that same slot in other racks, but assigning
 it to a different slot results in an error.
 
-For example, `switch0` names one path per forwarding router: `cr1:switch0`
+For example, `switch0` selects one path per forwarding router: `cr1:switch0`
 pins a single path toward the rack, and `cr1:switch0,cr2:switch1` reaches both
 switches of a two-router, two-switch rack (2x2) with one path per router.
 
@@ -760,7 +775,7 @@ fabric-router entry selects its rack-facing links.
 ### The host must not offload checksums
 
 If the host offloads the IPv4 header checksum, a multicast packet looped back
-to a guest can arrive at `cr1` with a zero checksum. Linux drops it at IP input
+to the `cr1` router VM can have a zero checksum. Linux drops it at IP input
 before forwarding. SoftNPU accepts the same packet, but the sidecar parser
 will drop it. With offload disabled, the host fills in the checksum before the
 packet reaches either path.
@@ -880,13 +895,15 @@ The group addresses come from rack-side pools and remain the same in either
 networking mode; only the sources change.
 
 The `check` command does not show the rack-side underlay mapping.
-Each external multicast group maps to an IPv6 multicast address in
-our internal, admin-scoped `ff04::/64` block. Switches replicate this
-address to the member sleds. To view this mapping, use `omdb`:
+To view this mapping, run `omdb` in the switch zone (see
+[Control-plane verification](#control-plane-verification)):
 
 ```sh
 omdb db multicast info --ip 239.100.0.1
 ```
+
+Return to the rack host before running the remaining `voxel` and `ping`
+commands.
 
 With no `--mcast-group` argument, voxel uses `239.1.1.1`,
 which needs its own host route, PIM configuration, and group assignment.
@@ -907,8 +924,8 @@ done
 
 ### Teardown
 
-Run `voxel network multicast down` before running `voxel destroy`, while the
-router VMs are reachable. The `destroy` command removes the recorded host
+If you use `voxel network multicast down`, run it before `voxel destroy`,
+while the router VMs are reachable. The `destroy` command removes the recorded host
 routes and deletes the `.falcon/` state record after successful teardown;
 router state disappears along with the VMs. `down` accepts the same repeated
 `--group` argument as the `up` command.
@@ -974,7 +991,7 @@ done
 | Symptom | Where to look / what to run |
 | --- | --- |
 | Group absent | Confirm a linked multicast pool covers the address. |
-| A group is stuck in "Creating" or its members are stuck in "Joining" | `omdb nexus background-tasks show multicast_reconciler`, and then activate it. |
+| A group is stuck in `Creating` or its members are stuck in `Joining` | Inspect `omdb nexus background-tasks show multicast_reconciler`, then run `omdb --destructive nexus background-tasks activate multicast_reconciler` in the switch zone. |
 | SSM groups are silent, but ASM groups are fine | The join's `source_ips` must contain the sending host address in this setup. |
 | Some members reply, while others don't | Per-sled, run `omdb db multicast members --group-ip <ip>` to return which sled has which members. |
 

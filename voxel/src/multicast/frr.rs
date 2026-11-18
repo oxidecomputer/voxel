@@ -30,7 +30,7 @@ pub(super) struct Transit {
     pub(super) ifaces: Vec<String>,
 }
 
-/// One `interface <iif>` block carrying an `ip mroute` (or `no ip mroute`)
+/// An `interface <iif>` block with one `ip mroute` (or `no ip mroute`)
 /// command per outgoing interface.
 ///
 /// This is empty when nothing is selected.
@@ -57,7 +57,7 @@ fn mroute_block(
 }
 
 impl Transit {
-    /// The router and the interfaces that FRR configuration names.
+    /// The router and interfaces used in the FRR configuration.
     ///
     /// This is derived from configuration. The router's address is resolved
     /// separately (via `node_addr`), which is the only step that needs a
@@ -93,7 +93,7 @@ impl Transit {
             .collect()
     }
 
-    /// The rack-facing links a selection names.
+    /// The rack-facing links selected for forwarding.
     ///
     /// `None` means every link.
     pub(super) fn selected(&self, links: Option<&[usize]>) -> Vec<String> {
@@ -127,7 +127,7 @@ impl Transit {
     }
 }
 
-/// A `vtysh` invocation, one `-c` per line, quoted so FRR sees each line whole.
+/// A `vtysh` invocation with each configuration line quoted as one `-c` argument.
 fn vtysh(lines: &[String]) -> String {
     std::iter::once("vtysh".to_string())
         .chain(lines.iter().map(|l| format!("-c {}", shell_quote(l))))
@@ -170,7 +170,7 @@ impl Mroute {
 
     /// A parsed `show ip mroute` result for a `(S,G)` forwarding entry.
     ///
-    /// `None` when the table holds no entry for that pair.
+    /// `None` when the table has no entry for that pair.
     ///
     /// # Errors
     ///
@@ -218,8 +218,8 @@ struct MrouteRecord {
 
 /// A single outgoing-interface entry from `show ip mroute json`.
 ///
-/// Static mroutes carry no top-level `installed`; `protocolStatic` on the oil
-/// entry is what marks them as programmed in.
+/// Static mroutes have no top-level `installed` field; `protocolStatic` on the
+/// oil entry indicates that the route is programmed.
 #[derive(serde::Deserialize, Default)]
 struct OilEntry {
     #[serde(default, rename = "protocolStatic")]
@@ -245,10 +245,9 @@ pub(super) fn vtysh_config(lines: &[String]) -> String {
     vtysh(&session)
 }
 
-/// The interfaces PIM holds a VIF on.
+/// Interfaces with a PIM VIF.
 ///
-/// FRR [keys on the interface name] with no wrapper around it, making the
-/// top-level keys the interface list.
+/// FRR [keys on the interface name] at the top level of its JSON output.
 ///
 /// [keys on the interface name]: https://github.com/FRRouting/frr/blob/85cf1ed576deed121751e16a64970f8a652a9e1e/pimd/pim_cmd_common.c#L2265-L2317
 pub(super) fn parse_pim_ifaces(json: &str) -> anyhow::Result<Vec<String>> {

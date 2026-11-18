@@ -30,9 +30,9 @@ const RUN_SUBCOMMAND: &str = "run";
 /// default (an empty list skips the multicast phase entirely), so voxel picks
 /// an administratively scoped group (RFC 2365) to make the phase run.
 ///
-/// TODO: IPv4 only, since commtest rejects v6 groups during validation. Pick a
-/// v6 default once its own `validate_mcast` TODO to add the v6 pool buckets and
-/// a v6 arm in `test_mcast_connectivity` is discharged.
+/// TODO: IPv4 only; commtest rejects v6 groups during validation. Pick a
+/// v6 default after adding v6 pool buckets in `validate_mcast` and a v6 arm
+/// in `test_mcast_connectivity`.
 pub(crate) const DEFAULT_MCAST_GROUP: &str = "239.1.1.1";
 const HELIOS_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
     -C link-arg=-R/usr/platform/oxide/lib/amd64 \
@@ -696,8 +696,10 @@ fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
     rest.into_iter().chain(dns_members).collect()
 }
 
-/// Whether the checkout's commtest has the multicast phases, detected from its
-/// source so older unicast-only eras keep working without a probe run.
+/// Whether or not the checkout's commtest supports multicast phases.
+///
+/// Source inspection supports older unicast-only versions without running
+/// the binary.
 fn supports_multicast(source: &Utf8Path) -> anyhow::Result<bool> {
     let source_file = source.join("end-to-end-tests/src/bin/commtest.rs");
     let text = std::fs::read_to_string(&source_file)
@@ -869,9 +871,9 @@ fn add_default_mcast_group(args: &mut Vec<String>) {
 
 /// The groups the multicast preflight covers.
 ///
-/// This is empty here when the run skips the multicast phase
-/// (e.g., `--traffic unicast`, or a passed-through `--skip-mcast`),
-/// even if an explicit `--mcast-group` is given.
+/// No groups are checked when `--skip-mcast` is present, or when
+/// `--traffic unicast` is used without `--mcast-deny-group`. An explicit
+/// `--mcast-group` does not override either condition.
 fn preflight_groups(traffic: Traffic, args: &[String]) -> Vec<String> {
     if (matches!(traffic, Traffic::Unicast)
         && !has_arg(args, "--mcast-deny-group"))
@@ -886,7 +888,7 @@ fn preflight_groups(traffic: Traffic, args: &[String]) -> Vec<String> {
 /// defaulted or passed through, in either `--flag value` or `--flag=value`
 /// spellings.
 ///
-/// Deny groups exist here. They expect no delivery.
+/// Deny groups are included; their members must receive no traffic.
 fn mcast_groups(args: &[String]) -> Vec<String> {
     const FLAGS: [&str; 2] = ["--mcast-group", "--mcast-deny-group"];
     let mut out = Vec::new();
@@ -907,8 +909,8 @@ fn mcast_groups(args: &[String]) -> Vec<String> {
 
 /// Refuse to start a multicast run before the host plumbing is in place.
 ///
-/// Without the assignments and host routes, the traffic never leaves the host,
-/// and commtest reports it as a receive timeout.
+/// Without this check, missing host routes or router assignments would cause
+/// commtest receive timeouts.
 ///
 /// This check covers every fabric router in the topology.
 async fn ensure_mcast_plumbing(

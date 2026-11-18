@@ -21,7 +21,7 @@ use anyhow::{Context, Error};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use std::fs;
-use voxel_config::VoxelConfig;
+use voxel_config::{CP_IMAGE_PREFIX, VoxelConfig};
 
 mod access;
 mod commission;
@@ -263,6 +263,9 @@ enum ImageCmd {
             value_parser = abs_path
         )]
         sled_agent: Option<Utf8PathBuf>,
+        /// Helios base image to use for the CP build.
+        #[arg(long, default_value = imagebuild::DEFAULT_BASE_IMAGE)]
+        base_image: String,
     },
     /// Export an image bundle to a file for distribution.
     ///
@@ -297,6 +300,14 @@ enum ImageCmd {
         /// Image label; the image is named `voxel-frr-<version>`.
         #[arg(default_value = "proto")]
         version: String,
+    },
+    /// Update Helios packages and register a reusable base image.
+    CreateBase {
+        /// Name for the new base image; must not already exist.
+        name: String,
+        /// Helios base image to update.
+        #[arg(long, default_value = imagebuild::DEFAULT_BASE_IMAGE)]
+        from: String,
     },
 }
 
@@ -366,15 +377,15 @@ enum ExternalCmd {
 
 #[derive(Subcommand)]
 enum MulticastCmd {
-    /// Point each group's host route at `ce` and program its selected path
-    /// through the customer edge and fabric routers.
+    /// Point each group's host route at `ce` and configure forwarding on its
+    /// selected fabric routers.
     Up {
         /// Group to plumb (pass the flag once per group).
         ///
         /// This accepts commtest's `GROUP[@SRC,...]` form, of which only the
         /// address matters here.
         ///
-        /// Defaults to the group `voxel commtest --traffic multicast` sends.
+        /// Defaults to the group used by `voxel commtest --traffic multicast`.
         #[arg(long = "group", value_name = "GROUP", default_value = commtest::DEFAULT_MCAST_GROUP)]
         groups: Vec<multicast::GroupSpec>,
         /// Which ingress paths a group uses (in the `GROUP=SPEC` framing,
@@ -390,7 +401,7 @@ enum MulticastCmd {
         ///
         /// FRR withdraws a static mroute by (S,G) and ignores the interface
         /// during that operation. voxel keeps one path per router and rejects
-        /// `all` on a multi-switch rack.
+        /// `all` on a multi-switch topology.
         ///
         /// A group without a `--steer` flag keeps the paths a previous `up`
         /// recorded for it, or else takes the configured
@@ -405,22 +416,20 @@ enum MulticastCmd {
     Down {
         /// Group(s) to tear down (pass the flag once per group).
         ///
-        /// Same form as `up`. Defaults to everything this falcon environment
-        /// has recorded or still owns on its router. Routes belonging to
-        /// another environment are left untouched.
+        /// Same form as `up`. Defaults to the groups recorded for this falcon
+        /// environment. Routes belonging to other environments are unchanged.
         #[arg(long = "group", value_name = "GROUP")]
         groups: Vec<multicast::GroupSpec>,
         /// Print the host and router commands instead of running them.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Assert the host route and static multicast tree are in place, while
-    /// listing  anything that's missing.
+    /// Check host routes and router assignments, listing missing configuration.
     Check {
-        /// Group(s) to assert on (pass the flag once per group).
+        /// Group to check (pass the flag once per group).
         ///
-        /// Same form as `up`. Defaults to everything voxel has plumbed, i.e.,
-        /// the same set a groupless `down` tears down.
+        /// Same form as `up`. Defaults to the groups recorded for this falcon
+        /// environment, as with `down` when no groups are supplied.
         #[arg(long = "group", value_name = "GROUP")]
         groups: Vec<multicast::GroupSpec>,
     },
@@ -619,7 +628,7 @@ fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
         && !cpbuild::PINNED_OMICRON_REV.is_empty()
     {
         cfg.image.cp =
-            Some(format!("voxel-cp-{}", cpbuild::PINNED_OMICRON_REV));
+            Some(format!("{CP_IMAGE_PREFIX}{}", cpbuild::PINNED_OMICRON_REV));
     }
     Ok(cfg)
 }
@@ -858,12 +867,19 @@ async fn main() -> Result<(), Error> {
         }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
-            ImageCmd::Create { commit, src, from_tuf, sled_agent } => {
+            ImageCmd::Create {
+                commit,
+                src,
+                from_tuf,
+                sled_agent,
+                base_image,
+            } => {
                 cpbuild::create(
                     commit.as_deref(),
                     src.as_deref(),
                     from_tuf.as_deref(),
                     sled_agent.as_deref(),
+                    base_image,
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                 )
@@ -872,6 +888,15 @@ async fn main() -> Result<(), Error> {
             ImageCmd::CreateFrr { version } => {
                 imagebuild::create_frr(
                     version,
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
+                )
+                .await
+            }
+            ImageCmd::CreateBase { name, from } => {
+                imagebuild::create_base(
+                    from,
+                    name,
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                 )

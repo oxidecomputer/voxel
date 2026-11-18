@@ -2,15 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Host-side plumbing for running multicast into a running rack.
+//! Host routes and router configuration for multicast ingress to a voxel rack.
 //!
-//! The vtysh command rendering and parsing live in [`frr`].
+//! The [`frr`] module renders and parses vtysh commands.
 //!
 //! A host route sends each group's packets out through the external segment
-//! (L2 multicast), and once the fabric router receives them, a static
-//! [source-specific][RFC 4607] mroute replicates them toward its requesting
-//! rack-facing links. The rack does not signal upstream yet (v1), making the
-//! complete path explicit.
+//! (L2 multicast). A static [source-specific][RFC 4607] mroute on each fabric
+//! router replicates them over the selected rack-facing links. The rack does
+//! not signal upstream in v1.
 //!
 //! The `--steer` flag selects the delivery paths for each group.
 //!
@@ -29,12 +28,11 @@
 //! router configuration assigns [documentation-prefix][RFC 5737 §3]
 //! `/32`s for PIM, which is bootstrapped before the multicast setup runs.
 //!
-//! The host offloads checksumming, forcing a multicast packet looped back to
-//! arrive with its IPv4 header checksum unset. The routers validate that
-//! header and their Linux stack drops the packet at IP input. Softnpu
-//! accepts the frame. Tofino drops it in the parser stage of the pipeline.
+//! With checksum offload enabled, a multicast packet looped back to a router VM
+//! arrives with its IPv4 header checksum unset. The router's Linux stack drops
+//! it at IP input. SoftNPU accepts the frame; Tofino drops it in the parser stage.
 //!
-//! The host route table lives in the global zone and is shared across falcon
+//! The host route table is in the global zone and is shared across falcon
 //! environments. Voxel records each environment's groups, gateways, sources,
 //! and steering selections under the `.falcon/` directory, leaving routes
 //! owned by another environment untouched when setup or teardown take place.
@@ -133,7 +131,7 @@ async fn ce_nexthop(cfg: &VoxelConfig, name: &str) -> anyhow::Result<String> {
 /// Run a command on the transit router, or print it under `--dry-run`.
 ///
 /// Returns its stdout and fails when ssh cannot reach the router or the command
-/// exits with a non-zero.
+/// exits with a non-zero status.
 fn router_run(ip: &str, cmd: &str, dry_run: bool) -> anyhow::Result<String> {
     if dry_run {
         eprintln!("+ ssh root@{ip} {cmd}");
@@ -225,7 +223,7 @@ fn host_route_lines(
         .collect()
 }
 
-/// Name the host routes teardown process leaves in place.
+/// Report host routes not recorded for this environment.
 fn report_unrecorded_routes(
     entries: &[RouteEntry],
     addrs: &[Ipv4Addr],
@@ -242,8 +240,8 @@ fn report_unrecorded_routes(
 
 /// The groups recorded for a falcon environment.
 ///
-/// This is what a groupless `down` or `check` command starts from before a scan
-/// of the host route table.
+/// With no explicit groups, `down` and `check` start with this list before
+/// reading the host route table.
 fn state_groups(state: Option<&MulticastState>) -> Vec<Ipv4Addr> {
     state.map(|state| state.groups().collect()).unwrap_or_default()
 }
@@ -318,7 +316,7 @@ fn router_read_err(ip: &str, cmd: &str, e: SshFailure) -> anyhow::Error {
     }
 }
 
-/// The kernel tunable deciding whether the host computes checksums itself,
+/// The kernel tunable controlling whether the host computes checksums itself,
 /// as read through `mdb`.
 ///
 /// Returns `None` when it cannot be read, typically due to the lack of
@@ -490,13 +488,12 @@ fn persist_dohwcksum(dry_run: bool) -> anyhow::Result<()> {
 /// Disable hardware checksum offload now and across reboots.
 ///
 /// The host-global `dohwcksum` gate covers the IPv4 header checksum, ULP
-/// checksums, and LSO, for both address IP families.
+/// checksums, and LSO, for both IP address families.
 ///
-/// The `/etc/system.d/voxel` path gets applied at boot. The `mdb` write here
+/// The settings in `/etc/system.d/voxel` apply at boot. The `mdb` write here
 /// modifies the running kernel.
 ///
-/// When the `down` command is run, this operation leaves the host setting in
-/// place.
+/// `down` leaves this host setting in place.
 ///
 /// A preview prints both writes without changing the host.
 fn checksum_preflight(dry_run: bool) -> anyhow::Result<()> {
@@ -541,7 +538,7 @@ fn checksum_preflight(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The interfaces PIM currently holds a VIF on.
+/// Interfaces with a PIM VIF.
 fn router_pim_ifaces(ip: &str) -> anyhow::Result<Vec<String>> {
     let cmd = vtysh_show("show ip pim interface json");
     let out =
@@ -559,7 +556,7 @@ fn router_pim_ifaces(ip: &str) -> anyhow::Result<Vec<String>> {
 ///
 /// This fails when:
 /// - a route is not recorded for this environment
-/// - a route does not take on installation
+/// - a host route does not match the requested gateway after installation
 fn install_host_routes(
     addrs: &[Ipv4Addr],
     nexthop: &str,
@@ -668,9 +665,8 @@ struct MulticastUpdate<'a> {
 }
 
 impl MulticastUpdate<'_> {
-    /// Assign every group to one router's forwarding links, bringing up
-    /// `pimd` and the VIFs first when that router does not already carry
-    /// them.
+    /// Assign every group to one router's forwarding links, configuring
+    /// `pimd` and the VIFs first.
     ///
     /// # Errors
     ///
@@ -750,11 +746,10 @@ impl MulticastUpdate<'_> {
     }
 }
 
-/// On run, point each group's host route at `ce` and program the selected
-/// ingress path.
+/// Point each group's host route at `ce` and configure its selected ingress
+/// paths.
 ///
-/// This is safe to re-run because this environment's routes are deleted before
-/// being re-added.
+/// Repeating `up` replaces this environment's recorded routes.
 ///
 /// # Errors
 ///
@@ -763,7 +758,7 @@ impl MulticastUpdate<'_> {
 /// - the host still offloads checksums
 /// - `ce`'s or a router's external address cannot be resolved
 /// - a router is unreachable
-/// - a host route does not take upon run-up
+/// - a host route does not match the requested gateway after installation
 pub(crate) async fn up(
     cfg: &VoxelConfig,
     name: &str,
@@ -785,8 +780,8 @@ pub(crate) async fn up(
         state.add_router(router);
     }
 
-    // A path for a group this run is not plumbing would be silently ignored,
-    // which reads exactly like a typo taking effect.
+    // Reject steering for groups absent from this run; otherwise those
+    // selections would be ignored.
     if let Some(stray) = steering.groups().find(|addr| !addrs.contains(addr)) {
         bail!("--steer names {stray}, which is not among the groups to plumb");
     }
@@ -877,7 +872,7 @@ pub(crate) async fn up(
 ///
 /// With no groups given, this tears down everything this falcon environment
 /// has recorded on its routers, undoing any sequence of `up` runs without
-/// scanning other environment's host routes.
+/// scanning other environments' host routes.
 ///
 /// # Errors
 ///
@@ -904,9 +899,8 @@ pub(crate) async fn down(
     }
     eprintln!("[voxel] multicast: removing group assignments and host routes");
 
-    // Host routes first. They are the one piece that outlives `voxel destroy`,
-    // and resolving a router's address needs the rack up in lan mode, so a
-    // destroyed rack must not abort teardown before they are gone.
+    // DHCP address lookup requires a running router. Remove host routes
+    // before that lookup.
     purge_state_routes(&addrs, state.as_ref(), dry_run)?;
 
     let entries = route_entries()?;
@@ -1114,9 +1108,9 @@ struct PlumbingStatus {
     routers: Vec<String>,
 }
 
-/// Every piece of plumbing for `groups`, each paired with whether it is in
-/// place: the per-group host route once, then PIM and the group's assignment
-/// on each fabric router.
+/// Configuration checks for `groups`, paired with whether each check passes.
+/// The per-group host route is checked once, followed by PIM and group
+/// assignments on each fabric router.
 async fn plumbing_status(
     cfg: &VoxelConfig,
     name: &str,
@@ -1177,21 +1171,19 @@ async fn plumbing_status(
     Ok(PlumbingStatus { checks: out, steering, addrs, routers })
 }
 
-/// When the commtest preflight found missing or unreachable through to the
+/// Missing multicast setup and groups with no selected path into the target
 /// rack.
 pub(crate) struct MissingPlumbing {
     /// Plumbing items not in place (one line each).
     pub(crate) missing: Vec<String>,
-    /// Groups whose steering names no path into the target rack. These
-    /// fail the preflight process, even when their plumbing is complete.
+    /// Groups with no selected path into the target rack. These fail preflight
+    /// even when their host and router configuration is complete.
     pub(crate) unreached: Vec<Ipv4Addr>,
 }
 
-/// The pieces of plumbing missing for `groups`, as human-readable items.
-/// Empty here means the path is complete.
+/// Return missing multicast setup and groups with no selected path into `rack`.
 ///
-/// This is the `commtest` preflight's view. A run with missing plumbing
-/// fails here before any traffic is sent.
+/// The commtest preflight checks these before sending traffic.
 pub(crate) async fn missing_plumbing(
     cfg: &VoxelConfig,
     name: &str,
@@ -1210,10 +1202,9 @@ pub(crate) async fn missing_plumbing(
     })
 }
 
-/// The groups this environment recorded, which is what a groupless `check`
-/// asserts. Router-observed groups are left out: a group with no
-/// record belongs to whoever put it there, and holding it to this
-/// environment's nexthop and sender would fail it for no reason.
+/// Groups recorded for this environment. A `check` without explicit groups
+/// uses this list. Router-observed groups are excluded because their routes
+/// may belong to another environment.
 fn recorded_groups(name: &str) -> anyhow::Result<Vec<GroupSpec>> {
     Ok(state_groups(read_multicast_state(name)?.as_ref())
         .into_iter()
@@ -1221,16 +1212,15 @@ fn recorded_groups(name: &str) -> anyhow::Result<Vec<GroupSpec>> {
         .collect())
 }
 
-/// Assert the whole external host path is live, printing one line per item.
+/// Check host routes and router assignments, printing one line per item.
 ///
-/// With no groups given, this covers everything voxel has plumbed, the same
-/// set a groupless `down` tears down, so any sequence of `up` runs is
-/// asserted whole.
+/// With no groups supplied, check the groups recorded by this environment's
+/// `up` runs. A `down` without groups uses the same recorded set.
 ///
 /// # Errors
 ///
-/// This fails when any item is missing, so the CLI exit code reflects the
-/// result.
+/// Returns an error if any item is missing or does not match the expected
+/// configuration.
 pub(crate) async fn check(
     cfg: &VoxelConfig,
     name: &str,

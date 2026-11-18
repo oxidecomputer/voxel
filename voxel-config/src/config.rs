@@ -674,16 +674,22 @@ impl SledDisksSchema {
     }
 }
 
+pub const IMAGE_PREFIX: &str = "voxel-";
+pub const CP_IMAGE_PREFIX: &str = "voxel-cp-";
+pub const FRR_IMAGE_PREFIX: &str = "voxel-frr-";
+
 impl Image {
     pub fn cp_image(&self) -> String {
-        self.cp.clone().unwrap_or_else(|| format!("voxel-cp-{}", self.version))
+        self.cp
+            .clone()
+            .unwrap_or_else(|| format!("{CP_IMAGE_PREFIX}{}", self.version))
     }
 
     /// The omicron commit in the cp image name, locating the checkout under
     /// build_root; None if the name is not `voxel-cp-<commit>[-variant]`.
     pub fn cp_commit(&self) -> Option<String> {
         let name = self.cp_image();
-        name.strip_prefix("voxel-cp-")
+        name.strip_prefix(CP_IMAGE_PREFIX)
             .and_then(|s| s.split('-').next())
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -691,7 +697,7 @@ impl Image {
     pub fn frr_image(&self) -> String {
         self.frr
             .clone()
-            .unwrap_or_else(|| format!("voxel-frr-{}", self.version))
+            .unwrap_or_else(|| format!("{FRR_IMAGE_PREFIX}{}", self.version))
     }
 }
 
@@ -710,7 +716,7 @@ pub enum RouterMode {
 
 /// How much of the rack a group is delivered to.
 ///
-/// This is only the default path. The `--steer` override names paths per group
+/// This is only the default path. The `--steer` override selects paths per group
 /// and takes precedence.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
@@ -721,8 +727,8 @@ pub enum MulticastDelivery {
     #[default]
     Single,
     /// Every switch from every forwarding router. `up` rejects this once a
-    /// rack has more than one switch, as a router may carry one outgoing
-    /// path per group.
+    /// topology has more than one switch. Voxel permits at most one outgoing path
+    /// per router and group.
     All,
 }
 
@@ -732,7 +738,8 @@ pub enum MulticastDelivery {
 )]
 #[serde(default, deny_unknown_fields)]
 pub struct Multicast {
-    /// Delivery for a group whose `up` omits `--steer`.
+    /// Default delivery for groups without recorded paths or an explicit
+    /// `--steer` selection.
     pub delivery: MulticastDelivery,
 }
 
@@ -1120,7 +1127,7 @@ impl VoxelConfig {
             .collect()
     }
 
-    /// The links a transit router holds a multicast VIF on.
+    /// Interfaces on which a transit router configures multicast VIFs.
     ///
     /// This covers every scrimlet-facing link, plus the host-facing link
     /// an externally sourced group arrives on. `number` assigns a `/32`

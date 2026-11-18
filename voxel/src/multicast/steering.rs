@@ -6,9 +6,9 @@
 //! traffic toward the voxel rack's emulated customer network.
 //!
 //! A [`PathSelection`] is a switch slot with an optional router. An unqualified
-//! slot would apply to every forwarding router.
+//! slot applies to every forwarding router.
 //!
-//! The `--steer` flag, which this module supplies, accepts switch names, LLDP
+//! The `--steer` flag accepts switch names, LLDP
 //! labels, and router interface names. [`Steering::parse`] resolves these
 //! against the voxel rack topology before any FRR configuration is applied.
 
@@ -28,8 +28,8 @@ use super::record::{MulticastState, PathSelection};
 /// may name a source that never appears anywhere on the wire
 /// (e.g., commtest's deny group example).
 ///
-/// Processing-wise, this input is stripped here and the sender is
-/// resolved separately.
+/// Only the group address is retained. The host's sending address is resolved
+/// separately.
 ///
 /// TODO: IPv4 only, matching commtest's `validate_mcast`. Once that accepts v6
 /// groups, this file needs v6 throughout, which for the router side means the
@@ -51,7 +51,7 @@ fn group_addr(group: &str) -> anyhow::Result<Ipv4Addr> {
     Ok(addr)
 }
 
-/// A multicast group as commtest lays out, reduced to just a IPv4 address.
+/// A commtest multicast group reduced to an IPv4 address.
 #[derive(Clone, Debug)]
 pub(crate) struct GroupSpec {
     pub(super) addr: Ipv4Addr,
@@ -80,12 +80,12 @@ impl std::fmt::Display for GroupSpec {
     }
 }
 
-/// The spec determining which ingress paths a group uses, allowing us to
-/// drive duplicate copies into the rack (on purpose) or pin a group to one
-/// (router, switch) pairing path.
+/// Ingress paths selected for a group. Multiple paths can send duplicate
+/// packets into the rack; a router-qualified path selects one router and
+/// switch.
 ///
-/// LLDP spellings (`uplink0`) are accepted too, resolving through [`Aliases`]
-/// and reading back as `switchN` in the ownership record.
+/// LLDP labels such as `uplink0` resolve through [`Aliases`] to switch slots
+/// in the ownership record.
 #[derive(Clone, Debug)]
 pub(crate) struct SteerSpec {
     group: Ipv4Addr,
@@ -114,15 +114,15 @@ impl std::str::FromStr for SteerSpec {
 /// Each path pairs an optional router with the switch its rack-facing link
 /// reaches:
 ///
-/// - A path naming no router whatsoever applies to every configured router.
-/// - Naming one restricts the group to it.
+/// - A path without a router qualifier applies to every forwarding router.
+/// - A router qualifier restricts it to that router.
 ///
-/// Empty here means deliver to no one at all.
+/// An empty set selects no paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Paths(pub(super) Vec<PathSelection>);
 
 impl Paths {
-    /// The paths `[network.multicast] delivery` asks for.
+    /// Paths selected by `[network.multicast] delivery`.
     pub(super) fn from_config(
         cfg: &VoxelConfig,
         routers: &[String],
@@ -141,7 +141,7 @@ impl Paths {
 
     /// Reject selections with more than one outgoing path per router.
     ///
-    /// TODO: lift this once the frr image carries FRR's leaf-list `oif`
+    /// TODO: lift this once the frr image includes FRR's leaf-list `oif`
     /// (outgoing interface) model, which is on their mainline branch only.
     /// FRR 8.4 through 10.x withdraw by just `(S,G)` and can strand the other
     /// outgoing interface.
@@ -165,8 +165,8 @@ impl Paths {
         Ok(())
     }
 
-    /// The switches `router` is asked to deliver to. A group whose paths all
-    /// name other routers gives this one nothing.
+    /// The switches selected for `router`. Returns an empty list when all
+    /// paths are qualified for other routers.
     pub(super) fn switches_for(&self, router: &str) -> Vec<usize> {
         Self::switches_in(&self.0, router)
     }
@@ -187,9 +187,8 @@ impl Paths {
     /// Expand each unqualified path into one qualified path per forwarding
     /// router.
     ///
-    /// The result of this is what the ownership record persists, pinning paths
-    /// to the routers in order to keep a recorded selection fixed if/when the
-    /// forwarding set changes between commands.
+    /// The ownership record stores these qualified paths. Later changes to
+    /// the forwarding router set do not alter a recorded selection.
     pub(super) fn materialize(&mut self, routers: &[String]) {
         self.0 = self
             .0
@@ -208,7 +207,7 @@ impl Paths {
     }
 }
 
-/// The set of multicast group addresses mapped to its steering `Paths`.
+/// The `Paths` requested for each multicast group.
 #[derive(Debug, Default)]
 pub(super) struct Steering {
     paths: HashMap<Ipv4Addr, Paths>,
@@ -275,8 +274,7 @@ impl Steering {
 
     /// The delivery recorded for each of `addrs`, as switch indices.
     ///
-    /// A group without a record contributes nothing, falling back to the
-    /// configured delivery.
+    /// Groups without a record use the configured delivery.
     pub(super) fn from_recorded(
         state: Option<&MulticastState>,
         addrs: &[Ipv4Addr],
@@ -391,21 +389,19 @@ struct AliasPort {
     lldp: String,
 }
 
-/// A label to the entries it names.
+/// Entries associated with each label.
 type AliasTable<T> = Vec<(String, Vec<T>)>;
 
-/// The rack-facing paths a caller can name/assign.
+/// Rack-facing paths available in steering selections.
 ///
-/// Resolved once. A spelling names one or more (router, switch) pairs
-/// (an unqualified switch name selects that switch on every router).
+/// Each alias resolves to one or more (router, switch) pairs. An unqualified
+/// switch name selects that switch on every forwarding router.
 ///
-/// A path has three possible spellings:
+/// A path has three accepted forms:
 ///
-/// - `switch<N>`: the operator's, and the one `check` prints.
-/// - LLDP labels: the customer's, since they are what the rack advertises to
-///   the device on the other end of the cable.
-/// - Interface names: the router's, what the mroutes and `show ip mroute`
-///   name on the FRR side.
+/// - `switch<N>`, used by operators and printed by `check`.
+/// - LLDP labels, advertised by the rack to its upstream device.
+/// - Interface names, used by mroutes and `show ip mroute` on the router.
 struct Aliases {
     /// Fabric routers in topology order, which is the order `uplink_ports`
     /// indexes them by.
@@ -413,7 +409,7 @@ struct Aliases {
     /// LLDP base label (`uplink0`) to switch slot (the label as written
     /// in config, not emitted).
     base: AliasTable<(usize, usize)>,
-    /// Emitted LLDP label (`uplink0-cr1`) to the full path it names.
+    /// Emitted LLDP label (`uplink0-cr1`) to its complete path.
     emitted: AliasTable<(String, usize)>,
     interfaces: AliasTable<(String, usize)>,
     switches: usize,
@@ -448,8 +444,9 @@ impl TryFrom<&VoxelConfig> for Aliases {
 impl Aliases {
     /// One element of a steering selection.
     ///
-    /// A selection names more than one path. For example, `switch0` selects
-    /// slot 0 on every router, while `cr1:uplink0` selects slot 0 on `cr1`.
+    /// One selection can expand to multiple paths. For example, `switch0`
+    /// selects slot 0 on every router, while `cr1:uplink0` selects slot 0 on
+    /// `cr1`.
     ///
     /// # Errors
     ///
@@ -467,7 +464,7 @@ impl Aliases {
             None => (None, one),
         };
 
-        // An emitted LLDP label already names a router.
+        // An emitted LLDP label already includes a router.
         if let Some(paths) = self.emitted_path(name) {
             let selected: Vec<PathSelection> = paths
                 .into_iter()
@@ -539,7 +536,7 @@ impl Aliases {
             .map(|(_, slots)| slots.iter().map(|(_, slot)| *slot).collect())
     }
 
-    /// The full path an emitted LLDP label names.
+    /// The router and switch selected by an emitted LLDP label.
     fn emitted_path(&self, name: &str) -> Option<Vec<(String, usize)>> {
         self.emitted
             .iter()
@@ -547,7 +544,7 @@ impl Aliases {
             .map(|(_, paths)| paths.clone())
     }
 
-    /// The paths named by a router interface.
+    /// Paths selected by a router interface name.
     fn interface_paths(&self, name: &str) -> Vec<(String, usize)> {
         self.interfaces
             .iter()
@@ -557,7 +554,8 @@ impl Aliases {
     }
 }
 
-/// The entries record under a `label`, inserting an empty row on init.
+/// Return the entries for `label`, creating an empty list when the label
+/// is absent.
 fn bucket<'t, T>(table: &'t mut AliasTable<T>, label: &str) -> &'t mut Vec<T> {
     let at = match table.iter().position(|(known, _)| known == label) {
         Some(at) => at,

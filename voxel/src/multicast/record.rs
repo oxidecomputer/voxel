@@ -9,8 +9,8 @@
 //! is replaced, i.e., becomes stale, it remains alongside the current ones
 //! until that update commits.
 //!
-//! Multicast commands run while sharing a working-directory lock; state-file
-//! writes replace previous records atomically.
+//! Multicast commands hold a working-directory lock for each operation.
+//! State-file writes replace previous records atomically.
 
 use std::fs::{self, File};
 use std::io::ErrorKind;
@@ -40,7 +40,7 @@ impl Selection {
             Selection::Paths(paths) => Some(paths),
         }
     }
-    /// Whether this selects every path or not.
+    /// Whether the selection includes every path.
     pub(super) fn is_all(&self) -> bool {
         *self == Selection::All
     }
@@ -79,8 +79,8 @@ pub(super) struct MulticastRoute {
     pub(super) source: Option<Ipv4Addr>,
     /// The rack-facing paths selected for this group.
     ///
-    /// This can be [`Selection::All`] or an empty `Paths` when steering
-    /// nowhere explicitly.
+    /// [`Selection::All`] selects every path; an empty `Paths` explicitly
+    /// selects no path.
     #[serde(default, skip_serializing_if = "Selection::is_all")]
     selection: Selection,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -189,8 +189,8 @@ impl MulticastState {
         }
     }
 
-    /// Prepare source and steering changes for an existing route, if
-    /// it exists.
+    /// Prepare source and steering changes for a recorded route. Does nothing
+    /// when the group has no recorded route.
     ///
     /// This keeps replaced sources in the stale list until the update
     /// is committed.
@@ -215,7 +215,7 @@ impl MulticastState {
     }
 
     /// The current selection's paths or `None` when it selects
-    /// every single path.
+    /// every path.
     pub(super) fn selected_paths(
         &self,
         group: &Ipv4Addr,
@@ -273,15 +273,14 @@ impl MulticastRoute {
     }
 }
 
-/// The local state file is keyed by the falcon environment name, and hexed
-/// to retain one file per environment.
+/// The state-file path for a falcon environment, with the environment name
+/// encoded as hexadecimal.
 pub(super) fn multicast_state_path(name: &str) -> PathBuf {
     let key = hex::encode(name);
     PathBuf::from(".falcon").join(format!("multicast-{key}.json"))
 }
 
-/// This holds an advisory lock on the working directory for the life of a
-/// multicast command.
+/// An advisory working-directory lock held for a multicast command.
 pub(crate) struct MulticastLock {
     _lock: File,
 }
@@ -307,9 +306,8 @@ fn remove_multicast_state_at(path: &Path) -> anyhow::Result<()> {
 
 /// Lock multicast state in the current working directory.
 ///
-/// The scope of this is the working directory, not an environment. The host
-/// route table and the fabric routers are shared by every falcon environment
-/// recorded through here; their updates must serialize with each other.
+/// The lock covers all falcon environments recorded in this working directory.
+/// Their host-route and fabric-router updates must be serialized.
 ///
 /// Returns a guard that holds the lock until it's dropped.
 ///
