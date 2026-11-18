@@ -18,4 +18,4 @@ artifact = "faux-mgs.gz"
 [sidecar-lite]
 repo = "sidecar-lite"
 series = "release"
-rev = "ff2aac077ab15f70794192f4c7f65707712e9ac0"
+rev = "4d57f3a1fac7e5ed2a63ab5bc54b9b18b7b2cf73"
