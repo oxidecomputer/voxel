@@ -20,7 +20,8 @@ use voxel_config::{FRR_IMAGE_PREFIX, IMAGE_PREFIX};
 const NODE: &str = "vbuild";
 /// The builder's falcon deployment name.
 const DEPLOY: &str = "voxel_build";
-pub(crate) const DEFAULT_BASE_IMAGE: &str = "helios-3.0";
+/// Falcon base image for the illumos images (builder and voxel-cp).
+pub(crate) const HELIOS_BASE: &str = "helios-3.1";
 const LINUX_BASE_PREFIXES: [&str; 3] = ["debian", "ubuntu", "linux"];
 const STAGING_IMAGE_PREFIX: &str = "incoming-";
 
@@ -294,13 +295,13 @@ pub(crate) async fn create_base(
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
     validate_image_name(name)?;
-    if name == DEFAULT_BASE_IMAGE
+    if name == HELIOS_BASE
         || name.starts_with(IMAGE_PREFIX)
         || name.starts_with(STAGING_IMAGE_PREFIX)
         || is_linux_base(name)
     {
         bail!(
-            "{name} is reserved: base names may not be {DEFAULT_BASE_IMAGE} or \
+            "{name} is reserved: base names may not be {HELIOS_BASE} or \
              start with {IMAGE_PREFIX}, {STAGING_IMAGE_PREFIX}, or {}",
             LINUX_BASE_PREFIXES.join("/")
         );
@@ -369,7 +370,7 @@ pub(crate) fn check_base_image(dataset: &str, base_image: &str) -> Result<()> {
         bail!("{base_image} is not a Helios base image");
     }
 
-    if base_image == DEFAULT_BASE_IMAGE {
+    if base_image == HELIOS_BASE {
         return Ok(());
     }
     let image = Dataset::new(format!("{dataset}/img/{base_image}"))?;
@@ -377,7 +378,7 @@ pub(crate) fn check_base_image(dataset: &str, base_image: &str) -> Result<()> {
     if !zfs_exists(&snap) {
         bail!(
             "base image {base_image} is not registered ({snap} not found); \
-             falcon can only download {DEFAULT_BASE_IMAGE}"
+             falcon can only download {HELIOS_BASE}"
         );
     }
     let parent = get_property(&image, crate::topo::PROP_BASE_IMAGE)?;

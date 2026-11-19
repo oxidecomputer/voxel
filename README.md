@@ -65,18 +65,18 @@ accessing, and tearing down a rack, see the
 
 Omicron pins OPTE in `tools/opte_version` and installs it as the
 `driver/network/opte` package. A new OPTE build can require a newer Helios
-kernel than the one in falcon's default guest image, `helios-3.0`. In that
+kernel than the one in falcon's default guest image, `helios-3.1`. In that
 case, `install_opte.sh` installs an older OPTE and the bake stops with an
 "opte API mismatch" error.
 
 To update the base image before baking, run:
 
 ```
-pfexec voxel image create-base helios-3.0-20261118
-pfexec voxel image create --base-image helios-3.0-20261118
+pfexec voxel image create-base helios-3.1-20261119
+pfexec voxel image create --base-image helios-3.1-20261119
 ```
 
-`create-base` boots `helios-3.0`, runs `pkg update` and captures the result as
+`create-base` boots `helios-3.1`, runs `pkg update` and captures the result as
 a new base image. Reuse it for later builds until you want a newer Helios.
 
 A few notes: by default, this will all happen under $HOME. If you don't like that or need

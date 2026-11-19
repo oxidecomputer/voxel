@@ -121,7 +121,7 @@ programs OPTE's boundary table through the xde ioctl API.
 The `propolis` row is the server packaged into the control-plane image. The
 host server for the rack VMs is selected separately with
 `falcon.propolis_binary`. Voxel's own `propolis-client` follows libfalcon at
-[`5e201ec4`]; the host server's instance-spec types must match that client.
+[`12b00ba8`]; the host server's instance-spec types must match that client.
 
 For a local test run, build the control-plane image from the local Omicron
 checkout like so:
@@ -1007,7 +1007,7 @@ done
 [775]: https://code.oxide.computer/c/illumos-gate/+/775
 [`41645034`]: https://github.com/oxidecomputer/omicron/commit/41645034ff180922d19ba0746e6fe250cf5b9c00
 [`7c298670`]: https://github.com/oxidecomputer/propolis/commit/7c298670530922c53ae3f35cd853c0c82229d1ca
-[`5e201ec4`]: https://github.com/oxidecomputer/propolis/commit/5e201ec4185ccb9182cc6ffcb09fadd9deee24ca
+[`12b00ba8`]: https://github.com/oxidecomputer/propolis/commit/12b00ba88d088e0c61b2d4d26f765fc83f6a76b8
 [`multicast.rs`]: ../voxel/src/multicast.rs
 [`commtest.rs`]: ../voxel/src/commtest.rs
 [multicast-to-physical table]: https://github.com/oxidecomputer/opte/blob/931e2ccba7b17d7d98148cf8b36c56d18b256e6b/lib/oxide-vpc/src/engine/overlay.rs#L345-L369

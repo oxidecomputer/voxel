@@ -264,7 +264,7 @@ enum ImageCmd {
         )]
         sled_agent: Option<Utf8PathBuf>,
         /// Helios base image to use for the CP build.
-        #[arg(long, default_value = imagebuild::DEFAULT_BASE_IMAGE)]
+        #[arg(long, default_value = imagebuild::HELIOS_BASE)]
         base_image: String,
     },
     /// Export an image bundle to a file for distribution.
@@ -306,7 +306,7 @@ enum ImageCmd {
         /// Name for the new base image; must not already exist.
         name: String,
         /// Helios base image to update.
-        #[arg(long, default_value = imagebuild::DEFAULT_BASE_IMAGE)]
+        #[arg(long, default_value = imagebuild::HELIOS_BASE)]
         from: String,
     },
 }
