@@ -21,6 +21,7 @@ use crate::net::{
     wait_external_reachable,
 };
 use crate::rss::watch_rss;
+use crate::ssh_keys::stage_ssh_pubkey;
 use crate::topo::{
     Topo, build_topo, is_tuf_image, reset_node_cargo_bay, stage_config,
     stage_sprockets,
@@ -241,6 +242,7 @@ pub(crate) async fn cmd_launch(
     reset_node_cargo_bay(cfg)?;
     stage_config(cfg, opts.emu, opts.init_rss, opts.sp_firmware)?;
     stage_sprockets(cfg)?;
+    stage_ssh_pubkey(cfg)?;
     // The switch zones' MGS dials the host fleet, so it exists before any node boots.
     if opts.emu {
         sp_host::up_all(cfg, opts.emu)?;
