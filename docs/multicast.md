@@ -48,12 +48,17 @@ voxel network multicast up --group 239.100.0.1 --group 239.100.0.2 \
 voxel network multicast check
 
 # pools, project, probes, memberships, then traffic (isolated-mode sources)
+# 60s warmup; freshly created probes can take > 30s to start receiving traffic
 voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
-    --test-duration 200s --warmup 30s --packet-rate 10 \
+    --test-duration 200s --warmup 60s --packet-rate 10 \
     --mcast-group 239.100.0.1 \
     --mcast-group 239.100.0.2@172.30.199.199 \
     --mcast-group 232.100.0.1@172.30.199.199 \
     --mcast-deny-group 239.100.0.9@172.30.199.198
+
+# persist the transcript (cleanup overwrites .falcon/commtest.log)
+cp ~/.config/voxel/.falcon/commtest.log \
+    ~/.config/voxel/commtest-$(date +%Y%m%d-%H%M).log
 
 # undo (destroy also purges the host routes, so running down is optional)
 voxel commtest -- cleanup
@@ -100,7 +105,7 @@ calls if done by hand, and how to read back state information in the rack.
 
 ### TODO: Dependencies
 
-`Cargo.toml` pins Voxel's Omicron dependencies to [`41645034`]. A default
+`Cargo.toml` pins Voxel's Omicron dependencies to [`dce8d982`]. A default
 `voxel image create` builds that revision. The packaged service revisions below
 come from that Omicron commit's `package-manifest.toml`; `sidecar-lite` is
 selected by Voxel's `pins.toml`.
@@ -111,11 +116,11 @@ programs OPTE's boundary table through the xde ioctl API.
 | Repository | Revision | PR |
 | --- | --- | --- |
 | `propolis` | [`7c298670`] | [#1262](https://github.com/oxidecomputer/propolis/pull/1262) |
-| `omicron` | [`41645034`] | [#11128](https://github.com/oxidecomputer/omicron/pull/11128) |
+| `omicron` | [`dce8d982`] | [`zl/mcast-build`](https://github.com/oxidecomputer/omicron/tree/zl/mcast-build) |
 | `maghemite` | [`c02f1674`](https://github.com/oxidecomputer/maghemite/commit/c02f16749b8d29ff749fa745d4118577cddc44c6) | |
 | `dendrite` | [`28789d60`](https://github.com/oxidecomputer/dendrite/commit/28789d607071cc52a60304f5e6bce52fec3d5597) | |
 | `sidecar-lite` | [`4d57f3a1`](https://github.com/oxidecomputer/sidecar-lite/commit/4d57f3a1fac7e5ed2a63ab5bc54b9b18b7b2cf73) | |
-| `opte` | [`104a6845`](https://github.com/oxidecomputer/opte/commit/104a684534c928cb6af6c0845640ba31b239885f) | [#1108](https://github.com/oxidecomputer/opte/pull/1108) |
+| `opte` | [`ec15113a`](https://github.com/oxidecomputer/opte/commit/ec15113af6b8b8b04a25ffc30940abbdc0ea7f88) | [#1108](https://github.com/oxidecomputer/opte/pull/1108) |
 | `propolis` (host) | [`7c298670`](https://github.com/oxidecomputer/propolis/commit/7c298670530922c53ae3f35cd853c0c82229d1ca) | [#1262](https://github.com/oxidecomputer/propolis/pull/1262) |
 
 The `propolis` row is the server packaged into the control-plane image. The
@@ -865,7 +870,7 @@ voxel network multicast up --group 239.100.0.1 --group 239.100.0.2 \
     --group 232.100.0.1 --group 239.100.0.9
 
 voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
-    --test-duration 200s --warmup 30s --packet-rate 10 \
+    --test-duration 200s --warmup 60s --packet-rate 10 \
     --mcast-group 239.100.0.1 \
     --mcast-group 239.100.0.2@172.30.199.199 \
     --mcast-group 232.100.0.1@172.30.199.199 \
@@ -884,7 +889,7 @@ voxel network multicast up --group 239.100.0.1 --group 239.100.0.2 \
     --group 232.100.0.1 --group 239.100.0.9
 
 voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
-    --test-duration 200s --warmup 30s --packet-rate 10 \
+    --test-duration 200s --warmup 60s --packet-rate 10 \
     --mcast-group 239.100.0.1 \
     --mcast-group 239.100.0.2@192.168.1.199 \
     --mcast-group 232.100.0.1@192.168.1.199 \
@@ -893,6 +898,36 @@ voxel commtest --source /oxide/workspace/omicron --traffic multi -- run \
 
 The group addresses come from rack-side pools and remain the same in either
 networking mode; only the sources change.
+
+After the last group drains, commtest writes
+`multicast-connectivity-report.json` to the working directory (see the README's
+Omicron commtest section). A run that fails mid-traffic keeps the previous
+report in place, so always check the report's `mtime`. To derive a readable,
+per-member table, you can run:
+
+```sh
+jq -r '["group","expect","member","tx","rx","lost","self_rx"],
+  (.v4[] | . as $g | .members[] |
+    [$g.group, $g.expect, .member, .tx_count, .rx_count, .lost,
+     $g.sender_self_rx])
+  | @tsv' ~/.config/voxel/multicast-connectivity-report.json \
+  | expand -t 16,25,42,50,58,64
+```
+
+Given this display, it outputs columns, per row (one row per group member):
+
+- `group`, `expect`: the group address and whether it came from
+  `--mcast-group` (`deliver`) or `--mcast-deny-group` (`deny`)
+- `member`: the probe address, seeded from the expected members, plus any
+  unexpected responder showing up
+- `tx`: requests the host sent to the group
+- `rx`: unicast echo replies from a member subscriber, counted through to the
+  draining of receives (duplicate copies count too; both-switch traffic
+  steering can produce `rx` above `tx` for example)
+- `lost`: `tx` minus `rx`, counted from the member's first reply; drops before
+  the reply aren't charged as lost, and it floors at 0
+- `self_rx`: copies of the host's own request stream that returned to it (per
+  group, repeated on each row)
 
 The `check` command does not show the rack-side underlay mapping.
 To view this mapping, run `omdb` in the switch zone (see
@@ -1005,7 +1040,7 @@ done
 - guest membership snooping and querying from IGMP or MLD reports.
 
 [775]: https://code.oxide.computer/c/illumos-gate/+/775
-[`41645034`]: https://github.com/oxidecomputer/omicron/commit/41645034ff180922d19ba0746e6fe250cf5b9c00
+[`dce8d982`]: https://github.com/oxidecomputer/omicron/commit/dce8d982923f37fd912fd0b22594eddd6447cf61
 [`7c298670`]: https://github.com/oxidecomputer/propolis/commit/7c298670530922c53ae3f35cd853c0c82229d1ca
 [`12b00ba8`]: https://github.com/oxidecomputer/propolis/commit/12b00ba88d088e0c61b2d4d26f765fc83f6a76b8
 [`multicast.rs`]: ../voxel/src/multicast.rs

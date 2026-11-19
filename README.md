@@ -161,6 +161,18 @@ image that predates probe multicast silently drops a probe's
 two commits aligned. `--api URL` overrides the derived Nexus API address, and
 `--no-build` runs an existing `<omicron>/target/debug/commtest`.
 
+Results from a commtest run are stored in the working directory
+(`--workdir`/`$VOXEL_WORKDIR`, then `falcon.workdir`, then the directory
+containing `voxel.toml`; `~/.config/voxel` by default, or `/etc/voxel` if it's
+the current configuration in use). `.falcon/commtest.log` contains the entire
+transcript of the run and is overwritten by succeeding `voxel commtest`
+invocations, `-- cleanup` included. The summarized report(s),
+`multicast-connectivity-report.json`/`connectivity-report.json`, are written
+once network traffic has finished and every group has drained. A run that
+fails before then (a group with no members, a drain that never settles, or a
+unicast check failing ahead of the multicast phase) writes no new report and
+leaves the previous run's file in place, so check the mtime.
+
 Voxel supplies arguments for which commtest has no usable default. It passes
 everything after `--` through unchanged:
 
