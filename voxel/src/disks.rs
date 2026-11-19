@@ -104,10 +104,7 @@ fn serial_bytes(serial: &str) -> Result<[u8; 20]> {
     Ok(out)
 }
 
-/// Create this launch's sled disks. They live under the deployment's own falcon
-/// dataset, so `teardown`'s `zfs destroy -r` already reaps them and every launch
-/// starts on blank media - which matters, since a stale U.2 carries the previous
-/// rack's crucible and trust-quorum state.
+/// Create each sled's M.2 and U.2 zvols under the deployment's topo dataset.
 pub(crate) fn create_zvols(
     dataset: &str,
     deployment: &str,
@@ -117,11 +114,6 @@ pub(crate) fn create_zvols(
         for disk in layout() {
             let vol =
                 format!("{dataset}/topo/{deployment}/{}", disk.volume(sled));
-            // A launch over a half-torn-down rack would otherwise inherit the
-            // old media.
-            let _ = std::process::Command::new("zfs")
-                .args(["destroy", &vol])
-                .output();
             let size = format!("{}G", disk.size_gb);
             // Disabling synchronous writes helps us init the rack more
             // smoothly without saturating the host's disk.

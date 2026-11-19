@@ -249,6 +249,15 @@ pub(crate) async fn cmd_launch(
     // the RAM spike) is torn down and retried from a fresh topology.
     let mut attempt = 1;
     let topo = loop {
+        let stale = leftover_datasets(name);
+        if let Some(first) = stale.first() {
+            bail!(
+                "{} datasets of an earlier {name} deployment still exist \
+                 (first: {first}). \
+                 Run `voxel destroy` and ensure that it removes them.",
+                stale.len()
+            );
+        }
         // Create the zvols on each loop iteration, since teardown's zfs destroy
         // -r of the topo dataset removes them.
         disks::create_zvols(&image::falcon_dataset(), name, &sleds)
@@ -404,8 +413,17 @@ fn reap_orphan_propolis(name: &str, log: &Logger) -> usize {
     reaped
 }
 
+/// Datasets present under a deployment's falcon topo dataset. Required
+/// check due to `zfs -p` default reuse logic.
+fn leftover_datasets(name: &str) -> Vec<String> {
+    let topo_ds = format!("{}/topo/{name}", image::falcon_dataset());
+    probe_out("zfs", &["list", "-H", "-o", "name", "-r", &topo_ds])
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// Tear down a deployment: reap orphan propolis, run falcon's destroy, then wipe
-/// the node disks so the next launch boots clean even when destroy erred.
+/// the node disks and fail if any survive, so the next launch boots clean.
 fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
     if reap_orphan_propolis(name, &runner.log) > 0 {
         // Let the kernel release the freed VNIC and zvol handles.
@@ -414,6 +432,20 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
     let result = runner.destroy();
     let topo_ds = format!("{}/topo/{name}", image::falcon_dataset());
     let wipe = Command::new("zfs").args(["destroy", "-r", &topo_ds]).output();
+    // Neither falcon's destroy nor a zero exit proves the disks are gone.
+    let stale = leftover_datasets(name);
+    if let Some(first) = stale.first() {
+        let why = match &wipe {
+            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        bail!(
+            "destroy left {} datasets under {topo_ds} (first: {first}): \
+             {why}; check for unexpected artifacts in \
+             `pgrep -fl propolis-server` and /dev/vmm, then destroy again",
+            stale.len()
+        );
+    }
     match (&result, wipe) {
         (Err(e), Ok(o)) if o.status.success() => {
             warn!(
