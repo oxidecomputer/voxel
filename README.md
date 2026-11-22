@@ -39,15 +39,19 @@ them and bring up a rack for an omicron commit in one go:
 
 ```sh
 voxel heading 5ce2b2c            # print the plan: what exists, what will run
-voxel heading 5ce2b2c engage     # make it so
+pfexec voxel heading 5ce2b2c engage     # make it so
 ```
 
 `engage` builds whatever is missing: the frr and builder images, and
 `voxel-cp-<sha>` in the builder. It then points `image.cp` at that image and
 runs `launch --emu`, `status` and `commtest`. Finished steps are skipped, so
 rerunning `engage` after a failure picks up where it stopped, and a heading
-for a new commit reuses the frr and builder images. A rack already up on a
-different image stops it; `voxel destroy` first.
+for a new commit reuses the frr image. Each commit gets its own builder
+(`voxel builder status` lists them), and a new one starts as a copy of the
+most recently used builder's disk, so cargo's caches carry over; an existing
+`voxel-cp-<sha>` skips the builder entirely. A rack already up on a
+different image stops it; `voxel destroy` first. The builder's checkout must
+be clean, or pass `engage --force` to discard its changes.
 
 ### Building the archive yourself
 

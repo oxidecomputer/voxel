@@ -620,15 +620,11 @@ fn stage_sp_emu(
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.join(".tuf-host").join(format!("phase1-{key}.rom")));
-    match rom {
-        Some(rom) if rom.exists() => {
-            fs::copy(&rom, out.join("host-phase1.rom"))
-                .with_context(|| format!("stage host phase 1 from {rom}"))?;
-        }
-        _ => eprintln!(
-            "[voxel] no cached host phase 1 rom for {key}; \
-             gimlet host flash stays blank"
-        ),
+    // Only `--from-tuf` images cache one. Without it the host flash stays
+    // blank, which is normal: the sleds boot from their disks either way.
+    if let Some(rom) = rom.filter(|r| r.exists()) {
+        fs::copy(&rom, out.join("host-phase1.rom"))
+            .with_context(|| format!("stage host phase 1 from {rom}"))?;
     }
     Ok(())
 }

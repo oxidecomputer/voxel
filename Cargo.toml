@@ -23,7 +23,7 @@ expectorate = "1.2.0"
 # Our crates use only #[tokio::main] + tokio::time; libfalcon pulls its own
 # tokio features (they're additive), so we don't need "full".
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
-libfalcon = { git = "https://github.com/oxidecomputer/falcon", branch = "falcon-img" }
+libfalcon = { git = "https://github.com/oxidecomputer/falcon", rev = "826830f679f4d754882c0c057a4c75b7f4045daf" }
 # Must be the rev libfalcon pins, so instance-spec component types unify.
 propolis-client = { git = "https://github.com/oxidecomputer/propolis", rev = "12b00ba88d088e0c61b2d4d26f765fc83f6a76b8" }
 futures = "0.3"

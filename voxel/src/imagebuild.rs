@@ -79,11 +79,60 @@ pub(crate) fn builder_network(
     })
 }
 
+/// Held while an image bake runs. Every bake uses the one falcon
+/// deployment `voxel_build` (its dataset and vnic are host-wide), and a bake
+/// clears a leftover one, so two at once would tear each other down.
+/// Re-entrant within the process: `builder build` holds it around the whole
+/// cp bake, `bake` included.
+pub(crate) struct BakeLock {
+    /// The locked file, held for its lifetime; None in a nested hold.
+    _file: Option<std::fs::File>,
+}
+
+static BAKE_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for BakeLock {
+    fn drop(&mut self) {
+        BAKE_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn bake_lock() -> Result<BakeLock> {
+    use std::os::fd::AsRawFd;
+    const PATH: &str = "/var/run/voxel-image-build.lock";
+    let depth = BAKE_DEPTH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if depth > 0 {
+        return Ok(BakeLock { _file: None });
+    }
+    // Built before anything can fail, so an early return still drops it and
+    // undoes the depth count.
+    let mut lock = BakeLock { _file: None };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(PATH)
+        .with_context(|| format!("open {PATH}"))?;
+    let fd = file.as_raw_fd();
+    // SAFETY: flock(3C) on an fd owned by `file`, which outlives the call.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("[voxel] another image bake is running; waiting for it");
+        // SAFETY: as above.
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            bail!("lock {PATH}: {}", std::io::Error::last_os_error());
+        }
+    }
+    lock._file = Some(file);
+    Ok(lock)
+}
+
 /// Bring up the builder, install, quiesce, capture, tear down.
 pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     if !o.cargo_bay.exists() {
         bail!("cargo-bay {} not found", o.cargo_bay);
     }
+    let _lock = bake_lock()?;
 
     // Replacing an image destroys it at the end, which zfs refuses while
     // clones of it exist (a builder disk, or a rack's nodes). Find out now,
@@ -93,7 +142,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     if !clones.is_empty() {
         bail!(
             "cannot replace {}: it has dependent clones ({}). Remove them \
-             first (`voxel builder down --destroy` for a builder disk, \
+             first (`voxel builder down <sha> --destroy` for a builder disk, \
              `voxel destroy` for a rack), or build under a new name",
             image.as_str(),
             clones.join(", ")
@@ -514,8 +563,10 @@ async fn quiesce(d: &Runner, node: libfalcon::NodeRef) {
     hyperstop(falcon_dir(), NODE);
 }
 
-/// Give the halting guest time to flush. Propolis usually outlives the halt;
-/// reaching the timeout is the normal path and `hyperstop` follows either way.
+/// Give the halting guest time to flush. Propolis outlives the halt but
+/// destroys the bhyve VM, so the VM's `/dev/vmm` node going away is the
+/// signal that the guest is down. Without one to watch (or if it never goes
+/// away) this waits out the timeout; `hyperstop` follows either way.
 pub(crate) fn wait_for_propolis_exit(
     dir: &Utf8Path,
     name: &str,
@@ -524,16 +575,26 @@ pub(crate) fn wait_for_propolis_exit(
     if read_pidfile(dir, name).is_none() {
         return;
     }
-    eprintln!("[voxel] flushing, up to {}s", timeout.as_secs());
+    let vmm = std::fs::read_to_string(dir.join(format!("{name}.uuid")))
+        .ok()
+        .map(|u| Utf8PathBuf::from(format!("/dev/vmm/{}", u.trim())))
+        .filter(|p| p.exists());
+    eprintln!(
+        "[voxel] waiting for the guest to halt, up to {}s",
+        timeout.as_secs()
+    );
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if !propolis_alive(dir, name) {
             return;
         }
+        if vmm.as_ref().is_some_and(|p| !p.exists()) {
+            return;
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
     eprintln!(
-        "[voxel] still running after {}s; forcing it down",
+        "[voxel] guest did not halt within {}s; stopping it",
         timeout.as_secs()
     );
 }

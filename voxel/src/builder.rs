@@ -2,10 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `voxel builder`: a persistent omicron build host with its own disk.
+//! `voxel builder`: persistent omicron build hosts, one per omicron commit.
 //!
-//! The disk is `<dataset>/img/builder-disk`, cloned from the builder image on
-//! the first `up`. falcon clones a disk at every launch and cannot reuse one.
+//! A builder is keyed by the first 7 hex digits of its commit. Its disk is
+//! `<dataset>/img/builder-<key>`, its falcon deployment `vb_<key>` (short:
+//! falcon's vnic names must fit illumos' 31 characters) and its host state
+//! `<workdir>/builder/<key>`, so several can be up at once.
+//!
+//! The first `up` of a commit copies the most recently used builder's disk
+//! (`zfs send | recv`, so neither depends on the other), which keeps cargo's
+//! caches and target dir warm. With no builder to copy, or with `--fresh`,
+//! the disk is cloned from the builder image instead. falcon clones a disk
+//! at every launch and cannot reuse one.
 //! `up` therefore has it clone the kept disk, and `down` promotes the running
 //! clone back over it (`fold_disk`). The checkout, cargo caches and target
 //! dir survive on that disk, and the second build is incremental because of
@@ -29,13 +37,12 @@ use libfalcon::{NodeRef, Runner, unit::gb};
 use std::time::Duration;
 use voxel_config::VoxelConfig;
 
-const DEPLOY: &str = "voxel_builder";
 const NODE: &str = "builder";
 /// No `voxel-` prefix. `image ls` lists only `voxel-` images and must not
-/// offer the builder's live disk.
-const DISK: &str = "builder-disk";
-/// The builder's host directory under the anchored workdir, beside the
-/// rack's `.falcon`.
+/// offer a builder's live disk.
+const DISK_PREFIX: &str = "builder-";
+/// The builders' host directory under the anchored workdir, beside the
+/// rack's `.falcon`. Each builder has `<DIR>/<key>`.
 const DIR: &str = "builder";
 const GUEST_SRC: &str = "/work/omicron";
 const GUEST_RECORD: &str = "/opt/oxide/voxel/builder.toml";
@@ -50,20 +57,107 @@ enum State {
 pub(crate) struct Builder {
     cfg: VoxelConfig,
     dataset: String,
+    /// The omicron rev as given; `up` checks it out.
+    rev: String,
+    /// `rev`'s first 7 hex digits, which name the disk and deployment.
+    key: String,
     dir: Utf8PathBuf,
 }
 
+/// A builder's key: the first 7 digits of an omicron commit sha. Branch
+/// names are refused, since the builder would keep the name after the
+/// branch moved.
+pub(crate) fn key(rev: &str) -> Result<String> {
+    if rev.len() < 7
+        || rev.len() > 40
+        || !rev.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        bail!(
+            "builders are per omicron commit sha (7-40 hex digits), not {rev:?}"
+        );
+    }
+    Ok(rev[..7].to_ascii_lowercase())
+}
+
+/// The builders' host directory. Absolute, because the cp bake changes
+/// directory into image-build/ and state is written afterwards.
+fn builders_dir() -> Result<Utf8PathBuf> {
+    let cwd = std::env::current_dir().context("current dir")?;
+    Ok(Utf8PathBuf::try_from(cwd)
+        .context("non-utf8 working directory")?
+        .join(DIR))
+}
+
+/// Every builder disk under the dataset as (key, disk), least recently
+/// used first: `base` is re-taken at every `down`.
+fn disks(dataset: &str) -> Result<Vec<(String, String)>> {
+    let img = format!("{dataset}/img");
+    Ok(zfs::children_by_snapshot_age(&img, "base")?
+        .into_iter()
+        .filter_map(|ds| {
+            let key = ds.strip_prefix(&format!("{img}/{DISK_PREFIX}"))?;
+            Some((key.to_string(), ds))
+        })
+        .collect())
+}
+
 impl Builder {
-    pub(crate) fn new(cfg: VoxelConfig) -> Result<Self> {
-        // The path is made absolute because the cp bake changes directory
-        // into image-build/ and state is written afterwards.
-        let cwd = std::env::current_dir().context("current dir")?;
-        let dir = Utf8PathBuf::try_from(cwd)
-            .context("non-utf8 working directory")?
-            .join(DIR);
+    pub(crate) fn new(cfg: VoxelConfig, rev: &str) -> Result<Self> {
+        let key = key(rev)?;
+        let dir = builders_dir()?.join(&key);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("mkdir {dir}"))?;
-        Ok(Self { cfg, dataset: crate::image::falcon_dataset(), dir })
+        Ok(Self {
+            cfg,
+            dataset: crate::image::falcon_dataset(),
+            rev: rev.to_string(),
+            key,
+            dir,
+        })
+    }
+
+    /// The builder for `rev`, or without one the only builder that is up,
+    /// else the only one there is.
+    pub(crate) fn pick(cfg: VoxelConfig, rev: Option<&str>) -> Result<Self> {
+        if let Some(rev) = rev {
+            return Self::new(cfg, rev);
+        }
+        let dataset = crate::image::falcon_dataset();
+        let keys: Vec<String> = disks(&dataset)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| key(k).is_ok())
+            .collect();
+        let builders = keys
+            .iter()
+            .map(|k| Self::new(cfg.clone(), k))
+            .collect::<Result<Vec<_>>>()?;
+        let mut up = Vec::new();
+        for b in builders {
+            if b.state()? == State::Up {
+                up.push(b);
+            } else if keys.len() == 1 {
+                return Ok(b);
+            }
+        }
+        match (up.len(), keys.len()) {
+            (1, _) => Ok(up.remove(0)),
+            (_, 0) => {
+                bail!("no builders; `voxel builder up <sha>` creates one")
+            }
+            _ => bail!(
+                "several builders ({}); name one by its omicron sha",
+                keys.join(", ")
+            ),
+        }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn deploy(&self) -> String {
+        format!("vb_{}", self.key)
     }
 
     fn falcon_dir(&self) -> Utf8PathBuf {
@@ -80,12 +174,31 @@ impl Builder {
 
     /// The kept disk.
     fn disk(&self) -> Result<Dataset> {
-        Dataset::new(format!("{}/img/{DISK}", self.dataset))
+        Dataset::new(format!("{}/img/{DISK_PREFIX}{}", self.dataset, self.key))
     }
 
     /// falcon's clone of the kept disk while the builder is up.
     fn node_disk(&self) -> Result<Dataset> {
-        Dataset::new(format!("{}/topo/{DEPLOY}/{NODE}", self.dataset))
+        Dataset::new(format!("{}/topo/{}/{NODE}", self.dataset, self.deploy()))
+    }
+
+    /// The most recently used other builder's disk, which a new disk is
+    /// copied from.
+    fn seed(&self) -> Result<Option<Dataset>> {
+        let me = self.disk()?;
+        disks(&self.dataset)?
+            .into_iter()
+            .rev()
+            .map(|(_, ds)| ds)
+            .find(|ds| ds != me.as_str())
+            .map(Dataset::new)
+            .transpose()
+    }
+
+    /// Whether `up` needs the builder image: there is no disk for this
+    /// commit and none to copy.
+    pub(crate) fn needs_image(&self) -> Result<bool> {
+        Ok(!zfs::exists(&self.disk()?) && self.seed()?.is_none())
     }
 
     fn state(&self) -> Result<State> {
@@ -103,13 +216,14 @@ impl Builder {
     /// process can then exec into or tear down the running builder.
     fn runner(&self) -> Result<(Runner, NodeRef)> {
         let b = &self.cfg.builder;
-        let mut d = Runner::new(DEPLOY);
+        let mut d = Runner::new(&self.deploy());
         d.persistent = true;
         d.set_falcon_dir(Some(self.falcon_dir().to_string()));
         if let Some(bin) = &self.cfg.falcon.propolis_binary {
             d.set_propolis_binary(Some(bin.clone()));
         }
-        let n = d.node(NODE, DISK, b.cores, gb(b.memory_gb));
+        let disk = format!("{DISK_PREFIX}{}", self.key);
+        let n = d.node(NODE, &disk, b.cores, gb(b.memory_gb));
         d.reserve(n, b.disk_gb as usize);
         match self.cfg.external.isolated() {
             true => d.ext_link(crate::isolated_external::STUB, n),
@@ -146,23 +260,41 @@ impl Builder {
     /// The builder's address. Fails unless the builder is up.
     fn require_up(&self) -> Result<String> {
         if self.state()? != State::Up {
-            bail!("the builder is not up; `voxel builder up`");
+            bail!(
+                "builder {k} is not up; `voxel builder up {k}`",
+                k = self.key
+            );
         }
-        self.state_str("ip").context(
-            "the builder is up but its address is unknown; `voxel builder \
-             down` then `up`",
-        )
+        self.state_str("ip").with_context(|| {
+            format!(
+                "builder {k} is up but its address is unknown; `voxel \
+                 builder down {k}` then `up {k}`",
+                k = self.key
+            )
+        })
     }
 
+    /// Boot the builder and check out its rev. `force` discards uncommitted
+    /// changes in the checkout; `fresh` starts the disk over from the
+    /// builder image.
     pub(crate) async fn up(
         &self,
-        omicron: Option<&str>,
         force: bool,
         fresh: bool,
         yes: bool,
     ) -> Result<()> {
+        let k = &self.key;
         if self.state()? == State::Up {
-            bail!("the builder is already up; `voxel builder status`");
+            bail!("builder {k} is already up; `voxel builder status {k}`");
+        }
+        if self.cfg.external.isolated()
+            && let Some(other) = self.others_up()?.first()
+        {
+            // They would all take host_ip - 1.
+            bail!(
+                "builder {other} is up, and in isolated mode builders share \
+                 one address; `voxel builder down {other}` first"
+            );
         }
         let disk = self.disk()?;
         if fresh && zfs::exists(&disk) {
@@ -178,18 +310,36 @@ impl Builder {
             zfs::destroy_dataset_if_present(&disk)?;
         }
         let image = self.cfg.builder_image();
+        // A copied disk carries its source's checkout, whose changes belong
+        // to the source.
+        let mut force = force;
         if !zfs::exists(&disk) {
-            let base = Dataset::new(format!("{}/img/{image}", self.dataset))?
-                .snapshot("base");
-            if !base.exists() {
-                bail!(
-                    "no builder image {image}; build one with `voxel image \
-                     create-builder` or name one in [builder] image"
-                );
+            match self.seed()?.filter(|_| !fresh) {
+                Some(seed) => {
+                    eprintln!(
+                        "[voxel] new builder disk for {k}: copying {} \
+                         (warm caches)",
+                        seed.as_str()
+                    );
+                    self.copy_disk(&seed)?;
+                    force = true;
+                }
+                None => {
+                    let base =
+                        Dataset::new(format!("{}/img/{image}", self.dataset))?
+                            .snapshot("base");
+                    if !base.exists() {
+                        bail!(
+                            "no builder image {image}; build one with `voxel \
+                             image create-builder` or name one in [builder] \
+                             image"
+                        );
+                    }
+                    eprintln!("[voxel] new builder disk for {k} from {image}");
+                    zfs::clone(&base, &disk)?;
+                    zfs::snapshot(&disk, "base")?;
+                }
             }
-            eprintln!("[voxel] new builder disk from {image}");
-            zfs::clone(&base, &disk)?;
-            zfs::snapshot(&disk, "base")?;
         } else if zfs::exists(&self.node_disk()?) {
             // An interrupted `down` left the running clone in place.
             self.fold_disk()?;
@@ -201,13 +351,11 @@ impl Builder {
         imagebuild::stage_builder_net(&bay, network.static_address.as_deref())?;
         std::fs::write(bay.join("builder-image"), format!("{image}\n"))
             .context("stage builder-image")?;
-        if let Some(rev) = omicron {
-            std::fs::write(bay.join("omicron-rev"), format!("{rev}\n"))
-                .context("stage omicron-rev")?;
-            if force {
-                std::fs::write(bay.join("omicron-force"), "")
-                    .context("stage omicron-force")?;
-            }
+        std::fs::write(bay.join("omicron-rev"), format!("{}\n", self.rev))
+            .context("stage omicron-rev")?;
+        if force {
+            std::fs::write(bay.join("omicron-force"), "")
+                .context("stage omicron-force")?;
         }
 
         let (mut d, n) = self.runner()?;
@@ -244,7 +392,9 @@ impl Builder {
             state.insert("omicron".into(), rev.into());
         }
         self.write_state(&state)?;
-        println!("builder up at {ip}; `voxel builder login` opens a shell");
+        println!(
+            "builder {k} up at {ip}; `voxel builder login {k}` opens a shell"
+        );
         Ok(())
     }
 
@@ -262,7 +412,7 @@ impl Builder {
         match self.state()? {
             State::Up => {
                 let (d, n) = self.runner()?;
-                eprintln!("[voxel] halting the builder");
+                eprintln!("[voxel] halting builder {}", self.key);
                 let _ = exec(&d, n, "sync; sync; (sleep 1; halt) &").await;
                 imagebuild::wait_for_propolis_exit(
                     &self.falcon_dir(),
@@ -281,20 +431,59 @@ impl Builder {
                     self.fold_disk()?;
                 }
             }
-            State::Absent if !destroy => {
-                bail!("no builder; `voxel builder up` creates one")
-            }
+            State::Absent if !destroy => bail!(
+                "no builder {k}; `voxel builder up {k}` creates one",
+                k = self.key
+            ),
             State::Absent => {}
         }
         if destroy {
             zfs::destroy_dataset_if_present(&self.disk()?)?;
-            let _ = std::fs::remove_file(self.state_file());
-            println!("builder disk destroyed");
+            let _ = std::fs::remove_dir_all(&self.dir);
+            println!("builder {} destroyed", self.key);
         } else {
             let mut state = self.read_state();
             state.remove("ip");
             self.write_state(&state)?;
-            println!("builder down; the disk is kept for the next `up`");
+            println!(
+                "builder {} down; the disk is kept for the next `up`",
+                self.key
+            );
+        }
+        Ok(())
+    }
+
+    /// The keys of the other builders that are up.
+    fn others_up(&self) -> Result<Vec<String>> {
+        let mut up = Vec::new();
+        for (k, _) in disks(&self.dataset)? {
+            if k == self.key || key(&k).is_err() {
+                continue;
+            }
+            if imagebuild::propolis_alive(
+                &builders_dir()?.join(&k).join(".falcon"),
+                NODE,
+            ) {
+                up.push(k);
+            }
+        }
+        Ok(up)
+    }
+
+    /// Make this builder's disk a full copy of `seed@base`. Received under a
+    /// staging name and renamed, so a failed copy leaves no disk behind.
+    fn copy_disk(&self, seed: &Dataset) -> Result<()> {
+        let disk = self.disk()?;
+        let staging = Dataset::new(format!(
+            "{}/img/incoming-{DISK_PREFIX}{}",
+            self.dataset, self.key
+        ))?;
+        zfs::destroy_dataset_if_present(&staging)?;
+        zfs::send_recv(&seed.snapshot("base"), &staging)?;
+        zfs::rename(&staging, &disk)?;
+        // The stream carries `base` along, which the next clone needs.
+        if !disk.snapshot("base").exists() {
+            zfs::snapshot(&disk, "base")?;
         }
         Ok(())
     }
@@ -315,11 +504,40 @@ impl Builder {
         zfs::snapshot(&disk, "base")
     }
 
+    /// One line per builder.
+    pub(crate) fn list(cfg: &VoxelConfig) -> Result<()> {
+        let all = disks(&crate::image::falcon_dataset())?;
+        if all.is_empty() {
+            println!("no builders; `voxel builder up <sha>` creates one");
+        }
+        for (k, ds) in all {
+            if key(&k).is_err() {
+                println!("{k}: {ds} (not a per-commit builder; unused)");
+                continue;
+            }
+            let b = Self::new(cfg.clone(), &k)?;
+            let state = match b.state()? {
+                State::Up => format!(
+                    "up at {}",
+                    b.state_str("ip").unwrap_or_else(|| "?".into())
+                ),
+                _ => "down".into(),
+            };
+            let last = b
+                .state_str("last_build")
+                .map(|l| format!(", last build {l}"))
+                .unwrap_or_default();
+            println!("{k}: {state}{last}");
+        }
+        Ok(())
+    }
+
     pub(crate) fn status(&self) -> Result<()> {
         let state = self.state()?;
         let disk = self.disk()?;
         println!(
-            "builder: {}",
+            "builder {}: {}",
+            self.key,
             match state {
                 State::Absent => "absent (no disk)",
                 State::Down => "down",
@@ -423,24 +641,29 @@ impl Builder {
     }
 
     /// Build and package omicron in the builder, then bake `voxel-cp-<name>`.
-    pub(crate) async fn build(&self, name: &str) -> Result<()> {
+    /// With `halt`, the builder goes down once the packaged tree is pulled,
+    /// so its memory is free for the bake VM.
+    pub(crate) async fn build(&self, name: &str, halt: bool) -> Result<()> {
         let ip = self.require_up()?;
         // Read before the smf push renders into the checkout.
         let stamp = guest_stamp(&ip)?;
         if !cpbuild::PINNED_OMICRON_REV.starts_with(&stamp.commit) {
             eprintln!(
-                "[voxel] WARN: the builder's omicron {} is not the rev voxel is \
-                 pinned to ({}); the generated config-rss may not match this image",
+                "[voxel] building omicron {}; voxel's generated config-rss \
+                 tracks {}, so a schema change between them shows up at \
+                 commissioning",
                 stamp.commit,
                 cpbuild::PINNED_OMICRON_REV
             );
         }
         let root = imagebuild::build_root()?;
-        let cargo_bay = imagebuild::fresh_cargo_bay("vbuild")?;
+        // Staged in the builder's own dir: another builder may be pulling
+        // its tree at the same time.
+        let cargo_bay = imagebuild::fresh_dir(self.dir.join("bake-bay"))?;
         // voxel-config renders the smf configs on the host from the sled
         // schema sources, and the bake tail reads the firmware pins. Both
         // come through a checkout-shaped stub.
-        let stub = imagebuild::fresh_dir(root.join("schema-stub"))?;
+        let stub = imagebuild::fresh_dir(self.dir.join("schema-stub"))?;
         for (rel, file) in [
             ("sled-agent/src", "config.rs"),
             ("sled-hardware/src", "lib.rs"),
@@ -471,8 +694,12 @@ impl Builder {
         let stage = cargo_bay.join("omicron");
         eprintln!("[voxel] pulling the packaged tree -> {stage}");
         pull(&ip, cpbuild::STAGE_PATHS, &stage, &[])?;
+        if halt {
+            self.down(false, false).await?;
+        }
 
         let image_name = format!("voxel-cp-{name}");
+        let _lock = imagebuild::bake_lock()?;
         cpbuild::bake_cp(CpBake {
             root: &root,
             cargo_bay: &cargo_bay,
@@ -635,4 +862,25 @@ fn guest_stamp(ip: &str) -> Result<CpStamp> {
         .and_then(|l| l.trim().parse().ok())
         .context("no change count in the stamp probe")?;
     Ok(CpStamp { commit: commit.to_string(), dirty: changed > 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key;
+
+    #[test]
+    fn keys_are_short_shas() {
+        assert_eq!(key("5ce2b2c").unwrap(), "5ce2b2c");
+        assert_eq!(
+            key("5CE2B2C132de306765c8aad0df9d1cd0d55d4021").unwrap(),
+            "5ce2b2c"
+        );
+        assert!(key("main").is_err());
+        assert!(key("5ce2b2").is_err());
+        assert!(key("disk").is_err());
+        // falcon's vnic name for the builder must fit illumos' 31 chars.
+        let vnic =
+            format!("vb_{}_{}_vn_vnic0", key("5ce2b2c").unwrap(), super::NODE);
+        assert!(vnic.len() <= 31, "{vnic}");
+    }
 }

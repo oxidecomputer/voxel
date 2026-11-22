@@ -205,6 +205,37 @@ pub(crate) fn origin(ds: &Dataset) -> Option<String> {
     (out.status.success() && v != "-").then_some(v)
 }
 
+/// The direct children of `parent` that have a snapshot `snap`, oldest
+/// snapshot first.
+pub(crate) fn children_by_snapshot_age(
+    parent: &str,
+    snap: &str,
+) -> Result<Vec<String>> {
+    // A fresh host has no image dataset yet, so nothing under it either.
+    if !zfs_exists(parent) {
+        return Ok(Vec::new());
+    }
+    let out = Command::new("zfs")
+        .args([
+            "list", "-H", "-p", "-d", "2", "-t", "snapshot", "-s", "creation",
+            "-o", "name",
+        ])
+        .arg(parent)
+        .output()
+        .context("run zfs list -t snapshot")?;
+    if !out.status.success() {
+        bail!("zfs list snapshots under {parent} failed");
+    }
+    let suffix = format!("@{snap}");
+    let prefix = format!("{parent}/");
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().strip_suffix(&suffix))
+        .filter(|ds| ds.strip_prefix(&prefix).is_some_and(|c| !c.contains('/')))
+        .map(str::to_string)
+        .collect())
+}
+
 /// Stream a snapshot into a new dataset with a full send. The result carries
 /// no dependency on the base it was cloned from.
 pub(crate) fn send_recv(from: &Snapshot, to: &Dataset) -> Result<()> {

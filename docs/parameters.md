@@ -105,12 +105,12 @@ Runtime paths. Each unset value resolves via env then built-in default.
 
 ## [builder]
 
-`voxel builder`, the persistent Omicron build host. Omitted from `config show`
+`voxel builder`, the persistent Omicron build hosts (one per commit). These settings apply to each. Omitted from `config show`
 while every value is the default.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `image` | string | `voxel-builder-<image.version>` | Builder image the first `up` clones the disk from. |
+| `image` | string | `voxel-builder-<image.version>` | Builder image a commit's first `up` clones its disk from when there is no other builder disk to copy (or with `--fresh`). |
 | `memory_gb` | integer | `32` | Guest memory. Omicron release builds want 32. |
 | `cores` | integer | `8` | Guest vCPUs. |
 | `disk_gb` | integer | `80` | Disk size; the checkout, caches and target dir live on it. |

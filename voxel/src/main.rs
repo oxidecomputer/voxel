@@ -234,8 +234,12 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum HeadingCmd {
-    /// Make it so.
-    Engage,
+    /// Make it so. Needs root (`pfexec`).
+    Engage {
+        /// Discard uncommitted changes in the builder's omicron checkout.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -255,14 +259,14 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum BuilderCmd {
-    /// Boot the builder. The first `up` creates its disk from the builder
-    /// image; later ones reuse the disk and everything on it.
+    /// Boot the builder for an omicron commit and check it out. Its first
+    /// `up` copies the most recently used builder's disk (warm caches), or
+    /// clones the builder image if there is none; later ones reuse the disk.
     Up {
-        /// Check out this omicron rev in the builder's checkout.
+        /// omicron commit sha; names the builder by its first 7 digits.
+        rev: String,
+        /// Discard uncommitted changes in the checkout.
         #[arg(long)]
-        omicron: Option<String>,
-        /// With --omicron: discard uncommitted changes in the checkout.
-        #[arg(long, requires = "omicron")]
         force: bool,
         /// Discard the existing disk and start from the builder image again.
         #[arg(long)]
@@ -271,8 +275,10 @@ enum BuilderCmd {
         #[arg(long, requires = "fresh")]
         yes: bool,
     },
-    /// Halt the builder. The disk is kept unless --destroy.
+    /// Halt a builder. The disk is kept unless --destroy.
     Down {
+        /// The builder's omicron sha; optional if only one is up.
+        rev: Option<String>,
         /// Destroy the disk and its snapshots too.
         #[arg(long)]
         destroy: bool,
@@ -280,32 +286,50 @@ enum BuilderCmd {
         #[arg(long, requires = "destroy")]
         yes: bool,
     },
-    /// Show the builder's state, checkout and snapshots.
-    Status,
-    /// Open a root shell in the builder.
-    Login,
-    /// Push a local omicron checkout into the builder's (target/ and out/
+    /// List the builders, or show one's state, checkout and snapshots.
+    Status {
+        /// The builder's omicron sha.
+        rev: Option<String>,
+    },
+    /// Open a root shell in a builder.
+    Login {
+        /// The builder's omicron sha; optional if only one is up.
+        rev: Option<String>,
+    },
+    /// Push a local omicron checkout into a builder's (target/ and out/
     /// are left alone).
     Sync {
         /// The omicron checkout to push.
         #[arg(value_parser = abs_path)]
         dir: Utf8PathBuf,
-    },
-    /// Build and package omicron in the builder, then bake `voxel-cp-<name>`.
-    Build {
-        /// Image label; the image is named `voxel-cp-<name>`.
+        /// The builder's omicron sha; optional if only one is up.
         #[arg(long)]
-        name: String,
+        rev: Option<String>,
     },
-    /// Snapshot the builder disk.
+    /// Build and package omicron in a builder, then bake `voxel-cp-<label>`.
+    Build {
+        /// The builder's omicron sha; optional if only one is up.
+        rev: Option<String>,
+        /// Image label; the image is named `voxel-cp-<label>`. Defaults to
+        /// the builder's sha. (Not `--name`: that is the global rack name.)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Snapshot a builder disk.
     Snap {
         /// Snapshot label.
         label: String,
+        /// The builder's omicron sha; optional if only one is up.
+        #[arg(long)]
+        rev: Option<String>,
     },
-    /// Roll the builder disk back to a snapshot (requires down).
+    /// Roll a builder disk back to a snapshot (requires down).
     Restore {
         /// Snapshot label.
         label: String,
+        /// The builder's omicron sha; optional if there is one builder.
+        #[arg(long)]
+        rev: Option<String>,
     },
 }
 
@@ -839,6 +863,10 @@ async fn main() -> Result<(), Error> {
                 name: &cli.name,
                 rev,
                 engage: engage.is_some(),
+                force: matches!(
+                    engage,
+                    Some(HeadingCmd::Engage { force: true })
+                ),
             })
             .await
         }
@@ -929,20 +957,32 @@ async fn main() -> Result<(), Error> {
             ),
         },
         Cmd::Builder { cmd } => {
-            let b = builder::Builder::new(load_config(&config_path)?)?;
+            use builder::Builder;
+            let cfg = load_config(&config_path)?;
+            let pick = |rev: &Option<String>| {
+                Builder::pick(cfg.clone(), rev.as_deref())
+            };
             match cmd {
-                BuilderCmd::Up { omicron, force, fresh, yes } => {
-                    b.up(omicron.as_deref(), *force, *fresh, *yes).await
+                BuilderCmd::Up { rev, force, fresh, yes } => {
+                    Builder::new(cfg.clone(), rev)?
+                        .up(*force, *fresh, *yes)
+                        .await
                 }
-                BuilderCmd::Down { destroy, yes } => {
-                    b.down(*destroy, *yes).await
+                BuilderCmd::Down { rev, destroy, yes } => {
+                    pick(rev)?.down(*destroy, *yes).await
                 }
-                BuilderCmd::Status => b.status(),
-                BuilderCmd::Login => b.login(),
-                BuilderCmd::Sync { dir } => b.sync(dir),
-                BuilderCmd::Build { name } => b.build(name).await,
-                BuilderCmd::Snap { label } => b.snap(label).await,
-                BuilderCmd::Restore { label } => b.restore(label),
+                BuilderCmd::Status { rev: None } => Builder::list(&cfg),
+                BuilderCmd::Status { rev } => pick(rev)?.status(),
+                BuilderCmd::Login { rev } => pick(rev)?.login(),
+                BuilderCmd::Sync { dir, rev } => pick(rev)?.sync(dir),
+                BuilderCmd::Build { rev, label } => {
+                    let b = pick(rev)?;
+                    let label =
+                        label.clone().unwrap_or_else(|| b.key().to_string());
+                    b.build(&label, false).await
+                }
+                BuilderCmd::Snap { label, rev } => pick(rev)?.snap(label).await,
+                BuilderCmd::Restore { label, rev } => pick(rev)?.restore(label),
             }
         }
         Cmd::Network { cmd } => match cmd {
@@ -1058,6 +1098,38 @@ mod tests {
     use super::find_omicron_checkout;
 
     #[test]
+    fn builder_takes_a_rev() {
+        use super::{BuilderCmd, Cli, Cmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let mut v = vec!["voxel", "builder"];
+            v.extend_from_slice(args);
+            match Cli::try_parse_from(v).map(|c| c.cmd) {
+                Ok(Cmd::Builder { cmd }) => Ok(cmd),
+                Ok(_) => panic!("not a builder command"),
+                Err(e) => Err(e),
+            }
+        };
+        assert!(parse(&["up"]).is_err());
+        assert!(matches!(
+            parse(&["up", "5ce2b2c", "--force"]).unwrap(),
+            BuilderCmd::Up { ref rev, force: true, .. } if rev == "5ce2b2c"
+        ));
+        assert!(matches!(
+            parse(&["down"]).unwrap(),
+            BuilderCmd::Down { rev: None, .. }
+        ));
+        assert!(matches!(
+            parse(&["build", "5ce2b2c"]).unwrap(),
+            BuilderCmd::Build { rev: Some(_), label: None }
+        ));
+        assert!(matches!(
+            parse(&["snap", "before", "--rev", "5ce2b2c"]).unwrap(),
+            BuilderCmd::Snap { ref label, rev: Some(_) } if label == "before"
+        ));
+    }
+
+    #[test]
     fn heading_parses_rev_then_engage() {
         use clap::Parser;
         let cli = super::Cli::try_parse_from([
@@ -1066,8 +1138,21 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.cmd,
-            super::Cmd::Heading { ref rev, engage: Some(super::HeadingCmd::Engage) }
-                if rev == "5ce2b2c"
+            super::Cmd::Heading {
+                ref rev,
+                engage: Some(super::HeadingCmd::Engage { force: false }),
+            } if rev == "5ce2b2c"
+        ));
+        let cli = super::Cli::try_parse_from([
+            "voxel", "heading", "5ce2b2c", "engage", "--force",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            super::Cmd::Heading {
+                engage: Some(super::HeadingCmd::Engage { force: true }),
+                ..
+            }
         ));
         let cli = super::Cli::try_parse_from(["voxel", "heading", "5ce2b2c"])
             .unwrap();

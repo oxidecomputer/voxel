@@ -160,15 +160,11 @@ voxel_up() {
 	  . $root/env
 	  voxel config show
 
-	CI does not publish rack images. Build them once per host (pfexec keeps
-	VOXEL_CONFIG, so they land in $pool/falcon):
+	CI does not publish rack images. To build them and bring up a rack for an
+	omicron commit (images land in $pool/falcon):
 
-	  pfexec voxel image create-frr proto
-	  pfexec voxel image create
-	  voxel image ls
-	  voxel config set image.frr voxel-frr-proto
-	  voxel config set image.cp voxel-cp-<hash>
-	  pfexec voxel launch
+	  voxel heading <sha>                 # print the plan
+	  pfexec voxel heading <sha> engage   # make it so
 	EOF
 }
 

@@ -369,23 +369,32 @@ different Omicron checkout, not for every build.
 
 === Building in the Builder
 
-The builder is a persistent guest booted from the builder image. Its disk
-keeps the Omicron checkout, the cargo caches and the target directory
-between sessions, so the first build is a full one and later builds are
-incremental. The Helios host needs no Rust toolchain or git for any of this.
+A builder is a persistent guest for one Omicron commit, named by the
+commit's first 7 hex digits. Its disk keeps the checkout, the cargo caches
+and the target directory between sessions. A commit's first `up` copies the
+disk of the most recently used builder, so even a new commit builds
+incrementally; only the very first builder (or `up --fresh`) clones the
+builder image and does a full build. Several builders can be up at once,
+memory permitting (in isolated mode only one, as they share an address). The
+Helios host needs no Rust toolchain or git for any of this.
+
+Commands other than `up` take the commit optionally: without it they act on
+the only builder that is up.
 
 [source,sh]
 ----
-pfexec voxel builder up                       # first up clones the disk from the builder image
-pfexec voxel builder up --omicron <rev>       # check out another Omicron rev
-pfexec voxel builder login                    # root shell in the builder
-pfexec voxel builder sync /path/to/omicron    # push a local tree into /work/omicron
-pfexec voxel builder build --name my-change   # build, package, bake voxel-cp-my-change
-pfexec voxel builder snap before-refactor     # checkpoint the disk: checkout, edits, caches
-pfexec voxel builder restore before-refactor  # roll back to it; later snapshots are discarded
-pfexec voxel builder status
-pfexec voxel builder down                     # halt, keep the disk
-pfexec voxel builder down --destroy           # halt and discard the disk (asks first)
+pfexec voxel builder up <sha>                  # boot <sha>'s builder, checked out at <sha>
+pfexec voxel builder up <sha> --force          # discard uncommitted changes in its checkout
+pfexec voxel builder login [<sha>]             # root shell in the builder
+pfexec voxel builder sync /path/to/omicron     # push a local tree into /work/omicron
+pfexec voxel builder build [<sha>]             # build, package, bake voxel-cp-<sha>
+pfexec voxel builder build --label my-change   # ... or bake voxel-cp-my-change
+pfexec voxel builder snap before-refactor      # checkpoint the disk: checkout, edits, caches
+pfexec voxel builder restore before-refactor   # roll back to it; later snapshots are discarded
+pfexec voxel builder status                    # list the builders
+pfexec voxel builder status <sha>              # one builder's checkout and snapshots
+pfexec voxel builder down [<sha>]              # halt, keep the disk
+pfexec voxel builder down <sha> --destroy      # halt and discard the disk (asks first)
 ----
 
 Images from `builder build` are stamped with the Omicron commit they were

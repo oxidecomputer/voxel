@@ -2604,7 +2604,7 @@ source = "git+https://github.com/oxidecomputer/dlpi-sys#7bd1bc8027d31a257da7a864
 [[package]]
 name = "libfalcon"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/falcon?branch=falcon-img#826830f679f4d754882c0c057a4c75b7f4045daf"
+source = "git+https://github.com/oxidecomputer/falcon?rev=826830f679f4d754882c0c057a4c75b7f4045daf#826830f679f4d754882c0c057a4c75b7f4045daf"
 dependencies = [
  "anstyle",
  "anyhow",

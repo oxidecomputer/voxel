@@ -9,8 +9,11 @@
 //! and builder images, a `voxel-cp-<rev>` image built in the builder,
 //! `image.cp` pointed at it, `launch --emu`, `status` and `commtest`. A step
 //! whose result already exists is skipped, so `engage` resumes after a
-//! failure and a second heading reuses the frr and builder images. Without
-//! `engage` it only prints the plan.
+//! failure and a second heading reuses the frr and builder images. Each rev
+//! gets its own builder (see `builder`), copied from the most recently used
+//! one when there is one, so the builder image is only needed for the very
+//! first, and not at all once the cp image exists. Without `engage` it only
+//! prints the plan.
 
 use crate::builder::Builder;
 use crate::commtest;
@@ -25,6 +28,8 @@ pub(crate) struct Opts<'a> {
     pub name: &'a str,
     pub rev: &'a str,
     pub engage: bool,
+    /// Discard uncommitted changes in the builder's checkout.
+    pub force: bool,
 }
 
 /// What the course needs and which parts of it already exist.
@@ -37,38 +42,49 @@ struct Plan {
     cp_ready: bool,
     cp_selected: bool,
     rack_up: bool,
+    /// The builder image is needed: no cp image, and no builder disk for this
+    /// rev or to copy one from.
+    builder_needed: bool,
 }
 
 impl Plan {
-    fn new(cfg: &VoxelConfig, rev: &str) -> Self {
+    fn new(cfg: &VoxelConfig, rev: &str) -> Result<Self> {
         let frr = cfg.image.frr_image();
         let builder = cfg.builder_image();
         let cp = cp_image(rev);
-        Self {
+        let cp_ready = image_exists(&cp);
+        let builder_ready = image_exists(&builder);
+        let builder_needed = !cp_ready
+            && !builder_ready
+            && Builder::new(cfg.clone(), rev)?.needs_image()?;
+        Ok(Self {
             frr_ready: image_exists(&frr),
-            builder_ready: image_exists(&builder),
-            cp_ready: image_exists(&cp),
+            builder_ready,
+            cp_ready,
             cp_selected: cfg.image.cp_image() == cp,
             rack_up: rack_up(cfg),
+            builder_needed,
             frr,
             builder,
             cp,
-        }
+        })
     }
 
     fn print(&self, rev: &str) {
         let mark = |done: bool| if done { "done" } else { "todo" };
         println!("heading: omicron {rev}");
         println!("  [{}] frr image {}", mark(self.frr_ready), self.frr);
+        let builder = match (self.builder_ready, self.builder_needed) {
+            (true, _) => "done",
+            (false, true) => "todo",
+            (false, false) => "skip",
+        };
+        println!("  [{builder}] builder image {}", self.builder);
         println!(
-            "  [{}] builder image {}",
-            mark(self.builder_ready),
-            self.builder
-        );
-        println!(
-            "  [{}] cp image {} (built in the builder)",
+            "  [{}] cp image {} (built in builder {})",
             mark(self.cp_ready),
-            self.cp
+            self.cp,
+            &rev[..7]
         );
         println!("  [{}] image.cp = {}", mark(self.cp_selected), self.cp);
         let launch = match (self.rack_up, self.cp_selected) {
@@ -86,7 +102,7 @@ pub(crate) async fn run(o: Opts<'_>) -> Result<()> {
     let rev = o.rev;
     check_rev(rev)?;
     let cfg = crate::load_config(o.config_path)?;
-    let plan = Plan::new(&cfg, rev);
+    let plan = Plan::new(&cfg, rev)?;
     plan.print(rev);
     if plan.rack_up && !plan.cp_selected {
         bail!(
@@ -95,8 +111,14 @@ pub(crate) async fn run(o: Opts<'_>) -> Result<()> {
         );
     }
     if !o.engage {
-        println!("`voxel heading {rev} engage` to make it so");
+        println!("`pfexec voxel heading {rev} engage` to make it so");
         return Ok(());
+    }
+    // Every step creates datasets, vnics or VMs. Fail now, not after the
+    // downloads.
+    // SAFETY: geteuid(2) has no preconditions and does not dereference memory.
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("engage needs root: `pfexec voxel heading {rev} engage`");
     }
 
     // Image builds cd into image-build/; everything after them expects the
@@ -122,7 +144,7 @@ pub(crate) async fn run(o: Opts<'_>) -> Result<()> {
         .await?;
         back()?;
     }
-    if !plan.builder_ready {
+    if plan.builder_needed {
         step(&format!("building builder image {}", plan.builder));
         let version = label(&plan.builder, "voxel-builder-")?;
         imagebuild::create_builder(
@@ -137,16 +159,16 @@ pub(crate) async fn run(o: Opts<'_>) -> Result<()> {
     }
     if !plan.cp_ready {
         step(&format!("building {} in the builder", plan.cp));
-        let b = Builder::new(cfg.clone())?;
+        let b = Builder::new(cfg.clone(), rev)?;
         if b.is_up()? {
             // `up` is what checks out the rev, so cycle a running builder.
             b.down(false, false).await?;
         }
-        b.up(Some(rev), false, false, false).await?;
+        b.up(o.force, false, false).await?;
         back()?;
-        b.build(label(&plan.cp, "voxel-cp-")?).await?;
-        back()?;
-        b.down(false, false).await?;
+        // The builder halts once the packaged tree is pulled, so it and the
+        // bake VM never hold the host's memory at the same time.
+        b.build(label(&plan.cp, "voxel-cp-")?, true).await?;
         back()?;
     }
     if !plan.cp_selected {
