@@ -8,6 +8,7 @@
 use anyhow::{Context, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::fs;
+use voxel_config::{CP_IMAGE_PREFIX, IMAGE_PREFIX};
 
 use crate::ImageCmd;
 use crate::util::shell_quote;
@@ -167,7 +168,7 @@ pub(crate) fn cmd_image(
                     "snapshot" => {
                         if let Some((path, "base")) = name.rsplit_once('@')
                             && let Some(short) = path.strip_prefix(&prefix)
-                            && short.starts_with("voxel-")
+                            && short.starts_with(IMAGE_PREFIX)
                         {
                             bundles.push(short.to_string());
                         }
@@ -218,7 +219,7 @@ pub(crate) fn cmd_image(
             }
             // Commit from the name: voxel-cp-<commit>[-<variant>] -> <commit>.
             let commit_of = |name: &str| -> String {
-                name.strip_prefix("voxel-cp-")
+                name.strip_prefix(CP_IMAGE_PREFIX)
                     .and_then(|s| s.split('-').next())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("-")
@@ -392,6 +393,9 @@ pub(crate) fn cmd_image(
         }
         ImageCmd::CreateFrr { .. } => {
             bail!("internal: `image create-frr` is dispatched in main")
+        }
+        ImageCmd::CreateBase { .. } => {
+            bail!("internal: `image create-base` is dispatched in main")
         }
     }
 }
