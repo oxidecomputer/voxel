@@ -1,7 +1,6 @@
-# Prebuilt artifacts voxel fetches from buildomat. Each rev is a validated
-# pairing with this voxel commit; bump by hand, not by habit. Embedded into
-# the voxel binary at build time. sp-emu and faux-mgs yield to a matching
-# [sp] override.
+# Prebuilt binaries voxel fetches from buildomat when the matching [sp]
+# override is unset. Each rev is a validated pairing with this voxel commit;
+# bump deliberately. Embedded into the voxel binary at build time.
 
 [sp-emu]
 repo = "sp-emu"
@@ -14,8 +13,3 @@ repo = "management-gateway-service"
 series = "bins"
 rev = "da0ac17b9d465db5b1f7a2597d068ae091a89b22"
 artifact = "faux-mgs.gz"
-
-[sidecar-lite]
-repo = "sidecar-lite"
-series = "release"
-rev = "4d57f3a1fac7e5ed2a63ab5bc54b9b18b7b2cf73"

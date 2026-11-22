@@ -1,10 +1,10 @@
 # voxel-image (prototype)
 
-Build Voxel images by booting one node, installing software on it, then
-capturing its disk as a falcon base image
+Machinery to build pre-built Voxel images via the snapshot-first path: boot one
+node, install baked software onto it, then capture its disk as a falcon base image
 (optionally a distributable `<name>_0.raw.xz`). Topologies later boot from these
-images and apply topology-specific config at launch. One image can be reused
-across topologies. The same build machinery produces two image kinds:
+images and apply topology-specific config at launch, so one image serves every
+topology. Two image kinds, same machinery:
 
 - **`voxel-cp`**: Helios plus the version-pinned Oxide control plane (`install-cp.sh`).
 - **`voxel-frr`**: Debian plus FRR for the customer/edge routers (`install-frr.sh`).
@@ -14,15 +14,16 @@ across topologies. The same build machinery produces two image kinds:
 > Status: prototype. The build must run on a Helios host with
 > bhyve/propolis/falcon and zfs.
 
-## Image contents and launch configuration
+## What's baked vs applied at launch
 
-The image build stops after `omicron-package unpack`. It includes:
+The cut line is right after `omicron-package unpack`. Baked (everything up to that
+line):
 
 - pinned pkgs (`tofino looker htop jq`)
 - `install_runner_prerequisites.sh`
 - `omicron-package unpack` (control-plane zones in `/opt/oxide`)
 
-Voxel applies the following per-topology or per-node configuration at launch:
+Not baked (per-topology or per-node, applied by voxel at launch):
 
 - `config-rss.toml` injection (generated on the fly per topology)
 - `omicron-package activate` / RSS
@@ -49,7 +50,7 @@ Voxel applies the following per-topology or per-node configuration at launch:
 
 ## Usage (on the Helios box)
 
-The `voxel` CLI runs `build-cp.sh`:
+The one-shot path is the `voxel` CLI, which drives `build-cp.sh`:
 
 ```sh
 voxel image create <omicron-commit>   # clone + build omicron, generate the
@@ -75,8 +76,8 @@ FALCON_DATASET=testbed/falcon CAPTURE_MODE=zfs VERSION=<commit> ./build-image.sh
 FALCON_DATASET=testbed/falcon REGISTER=1 VERSION=<commit> ./build-image.sh
 ```
 
-Either mode produces the falcon base image `img/voxel-cp-<version>@base`.
-Use `voxel-cp-<version>` as the node image in any topology.
+Either mode produces falcon base image `img/voxel-cp-<version>@base`, referenceable
+from any topology as node image `voxel-cp-<version>`.
 
 ### voxel-frr (router image)
 

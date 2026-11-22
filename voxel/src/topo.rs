@@ -53,12 +53,8 @@ impl Topo {
     }
 }
 
-/// Wire a node's external NIC.
-///
-/// Precedence follows in this order: `$EXT_INTERFACE` env, then the
-/// config-driven link (the voxel-managed stub in isolated mode, `[external]
-/// link` in lan mode), then falcon's default (the host's default-route
-/// interface).
+/// Wire a node's external NIC: EXT_INTERFACE, then cfg_link, then falcon's
+/// default-route interface.
 fn ext_interface(
     d: &mut Runner,
     n: NodeRef,
@@ -124,14 +120,8 @@ pub(crate) fn build_topo(
         routers.push((r.clone(), n));
     }
 
-    // Isolated mode wires every external NIC onto the voxel-managed etherstub
-    // instead of the host LAN. Lan mode reads `[external] link` when set
-    // ($EXT_INTERFACE still wins inside ext_interface).
-    let ext_if = if cfg.external.isolated() {
-        Some(STUB)
-    } else {
-        cfg.external.link.as_deref()
-    };
+    // Isolated mode puts every external NIC on the voxel-managed etherstub.
+    let ext_if = cfg.external.isolated().then_some(STUB);
 
     let all_scrimlets: Vec<NodeRef> =
         sleds.iter().filter(|(s, _)| s.scrimlet).map(|(_, n)| *n).collect();
@@ -229,7 +219,8 @@ pub(crate) fn reset_node_cargo_bay(cfg: &VoxelConfig) -> anyhow::Result<()> {
     for node in nodes {
         let dir = cargo_bay(&node);
         if dir.exists() {
-            fs::remove_dir_all(&dir).with_context(|| format!("reset {dir}"))?;
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("reset {}", dir))?;
         }
         fs::create_dir_all(&dir)?;
     }
@@ -243,8 +234,6 @@ pub(crate) const PROP_DISKS: &str = "voxel:disks-schema";
 pub(crate) const PROP_TUF_VERSION: &str = "voxel:tuf-version";
 /// Firmware directory image create --from-tuf extracted from the same repo.
 pub(crate) const PROP_TUF_FW: &str = "voxel:tuf-fw";
-/// Base image used by the builder.
-pub(crate) const PROP_BASE_IMAGE: &str = "voxel:base-image";
 
 fn image_dataset(image: &str) -> String {
     format!("{}/img/{image}", falcon_dataset())
@@ -468,12 +457,9 @@ pub(crate) fn stage_config(
         fs::write(dir.join("ce-external-ip"), ip)?;
     }
 
-    // For static addressing (i.e., isolated mode, or a lan without DHCP), we
-    // stage each node's assigned address into its cargo-bay.
-    //
-    // voxel-init picks it up on both the sled and router roles. The router
-    // role also needs the interface name.
-    if cfg.external.static_addressing() {
+    // Isolated mode has no DHCP: stage each node's static address. Routers
+    // also need the interface name; sleds self-classify.
+    if cfg.external.isolated() {
         let prefix = cfg.external.prefix_length().ok_or_else(|| {
             anyhow!(
                 "[external].subnet '{}' must be CIDR (a.b.c.d/len)",
