@@ -94,15 +94,13 @@ pub(crate) enum DryRun {
     No,
 }
 
-impl From<DryRun> for bool {
+impl DryRun {
     /// True when commands should only be printed.
-    fn from(dry_run: DryRun) -> Self {
-        matches!(dry_run, DryRun::Yes)
+    fn applies(self) -> bool {
+        matches!(self, DryRun::Yes)
     }
-}
 
-impl From<bool> for DryRun {
-    fn from(dry_run: bool) -> Self {
+    pub(crate) fn from_flag(dry_run: bool) -> Self {
         if dry_run { DryRun::Yes } else { DryRun::No }
     }
 }
@@ -277,8 +275,8 @@ fn pipe_nat(
         .take()
         .expect("stdin piped")
         .write_all(format!("{rules}\n").as_bytes())
-        .context("write NAT rules to ipnat")?;
-    let st = child.wait().context("wait for ipnat")?;
+        .context("writing NAT rules to ipnat")?;
+    let st = child.wait().context("waiting for ipnat")?;
     if !st.success() {
         bail!("{cmd} failed ({st})");
     }
@@ -290,12 +288,12 @@ fn pipe_nat(
 ///
 /// # Errors
 ///
-/// This fails when `uplink` is unset or not up, when `mtu` reaches the jumbo
+/// Fails when `uplink` is unset or not up, when `mtu` reaches the jumbo
 /// threshold, when `subnet` is not CIDR or overlaps a host-owned address, or
 /// when one of the underlying `dladm`/`ipadm`/`routeadm`/`ipnat` commands
 /// fails.
 pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
-    let dry_run = bool::from(dry_run);
+    let dry_run = dry_run.applies();
     let uplink = x.uplink.as_deref().context(
         "external.uplink must be set in isolated mode (voxel config set external.uplink <link>)",
     )?;
@@ -385,10 +383,10 @@ pub(crate) fn up(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// This fails when a delete command fails, e.g. the etherstub still carries node
+/// Fails when a delete command fails, e.g. the etherstub still carries node
 /// VNICs from a running rack.
 pub(crate) fn down(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
-    let dry_run = bool::from(dry_run);
+    let dry_run = dry_run.applies();
     eprintln!("[voxel] external: taking down isolated segment");
     if probe("ipadm", &["show-addr", ADDROBJ]) {
         run(dry_run, &["ipadm", "delete-addr", ADDROBJ])?;
@@ -421,7 +419,7 @@ pub(crate) fn down(x: &External, dry_run: DryRun) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// This fails when any item is missing. The CLI exit code reflects the result.
+/// Fails when any item is missing, so the CLI exit code reflects the result.
 pub(crate) fn check(x: &External) -> anyhow::Result<()> {
     let mut ok = true;
     let mut item = |good: bool, what: &str| {

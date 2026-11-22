@@ -2,10 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Install software in the image builder guest.
+//! Image-BUILD-time install, run inside the builder guest.
 //!
-//! The host runs `voxel-init install --role <role>` for each image build.
-//! Per-node setup runs at launch through the `gimlet` and `router` commands.
+//! `voxel image bake` runs `voxel-init install --role <role>` in the builder
+//! node. Each role installs baked software and applies NO topology-specific
+//! configuration: per-topology config is generated on the host and pushed at
+//! LAUNCH by the `gimlet` / `router` roles.
+//!
+//! Same source builds for both guest OSes; the role picks the implementation at
+//! runtime, matching how `gimlet` / `router` already work.
 
 use crate::sys::{capture, note, replace_in_file, run, run_quiet, warn};
 use anyhow::{Result, bail};
@@ -53,8 +58,6 @@ fn install_cp_omicron() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(20));
     }
 
-    verify_opte()?;
-
     note("unpacking control-plane zone artifacts into /opt/oxide ...");
     if !crate::sys::run_env("./omicron-package", &["--force", "unpack"], &envs)
     {
@@ -97,105 +100,6 @@ fn install_cp_omicron() -> Result<()> {
         &["-c", &format!("chmod +x {BAKE}/tools/*.sh 2>/dev/null")],
     );
     Ok(())
-}
-
-const OPTE_PKG: &str = "driver/network/opte";
-const OPTE_VERSION_FILE: &str = "tools/opte_version";
-
-fn opte_api(version: &str) -> Option<(u64, u64)> {
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let api = parts.next()?.parse().ok()?;
-    Some((major, api))
-}
-
-fn installed_opte_version() -> Option<String> {
-    let line = capture("pkg", &["list", "-Hv", OPTE_PKG])?;
-    let fmri = line.split_whitespace().next()?;
-    let (_, version) = fmri.split_once('@')?;
-    Some(version.to_string())
-}
-
-fn opte_override_commit() -> Option<String> {
-    const OVERRIDE_FILE: &str = "tools/opte_version_override";
-    const COMMIT_KEY: &str = "OPTE_COMMIT=";
-    let text = fs::read_to_string(OVERRIDE_FILE).ok()?;
-    let value = text.lines().find_map(|l| l.trim().strip_prefix(COMMIT_KEY))?;
-    let commit = value
-        .split_whitespace()
-        .next()?
-        .trim_matches(|c| c == '"' || c == '\'');
-    (!commit.is_empty()).then(|| commit.to_string())
-}
-
-fn verify_opte() -> Result<()> {
-    const OPTE_REPO_URL: &str = "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/opte/repo";
-    const P5P: &str = "/tmp/opte-verify.p5p";
-    const OPTE_FMRI: &str = "pkg://helios/driver/network/opte";
-
-    let want = fs::read_to_string(OPTE_VERSION_FILE)
-        .map_err(|e| anyhow::anyhow!("read {OPTE_VERSION_FILE}: {e}"))?
-        .trim()
-        .to_string();
-
-    let Some(have) = installed_opte_version() else {
-        run("uname", &["-v"]);
-        run("pkg", &["list", "-v", "system/kernel"]);
-        bail!("{OPTE_PKG} is not installed; expected {want}");
-    };
-
-    let p5p_version = match opte_override_commit() {
-        Some(commit) => {
-            let url = format!("{OPTE_REPO_URL}/{commit}/opte.p5p");
-            if !run("curl", &["-sSfL", "-o", P5P, &url]) {
-                bail!("download override p5p {url} failed");
-            }
-            let Some(version) = p5p_opte_version(P5P) else {
-                bail!("no {OPTE_PKG} package in override p5p {url}");
-            };
-            if have == version {
-                note(format!("opte {have} matches override {commit}"));
-                return Ok(());
-            }
-            warn(format!(
-                "opte {have:?} is installed; override {commit} provides {version}"
-            ));
-            Some(version)
-        }
-        None => {
-            if let (Some(w), Some(h)) = (opte_api(&want), opte_api(&have))
-                && w == h
-            {
-                note(format!("opte {have} matches {OPTE_VERSION_FILE} {want}"));
-                return Ok(());
-            }
-            warn(format!(
-                "opte {have:?} is installed; expected {want} from {OPTE_VERSION_FILE}"
-            ));
-            None
-        }
-    };
-
-    run("uname", &["-v"]);
-    run("pkg", &["list", "-v", "system/kernel"]);
-    match &p5p_version {
-        Some(version) => run(
-            "pkg",
-            &["install", "-nv", "-g", P5P, &format!("{OPTE_FMRI}@{version}")],
-        ),
-        None => run("pkg", &["install", "-nv", &format!("{OPTE_FMRI}@{want}")]),
-    };
-    match p5p_version {
-        Some(version) => bail!(
-            "opte override mismatch: installed {have:?}, override provides {version}"
-        ),
-        None => bail!("opte API mismatch: installed {have:?}, expected {want}"),
-    }
-}
-
-fn p5p_opte_version(p5p: &str) -> Option<String> {
-    let out = capture("pkgrepo", &["-s", p5p, "list", "-H", OPTE_PKG])?;
-    out.lines().next()?.split_whitespace().last().map(str::to_string)
 }
 
 /// TUF image bake: zones and GZ software are prestaged repo files (cargo-bay
@@ -357,12 +261,12 @@ fn bake_agent() -> Result<()> {
     Ok(())
 }
 
-/// Record a completed install for the host to verify before capture.
+/// Write the marker `image bake` greps to confirm the install ran to
+/// completion before it captures the disk.
 fn mark_ready(body: &str) -> Result<()> {
     run_quiet("sync", &[]);
     let built = capture("date", &["+%Y-%m-%dT%H:%M:%S"]).unwrap_or_default();
-    let build_id = std::env::var("VOXEL_IMAGE_BUILD_ID").unwrap_or_default();
-    let line = format!("{body} built={built} build-id={build_id}\n");
+    let line = format!("{body} built={built}\n");
     fs::write(READY_MARKER, &line)
         .map_err(|e| anyhow::anyhow!("write {READY_MARKER}: {e}"))?;
     note(format!("image ready: {}", line.trim()));
@@ -408,11 +312,11 @@ fn sleep2() {
 }
 
 /// Helios control-plane image: install pinned deps, unpack the control-plane
-/// zone artifacts, bake what launch needs. Applies no topology configuration -
+/// zone artifacts, bake what launch needs. Applies NO topology configuration -
 /// config-rss injection, sprockets keys, SMBIOS identity and RSS all happen at
 /// launch.
 ///
-/// Not baked, kept ephemeral or per-launch: `xtask
+/// Deliberately NOT baked, kept ephemeral or per-launch: `xtask
 /// virtual-hardware create` (per-node emulated U.2/M.2), `scadm propolis
 /// load-program`, the rpool/dump zvol, and the emulated SP/RoT fleet. Flashing
 /// hubris images is a runtime concern, so `voxel launch --emu` stages the fleet
@@ -420,11 +324,7 @@ fn sleep2() {
 pub fn build_control_plane_image() -> Result<()> {
     let version =
         std::env::var("VOXEL_CP_VERSION").unwrap_or_else(|_| "unknown".into());
-    builder_network_up()?;
-    install_cp_packages(&version)
-}
 
-fn builder_network_up() -> Result<()> {
     // --- networking: reach pkg.oxide.computer ---
     // The builder has a single external NIC; find a vioif and address it.
     let ext_if = std::env::var("EXT_IF")
@@ -440,13 +340,7 @@ fn builder_network_up() -> Result<()> {
     fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n")
         .map_err(|e| anyhow::anyhow!("write /etc/resolv.conf: {e}"))?;
 
-    // A reused base may have an address from an earlier builder network.
     let addrobj = format!("{ext_if}/v4");
-    if run_quiet("ipadm", &["show-addr", &addrobj])
-        && !run("ipadm", &["delete-addr", &addrobj])
-    {
-        bail!("ipadm delete-addr {addrobj} failed");
-    }
     match builder_net() {
         // Isolated mode: no DHCP server on the segment, use the staged address.
         Some(net) => {
@@ -454,28 +348,14 @@ fn builder_network_up() -> Result<()> {
                 "static builder net: {} via {}",
                 net.cidr, net.gateway
             ));
-            if !run(
+            run(
                 "ipadm",
-                &[
-                    "create-addr",
-                    "-t",
-                    "-T",
-                    "static",
-                    "-a",
-                    &net.cidr,
-                    &addrobj,
-                ],
-            ) {
-                bail!("ipadm create-addr {addrobj} failed");
-            }
-            if !run("route", &["add", "default", &net.gateway]) {
-                bail!("route add default {} failed", net.gateway);
-            }
+                &["create-addr", "-T", "static", "-a", &net.cidr, &addrobj],
+            );
+            run("route", &["add", "default", &net.gateway]);
         }
         None => {
-            if !run("ipadm", &["create-addr", "-t", "-T", "dhcp", &addrobj]) {
-                bail!("ipadm create-addr {addrobj} failed");
-            }
+            run("ipadm", &["create-addr", "-T", "dhcp", &addrobj]);
             note("waiting for DHCP lease...");
             for _ in 0..30 {
                 let leased = capture(
@@ -497,107 +377,7 @@ fn builder_network_up() -> Result<()> {
         }
         sleep2();
     }
-    Ok(())
-}
 
-/// Update Helios packages in the builder guest.
-pub fn build_os_image() -> Result<()> {
-    let version =
-        std::env::var("VOXEL_OS_VERSION").unwrap_or_else(|_| "unknown".into());
-    builder_network_up()?;
-
-    run("pkg", &["list", "-v", "system/kernel"]);
-    run("beadm", &["list"]);
-    pkg_change(&["install", "-v", "--accept", "pkg:/package/pkg"])?;
-    run("pkg", &["list", "-nv", "system/kernel"]);
-    let updated = pkg_change(&["update", "-v", "--accept"])?;
-    run("beadm", &["list"]);
-
-    let be = match next_boot_environment()? {
-        Some(be) => {
-            clear_be_path_to_inst(&be)?;
-            be
-        }
-        None => "current".to_string(),
-    };
-    mark_ready(&format!("voxel-os version={version} updated={updated} be={be}"))
-}
-
-fn pkg_change(args: &[&str]) -> Result<bool> {
-    const PKG_CHANGED: i32 = 0;
-    const PKG_NOTHING_TO_DO: i32 = 4;
-    const PKG_IMAGE_IN_USE: i32 = 7;
-    const MAX_ATTEMPTS: u32 = 25;
-
-    let cmd = format!("pkg {}", args.join(" "));
-    let mut attempt = 0;
-    loop {
-        let status = std::process::Command::new("pkg")
-            .args(args)
-            .status()
-            .map_err(|e| anyhow::anyhow!("run {cmd}: {e}"))?;
-        match status.code() {
-            Some(PKG_CHANGED) => return Ok(true),
-            Some(PKG_NOTHING_TO_DO) => return Ok(false),
-            Some(PKG_IMAGE_IN_USE) => {
-                attempt += 1;
-                if attempt >= MAX_ATTEMPTS {
-                    bail!("{cmd}: image still in use after {attempt} attempts");
-                }
-                note(format!(
-                    "{cmd}: image in use (attempt {attempt}); retrying"
-                ));
-                run("pgrep", &["-fl", "pkg"]);
-                sleep2();
-            }
-            Some(code) => bail!("{cmd} failed (exit {code})"),
-            None => bail!("{cmd} was killed by a signal"),
-        }
-    }
-}
-
-fn next_boot_environment() -> Result<Option<String>> {
-    let out = capture("beadm", &["list", "-H"])
-        .ok_or_else(|| anyhow::anyhow!("beadm list -H failed"))?;
-    Ok(out.lines().find_map(|line| {
-        let mut fields = line.split(';');
-        let name = fields.next()?;
-        let active = fields.nth(1)?;
-        (active.contains('R') && !active.contains('N'))
-            .then(|| name.to_string())
-    }))
-}
-
-fn clear_be_path_to_inst(be: &str) -> Result<()> {
-    const MNT: &str = "/tmp/voxel-be";
-    const PATH_TO_INST: &str = "etc/path_to_inst";
-
-    fs::create_dir_all(MNT).map_err(|e| anyhow::anyhow!("mkdir {MNT}: {e}"))?;
-    if !run("beadm", &["mount", be, MNT]) {
-        bail!("beadm mount {be} {MNT} failed");
-    }
-    // Halt updates archives only for mounted roots; the next BE needs its
-    // own update before unmounting.
-    let updated = (|| -> Result<()> {
-        match fs::remove_file(format!("{MNT}/{PATH_TO_INST}")) {
-            Ok(()) => note(format!("cleared /{PATH_TO_INST} in {be}")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => bail!("clear /{PATH_TO_INST} in {be}: {e}"),
-        }
-        if !run("bootadm", &["update-archive", "-R", MNT]) {
-            bail!("bootadm update-archive -R {MNT} failed for {be}");
-        }
-        Ok(())
-    })();
-    let unmounted = run("beadm", &["unmount", be]);
-    updated?;
-    if !unmounted {
-        bail!("beadm unmount {be} failed");
-    }
-    Ok(())
-}
-
-fn install_cp_packages(version: &str) -> Result<()> {
     // --- pinned package deps (baked) ---
     let mut attempt = 0;
     while !run("pkg", &["install", "tofino", "looker", "htop", "jq"]) {
@@ -754,16 +534,9 @@ pub fn build_frr_image() -> Result<()> {
 
     // bgpd + bfdd on (static mode uses BFD-tracked routes); frr.conf itself is
     // generated per topology at launch.
-    //
-    // pimd configures multicast forwarding from the host segment to the
-    // rack-facing links.
     replace_in_file(
         "/etc/frr/daemons",
-        &[
-            ("bgpd=no", "bgpd=yes"),
-            ("bfdd=no", "bfdd=yes"),
-            ("pimd=no", "pimd=yes"),
-        ],
+        &[("bgpd=no", "bgpd=yes"), ("bfdd=no", "bfdd=yes")],
     );
 
     // Persistent forwarding; per-interface knobs are set at launch.

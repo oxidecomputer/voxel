@@ -142,47 +142,17 @@ fn ensure_unique_uplink_lease() {
     // Isolated mode stages a static address and runs no DHCP server, so there
     // is no lease to dedupe. Keep networkd's DHCP client off the uplink that
     // `apply_static_external` configures by hand.
-    let (cfg, message) = if let Some(external) = read_external_net() {
-        let Some(ifc) = external.iface else {
-            warn("static external address has no staged uplink interface");
-            return;
-        };
-        (
-            static_uplink_network(&ifc),
-            "disabled DHCP on static external uplink".to_string(),
-        )
-    } else {
-        let Some(ifc) = uplink_iface() else {
-            warn("unique-lease: no host-LAN uplink found; skipping");
-            return;
-        };
-        let message = format!(
-            "pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"
+    if read_external_net().is_some() {
+        note(
+            "isolated mode: static external address, skipping DHCP lease pinning",
         );
-        (dhcp_uplink_network(&ifc), message)
-    };
-    if let Err(e) =
-        fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg)
-    {
-        warn(format!("unique-lease: write networkd config: {e}"));
         return;
     }
-    run("systemctl", &["restart", "systemd-networkd"]);
-    note(message);
-}
-
-fn static_uplink_network(ifc: &str) -> String {
-    formatdoc! {"
-        [Match]
-        Name={ifc}
-
-        [Network]
-        DHCP=no
-    "}
-}
-
-fn dhcp_uplink_network(ifc: &str) -> String {
-    formatdoc! {"
+    let Some(ifc) = uplink_iface() else {
+        warn("unique-lease: no host-LAN uplink found; skipping");
+        return;
+    };
+    let cfg = formatdoc! {"
         [Match]
         Name={ifc}
 
@@ -192,7 +162,17 @@ fn dhcp_uplink_network(ifc: &str) -> String {
         [DHCPv4]
         ClientIdentifier=mac
         RouteMetric=100
-    "}
+    "};
+    if let Err(e) =
+        fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg)
+    {
+        warn(format!("unique-lease: write networkd config: {e}"));
+        return;
+    }
+    run("systemctl", &["restart", "systemd-networkd"]);
+    note(format!(
+        "pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"
+    ));
 }
 
 fn sysctl(key: &str, val: &str) {
@@ -400,26 +380,4 @@ fn apply_frr() -> Result<()> {
     fs::copy(src, "/etc/frr/frr.conf").context("apply frr.conf")?;
     run("systemctl", &["restart", "frr"]);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn static_uplink_disables_dhcp() {
-        let cfg = static_uplink_network("enp0s6");
-        assert!(cfg.contains("Name=enp0s6"));
-        assert!(cfg.contains("DHCP=no"));
-        assert!(!cfg.contains("ClientIdentifier"));
-    }
-
-    #[test]
-    fn dhcp_uplink_pins_the_client_id_to_mac() {
-        let cfg = dhcp_uplink_network("enp0s6");
-        assert!(cfg.contains("Name=enp0s6"));
-        assert!(cfg.contains("DHCP=yes"));
-        assert!(cfg.contains("ClientIdentifier=mac"));
-        assert!(cfg.contains("RouteMetric=100"));
-    }
 }

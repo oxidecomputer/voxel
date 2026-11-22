@@ -17,13 +17,13 @@
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
-use voxel_config::CP_IMAGE_PREFIX;
 
 use crate::imagebuild::{
-    BakeOpts, bake, build_agent, builder_network, check_base_image, repo_root,
-    reset_cargo_bay, toolchain_bin,
+    BakeOpts, bake, builder_network, repo_root, toolchain_bin,
 };
 
+/// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
+const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
 const SIDECAR_URL: &str = "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
 
 /// Build flags matching the validated recipe for building omicron on Helios.
@@ -45,14 +45,12 @@ pub(crate) struct CpBuild<'a> {
     /// Gimlet SP count baked into the build-time smf configs.
     pub num_gimlets: usize,
     pub dataset: &'a str,
-    pub base_image: &'a str,
     pub external: Option<&'a voxel_config::External>,
 }
 
 /// The omicron sha voxel's own rack-init-config dependency is pinned to. Empty while
 /// the dependency is a path dep. Set by build.rs from Cargo.lock.
-pub(crate) const PINNED_OMICRON_REV: &str =
-    env!("RACK_INIT_CONFIG_OMICRON_REV");
+const PINNED_OMICRON_REV: &str = env!("RACK_INIT_CONFIG_OMICRON_REV");
 
 /// `voxel image create`: resolve the omicron source and the image name, then
 /// build. With `--src` the checkout is built as-is and `commit` is the label.
@@ -61,11 +59,9 @@ pub(crate) async fn create(
     src: Option<&Utf8Path>,
     from_tuf: Option<&Utf8Path>,
     sled_agent: Option<&Utf8Path>,
-    base_image: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
-    check_base_image(dataset, base_image)?;
     if let Some(repo) = from_tuf {
         if src.is_some() {
             bail!("--from-tuf and --src are mutually exclusive");
@@ -103,7 +99,6 @@ pub(crate) async fn create(
             &full_sha,
             sled_agent,
             num_gimlets,
-            base_image,
             dataset,
             external,
         )
@@ -166,7 +161,6 @@ pub(crate) async fn create(
         commit: if as_is { None } else { Some(&label) },
         num_gimlets,
         dataset,
-        base_image,
         external,
     })
     .await
@@ -174,6 +168,7 @@ pub(crate) async fn create(
 
 pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     if std::env::consts::OS != "solaris" && !cfg!(target_os = "illumos") {
+        // Belt and braces: the omicron build and falcon are Helios-only.
         eprintln!("[voxel] warning: control-plane builds are Helios-only");
     }
     let root = repo_root()?;
@@ -181,9 +176,16 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     let cargo_bay = voxel_image.join("cargo-bay/vbuild");
     // vbuild is regenerated per run. Leftovers owned by another user (an
     // earlier pfexec run) would fail every later write.
-    reset_cargo_bay(&cargo_bay)?;
+    if cargo_bay.exists() {
+        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
+            format!(
+                "clear {cargo_bay} (owned by another user? \
+                 remove it with pfexec rm -rf)"
+            )
+        })?;
+    }
     let src = &b.omicron_src;
-    let image_name = format!("{CP_IMAGE_PREFIX}{}", b.label);
+    let image_name = format!("voxel-cp-{}", b.label);
 
     // --- 1. clone + checkout --------------------------------------------------
     if b.as_is {
@@ -329,12 +331,24 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     eprintln!(
         "[voxel] building voxel-init (native illumos) for the gimlet image"
     );
-    build_agent(&root, &cargo_bay)?;
+    run(
+        Command::new(toolchain_bin("cargo")).current_dir(&root).args([
+            "build",
+            "-p",
+            "voxel-init",
+            "--release",
+        ]),
+        "cargo build voxel-init",
+    )?;
+    let agent = cargo_bay.join("voxel-init");
+    std::fs::copy(root.join("target/release/voxel-init"), &agent)
+        .context("stage voxel-init into the cargo-bay")?;
+    let _ = Command::new("chmod").arg("+x").arg(&agent).status();
 
     // --- 8. bake -------------------------------------------------------------
     let network = builder_network(b.external)?;
     bake(BakeOpts {
-        base_image: b.base_image,
+        base_image: crate::imagebuild::HELIOS_BASE,
         role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
@@ -370,10 +384,8 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
 /// Fetch sidecar-lite's scadm + libsidecar_lite.so via a rev-keyed cache and
 /// stage them for the image. Only the host reaches buildomat.
 fn fetch_sidecar(voxel_image: &Utf8Path, dest: &Utf8Path) -> Result<()> {
-    let rev = match std::env::var("SIDECAR_LITE_REV") {
-        Ok(rev) => rev,
-        Err(_) => crate::pins::pin_rev("sidecar-lite")?,
-    };
+    let rev = std::env::var("SIDECAR_LITE_REV")
+        .unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
     let cache = voxel_image.join(format!(".sidecar-lite/{rev}"));
     std::fs::create_dir_all(&cache)
         .with_context(|| format!("mkdir {cache}"))?;
@@ -405,17 +417,23 @@ async fn create_cp_tuf(
     full_sha: &str,
     sled_agent: Option<&Utf8Path>,
     num_gimlets: usize,
-    base_image: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
 ) -> Result<()> {
     let root = repo_root()?;
     let voxel_image = root.join("voxel-image");
     let cargo_bay = voxel_image.join("cargo-bay/vbuild");
-    reset_cargo_bay(&cargo_bay)?;
+    if cargo_bay.exists() {
+        std::fs::remove_dir_all(&cargo_bay).with_context(|| {
+            format!(
+                "clear {cargo_bay} (owned by another user? \
+                 remove it with pfexec rm -rf)"
+            )
+        })?;
+    }
     std::fs::create_dir_all(&cargo_bay)
         .with_context(|| format!("mkdir {cargo_bay}"))?;
-    let image_name = format!("{CP_IMAGE_PREFIX}{}-tuf", t.commit);
+    let image_name = format!("voxel-cp-{}-tuf", t.commit);
 
     // --- 1. zones + measurement corpus, byte exact from the repo -------------
     let zones = t.extract_zones_into(&cargo_bay.join("zones"))?;
@@ -533,7 +551,7 @@ async fn create_cp_tuf(
     // --- 6. bake ---------------------------------------------------------------
     let network = builder_network(external)?;
     bake(BakeOpts {
-        base_image,
+        base_image: crate::imagebuild::HELIOS_BASE,
         role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
