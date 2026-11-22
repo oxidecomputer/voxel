@@ -138,7 +138,7 @@ async fn discover_rss_ip(
         match crate::net::serial_bounded_within(
             &format!("{tag}: reading the RSS node's IP"),
             ip_deadline,
-            crate::net::node_external_ip(d, rss, false),
+            crate::net::node_external_ip(d, rss, false, None),
         )
         .await
         {
