@@ -30,6 +30,7 @@ mod commtest;
 mod config_cmd;
 mod cpbuild;
 mod disks;
+mod heading;
 mod image;
 mod imagebuild;
 mod isolated_external;
@@ -111,6 +112,16 @@ enum Cmd {
         #[arg(long, value_name = "DIR", value_parser = abs_path)]
         sp_firmware: Option<Utf8PathBuf>,
     },
+    /// Set course for omicron REV: build whatever images are missing (frr,
+    /// builder, `voxel-cp-<rev>` in the builder), point `image.cp` at it,
+    /// `launch --emu`, `status` and `commtest`. Steps already done are
+    /// skipped. Without `engage`, print the plan.
+    Heading {
+        /// omicron commit sha.
+        rev: String,
+        #[command(subcommand)]
+        engage: Option<HeadingCmd>,
+    },
     /// A persistent omicron build host: build cp images in-guest with no
     /// toolchain on the host, and iterate on an omicron tree between builds.
     Builder {
@@ -179,18 +190,9 @@ enum Cmd {
     /// supplied, defaults to `run`; voxel supplies the rack API and a test IP
     /// pool unless those are explicitly overridden.
     Commtest {
-        /// Omicron commit/tag to test, or `main` for the latest upstream.
-        /// Omit to use the commit encoded in the configured control-plane image.
-        #[arg(value_name = "COMMIT")]
-        reference: Option<String>,
-
-        /// Use an existing Omicron checkout without fetching or changing it.
-        #[arg(
-            long,
-            value_name = "PATH",
-            conflicts_with = "reference",
-            value_parser = abs_path
-        )]
+        /// Build and run this Omicron checkout's commtest as-is instead of
+        /// the built-in one (for versions it lacks, such as multicast).
+        #[arg(long, value_name = "PATH", value_parser = abs_path)]
         source: Option<Utf8PathBuf>,
 
         /// Rack to target (1-based).
@@ -209,15 +211,34 @@ enum Cmd {
         #[arg(long)]
         no_build: bool,
 
-        /// Permit running with effective uid 0. Build artifacts and reports
-        /// under the build root become root-owned, which later unprivileged
-        /// runs may trip over.
-        #[arg(long)]
-        allow_root: bool,
-
         /// Arguments passed to Omicron commtest (place them after `--`).
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// (internal) Omicron's commtest library, run by `voxel commtest` as a
+    /// child so its output can be mirrored. Arguments after `--` are
+    /// commtest's own.
+    #[command(hide = true)]
+    CommtestExec {
+        /// Resolve HOST to IP in commtest's HTTP clients instead of asking the
+        /// system resolver. The URL's port is kept.
+        #[arg(long, value_name = "HOST=IP")]
+        resolve: Option<String>,
+        /// PEM CA certificate commtest's HTTP clients trust for the API.
+        #[arg(long, value_name = "FILE")]
+        cacert: Option<Utf8PathBuf>,
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HeadingCmd {
+    /// Make it so. Needs root (`pfexec`).
+    Engage {
+        /// Discard uncommitted changes in the builder's omicron checkout.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -238,14 +259,14 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum BuilderCmd {
-    /// Boot the builder. The first `up` creates its disk from the builder
-    /// image; later ones reuse the disk and everything on it.
+    /// Boot the builder for an omicron commit and check it out. Its first
+    /// `up` copies the most recently used builder's disk (warm caches), or
+    /// clones the builder image if there is none; later ones reuse the disk.
     Up {
-        /// Check out this omicron rev in the builder's checkout.
+        /// omicron commit sha; names the builder by its first 7 digits.
+        rev: String,
+        /// Discard uncommitted changes in the checkout.
         #[arg(long)]
-        omicron: Option<String>,
-        /// With --omicron: discard uncommitted changes in the checkout.
-        #[arg(long, requires = "omicron")]
         force: bool,
         /// Discard the existing disk and start from the builder image again.
         #[arg(long)]
@@ -254,8 +275,10 @@ enum BuilderCmd {
         #[arg(long, requires = "fresh")]
         yes: bool,
     },
-    /// Halt the builder. The disk is kept unless --destroy.
+    /// Halt a builder. The disk is kept unless --destroy.
     Down {
+        /// The builder's omicron sha; optional if only one is up.
+        rev: Option<String>,
         /// Destroy the disk and its snapshots too.
         #[arg(long)]
         destroy: bool,
@@ -263,32 +286,50 @@ enum BuilderCmd {
         #[arg(long, requires = "destroy")]
         yes: bool,
     },
-    /// Show the builder's state, checkout and snapshots.
-    Status,
-    /// Open a root shell in the builder.
-    Login,
-    /// Push a local omicron checkout into the builder's (target/ and out/
+    /// List the builders, or show one's state, checkout and snapshots.
+    Status {
+        /// The builder's omicron sha.
+        rev: Option<String>,
+    },
+    /// Open a root shell in a builder.
+    Login {
+        /// The builder's omicron sha; optional if only one is up.
+        rev: Option<String>,
+    },
+    /// Push a local omicron checkout into a builder's (target/ and out/
     /// are left alone).
     Sync {
         /// The omicron checkout to push.
         #[arg(value_parser = abs_path)]
         dir: Utf8PathBuf,
-    },
-    /// Build and package omicron in the builder, then bake `voxel-cp-<name>`.
-    Build {
-        /// Image label; the image is named `voxel-cp-<name>`.
+        /// The builder's omicron sha; optional if only one is up.
         #[arg(long)]
-        name: String,
+        rev: Option<String>,
     },
-    /// Snapshot the builder disk.
+    /// Build and package omicron in a builder, then bake `voxel-cp-<label>`.
+    Build {
+        /// The builder's omicron sha; optional if only one is up.
+        rev: Option<String>,
+        /// Image label; the image is named `voxel-cp-<label>`. Defaults to
+        /// the builder's sha. (Not `--name`: that is the global rack name.)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Snapshot a builder disk.
     Snap {
         /// Snapshot label.
         label: String,
+        /// The builder's omicron sha; optional if only one is up.
+        #[arg(long)]
+        rev: Option<String>,
     },
-    /// Roll the builder disk back to a snapshot (requires down).
+    /// Roll a builder disk back to a snapshot (requires down).
     Restore {
         /// Snapshot label.
         label: String,
+        /// The builder's omicron sha; optional if there is one builder.
+        #[arg(long)]
+        rev: Option<String>,
     },
 }
 
@@ -355,6 +396,10 @@ enum ImageCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Tear down a leftover image-build VM (from a `create*` run that was
+    /// killed before cleaning up): its propolis, vnic and disk. Built images
+    /// are not touched. The next `create*` also does this on its own.
+    Clean,
     /// Build a `voxel-frr` customer-router image.
     CreateFrr {
         /// Image label; the image is named `voxel-frr-<version>`.
@@ -744,18 +789,34 @@ fn resolve_falcon_env(cli: &Cli, cfg: Option<&VoxelConfig>) {
 /// `chdir` to the project root. `cargo-bay/`, `.falcon/` and `image-build/`
 /// are CWD-relative and must resolve from any invocation directory.
 /// Root: `--workdir`/`$VOXEL_WORKDIR` > `[falcon].workdir` > the discovered
-/// `voxel.toml`'s directory. No-op if the chosen root isn't a directory.
+/// `voxel.toml`'s directory.
+///
+/// An explicit workdir (flag, env or config) that is not a directory is an
+/// error. Falling back to the invocation directory would scatter a rack's
+/// state wherever voxel happened to be run. Only the implicit config-dir
+/// default is skipped when absent.
 fn anchor_workdir(
     cli: &Cli,
     cfg: Option<&VoxelConfig>,
     config_path: &Utf8Path,
 ) -> anyhow::Result<()> {
-    let root = cli
-        .workdir
-        .clone()
-        .or_else(|| {
-            cfg.and_then(|c| c.falcon.workdir.clone()).map(Utf8PathBuf::from)
-        })
+    let explicit =
+        cli.workdir.clone().map(|p| (p, "--workdir/$VOXEL_WORKDIR")).or_else(
+            || {
+                cfg.and_then(|c| c.falcon.workdir.clone())
+                    .map(|p| (Utf8PathBuf::from(p), "falcon.workdir"))
+            },
+        );
+    if let Some((root, source)) = &explicit
+        && !root.is_dir()
+    {
+        bail!(
+            "workdir {root} (from {source}) does not exist; create it \
+             (`mkdir -p {root}`) or point {source} at an existing directory"
+        );
+    }
+    let root = explicit
+        .map(|(p, _)| p)
         .or_else(|| config_path.parent().map(Utf8Path::to_path_buf));
     if let Some(root) = root
         && root.is_dir()
@@ -779,7 +840,12 @@ async fn main() -> Result<(), Error> {
         Err(_) => None,
     };
     resolve_falcon_env(&cli, cfg.as_ref());
-    anchor_workdir(&cli, cfg.as_ref(), &config_path)?;
+    // `voxel config` stays usable with a bad workdir, so it can be fixed.
+    if let Err(e) = anchor_workdir(&cli, cfg.as_ref(), &config_path)
+        && !matches!(cli.cmd, Cmd::Config { .. })
+    {
+        return Err(e);
+    }
     match &cli.cmd {
         Cmd::Launch { no_progress, no_route, emu, init_rss, sp_firmware } => {
             let opts = rack::LaunchOpts {
@@ -790,6 +856,19 @@ async fn main() -> Result<(), Error> {
                 sp_firmware: sp_firmware.as_deref(),
             };
             rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
+        }
+        Cmd::Heading { rev, engage } => {
+            heading::run(heading::Opts {
+                config_path: &config_path,
+                name: &cli.name,
+                rev,
+                engage: engage.is_some(),
+                force: matches!(
+                    engage,
+                    Some(HeadingCmd::Engage { force: true })
+                ),
+            })
+            .await
         }
         Cmd::CommissionDryrun { rack } => {
             commission::dryrun(&load_config(&config_path)?, *rack)
@@ -809,32 +888,23 @@ async fn main() -> Result<(), Error> {
         Cmd::Status => {
             rack::cmd_status(&load_config(&config_path)?, &cli.name).await
         }
-        Cmd::Commtest {
-            reference,
-            source,
-            rack,
-            api,
-            traffic,
-            no_build,
-            allow_root,
-            args,
-        } => commtest::run(
-            &load_config(&config_path)?,
-            commtest::Options {
-                // clap rejects <COMMIT> together with --source (conflicts_with).
-                source: match (source.as_deref(), reference.as_deref()) {
-                    (Some(path), _) => commtest::Source::Local(path),
-                    (None, Some(r)) => commtest::Source::Reference(r),
-                    (None, None) => commtest::Source::Image,
+        Cmd::Commtest { source, rack, api, traffic, no_build, args } => {
+            commtest::run(
+                &load_config(&config_path)?,
+                commtest::Options {
+                    config_path: &config_path,
+                    source: source.as_deref(),
+                    rack: *rack,
+                    api_override: api.as_deref(),
+                    traffic: *traffic,
+                    no_build: *no_build,
+                    passthrough: args,
                 },
-                rack: *rack,
-                api_override: api.as_deref(),
-                traffic: *traffic,
-                no_build: *no_build,
-                allow_root: *allow_root,
-                passthrough: args,
-            },
-        ),
+            )
+        }
+        Cmd::CommtestExec { resolve, cacert, args } => {
+            commtest::exec(resolve.as_deref(), cacert.as_deref(), args).await
+        }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
             ImageCmd::Create { commit, src, from_tuf, sled_agent } => {
@@ -860,6 +930,7 @@ async fn main() -> Result<(), Error> {
                 )
                 .await
             }
+            ImageCmd::Clean => imagebuild::clean(&image::falcon_dataset()),
             ImageCmd::CreateBuilder { version, omicron } => {
                 let rev = match omicron.as_deref() {
                     Some(r) => r,
@@ -886,20 +957,32 @@ async fn main() -> Result<(), Error> {
             ),
         },
         Cmd::Builder { cmd } => {
-            let b = builder::Builder::new(load_config(&config_path)?)?;
+            use builder::Builder;
+            let cfg = load_config(&config_path)?;
+            let pick = |rev: &Option<String>| {
+                Builder::pick(cfg.clone(), rev.as_deref())
+            };
             match cmd {
-                BuilderCmd::Up { omicron, force, fresh, yes } => {
-                    b.up(omicron.as_deref(), *force, *fresh, *yes).await
+                BuilderCmd::Up { rev, force, fresh, yes } => {
+                    Builder::new(cfg.clone(), rev)?
+                        .up(*force, *fresh, *yes)
+                        .await
                 }
-                BuilderCmd::Down { destroy, yes } => {
-                    b.down(*destroy, *yes).await
+                BuilderCmd::Down { rev, destroy, yes } => {
+                    pick(rev)?.down(*destroy, *yes).await
                 }
-                BuilderCmd::Status => b.status(),
-                BuilderCmd::Login => b.login(),
-                BuilderCmd::Sync { dir } => b.sync(dir),
-                BuilderCmd::Build { name } => b.build(name).await,
-                BuilderCmd::Snap { label } => b.snap(label).await,
-                BuilderCmd::Restore { label } => b.restore(label),
+                BuilderCmd::Status { rev: None } => Builder::list(&cfg),
+                BuilderCmd::Status { rev } => pick(rev)?.status(),
+                BuilderCmd::Login { rev } => pick(rev)?.login(),
+                BuilderCmd::Sync { dir, rev } => pick(rev)?.sync(dir),
+                BuilderCmd::Build { rev, label } => {
+                    let b = pick(rev)?;
+                    let label =
+                        label.clone().unwrap_or_else(|| b.key().to_string());
+                    b.build(&label, false).await
+                }
+                BuilderCmd::Snap { label, rev } => pick(rev)?.snap(label).await,
+                BuilderCmd::Restore { label, rev } => pick(rev)?.restore(label),
             }
         }
         Cmd::Network { cmd } => match cmd {
@@ -1013,6 +1096,68 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::find_omicron_checkout;
+
+    #[test]
+    fn builder_takes_a_rev() {
+        use super::{BuilderCmd, Cli, Cmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let mut v = vec!["voxel", "builder"];
+            v.extend_from_slice(args);
+            match Cli::try_parse_from(v).map(|c| c.cmd) {
+                Ok(Cmd::Builder { cmd }) => Ok(cmd),
+                Ok(_) => panic!("not a builder command"),
+                Err(e) => Err(e),
+            }
+        };
+        assert!(parse(&["up"]).is_err());
+        assert!(matches!(
+            parse(&["up", "5ce2b2c", "--force"]).unwrap(),
+            BuilderCmd::Up { ref rev, force: true, .. } if rev == "5ce2b2c"
+        ));
+        assert!(matches!(
+            parse(&["down"]).unwrap(),
+            BuilderCmd::Down { rev: None, .. }
+        ));
+        assert!(matches!(
+            parse(&["build", "5ce2b2c"]).unwrap(),
+            BuilderCmd::Build { rev: Some(_), label: None }
+        ));
+        assert!(matches!(
+            parse(&["snap", "before", "--rev", "5ce2b2c"]).unwrap(),
+            BuilderCmd::Snap { ref label, rev: Some(_) } if label == "before"
+        ));
+    }
+
+    #[test]
+    fn heading_parses_rev_then_engage() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "voxel", "heading", "5ce2b2c", "engage",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            super::Cmd::Heading {
+                ref rev,
+                engage: Some(super::HeadingCmd::Engage { force: false }),
+            } if rev == "5ce2b2c"
+        ));
+        let cli = super::Cli::try_parse_from([
+            "voxel", "heading", "5ce2b2c", "engage", "--force",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            super::Cmd::Heading {
+                engage: Some(super::HeadingCmd::Engage { force: true }),
+                ..
+            }
+        ));
+        let cli = super::Cli::try_parse_from(["voxel", "heading", "5ce2b2c"])
+            .unwrap();
+        assert!(matches!(cli.cmd, super::Cmd::Heading { engage: None, .. }));
+    }
 
     #[test]
     fn checkout_lookup_matches_short_and_full_shas() {

@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+clap.workspace = true
+sha2 = "0.10"
+toml = "0.9"

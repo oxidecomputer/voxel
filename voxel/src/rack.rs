@@ -359,6 +359,7 @@ pub(crate) async fn cmd_launch(
         }
     }
 
+    crate::net::print_endpoints(cfg);
     Ok(())
 }
 
@@ -484,5 +485,6 @@ pub(crate) async fn cmd_status(
         async move { watch_rss(d, *n, &addr, &tag, watch_cap, known_ip).await }
     });
     futures::future::join_all(watchers).await;
+    crate::net::print_endpoints(cfg);
     Ok(())
 }

@@ -2,11 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Build and run Omicron's `commtest` against a Voxel rack.
+//! Run Omicron's `commtest` against a Voxel rack.
 //!
-//! The source defaults to the checkout matching the configured control-plane
-//! image. An explicit git ref can select another Omicron era (including the
-//! latest upstream `main`), while `--source` runs a local checkout as-is.
+//! By default this is omicron's `commtest` library, linked into voxel and run
+//! as a `voxel commtest-exec` child so its transcript can be mirrored for
+//! dashboards. Voxel hands it HTTP clients that resolve the rack's API name
+//! themselves and trust the rack's CA, so the host needs no `/etc/hosts`
+//! entry and no toolchain.
+//!
+//! `--source` instead builds and runs a local Omicron checkout's commtest, for
+//! versions the port does not have yet (the multicast phases).
 
 use anyhow::{Context, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -14,7 +19,6 @@ use std::net::Ipv4Addr;
 use std::process::{Command, ExitStatus, Stdio};
 use voxel_config::{Network, VoxelConfig};
 
-const DEFAULT_REPO: &str = "https://github.com/oxidecomputer/omicron";
 const DEFAULT_POOL_SIZE: u32 = 16;
 /// Commtest's connectivity subcommand. Voxel only derives arguments and demands
 /// privileges for this one, so passthrough naming another subcommand is
@@ -29,9 +33,11 @@ const RUN_SUBCOMMAND: &str = "run";
 /// v6 default once its own `validate_mcast` TODO to add the v6 pool buckets and
 /// a v6 arm in `test_mcast_connectivity` is discharged.
 const DEFAULT_MCAST_GROUP: &str = "239.1.1.1";
-const HELIOS_RUSTFLAGS: &str = "--cfg svcadm_autoclear \
-    -C link-arg=-R/usr/platform/oxide/lib/amd64 \
-    -C link-arg=-Wl,-znocompstrtab --cfg tokio_unstable";
+/// The flags `image create` builds omicron with, so commtest links against
+/// the same Helios runtime as the image it tests.
+const HELIOS_RUSTFLAGS: &str = crate::cpbuild::OMICRON_RUSTFLAGS;
+/// What the built-in commtest is called in messages.
+const BUILTIN: &str = "the built-in commtest";
 
 /// Watch-facing run artifacts, anchored to the falcon workdir like the
 /// `.sp-ip-<node>` cache (`anchor_workdir` chdirs there before we run). A
@@ -58,24 +64,27 @@ impl std::fmt::Display for Traffic {
     }
 }
 
-/// Where the Omicron checkout to test comes from.
-pub(crate) enum Source<'a> {
-    /// The commit encoded in the configured control-plane image.
-    Image,
-    /// An explicit commit, tag, or ref, materialized via the mirror cache.
-    Reference(&'a str),
-    /// A local checkout built in place, without fetching or changing it.
-    Local(&'a Utf8Path),
-}
-
 pub(crate) struct Options<'a> {
-    pub source: Source<'a>,
+    /// The voxel.toml in use, handed to the `commtest-exec` child.
+    pub config_path: &'a Utf8Path,
+    /// A local Omicron checkout whose commtest to build and run instead of
+    /// the built-in one.
+    pub source: Option<&'a Utf8Path>,
     pub rack: usize,
     pub api_override: Option<&'a str>,
     pub traffic: Traffic,
     pub no_build: bool,
-    pub allow_root: bool,
     pub passthrough: &'a [String],
+}
+
+/// Where and how to reach the rack's API.
+struct Api {
+    url: String,
+    /// For a TLS rack: the silo name and the Nexus address it resolves to
+    /// in the rack's own DNS.
+    resolve: Option<(String, String)>,
+    /// The rack's CA, for a TLS rack.
+    ca: Option<Utf8PathBuf>,
 }
 
 pub(crate) fn run(
@@ -83,15 +92,14 @@ pub(crate) fn run(
     options: Options<'_>,
 ) -> anyhow::Result<()> {
     let Options {
+        config_path,
         source,
         rack,
         api_override,
         traffic,
         no_build,
-        allow_root,
         passthrough,
     } = options;
-    ensure_unprivileged(allow_root)?;
     if passthrough.is_empty()
         || passthrough.iter().any(|arg| arg == RUN_SUBCOMMAND)
     {
@@ -103,25 +111,65 @@ pub(crate) fn run(
             cfg.topology.racks()
         );
     }
+    if source.is_none() && no_build {
+        bail!(
+            "--no-build applies to --source; the built-in commtest needs no build"
+        );
+    }
     ensure_default_recovery_silo(cfg)?;
     let rack_net = cfg.network.for_rack(rack - 1);
-    let source = resolve_source(cfg, source)?;
-    let bin = target_dir(&source).join("debug/commtest");
     let mut api = match api_override {
-        Some(api) => api.to_string(),
-        None => derive_api(&rack_net)?,
+        Some(url) => Api { url: url.to_string(), resolve: None, ca: None },
+        None => derive_api(&rack_net, &cfg.recovery_silo.silo_name, rack - 1)?,
     };
-    api.truncate(api.trim_end_matches('/').len());
-    let args = commtest_args_for(
-        &source,
-        &rack_net,
-        cfg.topology.sleds,
-        traffic,
-        passthrough,
-        supports_multicast(&source)?,
-    )?;
+    api.url.truncate(api.url.trim_end_matches('/').len());
 
+    let Some(source) = source else {
+        let args = commtest_args_for(
+            BUILTIN,
+            &rack_net,
+            cfg.topology.sleds,
+            traffic,
+            passthrough,
+            false,
+        )?;
+        let exe = std::env::current_exe().context("locate the voxel binary")?;
+        let exe = Utf8PathBuf::try_from(exe).context("non-utf8 voxel path")?;
+        let workdir = std::env::current_dir().context("current dir")?;
+        let mut argv: Vec<String> = vec![
+            "--config".into(),
+            config_path.to_string(),
+            "--workdir".into(),
+            workdir.to_string_lossy().into_owned(),
+            "commtest-exec".into(),
+        ];
+        if let Some(ca) = &api.ca {
+            argv.extend(["--cacert".into(), ca.to_string()]);
+        }
+        if let Some((host, ip)) = &api.resolve {
+            argv.extend(["--resolve".into(), format!("{host}={ip}")]);
+        }
+        argv.push("--".into());
+        let shown = argv.len();
+        argv.push(api.url.clone());
+        argv.extend(args);
+        eprintln!(
+            "[voxel] running {BUILTIN} ({}): {}",
+            argv[5..shown - 1].join(" "),
+            argv[shown..].join(" ")
+        );
+        publish_mode(traffic);
+        let status = run_streamed(&exe, &argv, None)?;
+        if !status.success() {
+            bail!("commtest failed ({status})");
+        }
+        return Ok(());
+    };
+
+    let source = validate_source(source)?;
+    let bin = target_dir(&source).join("debug/commtest");
     if !no_build {
+        refuse_root_build(&source)?;
         eprintln!("[voxel] building Omicron commtest from {}", source);
         let mut cargo = Command::new("cargo");
         cargo.current_dir(&source).args([
@@ -140,14 +188,81 @@ pub(crate) fn run(
             bin
         );
     }
-
-    eprintln!("[voxel] running {} {api} {}", bin, args.join(" "));
+    // Upstream commtest has no resolver override: the name must resolve here.
+    if let Some((host, ip)) = &api.resolve {
+        use std::net::ToSocketAddrs;
+        if (host.as_str(), 443).to_socket_addrs().is_err() {
+            bail!(
+                "{host} does not resolve on this host. Omicron's commtest (from \
+                 --source) uses the system resolver, and the rack serves its \
+                 API over TLS by name only. Add it to /etc/hosts:\n\n  \
+                 {ip} {host}\n\nor run without --source (the built-in \
+                 commtest resolves it itself)"
+            );
+        }
+    }
+    let args = commtest_args_for(
+        source.as_str(),
+        &rack_net,
+        cfg.topology.sleds,
+        traffic,
+        passthrough,
+        supports_multicast(&source)?,
+    )?;
+    let mut argv = vec![api.url.clone()];
+    argv.extend(args);
+    eprintln!("[voxel] running {} {}", bin, argv.join(" "));
     publish_mode(traffic);
-    let status = run_streamed(&bin, &api, &args)?;
+    // Upstream commtest's rustls client takes extra roots from SSL_CERT_FILE.
+    let status = run_streamed(&bin, &argv, api.ca.as_deref())?;
     if !status.success() {
         bail!("commtest failed ({status})");
     }
     Ok(())
+}
+
+/// `voxel commtest-exec`: run omicron's commtest library with `args` (its own
+/// command line, without the program name), building every HTTP client it
+/// makes with `resolve` (`HOST=IP`) and `cacert` applied.
+pub(crate) async fn exec(
+    resolve: Option<&str>,
+    cacert: Option<&Utf8Path>,
+    args: &[String],
+) -> anyhow::Result<()> {
+    use clap::Parser;
+    let cli = commtest::Cli::try_parse_from(
+        std::iter::once("commtest").chain(args.iter().map(String::as_str)),
+    )?;
+    let resolve = resolve
+        .map(|r| -> anyhow::Result<(String, std::net::SocketAddr)> {
+            let (host, ip) = r
+                .split_once('=')
+                .with_context(|| format!("--resolve {r:?} is not HOST=IP"))?;
+            let ip: std::net::IpAddr =
+                ip.parse().with_context(|| format!("--resolve {r:?}"))?;
+            // Port 0 keeps the URL's own port.
+            Ok((host.to_string(), std::net::SocketAddr::new(ip, 0)))
+        })
+        .transpose()?;
+    let ca = cacert
+        .map(|path| -> anyhow::Result<reqwest::Certificate> {
+            let pem =
+                std::fs::read(path).with_context(|| format!("read {path}"))?;
+            reqwest::Certificate::from_pem(&pem)
+                .with_context(|| format!("parse {path}"))
+        })
+        .transpose()?;
+    let client_builder = move || {
+        let mut b = reqwest::ClientBuilder::new();
+        if let Some((host, addr)) = &resolve {
+            b = b.resolve(host, *addr);
+        }
+        if let Some(ca) = &ca {
+            b = b.add_root_certificate(ca.clone());
+        }
+        b
+    };
+    commtest::run_cli_with(&cli, &client_builder).await
 }
 
 /// Record the traffic mode for dashboards. The write is best-effort, since
@@ -163,14 +278,17 @@ fn publish_mode(traffic: Traffic) {
 /// is complete before the exit status is reported.
 fn run_streamed(
     bin: &Utf8Path,
-    api: &str,
-    args: &[String],
+    argv: &[String],
+    ca: Option<&Utf8Path>,
 ) -> anyhow::Result<ExitStatus> {
     let log = std::fs::File::create(RUN_LOG).ok();
     let log_err = log.as_ref().and_then(|f| f.try_clone().ok());
-    let mut child = Command::new(bin)
-        .arg(api)
-        .args(args)
+    let mut cmd = Command::new(bin);
+    if let Some(ca) = ca {
+        cmd.env("SSL_CERT_FILE", ca);
+    }
+    let mut child = cmd
+        .args(argv)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -226,27 +344,6 @@ fn tee(
     }
 }
 
-/// Resolve the Omicron checkout to run from.
-fn resolve_source(
-    cfg: &VoxelConfig,
-    source: Source<'_>,
-) -> anyhow::Result<Utf8PathBuf> {
-    match source {
-        Source::Local(path) => validate_source(path),
-        Source::Reference(r) => checkout(r),
-        Source::Image => {
-            let commit = cfg.image.cp_commit().with_context(|| {
-                format!(
-                    "configured image '{}' does not encode an Omicron commit; \
-                     pass one (`voxel commtest <commit> -- ...`) or use --source",
-                    cfg.image.cp_image()
-                )
-            })?;
-            checkout(&commit)
-        }
-    }
-}
-
 fn validate_source(path: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
     let path = path
         .canonicalize_utf8()
@@ -258,32 +355,17 @@ fn validate_source(path: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
     Ok(path)
 }
 
-fn build_root() -> Utf8PathBuf {
-    std::env::var("BUILD_ROOT")
-        .map(Utf8PathBuf::from)
-        .ok()
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Utf8PathBuf::from(home).join("voxel-builds"))
-        })
-        .unwrap_or_else(|| Utf8PathBuf::from("."))
-}
-
-fn ensure_unprivileged(allow_root: bool) -> anyhow::Result<()> {
+/// A root `cargo build` in a checkout leaves root-owned build output that
+/// breaks the owner's next build there, so build it as its owner instead.
+/// Running commtest as root is fine; only the build is refused.
+fn refuse_root_build(source: &Utf8Path) -> anyhow::Result<()> {
     // SAFETY: geteuid(2) has no preconditions and does not dereference memory.
     if unsafe { libc::geteuid() } == 0 {
-        if allow_root {
-            eprintln!(
-                "[voxel] warning: running as root; artifacts under {} will \
-                 be root-owned and may break later unprivileged runs",
-                build_root()
-            );
-            return Ok(());
-        }
         bail!(
-            "`voxel commtest` must not run with effective uid 0; run it as your \
-             login user with the net_icmpaccess privilege, or pass --allow-root"
+            "refusing to build {source} as root: the build output would be \
+             root-owned and break your next build there. Build it as yourself \
+             (`cargo build -p end-to-end-tests --bin commtest` in {source}), \
+             then rerun with --no-build"
         );
     }
     Ok(())
@@ -313,7 +395,7 @@ fn ensure_icmp_privilege() -> anyhow::Result<()> {
         bail!(
             "`voxel commtest` needs net_icmpaccess in the effective privilege \
              set. Grant it to this user and start a new login session, verifying \
-             with `ppriv $$`, or run under `pfexec` with --allow-root."
+             with `ppriv $$`, or run it under `pfexec`."
         );
     }
     Ok(())
@@ -338,224 +420,6 @@ fn ensure_default_recovery_silo(cfg: &VoxelConfig) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-fn checkout(reference: &str) -> anyhow::Result<Utf8PathBuf> {
-    let root = build_root().join("commtest");
-    let repository = root.join("omicron.git");
-    let worktrees = root.join("worktrees");
-    let repo =
-        std::env::var("OMICRON_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
-
-    std::fs::create_dir_all(&root)
-        .with_context(|| format!("create commtest cache {}", root))?;
-    if !repository.exists() {
-        eprintln!("[voxel] creating Omicron Git cache in {}", repository);
-        let mut clone = Command::new("git");
-        clone.args(["clone", "--mirror", "--", &repo]).arg(&repository);
-        require_success(clone.status(), "git clone Omicron")?;
-    } else {
-        validate_repository(&repository, &repo)?;
-    }
-
-    eprintln!("[voxel] updating Omicron Git cache");
-    require_success(
-        git_dir_command(&repository)
-            .args(["fetch", "--prune", "origin"])
-            .status(),
-        "git fetch Omicron",
-    )?;
-    let wanted = resolve_reference(&repository, reference)?;
-    let source = worktrees.join(&wanted);
-
-    if source.exists() {
-        validate_worktree(&source, &wanted)?;
-    } else {
-        std::fs::create_dir_all(&worktrees).with_context(|| {
-            format!("create worktree directory {}", worktrees)
-        })?;
-        require_success(
-            git_dir_command(&repository).args(["worktree", "prune"]).status(),
-            "git worktree prune",
-        )?;
-        eprintln!("[voxel] creating detached Omicron worktree {}", source);
-        require_success(
-            git_dir_command(&repository)
-                .args(["worktree", "add", "--detach", "--"])
-                .arg(&source)
-                .arg(&wanted)
-                .status(),
-            "git worktree add",
-        )?;
-    }
-    validate_source(&source)
-}
-
-fn validate_repository(
-    repository: &Utf8Path,
-    expected_remote: &str,
-) -> anyhow::Result<()> {
-    if git_dir_output(repository, &["rev-parse", "--is-bare-repository"])?
-        != "true"
-    {
-        bail!("{} exists but is not a bare Git repository", repository);
-    }
-    // `remote get-url` applies the user's `url.<base>.insteadOf` rewrites and
-    // can false-mismatch the configured URL. Read the raw remote instead.
-    let actual_remote =
-        git_dir_output(repository, &["config", "--get", "remote.origin.url"])?;
-    if actual_remote != expected_remote {
-        bail!(
-            "{} uses origin '{}', but OMICRON_REPO is '{}'; use a different \
-             BUILD_ROOT for the other repository",
-            repository,
-            actual_remote,
-            expected_remote
-        );
-    }
-    Ok(())
-}
-
-fn resolve_reference(
-    repository: &Utf8Path,
-    reference: &str,
-) -> anyhow::Result<String> {
-    let candidates = reference_candidates(reference)?;
-    let mut matches = Vec::new();
-    for candidate in &candidates {
-        let out = git_dir_command(repository)
-            .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
-            .arg(format!("{candidate}^{{commit}}"))
-            .output()
-            .with_context(|| format!("resolve Omicron ref {reference}"))?;
-        if out.status.success() {
-            let commit_id =
-                String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // Dedup so candidates pointing at the same commit (a branch and
-            // tag, or a hex-named ref and the commit it names) resolve
-            // unambiguously.
-            if !matches.contains(&commit_id) {
-                matches.push(commit_id);
-            }
-        }
-    }
-    match matches.as_slice() {
-        [commit_id] => Ok(commit_id.clone()),
-        [] => bail!(
-            "Omicron commit or ref '{reference}' was not found in {}",
-            repository
-        ),
-        _ => bail!(
-            "Omicron ref '{reference}' is ambiguous; use a full refs/heads/... \
-             or refs/tags/... name, or a longer commit ID"
-        ),
-    }
-}
-
-fn reference_candidates(reference: &str) -> anyhow::Result<Vec<String>> {
-    if reference == "main" {
-        return Ok(vec!["refs/heads/main".into()]);
-    }
-    if reference.starts_with("refs/") {
-        validate_refname(reference)?;
-        return Ok(vec![reference.into()]);
-    }
-
-    let branch = format!("refs/heads/{reference}");
-    let tag = format!("refs/tags/{reference}");
-    validate_refname(&branch)?;
-    validate_refname(&tag)?;
-    let mut candidates = vec![branch, tag];
-    // A hex string may also be an abbreviated commit ID. Named refs come
-    // first, matching git's own refname-over-object-ID precedence, and a ref
-    // and commit that resolve differently surface as ambiguous.
-    if (4..=40).contains(&reference.len())
-        && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        candidates.push(reference.into());
-    }
-    Ok(candidates)
-}
-
-fn validate_refname(reference: &str) -> anyhow::Result<()> {
-    let status = Command::new("git")
-        .args(["check-ref-format", reference])
-        .status()
-        .with_context(|| format!("validate Git ref {reference}"))?;
-    if !status.success() {
-        bail!("'{reference}' is not a valid Git ref");
-    }
-    Ok(())
-}
-
-fn validate_worktree(source: &Utf8Path, wanted: &str) -> anyhow::Result<()> {
-    let current = git_worktree_output(source, &["rev-parse", "HEAD"])?;
-    if current != wanted {
-        bail!(
-            "{} is registered for Omicron commit {}, but is currently at {}; \
-             move it aside or select a different BUILD_ROOT",
-            source,
-            &wanted[..wanted.len().min(12)],
-            &current[..current.len().min(12)]
-        );
-    }
-    let dirty = git_worktree_output(
-        source,
-        &["status", "--porcelain", "--untracked-files=no"],
-    )?;
-    if !dirty.is_empty() {
-        bail!(
-            "{} has tracked local changes; move them to a separate checkout and \
-             use --source, or restore this cached worktree",
-            source
-        );
-    }
-    Ok(())
-}
-
-fn git_dir_command(repository: &Utf8Path) -> Command {
-    let mut git = Command::new("git");
-    git.arg("--git-dir").arg(repository);
-    git
-}
-
-fn git_dir_output(
-    repository: &Utf8Path,
-    args: &[&str],
-) -> anyhow::Result<String> {
-    let out = git_dir_command(repository)
-        .args(args)
-        .output()
-        .with_context(|| format!("run git {}", args.join(" ")))?;
-    if !out.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn git_worktree_output(
-    source: &Utf8Path,
-    args: &[&str],
-) -> anyhow::Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(args)
-        .output()
-        .with_context(|| format!("run git {}", args.join(" ")))?;
-    if !out.status.success() {
-        bail!(
-            "git {} failed in {}: {}",
-            args.join(" "),
-            source,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn require_success(
@@ -607,69 +471,63 @@ fn apply_helios_build_env(cmd: &mut Command) {
     }
 }
 
-/// Pick the rack API base URL. Nexus's external addresses are allocated from
-/// the service pool at RSS time and can move between pool members, so probe
-/// the candidates for a live HTTP listener.
+/// The rack API, derived from the configuration alone: its base URL, the
+/// address its name resolves to, and the CA that issued its certificate.
 ///
-/// TLS-only racks (commission-driven setup, the launch default, uploads a
-/// self-signed certificate with DNS-only SANs) are refused rather than guessed
-/// at. Therefore, commtest's
-/// oxide client has no way to trust that certificate on a raw-IP URL, so
-/// handing it a `https://` base would spin its API wait until the 60 minute
-/// timeout.
+/// A launch sets the rack up through wicketd's commission API, which serves
+/// the API over TLS on 443 only, under a certificate from the per-rack CA the
+/// launch saves (`.falcon/rack<N>-ca.pem` in the workdir). Nexus picks its
+/// certificate from the TLS SNI name and refuses a handshake without one, so
+/// the API is reached by the silo's name, `<silo>.sys.<rack zone>`. That name
+/// is looked up in the rack's own external DNS, so the host's resolver never
+/// has to know the zone.
+///
+/// Nothing is probed or guessed. A rack launched with `--init-rss` (plain
+/// HTTP, no CA) is not described by the configuration, so it takes `--api`.
 ///
 /// # Errors
 ///
-/// Returns an error when a candidate answers on 443 but none answer on 80.
-/// Falls back to plain HTTP on the first candidate when nothing answers at
-/// all (commtest itself waits for the API to come up).
-fn derive_api(network: &Network) -> anyhow::Result<String> {
-    let candidates = api_candidates(network);
-    let live_on = |port: u16| {
-        candidates.iter().copied().find(|&addr| {
-            std::net::TcpStream::connect_timeout(
-                &(addr, port).into(),
-                std::time::Duration::from_millis(250),
-            )
-            .is_ok()
-        })
-    };
-    if let Some(host) = live_on(80) {
-        return Ok(format!("http://{host}"));
-    }
-    if let Some(host) = live_on(443) {
+/// When the rack's CA is missing, or its DNS has no address for the silo.
+fn derive_api(
+    network: &Network,
+    silo: &str,
+    rack: usize,
+) -> anyhow::Result<Api> {
+    let ca = crate::commission::rack_ca_path(rack);
+    // Absolute, for messages and for a child whose directory may differ.
+    let ca = std::env::current_dir()
+        .ok()
+        .and_then(|d| Utf8PathBuf::try_from(d).ok())
+        .map(|d| d.join(&ca))
+        .unwrap_or(ca);
+    if !ca.is_file() {
         bail!(
-            "the rack API at {host} answers on 443 only (the self-signed \
-             certificate a commission-driven launch uploads); commtest cannot \
-             validate that certificate, so pass --api with an endpoint it can \
-             reach, or launch with --init-rss for a plain-HTTP rack"
+            "rack{n} has no CA at {ca}, where a launch saves it. The rack \
+             was launched by a voxel that did not save its CA (relaunch it), \
+             or with --init-rss (plain HTTP: pass --api http://<nexus ip>)",
+            n = rack + 1
         );
     }
-    Ok(match candidates.first() {
-        Some(host) => format!("http://{host}"),
-        None => format!("http://{}", network.service_pool_first),
+    let host = format!("{silo}.sys.{}", network.dns_zone);
+    let dns = network
+        .external_dns_ips
+        .first()
+        .context("no external DNS address for this rack")?;
+    let ip = crate::net::dig_a(dns, &host)
+        .context("`dig` is needed to look the rack API up in its DNS")?
+        .into_iter()
+        .next()
+        .with_context(|| {
+            format!(
+                "the rack's DNS ({dns}) has no address for {host}; is the \
+                 rack up? (`voxel status`)"
+            )
+        })?;
+    Ok(Api {
+        url: format!("https://{host}"),
+        resolve: Some((host, ip)),
+        ca: Some(ca),
     })
-}
-
-/// Service-pool addresses in probe order.
-///
-/// Members external DNS has not claimed come first, since Nexus draws its
-/// external address from the same pool and lands on one of those. The DNS
-/// addresses follow as a fallback. The range is capped at 32 addresses so a
-/// misconfigured pool cannot stall the probe.
-fn api_candidates(network: &Network) -> Vec<Ipv4Addr> {
-    let Ok(first) = network.service_pool_first.parse::<Ipv4Addr>() else {
-        return Vec::new();
-    };
-    let last = network.service_pool_last.parse::<Ipv4Addr>().unwrap_or(first);
-    let lo = u32::from(first);
-    let hi = u32::from(last).max(lo).min(lo.saturating_add(31));
-    let dns: Vec<&str> =
-        network.external_dns_ips.iter().map(String::as_str).collect();
-    let (rest, dns_members): (Vec<Ipv4Addr>, Vec<Ipv4Addr>) = (lo..=hi)
-        .map(Ipv4Addr::from)
-        .partition(|addr| !dns.contains(&addr.to_string().as_str()));
-    rest.into_iter().chain(dns_members).collect()
 }
 
 /// Whether the checkout's commtest has the multicast phases, detected from its
@@ -682,7 +540,7 @@ fn supports_multicast(source: &Utf8Path) -> anyhow::Result<bool> {
 }
 
 fn commtest_args_for(
-    source: &Utf8Path,
+    source: &str,
     network: &Network,
     sleds: usize,
     traffic: Traffic,
@@ -699,6 +557,7 @@ fn commtest_args_for(
     }
 
     apply_traffic(source, traffic, supports_multicast, &mut args)?;
+    apply_loss_tolerance(&mut args)?;
 
     let has_begin = args
         .iter()
@@ -730,7 +589,7 @@ fn commtest_args_for(
 }
 
 fn apply_traffic(
-    source: &Utf8Path,
+    source: &str,
     traffic: Traffic,
     supports_multicast: bool,
     args: &mut Vec<String>,
@@ -750,7 +609,8 @@ fn apply_traffic(
         Traffic::Multicast | Traffic::Both if !supports_multicast => {
             bail!(
                 "{} does not support multicast commtest; select --traffic unicast \
-                 or use an Omicron commit containing multicast commtest support",
+                 or pass --source with an Omicron checkout that has multicast \
+                 commtest support",
                 source
             );
         }
@@ -776,6 +636,48 @@ fn apply_traffic(
         }
     }
     Ok(())
+}
+
+/// commtest's run defaults, for sizing the loss tolerance.
+const DEFAULT_TEST_DURATION: &str = "100s";
+const DEFAULT_PACKET_RATE: u64 = 10;
+/// Share of each probe's ICMP packets that may be lost. commtest's own
+/// default is zero, which an emulated rack's software switch can't promise.
+const LOSS_TOLERANCE_PCT: u64 = 5;
+
+/// Add `--icmp-loss-tolerance` (a packet count) as 5% of the packets the run
+/// sends, unless the caller set it.
+fn apply_loss_tolerance(args: &mut Vec<String>) -> anyhow::Result<()> {
+    if has_arg(args, "--icmp-loss-tolerance") {
+        return Ok(());
+    }
+    let duration =
+        arg_value(args, "--test-duration").unwrap_or(DEFAULT_TEST_DURATION);
+    let duration = humantime::parse_duration(duration)
+        .with_context(|| format!("parse --test-duration {duration:?}"))?;
+    let rate = match arg_value(args, "--packet-rate") {
+        Some(r) => r
+            .parse::<u64>()
+            .with_context(|| format!("parse --packet-rate {r:?}"))?,
+        None => DEFAULT_PACKET_RATE,
+    };
+    let packets = duration.as_secs() * rate;
+    let tolerance = packets * LOSS_TOLERANCE_PCT / 100;
+    args.push("--icmp-loss-tolerance".into());
+    args.push(tolerance.to_string());
+    Ok(())
+}
+
+/// The value of `--name value` or `--name=value`.
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let eq = format!("{name}=");
+    args.iter().enumerate().find_map(|(i, a)| {
+        if a == name {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            a.strip_prefix(&eq)
+        }
+    })
 }
 
 fn has_arg(args: &[String], name: &str) -> bool {
@@ -835,12 +737,6 @@ mod test {
     #[test]
     fn derives_voxel_defaults() {
         let network = Network::default().for_rack(0);
-        // `derive_api` probes the live host, so pin only the candidate order:
-        // non-DNS pool members (.22-.29) ahead of the DNS pair (.20/.21).
-        let candidates = api_candidates(&network);
-        assert_eq!(candidates.len(), 10);
-        assert_eq!(candidates[0], "198.51.100.22".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(candidates[8], "198.51.100.20".parse::<Ipv4Addr>().unwrap());
         assert_eq!(
             derive_pool(&network, 4).unwrap(),
             (
@@ -850,7 +746,7 @@ mod test {
         );
         assert_eq!(
             commtest_args_for(
-                Utf8Path::new("/tmp/old-omicron"),
+                "/tmp/old-omicron",
                 &network,
                 4,
                 Traffic::Unicast,
@@ -860,11 +756,33 @@ mod test {
             .unwrap(),
             [
                 "run",
+                "--icmp-loss-tolerance",
+                "50",
                 "--ip-pool-begin",
                 "198.51.100.30",
                 "--ip-pool-end",
                 "198.51.100.45"
             ]
+        );
+    }
+
+    #[test]
+    fn loss_tolerance_scales_and_yields() {
+        let tolerance = |extra: &[&str]| {
+            let mut args = vec!["run".to_string()];
+            args.extend(extra.iter().map(|a| a.to_string()));
+            apply_loss_tolerance(&mut args).unwrap();
+            arg_value(&args, "--icmp-loss-tolerance").map(str::to_string)
+        };
+        assert_eq!(tolerance(&[]).as_deref(), Some("50"));
+        assert_eq!(
+            tolerance(&["--test-duration", "10m", "--packet-rate=20"])
+                .as_deref(),
+            Some("600")
+        );
+        assert_eq!(
+            tolerance(&["--icmp-loss-tolerance", "3"]).as_deref(),
+            Some("3")
         );
     }
 
@@ -880,10 +798,12 @@ mod test {
             "203.0.113.20".into(),
             "--test-duration".into(),
             "5s".into(),
+            "--icmp-loss-tolerance".into(),
+            "0".into(),
         ];
         assert_eq!(
             commtest_args_for(
-                Utf8Path::new("/tmp/old-omicron"),
+                "/tmp/old-omicron",
                 &network,
                 4,
                 Traffic::Unicast,
@@ -895,7 +815,7 @@ mod test {
         );
         assert_eq!(
             commtest_args_for(
-                Utf8Path::new("/tmp/old-omicron"),
+                "/tmp/old-omicron",
                 &network,
                 4,
                 Traffic::Unicast,
@@ -920,7 +840,7 @@ mod test {
         ] {
             assert!(
                 commtest_args_for(
-                    Utf8Path::new("/tmp/old-omicron"),
+                    "/tmp/old-omicron",
                     &network,
                     4,
                     Traffic::Unicast,
@@ -936,7 +856,7 @@ mod test {
     fn selects_multicast_phases() {
         let network = Network::default();
         let multicast = commtest_args_for(
-            Utf8Path::new("/tmp/new-omicron"),
+            "/tmp/new-omicron",
             &network,
             4,
             Traffic::Multicast,
@@ -948,7 +868,7 @@ mod test {
         assert!(multicast.contains(&DEFAULT_MCAST_GROUP.into()));
 
         let both = commtest_args_for(
-            Utf8Path::new("/tmp/new-omicron"),
+            "/tmp/new-omicron",
             &network,
             4,
             Traffic::Both,
@@ -965,7 +885,7 @@ mod test {
     fn rejects_multicast_on_old_commtest() {
         assert!(
             commtest_args_for(
-                Utf8Path::new("/tmp/old-omicron"),
+                "/tmp/old-omicron",
                 &Network::default(),
                 4,
                 Traffic::Multicast,
@@ -985,19 +905,5 @@ mod test {
             ..Network::default()
         };
         assert!(derive_pool(&network, 4).is_err());
-    }
-
-    #[test]
-    fn resolves_only_explicit_git_reference_forms() {
-        assert_eq!(reference_candidates("main").unwrap(), ["refs/heads/main"]);
-        assert_eq!(
-            reference_candidates("43bb5af").unwrap(),
-            ["refs/heads/43bb5af", "refs/tags/43bb5af", "43bb5af"]
-        );
-        assert_eq!(
-            reference_candidates("release/test").unwrap(),
-            ["refs/heads/release/test", "refs/tags/release/test"]
-        );
-        assert!(reference_candidates("not a ref").is_err());
     }
 }

@@ -168,6 +168,33 @@ pub(crate) fn snapshots(ds: &Dataset) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
+/// Clones of `ds`'s snapshots, which block destroying it. Empty when `ds` does
+/// not exist.
+pub(crate) fn dependent_clones(ds: &Dataset) -> Result<Vec<String>> {
+    if !exists(ds) {
+        return Ok(Vec::new());
+    }
+    let out = Command::new("zfs")
+        .args(["get", "-H", "-r", "-t", "snapshot", "-o", "value", "clones"])
+        .arg(ds.as_str())
+        .output()
+        .with_context(|| format!("zfs get clones {}", ds.as_str()))?;
+    if !out.status.success() {
+        bail!(
+            "zfs get clones {}: {}",
+            ds.as_str(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .flat_map(|l| l.split(','))
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && *c != "-")
+        .map(str::to_string)
+        .collect())
+}
+
 /// The snapshot a clone was made from, None for a dataset with no origin.
 pub(crate) fn origin(ds: &Dataset) -> Option<String> {
     let out = Command::new("zfs")
@@ -176,6 +203,37 @@ pub(crate) fn origin(ds: &Dataset) -> Option<String> {
         .ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && v != "-").then_some(v)
+}
+
+/// The direct children of `parent` that have a snapshot `snap`, oldest
+/// snapshot first.
+pub(crate) fn children_by_snapshot_age(
+    parent: &str,
+    snap: &str,
+) -> Result<Vec<String>> {
+    // A fresh host has no image dataset yet, so nothing under it either.
+    if !zfs_exists(parent) {
+        return Ok(Vec::new());
+    }
+    let out = Command::new("zfs")
+        .args([
+            "list", "-H", "-p", "-d", "2", "-t", "snapshot", "-s", "creation",
+            "-o", "name",
+        ])
+        .arg(parent)
+        .output()
+        .context("run zfs list -t snapshot")?;
+    if !out.status.success() {
+        bail!("zfs list snapshots under {parent} failed");
+    }
+    let suffix = format!("@{snap}");
+    let prefix = format!("{parent}/");
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().strip_suffix(&suffix))
+        .filter(|ds| ds.strip_prefix(&prefix).is_some_and(|c| !c.contains('/')))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Stream a snapshot into a new dataset with a full send. The result carries

@@ -42,7 +42,7 @@ Falcon settings resolve as: flag, then `voxel.toml`, then env, then built-in.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `dns_zone` | string | `"oxide.test"` | External DNS zone. |
+| `dns_zone` | string | `"oxide.test"` | Base external DNS zone. Each rack serves `rack<N>.<dns_zone>` (rack 1 is `rack1.oxide.test`), so the recovery silo is `recovery.sys.rack1.oxide.test`. `launch` and `status` print the effective zone. |
 | `external_dns_ips` | list | `["198.51.100.20", "198.51.100.21"]` | External DNS server addresses. |
 | `ntp_servers` | list | `["time.cloudflare.com"]` | Upstream NTP. |
 | `dns_servers` | list | `["1.1.1.1", "9.9.9.9"]` | Upstream DNS. |
@@ -105,12 +105,12 @@ Runtime paths. Each unset value resolves via env then built-in default.
 
 ## [builder]
 
-`voxel builder`, the persistent Omicron build host. Omitted from `config show`
+`voxel builder`, the persistent Omicron build hosts (one per commit). These settings apply to each. Omitted from `config show`
 while every value is the default.
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `image` | string | `voxel-builder-<image.version>` | Builder image the first `up` clones the disk from. |
+| `image` | string | `voxel-builder-<image.version>` | Builder image a commit's first `up` clones its disk from when there is no other builder disk to copy (or with `--fresh`). |
 | `memory_gb` | integer | `32` | Guest memory. Omicron release builds want 32. |
 | `cores` | integer | `8` | Guest vCPUs. |
 | `disk_gb` | integer | `80` | Disk size; the checkout, caches and target dir live on it. |

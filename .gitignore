@@ -17,3 +17,5 @@ multirack-staged/
 # multi-GiB download caches, all reproducible.
 image-build/
 old/
+# cargo xtask dist output
+/out/

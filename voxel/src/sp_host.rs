@@ -423,7 +423,11 @@ pub(crate) fn fetch_text(url: &str, f: Fetch) -> anyhow::Result<String> {
 
 /// Stream `url` into `dest` behind a progress bar, returning the body's
 /// sha256 hex. Retried whole; a partial `dest` is overwritten next attempt.
-fn download(url: &str, dest: &Utf8Path, f: Fetch) -> anyhow::Result<String> {
+pub(crate) fn download(
+    url: &str,
+    dest: &Utf8Path,
+    f: Fetch,
+) -> anyhow::Result<String> {
     run_fetch(async {
         let client = http_client(f)?;
         let mut last = None;

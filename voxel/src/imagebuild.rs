@@ -23,9 +23,11 @@ use std::time::Duration;
 const NODE: &str = "vbuild";
 /// The builder's falcon deployment name.
 const DEPLOY: &str = "voxel_build";
+/// Falcon base image for the illumos images (builder and voxel-cp).
+pub(crate) const HELIOS_BASE: &str = "helios-3.1";
 
 pub(crate) struct BakeOpts<'a> {
-    /// Base image to boot: `helios-3.0` or `debian-13.2`.
+    /// Base image to boot: [`HELIOS_BASE`] or `debian-13.2`.
     pub base_image: &'a str,
     /// Agent install role (`cp` / `frr`).
     pub role: &'a str,
@@ -77,10 +79,74 @@ pub(crate) fn builder_network(
     })
 }
 
+/// Held while an image bake runs. Every bake uses the one falcon
+/// deployment `voxel_build` (its dataset and vnic are host-wide), and a bake
+/// clears a leftover one, so two at once would tear each other down.
+/// Re-entrant within the process: `builder build` holds it around the whole
+/// cp bake, `bake` included.
+pub(crate) struct BakeLock {
+    /// The locked file, held for its lifetime; None in a nested hold.
+    _file: Option<std::fs::File>,
+}
+
+static BAKE_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for BakeLock {
+    fn drop(&mut self) {
+        BAKE_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn bake_lock() -> Result<BakeLock> {
+    use std::os::fd::AsRawFd;
+    const PATH: &str = "/var/run/voxel-image-build.lock";
+    let depth = BAKE_DEPTH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if depth > 0 {
+        return Ok(BakeLock { _file: None });
+    }
+    // Built before anything can fail, so an early return still drops it and
+    // undoes the depth count.
+    let mut lock = BakeLock { _file: None };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(PATH)
+        .with_context(|| format!("open {PATH}"))?;
+    let fd = file.as_raw_fd();
+    // SAFETY: flock(3C) on an fd owned by `file`, which outlives the call.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("[voxel] another image bake is running; waiting for it");
+        // SAFETY: as above.
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            bail!("lock {PATH}: {}", std::io::Error::last_os_error());
+        }
+    }
+    lock._file = Some(file);
+    Ok(lock)
+}
+
 /// Bring up the builder, install, quiesce, capture, tear down.
 pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     if !o.cargo_bay.exists() {
         bail!("cargo-bay {} not found", o.cargo_bay);
+    }
+    let _lock = bake_lock()?;
+
+    // Replacing an image destroys it at the end, which zfs refuses while
+    // clones of it exist (a builder disk, or a rack's nodes). Find out now,
+    // not after the whole build.
+    let image = Dataset::new(format!("{}/img/{}", o.dataset, o.image_name))?;
+    let clones = zfs::dependent_clones(&image)?;
+    if !clones.is_empty() {
+        bail!(
+            "cannot replace {}: it has dependent clones ({}). Remove them \
+             first (`voxel builder down <sha> --destroy` for a builder disk, \
+             `voxel destroy` for a rack), or build under a new name",
+            image.as_str(),
+            clones.join(", ")
+        );
     }
 
     stage_builder_net(o.cargo_bay, o.network.static_address.as_deref())?;
@@ -90,6 +156,9 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     let workspace = build_root()?;
     std::env::set_current_dir(&workspace)
         .with_context(|| format!("cd {workspace}"))?;
+    if clear_stale_builder(o.dataset, &workspace)? {
+        eprintln!("[voxel] leftover builder cleared");
+    }
 
     let mut d = Runner::new(DEPLOY);
     if let Some(bin) = o.propolis_binary {
@@ -245,7 +314,7 @@ pub(crate) async fn create_builder(
         .with_context(|| format!("stage omicron-rev into {cargo_bay}"))?;
 
     bake(BakeOpts {
-        base_image: "helios-3.0",
+        base_image: HELIOS_BASE,
         role: "builder",
         cargo_bay: &cargo_bay,
         image_name: &image_name,
@@ -345,11 +414,16 @@ pub(crate) fn find_voxel_init(agent: &Prebuilt) -> Result<Utf8PathBuf> {
                 .context("non-utf8 voxel-init path");
         }
     }
+    let tried: Vec<String> = agent
+        .candidates
+        .iter()
+        .map(|rel| dir.join(rel).display().to_string())
+        .collect();
     bail!(
-        "no prebuilt voxel-init for the {} next to {}; build it with `{}` \
+        "no prebuilt voxel-init for the {} (looked for {}); build it with `{}` \
          or point ${} at one",
         agent.role,
-        exe.display(),
+        tried.join(", "),
         agent.build,
         agent.env
     )
@@ -391,6 +465,89 @@ pub(crate) fn stage_builder_net(
     Ok(())
 }
 
+/// `voxel image clean`: tear down a leftover image-build VM.
+pub(crate) fn clean(dataset: &str) -> Result<()> {
+    let workspace = build_root()?;
+    std::env::set_current_dir(&workspace)
+        .with_context(|| format!("cd {workspace}"))?;
+    if !clear_stale_builder(dataset, &workspace)? {
+        eprintln!("[voxel] no leftover image-build VM");
+    }
+    Ok(())
+}
+
+/// A bake killed before its teardown (SIGHUP from a dropped ssh session, say)
+/// leaves its propolis running and its disk at `topo/voxel_build`. The next
+/// bake would then talk to, or boot from, the old builder's half-done state,
+/// so clear all of it first.
+fn clear_stale_builder(dataset: &str, workspace: &Utf8Path) -> Result<bool> {
+    let topo = Dataset::new(format!("{dataset}/topo/{DEPLOY}"))?;
+    let vnic = format!("{DEPLOY}_{NODE}_vn_vnic0");
+    let orphans = workspace_propolis(workspace);
+    let have_vnic = Command::new("dladm")
+        .args(["show-vnic", &vnic])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let have_pidfile = read_pidfile(falcon_dir(), NODE).is_some();
+    if orphans.is_empty() && !have_vnic && !have_pidfile && !zfs::exists(&topo)
+    {
+        return Ok(false);
+    }
+
+    eprintln!("[voxel] clearing a leftover builder from an interrupted run");
+    hyperstop(falcon_dir(), NODE);
+    for pid in &orphans {
+        eprintln!("[voxel] killing orphaned builder propolis (pid {pid})");
+        let _ = Command::new("pfexec").args(["kill", "-9", pid]).status();
+    }
+    // The zvol stays busy until the killed propolis is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !workspace_propolis(workspace).is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if have_vnic {
+        let _ = Command::new("pfexec")
+            .args(["dladm", "delete-vnic", &vnic])
+            .status();
+    }
+    zfs::destroy_dataset_if_present(&topo).with_context(|| {
+        format!(
+            "destroy the leftover builder disk {}; if it is busy, a \
+             propolis-server from the interrupted run may still be up \
+             (`pgrep -fl propolis-server`)",
+            topo.as_str()
+        )
+    })?;
+    Ok(true)
+}
+
+/// propolis-server processes running in the builder workspace. falcon starts
+/// them with that as their cwd, and a rack's nodes run from another workdir,
+/// so this finds the builder's even when its pidfile is gone.
+fn workspace_propolis(workspace: &Utf8Path) -> Vec<String> {
+    let want = std::fs::canonicalize(workspace).ok();
+    let Ok(out) =
+        Command::new("pgrep").args(["-x", "propolis-server"]).output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|pid| !pid.is_empty())
+        .filter(|pid| {
+            let cwd = std::fs::read_link(format!("/proc/{pid}/path/cwd")).ok();
+            cwd.is_some() && cwd.as_deref() == want.as_deref()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// Clear the device-instance map (nodes booted from the image otherwise
 /// mis-bind vioif instances), then halt cleanly: propolis must flush the zvol.
 async fn quiesce(d: &Runner, node: libfalcon::NodeRef) {
@@ -406,8 +563,10 @@ async fn quiesce(d: &Runner, node: libfalcon::NodeRef) {
     hyperstop(falcon_dir(), NODE);
 }
 
-/// Give the halting guest time to flush. Propolis usually outlives the halt;
-/// reaching the timeout is the normal path and `hyperstop` follows either way.
+/// Give the halting guest time to flush. Propolis outlives the halt but
+/// destroys the bhyve VM, so the VM's `/dev/vmm` node going away is the
+/// signal that the guest is down. Without one to watch (or if it never goes
+/// away) this waits out the timeout; `hyperstop` follows either way.
 pub(crate) fn wait_for_propolis_exit(
     dir: &Utf8Path,
     name: &str,
@@ -416,16 +575,26 @@ pub(crate) fn wait_for_propolis_exit(
     if read_pidfile(dir, name).is_none() {
         return;
     }
-    eprintln!("[voxel] flushing, up to {}s", timeout.as_secs());
+    let vmm = std::fs::read_to_string(dir.join(format!("{name}.uuid")))
+        .ok()
+        .map(|u| Utf8PathBuf::from(format!("/dev/vmm/{}", u.trim())))
+        .filter(|p| p.exists());
+    eprintln!(
+        "[voxel] waiting for the guest to halt, up to {}s",
+        timeout.as_secs()
+    );
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if !propolis_alive(dir, name) {
             return;
         }
+        if vmm.as_ref().is_some_and(|p| !p.exists()) {
+            return;
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
     eprintln!(
-        "[voxel] still running after {}s; forcing it down",
+        "[voxel] guest did not halt within {}s; stopping it",
         timeout.as_secs()
     );
 }
