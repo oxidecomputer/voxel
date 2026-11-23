@@ -73,15 +73,15 @@ struct Firmware {
 }
 
 /// The hubris boards a voxel emulated fleet presents.
-const GIMLET_BOARD: &str = "gimlet-c";
-const SIDECAR_BOARD: &str = "sidecar-c";
+pub(crate) const GIMLET_BOARD: &str = "gimlet-c";
+pub(crate) const SIDECAR_BOARD: &str = "sidecar-c";
 /// The RoT signing variant to take. "bart" is the hubris dev keyset: its SIGN
 /// and the CMPA the emulated RoTs enforce match, so these images are drop-in.
 /// The production and staging variants are signed for keysets only real
 /// hardware holds.
-const ROT_VARIANT: &str = "oxide-rot-1-selfsigned-bart";
+pub(crate) const ROT_VARIANT: &str = "oxide-rot-1-selfsigned-bart";
 /// The RoT bootloader (bootleby) variant, matching [`ROT_VARIANT`]'s keyset.
-const BOOTLOADER_VARIANT: &str = "bart";
+pub(crate) const BOOTLOADER_VARIANT: &str = "bart";
 /// The bart keyset's root key table hash, which the emulated RoTs enforce
 /// from their CMPA. v2 tags each RoT artifact with its keyset, so the image is
 /// selected by this hash.
