@@ -349,6 +349,24 @@ This produces `voxel-frr-proto`. The FRR configuration (BGP peers, route
 announcements) is generated at launch, so the image itself contains no
 topology-specific settings.
 
+=== Builder Image
+
+The builder image is a Helios guest with git, rustup and Omicron's builder
+prerequisites installed, and a checkout of the Omicron commit Voxel is pinned
+to under `/work`. It is the build host for the in-guest build flow, which
+needs no Rust toolchain or git on the Helios host. The argument is an image
+label; `--omicron` checks out a different Omicron rev:
+
+[source,sh]
+----
+pfexec voxel image create-builder proto
+----
+
+This produces `voxel-builder-proto`, about 9 GB, in roughly ten minutes. A
+builder instance boots from it and keeps its own Omicron build cache on its
+own disk, so you rebuild the image only to pick up newer prerequisites or a
+different Omicron checkout, not for every build.
+
 === Configuring Images
 
 Point Voxel at the images you built:

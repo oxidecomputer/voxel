@@ -60,6 +60,8 @@ enum InstallRole {
     Cp,
     /// voxel-frr router image (linux / debian).
     Frr,
+    /// voxel-builder omicron build host (illumos / helios).
+    Builder,
 }
 
 fn main() {
@@ -69,6 +71,7 @@ fn main() {
         Cmd::Install { role } => match role {
             InstallRole::Cp => install::build_control_plane_image(),
             InstallRole::Frr => install::build_frr_image(),
+            InstallRole::Builder => install::build_builder_image(),
         },
         Cmd::SwitchEnforcer { slot } => {
             gimlet::switch_enforcer(slot);
