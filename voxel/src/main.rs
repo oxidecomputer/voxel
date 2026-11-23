@@ -21,7 +21,7 @@ use anyhow::{Context, Error, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use std::fs;
-use voxel_config::VoxelConfig;
+use voxel_config::{CP_IMAGE_PREFIX, VoxelConfig};
 
 mod access;
 mod builder;
@@ -34,16 +34,19 @@ mod heading;
 mod image;
 mod imagebuild;
 mod isolated_external;
+mod multicast;
 mod multirack_join;
 mod net;
 mod network;
 mod permslip;
+mod pins;
 mod rack;
 mod repocmd;
 mod rss;
 mod rss_request;
 mod sp_cmd;
 mod sp_host;
+mod ssh_keys;
 mod topo;
 mod tufrepo;
 mod util;
@@ -196,7 +199,7 @@ enum Cmd {
         source: Option<Utf8PathBuf>,
 
         /// Rack to target (1-based).
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = rack_number)]
         rack: usize,
 
         /// Override the derived Nexus API URL.
@@ -367,6 +370,9 @@ enum ImageCmd {
             value_parser = abs_path
         )]
         sled_agent: Option<Utf8PathBuf>,
+        /// Helios base image to use for the CP build.
+        #[arg(long, default_value = imagebuild::HELIOS_BASE)]
+        base_image: String,
     },
     /// Export an image bundle to a file for distribution.
     ///
@@ -416,6 +422,14 @@ enum ImageCmd {
         #[arg(long)]
         omicron: Option<String>,
     },
+    /// Update Helios packages and register a reusable base image.
+    CreateBase {
+        /// Name for the new base image; must not already exist.
+        name: String,
+        /// Helios base image to update.
+        #[arg(long, default_value = imagebuild::HELIOS_BASE)]
+        from: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -454,6 +468,13 @@ enum NetworkCmd {
         #[command(subcommand)]
         cmd: ExternalCmd,
     },
+    /// Plumb host-sourced multicast into a running rack.
+    ///
+    /// This works in either `[external]` mode.
+    Multicast {
+        #[command(subcommand)]
+        cmd: MulticastCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -476,6 +497,66 @@ enum ExternalCmd {
 }
 
 #[derive(Subcommand)]
+enum MulticastCmd {
+    /// Point each group's host route at `ce` and configure forwarding on its
+    /// selected fabric routers.
+    Up {
+        /// Group to plumb (pass the flag once per group).
+        ///
+        /// This accepts commtest's `GROUP[@SRC,...]` form, of which only the
+        /// address matters here.
+        ///
+        /// Defaults to the group used by `voxel commtest --traffic multicast`.
+        #[arg(long = "group", value_name = "GROUP", default_value = commtest::DEFAULT_MCAST_GROUP)]
+        groups: Vec<multicast::GroupSpec>,
+        /// Which ingress paths a group uses (in the `GROUP=SPEC` framing,
+        /// passing the flag once per group).
+        ///
+        /// SPEC can be `all`, `none`, or a comma-separated list of paths. A
+        /// path is a rack-facing name on its own, which selects that switch on
+        /// every forwarding router, or `<router>:<name>` for one complete
+        /// (router, switch) path.
+        ///
+        /// For example, `239.100.0.1=cr1:switch0` is a single path through
+        /// switch0.
+        ///
+        /// FRR withdraws a static mroute by (S,G) and ignores the interface
+        /// during that operation. voxel keeps one path per router and rejects
+        /// `all` on a multi-switch topology.
+        ///
+        /// A group without a `--steer` flag keeps the paths a previous `up`
+        /// recorded for it, or else takes the configured
+        /// `[network.multicast] delivery`, a single path by default.
+        #[arg(long = "steer", value_name = "GROUP=SWITCHES")]
+        steer: Vec<multicast::SteerSpec>,
+        /// Print the host and router commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the group mroutes from the fabric routers and the host routes.
+    Down {
+        /// Group(s) to tear down (pass the flag once per group).
+        ///
+        /// Same form as `up`. Defaults to the groups recorded for this falcon
+        /// environment. Routes belonging to other environments are unchanged.
+        #[arg(long = "group", value_name = "GROUP")]
+        groups: Vec<multicast::GroupSpec>,
+        /// Print the host and router commands instead of running them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Check host routes and router assignments, listing missing configuration.
+    Check {
+        /// Group to check (pass the flag once per group).
+        ///
+        /// Same form as `up`. Defaults to the groups recorded for this falcon
+        /// environment, as with `down` when no groups are supplied.
+        #[arg(long = "group", value_name = "GROUP")]
+        groups: Vec<multicast::GroupSpec>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SpCmd {
     /// List the live SPs over MGS: type, serial, power, archive id.
     ///
@@ -490,7 +571,7 @@ enum SpCmd {
     #[command(visible_alias = "state")]
     Info {
         /// Target SP: serial (e.g. BRM44220001), node (sidecar | g0 | g1 ...),
-        /// or sim addr ([::1]:33310 | 33310).
+        /// or sim addr (`[::1]:33310` | 33310).
         target: String,
         #[arg(long, default_value = "switch0")]
         switch: String,
@@ -593,14 +674,15 @@ enum HostCmd {
         #[arg(default_value = "g0")]
         node: String,
     },
-    /// Run a command in a sled's global zone: `voxel host exec -c "svcs -x" g1`.
+    /// Run a command in a sled's global zone or on a router:
+    /// `voxel host exec -c "svcs -x" g1`.
     Exec {
         /// Command to run (quote multi-word commands).
         #[arg(short = 'c', long = "command")]
         command: String,
-        /// Target sled (g0, g1, ...).
+        /// Target sled or router (g0, g1, ..., cr1, ...).
         #[arg(default_value = "g0")]
-        sled: String,
+        node: String,
     },
 }
 
@@ -645,8 +727,7 @@ enum RepoCmd {
 
 fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
     if path.exists() {
-        Ok(fs::read_to_string(path)
-            .with_context(|| format!("read {}", path))?)
+        Ok(fs::read_to_string(path).with_context(|| format!("read {path}"))?)
     } else {
         Ok(VoxelConfig::default().to_toml())
     }
@@ -654,9 +735,22 @@ fn config_text(path: &Utf8Path) -> anyhow::Result<String> {
 
 fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
     let text = config_text(path)?;
-    let cfg = VoxelConfig::from_toml(&text)
-        .with_context(|| format!("parse {}", path))?;
-    cfg.topology.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let mut cfg = VoxelConfig::from_toml(&text)
+        .with_context(|| format!("parse {path}"))?;
+    cfg.validate().map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+
+    // A fully defaulted image selection follows the workspace's omicron pin
+    // (the image a commitless `voxel image create` would build).
+    //
+    // A repin and rebuild-relaunch cycle avoids config changes, while an
+    // explicit control plane or version still selects its own image.
+    if cfg.image.cp.is_none()
+        && cfg.image.version == voxel_config::Image::default().version
+        && !cpbuild::PINNED_OMICRON_REV.is_empty()
+    {
+        cfg.image.cp =
+            Some(format!("{CP_IMAGE_PREFIX}{}", cpbuild::PINNED_OMICRON_REV));
+    }
     Ok(cfg)
 }
 
@@ -665,6 +759,14 @@ fn load_config(path: &Utf8Path) -> anyhow::Result<VoxelConfig> {
 /// the directory voxel was invoked from.
 fn abs_path(s: &str) -> Result<Utf8PathBuf, String> {
     Ok(absolutize(Utf8PathBuf::from(s)))
+}
+
+fn rack_number(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("rack numbering starts at 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Make a path absolute against the current directory, dropping `.`
@@ -822,7 +924,7 @@ fn anchor_workdir(
         && root.is_dir()
     {
         std::env::set_current_dir(&root)
-            .with_context(|| format!("chdir to workdir {}", root))?;
+            .with_context(|| format!("chdir to workdir {root}"))?;
     }
     Ok(())
 }
@@ -891,6 +993,7 @@ async fn main() -> Result<(), Error> {
         Cmd::Commtest { source, rack, api, traffic, no_build, args } => {
             commtest::run(
                 &load_config(&config_path)?,
+                &cli.name,
                 commtest::Options {
                     config_path: &config_path,
                     source: source.as_deref(),
@@ -901,18 +1004,26 @@ async fn main() -> Result<(), Error> {
                     passthrough: args,
                 },
             )
+            .await
         }
         Cmd::CommtestExec { resolve, cacert, args } => {
             commtest::exec(resolve.as_deref(), cacert.as_deref(), args).await
         }
         Cmd::Config { cmd } => config_cmd::cmd_config(&config_path, cmd),
         Cmd::Image { cmd } => match cmd {
-            ImageCmd::Create { commit, src, from_tuf, sled_agent } => {
+            ImageCmd::Create {
+                commit,
+                src,
+                from_tuf,
+                sled_agent,
+                base_image,
+            } => {
                 cpbuild::create(
                     commit.as_deref(),
                     src.as_deref(),
                     from_tuf.as_deref(),
                     sled_agent.as_deref(),
+                    base_image,
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                     cfg.as_ref()
@@ -946,6 +1057,17 @@ async fn main() -> Result<(), Error> {
                     &image::falcon_dataset(),
                     cfg.as_ref().map(|c| &c.external),
                     rev,
+                    cfg.as_ref()
+                        .and_then(|c| c.falcon.propolis_binary.as_deref()),
+                )
+                .await
+            }
+            ImageCmd::CreateBase { name, from } => {
+                imagebuild::create_base(
+                    from,
+                    name,
+                    &image::falcon_dataset(),
+                    cfg.as_ref().map(|c| &c.external),
                     cfg.as_ref()
                         .and_then(|c| c.falcon.propolis_binary.as_deref()),
                 )
@@ -1018,16 +1140,30 @@ async fn main() -> Result<(), Error> {
             NetworkCmd::External { cmd } => {
                 let cfg = load_config(&config_path)?;
                 match cmd {
-                    ExternalCmd::Up { dry_run } => isolated_external::up(
-                        &cfg.external,
-                        isolated_external::DryRun::from_flag(*dry_run),
-                    ),
+                    ExternalCmd::Up { dry_run } => {
+                        isolated_external::up(&cfg.external, (*dry_run).into())
+                    }
                     ExternalCmd::Down { dry_run } => isolated_external::down(
                         &cfg.external,
-                        isolated_external::DryRun::from_flag(*dry_run),
+                        (*dry_run).into(),
                     ),
                     ExternalCmd::Check => {
                         isolated_external::check(&cfg.external)
+                    }
+                }
+            }
+            NetworkCmd::Multicast { cmd } => {
+                let cfg = load_config(&config_path)?;
+                match cmd {
+                    MulticastCmd::Up { groups, steer, dry_run } => {
+                        multicast::up(&cfg, &cli.name, groups, steer, *dry_run)
+                            .await
+                    }
+                    MulticastCmd::Down { groups, dry_run } => {
+                        multicast::down(&cfg, &cli.name, groups, *dry_run).await
+                    }
+                    MulticastCmd::Check { groups } => {
+                        multicast::check(&cfg, &cli.name, groups).await
                     }
                 }
             }
@@ -1048,11 +1184,11 @@ async fn main() -> Result<(), Error> {
                 )
                 .await
             }
-            HostCmd::Exec { command, sled } => {
+            HostCmd::Exec { command, node } => {
                 access::cmd_host_exec(
                     &load_config(&config_path)?,
                     &cli.name,
-                    sled,
+                    node,
                     command,
                 )
                 .await

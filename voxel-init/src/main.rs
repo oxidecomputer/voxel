@@ -2,14 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! voxel-init—the in-guest bring-up agent baked into voxel images.
+//! In-guest agent for Voxel images.
 //!
-//! Replaces the per-node launch shell scripts (`gimlet-launch.sh`,
-//! `router-launch.sh`): `voxel launch` runs `voxel-init <role>` inside each
-//! guest. One binary, two roles, cross-compiled for both guest OSes—illumos
-//! (the voxel-cp gimlet) and linux (the voxel-frr router). Everything is
-//! orchestration of OS commands, so the same source builds for both targets;
-//! only the role selected at runtime differs.
+//! `gimlet` and `router` configure rack nodes at launch. `install` prepares
+//! control-plane, FRR and Helios base images in the builder guest.
 
 mod builder;
 mod gimlet;
@@ -37,10 +33,10 @@ enum Cmd {
     Router,
     /// Bring up the omicron build host from a voxel-builder image (helios).
     Builder,
-    /// Image-BUILD-time install, run inside the builder guest by `image bake`.
-    /// Installs baked software only; applies no topology configuration.
+    /// Install software while building an image. Installs baked software
+    /// only; applies no topology configuration.
     Install {
-        /// Which image is being baked.
+        /// Image type to install.
         #[arg(long, value_enum)]
         role: InstallRole,
     },
@@ -55,8 +51,7 @@ enum Cmd {
     SwitchEnforcerSvc,
 }
 
-/// Which image `install` is baking. Both arms build for both guest OSes; the
-/// role picks the implementation at runtime, as with `gimlet` / `router`.
+/// Image type installed by the builder.
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum InstallRole {
     /// voxel-cp control-plane image (illumos / helios).
@@ -65,6 +60,8 @@ enum InstallRole {
     Frr,
     /// voxel-builder omicron build host (illumos / helios).
     Builder,
+    /// Helios base image, updated with `pkg update`.
+    Os,
 }
 
 fn main() {
@@ -76,6 +73,7 @@ fn main() {
             InstallRole::Cp => install::build_control_plane_image(),
             InstallRole::Frr => install::build_frr_image(),
             InstallRole::Builder => install::build_builder_image(),
+            InstallRole::Os => install::build_os_image(),
         },
         Cmd::SwitchEnforcer { slot } => {
             gimlet::switch_enforcer(slot);

@@ -202,6 +202,7 @@ pub(crate) async fn run(o: Opts<'_>) -> Result<()> {
     step("commtest");
     commtest::run(
         &cfg,
+        o.name,
         commtest::Options {
             config_path: o.config_path,
             source: None,
@@ -211,7 +212,8 @@ pub(crate) async fn run(o: Opts<'_>) -> Result<()> {
             no_build: false,
             passthrough: &[],
         },
-    )?;
+    )
+    .await?;
     step(&format!("arrived: omicron {rev}"));
     Ok(())
 }

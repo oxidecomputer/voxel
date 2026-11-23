@@ -21,6 +21,7 @@ humantime = "2.4"
 clap.workspace = true
 camino.workspace = true
 indoc.workspace = true
+itertools.workspace = true
 oxnet.workspace = true
 voxel-config = { path = "../voxel-config" }
 # Omicron's own RackInitializeRequest types and config-rss serialization,
@@ -34,6 +35,7 @@ sled-agent-types.workspace = true
 toml = "0.9"
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
+hex = "0.4"
 # Unpack TUF control-plane composites (GNU tar format; illumos tar rejects it).
 tar = "0.4"
 flate2 = "1"
@@ -56,6 +58,7 @@ base64 = "0.22"
 blake3 = "1"
 indicatif = "0.18"
 libc = "0.2"
+tempfile = "3"
 
 # Sprockets/trust-quorum test keys - generated at launch (replaces a4x2's
 # pre-generated per-sled sprockets material that prep.sh used to rsync in).
@@ -63,4 +66,5 @@ attest-mock.workspace = true
 sprockets-tls-test-utils.workspace = true
 
 [dev-dependencies]
+camino-tempfile.workspace = true
 expectorate.workspace = true

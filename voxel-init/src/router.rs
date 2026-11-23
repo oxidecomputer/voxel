@@ -10,7 +10,7 @@
 
 use crate::sys::{
     ExternalNet, capture, note, read_external_net, replace_in_file, run,
-    run_quiet, warn,
+    run_quiet, sync_authorized_keys, warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -50,29 +50,11 @@ pub fn bring_up() -> Result<()> {
 
 /// SSH convenience for `voxel host login <router>`, the router-role counterpart
 /// of the gimlet agent's `setup_ssh`. `openssh-server` is already in the image
-/// (install-frr.sh), so this only appends any staged operator key and relaxes
+/// (install-frr.sh), so this only syncs any staged operator key and relaxes
 /// sshd_config: voxel authenticates as root with the rack's empty password, and
 /// Debian's stock `PermitRootLogin prohibit-password` refuses that.
 fn setup_ssh() {
-    let authorized = "/opt/cargo-bay/root_authorized_keys";
-    if Utf8Path::new(authorized).exists() {
-        let _ = fs::create_dir_all("/root/.ssh");
-        if let Ok(keys) = fs::read(authorized) {
-            use std::io::Write;
-            match fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/root/.ssh/authorized_keys")
-            {
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(&keys) {
-                        warn(format!("authorized_keys: {e}"));
-                    }
-                }
-                Err(e) => warn(format!("authorized_keys: {e}")),
-            }
-        }
-    }
+    sync_authorized_keys("/opt/cargo-bay/root_authorized_keys");
 
     // Debian's stock sshd_config keeps PasswordAuthentication yes but defaults
     // PermitRootLogin to prohibit-password. Flip it so serial-first debugging
@@ -142,17 +124,47 @@ fn ensure_unique_uplink_lease() {
     // Isolated mode stages a static address and runs no DHCP server, so there
     // is no lease to dedupe. Keep networkd's DHCP client off the uplink that
     // `apply_static_external` configures by hand.
-    if read_external_net().is_some() {
-        note(
-            "isolated mode: static external address, skipping DHCP lease pinning",
+    let (cfg, message) = if let Some(external) = read_external_net() {
+        let Some(ifc) = external.iface else {
+            warn("static external address has no staged uplink interface");
+            return;
+        };
+        (
+            static_uplink_network(&ifc),
+            "disabled DHCP on static external uplink".to_string(),
+        )
+    } else {
+        let Some(ifc) = uplink_iface() else {
+            warn("unique-lease: no host-LAN uplink found; skipping");
+            return;
+        };
+        let message = format!(
+            "pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"
         );
+        (dhcp_uplink_network(&ifc), message)
+    };
+    if let Err(e) =
+        fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg)
+    {
+        warn(format!("unique-lease: write networkd config: {e}"));
         return;
     }
-    let Some(ifc) = uplink_iface() else {
-        warn("unique-lease: no host-LAN uplink found; skipping");
-        return;
-    };
-    let cfg = formatdoc! {"
+    run("systemctl", &["restart", "systemd-networkd"]);
+    note(message);
+}
+
+fn static_uplink_network(ifc: &str) -> String {
+    formatdoc! {"
+        [Match]
+        Name={ifc}
+
+        [Network]
+        DHCP=no
+    "}
+}
+
+fn dhcp_uplink_network(ifc: &str) -> String {
+    formatdoc! {"
         [Match]
         Name={ifc}
 
@@ -162,17 +174,7 @@ fn ensure_unique_uplink_lease() {
         [DHCPv4]
         ClientIdentifier=mac
         RouteMetric=100
-    "};
-    if let Err(e) =
-        fs::write("/etc/systemd/network/00-voxel-uplink.network", &cfg)
-    {
-        warn(format!("unique-lease: write networkd config: {e}"));
-        return;
-    }
-    run("systemctl", &["restart", "systemd-networkd"]);
-    note(format!(
-        "pinned {ifc} DHCP client-id to MAC; re-DHCPing host-LAN uplink"
-    ));
+    "}
 }
 
 fn sysctl(key: &str, val: &str) {
@@ -380,4 +382,26 @@ fn apply_frr() -> Result<()> {
     fs::copy(src, "/etc/frr/frr.conf").context("apply frr.conf")?;
     run("systemctl", &["restart", "frr"]);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_uplink_disables_dhcp() {
+        let cfg = static_uplink_network("enp0s6");
+        assert!(cfg.contains("Name=enp0s6"));
+        assert!(cfg.contains("DHCP=no"));
+        assert!(!cfg.contains("ClientIdentifier"));
+    }
+
+    #[test]
+    fn dhcp_uplink_pins_the_client_id_to_mac() {
+        let cfg = dhcp_uplink_network("enp0s6");
+        assert!(cfg.contains("Name=enp0s6"));
+        assert!(cfg.contains("DHCP=yes"));
+        assert!(cfg.contains("ClientIdentifier=mac"));
+        assert!(cfg.contains("RouteMetric=100"));
+    }
 }

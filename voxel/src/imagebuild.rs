@@ -5,9 +5,10 @@
 //! Bake an image: boot a one-node builder, run the in-guest agent's install
 //! role, and capture its disk as a registered falcon base image.
 //!
-//! `image create` and `image create-frr` both build through here. Everything
-//! host-side (the builder's falcon dir, cargo-bays, download caches) lives
-//! under `image-build/` in the anchored workdir, never in voxel's source tree.
+//! `image create`, `create-frr`, `create-builder` and `create-base` all build
+//! through here. Everything host-side (the builder's falcon dir, cargo-bays,
+//! download caches) lives under `image-build/` in the anchored workdir, never
+//! in voxel's source tree.
 
 use crate::isolated_external;
 use crate::zfs::{self, Dataset};
@@ -16,7 +17,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use libfalcon::{Runner, unit::gb};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use voxel_config::{FRR_IMAGE_PREFIX, IMAGE_PREFIX};
 
 /// The builder node name, which fixes the falcon workdir layout
 /// (`.falcon/vbuild.pid`).
@@ -25,11 +27,13 @@ const NODE: &str = "vbuild";
 const DEPLOY: &str = "voxel_build";
 /// Falcon base image for the illumos images (builder and voxel-cp).
 pub(crate) const HELIOS_BASE: &str = "helios-3.1";
+const LINUX_BASE_PREFIXES: [&str; 3] = ["debian", "ubuntu", "linux"];
+const STAGING_IMAGE_PREFIX: &str = "incoming-";
 
 pub(crate) struct BakeOpts<'a> {
-    /// Base image to boot: [`HELIOS_BASE`] or `debian-13.2`.
+    /// Image to boot: [`HELIOS_BASE`], a `create-base` image, or `debian-13.2`.
     pub base_image: &'a str,
-    /// Agent install role (`cp` / `frr`).
+    /// Install role (`cp`, `frr` or `os`).
     pub role: &'a str,
     /// Host dir mounted at `/opt/cargo-bay` in the guest.
     pub cargo_bay: &'a Utf8Path,
@@ -56,27 +60,33 @@ pub(crate) struct BuilderNetwork {
     pub static_address: Option<String>,
 }
 
-/// Host side of an image build's network. Isolated mode runs no DHCP: the
-/// segment comes up here and the builder gets a static `host_ip - 1`.
+/// Prepare the host side of an image build's network.
 pub(crate) fn builder_network(
     external: Option<&voxel_config::External>,
 ) -> Result<BuilderNetwork> {
-    let Some(x) = external.filter(|x| x.isolated()) else {
+    let Some(x) = external else {
         return Ok(BuilderNetwork::default());
     };
-    isolated_external::up(x, isolated_external::DryRun::No)
-        .context("bringing up the isolated external segment for the builder")?;
-    let address = x.builder_net().with_context(|| {
-        format!(
-            "cannot derive a usable isolated builder address below host_ip '{}' within \
-             subnet '{}'; choose a host_ip at least two addresses above the subnet network",
-            x.host_ip, x.subnet
-        )
-    })?;
-    Ok(BuilderNetwork {
-        interface: Some(isolated_external::STUB.to_string()),
-        static_address: Some(address),
-    })
+    let interface = if x.isolated() {
+        isolated_external::up(x, isolated_external::DryRun::No).context(
+            "bring up the isolated external segment for the builder",
+        )?;
+        Some(isolated_external::STUB.to_string())
+    } else {
+        std::env::var("EXT_INTERFACE").ok().or_else(|| x.link.clone())
+    };
+    let static_address = if x.static_addressing() {
+        Some(x.builder_net().with_context(|| {
+            format!(
+                "cannot derive a usable static builder address before ip_start '{}' within \
+                 subnet '{}'",
+                x.ip_start, x.subnet
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok(BuilderNetwork { interface, static_address })
 }
 
 /// Held while an image bake runs. Every bake uses the one falcon
@@ -176,10 +186,7 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
 
     // illumos guests use mount(); linux guests need mount_linux() (the guest-side
     // share mechanism differs). Pick from the base image name.
-    let is_linux = ["debian", "ubuntu", "linux"]
-        .iter()
-        .any(|p| o.base_image.starts_with(p));
-    let mounted = if is_linux {
+    let mounted = if is_linux_base(o.base_image) {
         d.mount_linux(o.cargo_bay.as_str(), "/opt/cargo-bay", node)
     } else {
         d.mount(o.cargo_bay.as_str(), "/opt/cargo-bay", node)
@@ -214,9 +221,19 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
     // The cargo-bay arrives without the exec bit, so the agent is copied to
     // local disk before running.
     let label = format!("install --role {}", o.role);
+    let build_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("read image build start time")?
+            .as_nanos()
+    );
     let cmd = format!(
-        "cp /opt/cargo-bay/voxel-init /tmp/voxel-init && chmod +x /tmp/voxel-init && \
-         /tmp/voxel-init install --role {} 2>&1 | tee /tmp/install.log",
+        "rm -f /var/voxel-image-ready /tmp/install.log && \
+         cp /opt/cargo-bay/voxel-init /tmp/voxel-init && chmod +x /tmp/voxel-init && \
+         VOXEL_IMAGE_BUILD_ID={build_id} /tmp/voxel-init install --role {} \
+         2>&1 | tee /tmp/install.log",
         o.role
     );
     let console = d
@@ -224,16 +241,30 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
 
-    // falcon's exec does NOT propagate the guest command's exit code, so
-    // validate the marker's CONTENT - written only on a complete run.
+    let install_log = d
+        .exec(node, "cat /tmp/install.log 2>/dev/null")
+        .await
+        .unwrap_or_default();
+    for line in install_log.lines().filter(|l| l.contains("[voxel-init]")) {
+        eprintln!("[voxel] {NODE}: {}", line.trim());
+    }
+    let log_path = workspace.join(format!("install-{}.log", o.role));
+    match std::fs::write(&log_path, &install_log) {
+        Ok(()) => eprintln!("[voxel] guest install log saved to {log_path}"),
+        Err(e) => eprintln!("[voxel] WARN: save {log_path}: {e}"),
+    }
+
+    // Falcon does not report guest exit status. Check the build ID in the marker.
     let marker =
         d.exec(node, "cat /var/voxel-image-ready").await.unwrap_or_default();
-    if !marker.contains("version=") {
+    let exp_build_id = format!("build-id={build_id}");
+    if !marker.contains("version=")
+        || !marker.split_whitespace().any(|field| field == exp_build_id)
+    {
         // Surface the guest's own log before teardown destroys it.
-        let tail = d
-            .exec(node, "tail -40 /tmp/install.log 2>/dev/null")
-            .await
-            .unwrap_or_default();
+        let tail_lines: Vec<&str> =
+            install_log.lines().rev().take(40).collect();
+        let tail = tail_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
         let last: Vec<&str> = console.lines().rev().take(40).collect();
         let console_tail =
             last.into_iter().rev().collect::<Vec<_>>().join("\n");
@@ -251,12 +282,12 @@ pub(crate) async fn bake(o: BakeOpts<'_>) -> Result<()> {
         } else {
             eprintln!("[voxel] guest install log tail:\n{}", tail.trim_end());
         }
-        bail!("ready marker missing/empty; {label} did not complete");
+        bail!("ready marker missing or stale; {label} did not complete");
     }
     eprintln!("[voxel] ready: {}", marker.trim());
 
     quiesce(&d, node).await;
-    capture(o.dataset, o.image_name)?;
+    capture(o.dataset, o.image_name, o.base_image)?;
 
     eprintln!("[voxel] destroying builder topology");
     let _ = d.destroy();
@@ -276,7 +307,7 @@ pub(crate) async fn create_frr(
     propolis_binary: Option<&str>,
 ) -> Result<()> {
     let network = builder_network(external)?;
-    let image_name = format!("voxel-frr-{version}");
+    let image_name = format!("{FRR_IMAGE_PREFIX}{version}");
     let cargo_bay = fresh_cargo_bay("vbuild-frr")?;
     stage_agent(&ROUTER_INIT, &cargo_bay)?;
 
@@ -328,6 +359,124 @@ pub(crate) async fn create_builder(
     .await?;
     println!("built image {image_name}");
     Ok(())
+}
+
+/// `image create-base`: update a Helios base image's packages and register
+/// the result, for `image create --base-image` and the other bakes.
+pub(crate) async fn create_base(
+    from: &str,
+    name: &str,
+    dataset: &str,
+    external: Option<&voxel_config::External>,
+    propolis_binary: Option<&str>,
+) -> Result<()> {
+    validate_image_name(name)?;
+    if name == HELIOS_BASE
+        || name.starts_with(IMAGE_PREFIX)
+        || name.starts_with(STAGING_IMAGE_PREFIX)
+        || name.starts_with(crate::builder::DISK_PREFIX)
+        || is_linux_base(name)
+    {
+        bail!(
+            "{name} is reserved: base names may not be {HELIOS_BASE} or \
+             start with {IMAGE_PREFIX}, {STAGING_IMAGE_PREFIX}, {} or {}",
+            crate::builder::DISK_PREFIX,
+            LINUX_BASE_PREFIXES.join("/")
+        );
+    }
+    let image = Dataset::new(format!("{dataset}/img/{name}"))?;
+    if zfs::exists(&image) {
+        bail!("{} already exists; pick a new base image name", image.as_str());
+    }
+    check_base_image(dataset, from)?;
+
+    let network = builder_network(external)?;
+    let cargo_bay = fresh_cargo_bay("vbase")?;
+    stage_agent(&SLED_INIT, &cargo_bay)?;
+
+    bake(BakeOpts {
+        base_image: from,
+        role: "os",
+        cargo_bay: &cargo_bay,
+        image_name: name,
+        dataset,
+        disk_gb: 100,
+        mem_gb: 16,
+        cores: 8,
+        network: &network,
+        propolis_binary,
+    })
+    .await?;
+
+    println!("built base image {name} from {from}");
+    Ok(())
+}
+
+fn is_linux_base(name: &str) -> bool {
+    LINUX_BASE_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+fn validate_image_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains(['/', '@'])
+        || name.contains(char::is_whitespace)
+    {
+        bail!("invalid image name {name:?}: no '/', '@' or whitespace");
+    }
+    Ok(())
+}
+
+/// Validate a Helios base image name and confirm its availability to the
+/// builder.
+///
+/// Falcon downloads [`HELIOS_BASE`] itself, but other bases need a registered
+/// `@base` snapshot built by `image create-base`. Invalid names and names
+/// prefixed with `voxel-` or a Linux image name are rejected outright.
+pub(crate) fn check_base_image(dataset: &str, base_image: &str) -> Result<()> {
+    validate_image_name(base_image)?;
+    if base_image.starts_with(IMAGE_PREFIX)
+        || base_image.starts_with(STAGING_IMAGE_PREFIX)
+        || is_linux_base(base_image)
+    {
+        bail!("{base_image} is not a Helios base image");
+    }
+
+    if base_image == HELIOS_BASE {
+        return Ok(());
+    }
+    let image = Dataset::new(format!("{dataset}/img/{base_image}"))?;
+    let snap = image.snapshot("base");
+    if !snap.exists() {
+        bail!(
+            "base image {base_image} is not registered ({} not found); \
+             falcon can only download {HELIOS_BASE}",
+            snap.as_str()
+        );
+    }
+    if get_property(&image, crate::topo::PROP_BASE_IMAGE)?.is_none() {
+        bail!(
+            "{base_image} has no {} property; build base images with \
+             `voxel image create-base`",
+            crate::topo::PROP_BASE_IMAGE
+        );
+    }
+    Ok(())
+}
+
+fn get_property(ds: &Dataset, key: &str) -> Result<Option<String>> {
+    let out = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", key, ds.as_str()])
+        .output()
+        .with_context(|| format!("run zfs get {key} {}", ds.as_str()))?;
+    if !out.status.success() {
+        bail!(
+            "zfs get {key} {} failed: {}",
+            ds.as_str(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((value != "-" && !value.is_empty()).then_some(value))
 }
 
 /// An empty staging dir. Root-owned leftovers from a pfexec run would fail
@@ -459,7 +608,8 @@ pub(crate) fn stage_builder_net(
                 .with_context(|| format!("write {path}"))?;
         }
         _ => {
-            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, "")
+                .with_context(|| format!("clear {path}"))?;
         }
     }
     Ok(())
@@ -659,7 +809,7 @@ pub(crate) fn hyperstop(dir: &Utf8Path, name: &str) {
 
 /// Capture the builder's disk as a registered falcon base image: a full send
 /// into a staging dataset, renamed over the target only after it succeeds.
-fn capture(dataset: &str, image_name: &str) -> Result<()> {
+fn capture(dataset: &str, image_name: &str, base_image: &str) -> Result<()> {
     let node = Dataset::new(format!("{dataset}/topo/{DEPLOY}/{NODE}"))?;
     let zvol = format!("/dev/zvol/rdsk/{}", node.as_str());
     if !Utf8Path::new(&zvol).exists() {
@@ -667,7 +817,9 @@ fn capture(dataset: &str, image_name: &str) -> Result<()> {
     }
     let image = Dataset::new(format!("{dataset}/img/{image_name}"))?;
     // Not `voxel-`-prefixed, so `image ls` never offers a half-streamed image.
-    let staging = Dataset::new(format!("{dataset}/img/incoming-{image_name}"))?;
+    let staging = Dataset::new(format!(
+        "{dataset}/img/{STAGING_IMAGE_PREFIX}{image_name}"
+    ))?;
     let replacing = zfs::exists(&image);
 
     if replacing {
@@ -681,6 +833,7 @@ fn capture(dataset: &str, image_name: &str) -> Result<()> {
     eprintln!("[voxel] building temp image {}", staging.as_str());
     zfs::snapshot(&node, "base")?;
     zfs::send_recv(&node.snapshot("base"), &staging)?;
+    zfs::set(&staging, &[(crate::topo::PROP_BASE_IMAGE, base_image)])?;
 
     if replacing {
         eprintln!("[voxel] build complete, overwriting image {image_name}");

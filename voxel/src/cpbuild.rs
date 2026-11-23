@@ -17,15 +17,14 @@
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use std::process::Command;
+use voxel_config::CP_IMAGE_PREFIX;
 
 use crate::imagebuild::{
-    BakeOpts, SLED_INIT, bake, build_root, builder_network, fresh_cargo_bay,
-    stage_agent,
+    BakeOpts, SLED_INIT, bake, build_root, builder_network, check_base_image,
+    fresh_cargo_bay, stage_agent,
 };
 use crate::zfs;
 
-/// sidecar-lite pinned rev. TODO repin to main once zl/multicast merges.
-const SIDECAR_LITE_REV: &str = "6f3311e8acd7e7e95c167aab61188355a93afe72";
 const SIDECAR_URL: &str = "https://buildomat.eng.oxide.computer/public/file/oxidecomputer/sidecar-lite/release";
 
 /// Build flags matching the validated recipe for building omicron on Helios.
@@ -47,6 +46,7 @@ pub(crate) struct CpBuild<'a> {
     /// Gimlet SP count baked into the build-time smf configs.
     pub num_gimlets: usize,
     pub dataset: &'a str,
+    pub base_image: &'a str,
     pub external: Option<&'a voxel_config::External>,
     pub propolis_binary: Option<&'a str>,
 }
@@ -58,15 +58,18 @@ pub(crate) const PINNED_OMICRON_REV: &str =
 
 /// `voxel image create`: resolve the omicron source and the image name, then
 /// build. With `--src` the checkout is built as-is and `commit` is the label.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     commit: Option<&str>,
     src: Option<&Utf8Path>,
     from_tuf: Option<&Utf8Path>,
     sled_agent: Option<&Utf8Path>,
+    base_image: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
     propolis_binary: Option<&str>,
 ) -> Result<()> {
+    check_base_image(dataset, base_image)?;
     if let Some(repo) = from_tuf {
         if src.is_some() {
             bail!("--from-tuf and --src are mutually exclusive");
@@ -101,6 +104,7 @@ pub(crate) async fn create(
             &full_sha,
             sled_agent,
             num_gimlets,
+            base_image,
             dataset,
             external,
             propolis_binary,
@@ -161,6 +165,7 @@ pub(crate) async fn create(
         commit: if as_is { None } else { Some(&label) },
         num_gimlets,
         dataset,
+        base_image,
         external,
         propolis_binary,
     })
@@ -169,13 +174,12 @@ pub(crate) async fn create(
 
 pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
     if std::env::consts::OS != "solaris" && !cfg!(target_os = "illumos") {
-        // Belt and braces: the omicron build and falcon are Helios-only.
         eprintln!("[voxel] warning: control-plane builds are Helios-only");
     }
     let root = build_root()?;
     let cargo_bay = fresh_cargo_bay("vbuild")?;
     let src = &b.omicron_src;
-    let image_name = format!("voxel-cp-{}", b.label);
+    let image_name = format!("{CP_IMAGE_PREFIX}{}", b.label);
 
     // --- 1. clone + checkout --------------------------------------------------
     if b.as_is {
@@ -298,6 +302,7 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         checkout: src,
         stamp: &stamp,
         propolis_binary: b.propolis_binary,
+        base_image: b.base_image,
     })
     .await
 }
@@ -400,6 +405,9 @@ pub(crate) struct CpBake<'a> {
     pub checkout: &'a Utf8Path,
     pub stamp: &'a CpStamp,
     pub propolis_binary: Option<&'a str>,
+    /// Image the bake VM boots: [`HELIOS_BASE`](crate::imagebuild::HELIOS_BASE)
+    /// or a `create-base` image.
+    pub base_image: &'a str,
 }
 
 pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
@@ -423,7 +431,7 @@ pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
 
     let network = builder_network(b.external)?;
     bake(BakeOpts {
-        base_image: crate::imagebuild::HELIOS_BASE,
+        base_image: b.base_image,
         role: "cp",
         cargo_bay: b.cargo_bay,
         image_name: b.image_name,
@@ -464,8 +472,10 @@ pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
 /// Fetch sidecar-lite's scadm + libsidecar_lite.so via a rev-keyed cache and
 /// stage them for the image. Only the host reaches buildomat.
 fn fetch_sidecar(build_root: &Utf8Path, dest: &Utf8Path) -> Result<()> {
-    let rev = std::env::var("SIDECAR_LITE_REV")
-        .unwrap_or_else(|_| SIDECAR_LITE_REV.to_string());
+    let rev = match std::env::var("SIDECAR_LITE_REV") {
+        Ok(rev) => rev,
+        Err(_) => crate::pins::pin_rev("sidecar-lite")?,
+    };
     let cache = build_root.join(format!(".sidecar-lite/{rev}"));
     std::fs::create_dir_all(&cache)
         .with_context(|| format!("mkdir {cache}"))?;
@@ -492,11 +502,13 @@ fn fetch_sidecar(build_root: &Utf8Path, dest: &Utf8Path) -> Result<()> {
 
 /// `--from-tuf`: build the image from the repo's own artifacts with no
 /// omicron compile. See the module doc for the sourcing.
+#[allow(clippy::too_many_arguments)]
 async fn create_cp_tuf(
     t: crate::tufrepo::TufRepoSource,
     full_sha: &str,
     sled_agent: Option<&Utf8Path>,
     num_gimlets: usize,
+    base_image: &str,
     dataset: &str,
     external: Option<&voxel_config::External>,
     propolis_binary: Option<&str>,
@@ -505,7 +517,7 @@ async fn create_cp_tuf(
     let cargo_bay = fresh_cargo_bay("vbuild")?;
     std::fs::create_dir_all(&cargo_bay)
         .with_context(|| format!("mkdir {cargo_bay}"))?;
-    let image_name = format!("voxel-cp-{}-tuf", t.commit);
+    let image_name = format!("{CP_IMAGE_PREFIX}{}-tuf", t.commit);
 
     // --- 1. zones + measurement corpus, byte exact from the repo -------------
     let zones = t.extract_zones_into(&cargo_bay.join("zones"))?;
@@ -612,7 +624,7 @@ async fn create_cp_tuf(
     // --- 6. bake ---------------------------------------------------------------
     let network = builder_network(external)?;
     bake(BakeOpts {
-        base_image: crate::imagebuild::HELIOS_BASE,
+        base_image,
         role: "cp",
         cargo_bay: &cargo_bay,
         image_name: &image_name,

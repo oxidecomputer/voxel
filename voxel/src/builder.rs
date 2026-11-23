@@ -40,7 +40,7 @@ use voxel_config::VoxelConfig;
 const NODE: &str = "builder";
 /// No `voxel-` prefix. `image ls` lists only `voxel-` images and must not
 /// offer a builder's live disk.
-const DISK_PREFIX: &str = "builder-";
+pub(crate) const DISK_PREFIX: &str = "builder-";
 /// The builders' host directory under the anchored workdir, beside the
 /// rack's `.falcon`. Each builder has `<DIR>/<key>`.
 const DIR: &str = "builder";
@@ -380,7 +380,7 @@ impl Builder {
         }
         let ip = match network.static_address.as_deref() {
             Some(cidr) => cidr.split('/').next().unwrap_or(cidr).to_string(),
-            None => net::node_external_ip(&d, n, false).await?,
+            None => net::node_external_ip(&d, n, false, None).await?,
         };
         let record = exec(&d, n, &format!("cat {GUEST_RECORD}"))
             .await
@@ -709,6 +709,7 @@ impl Builder {
             checkout: &stub,
             stamp: &stamp,
             propolis_binary: self.cfg.falcon.propolis_binary.as_deref(),
+            base_image: imagebuild::HELIOS_BASE,
         })
         .await?;
         let mut state = self.read_state();
