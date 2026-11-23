@@ -21,11 +21,14 @@
 //!
 //! `build` compiles and packages omicron over ssh, pulls the packaged tree
 //! into the image-build cargo-bay and bakes a `voxel-cp` image through the
-//! same tail as the host path. Host-side state lives under `<workdir>/builder`:
-//! the falcon dir, the cargo-bay staged for the guest, and `state.toml`, a
+//! same tail as the host path. It also builds the commit's own commtest and
+//! pulls it to `commtest/`, for `heading` and `voxel commtest --builder`.
+//! Host-side state lives under `<workdir>/builder`: the falcon dir, the
+//! cargo-bay staged for the guest, and `state.toml`, a
 //! cache of what the guest last reported. `status` reads it while the builder
 //! is down.
 
+use crate::commtest;
 use crate::cpbuild::{self, CpBake, CpStamp};
 use crate::imagebuild::{self, SLED_INIT, builder_network, stage_agent};
 use crate::net;
@@ -162,6 +165,12 @@ impl Builder {
 
     fn falcon_dir(&self) -> Utf8PathBuf {
         self.dir.join(".falcon")
+    }
+
+    /// The commtest this builder compiled for its checkout: `commtest` and
+    /// the `commtest.rs` it came from (which says whether it has multicast).
+    pub(crate) fn commtest_dir(&self) -> Utf8PathBuf {
+        self.dir.join("commtest")
     }
 
     fn cargo_bay(&self) -> Utf8PathBuf {
@@ -694,6 +703,9 @@ impl Builder {
         let stage = cargo_bay.join("omicron");
         eprintln!("[voxel] pulling the packaged tree -> {stage}");
         pull(&ip, cpbuild::STAGE_PATHS, &stage, &[])?;
+        // While the caches are warm, so heading can run this commit's own
+        // commtest (multicast included) on a host without a toolchain.
+        self.pull_commtest(&ip)?;
         if halt {
             self.down(false, false).await?;
         }
@@ -719,6 +731,33 @@ impl Builder {
     }
 
     /// Snapshot the builder disk, live or kept.
+    /// `voxel builder commtest`: build this commit's commtest in a running
+    /// builder and pull it to the host.
+    pub(crate) fn commtest(&self) -> Result<()> {
+        let ip = self.require_up()?;
+        self.pull_commtest(&ip)
+    }
+
+    fn pull_commtest(&self, ip: &str) -> Result<()> {
+        let dir = self.commtest_dir();
+        // Never leave a binary from an earlier checkout behind.
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("remove {dir}"))?;
+        }
+        let src = commtest::COMMTEST_SRC;
+        if net::ssh_capture(ip, &format!("test -f {GUEST_SRC}/{src}")).is_none()
+        {
+            eprintln!("[voxel] this omicron has no {src}; skipping commtest");
+            return Ok(());
+        }
+        eprintln!("[voxel] building commtest in the builder");
+        net::ssh_run(ip, &commtest_script())?;
+        pull(ip, &["target/release/commtest", src], &dir, &[])?;
+        eprintln!("[voxel] commtest -> {dir}");
+        Ok(())
+    }
+
     pub(crate) async fn snap(&self, label: &str) -> Result<()> {
         let (ds, up) = match self.state()? {
             State::Absent => bail!("no builder disk to snapshot"),
@@ -797,6 +836,18 @@ fn build_script() -> String {
          cargo build --release -p omicron-package -p xtask -p xtask-downloader\n\
          ./target/release/omicron-package -t default target create -p a4x2\n\
          ./target/release/omicron-package package\n",
+        cpbuild::OMICRON_RUSTFLAGS
+    )
+}
+
+/// Release, with the omicron build's flags: it shares that build's deps.
+fn commtest_script() -> String {
+    format!(
+        "set -e\n\
+         . /work/env.sh\n\
+         cd {GUEST_SRC}\n\
+         export RUSTFLAGS='{}'\n\
+         cargo build --release -p end-to-end-tests --bin commtest\n",
         cpbuild::OMICRON_RUSTFLAGS
     )
 }

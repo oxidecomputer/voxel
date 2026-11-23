@@ -445,30 +445,34 @@ fn persist_dohwcksum(dry_run: bool) -> anyhow::Result<()> {
     let staged = PathBuf::from(DOHWCKSUM_SYSTEM_DIR)
         .join(format!(".voxel.{}", std::process::id()));
 
+    // Base illumos tools only: `install` differs between SysV (/usr/sbin,
+    // first in root's PATH) and GNU, and a stock host has no GNU coreutils.
+    let src = source.path().display().to_string();
+    let dst = staged.display().to_string();
+    let stage: [&[&str]; 4] = [
+        &["/usr/bin/mkdir", "-p", DOHWCKSUM_SYSTEM_DIR],
+        &["/usr/bin/cp", &src, &dst],
+        &["/usr/bin/chmod", "0644", &dst],
+        &["/usr/bin/chown", "root:bin", &dst],
+    ];
+
     if dry_run {
-        eprintln!(
-            "+ pfexec install -D -m 0644 -o root -g bin {} {}",
-            source.path().display(),
-            staged.display()
-        );
-        eprintln!(
-            "+ pfexec mv -f {} {}",
-            staged.display(),
-            DOHWCKSUM_SYSTEM_FILE
-        );
+        for argv in stage {
+            eprintln!("+ pfexec {}", argv.join(" "));
+        }
+        eprintln!("+ pfexec mv -f {dst} {DOHWCKSUM_SYSTEM_FILE}");
         return Ok(());
     }
 
-    let status = Command::new("pfexec")
-        .args(["install", "-D", "-m", "0644", "-o", "root", "-g", "bin"])
-        .arg(source.path())
-        .arg(&staged)
-        .status()
-        .context("stage /etc/system.d/voxel")?;
-
-    if !status.success() {
-        remove_staged_system_file(&staged);
-        bail!("could not stage /etc/system.d/voxel");
+    for argv in stage {
+        let status = Command::new("pfexec")
+            .args(argv)
+            .status()
+            .context("stage /etc/system.d/voxel")?;
+        if !status.success() {
+            remove_staged_system_file(&staged);
+            bail!("could not stage /etc/system.d/voxel ({})", argv[0]);
+        }
     }
 
     let status = Command::new("pfexec")

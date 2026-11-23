@@ -198,6 +198,11 @@ enum Cmd {
         #[arg(long, value_name = "PATH", value_parser = abs_path)]
         source: Option<Utf8PathBuf>,
 
+        /// Run the commtest a builder compiled for its omicron commit (see
+        /// `voxel builder commtest`), for hosts without a toolchain.
+        #[arg(long, value_name = "REV", conflicts_with_all = ["source", "no_build"])]
+        builder: Option<String>,
+
         /// Rack to target (1-based).
         #[arg(long, default_value_t = 1, value_parser = rack_number)]
         rack: usize,
@@ -317,6 +322,12 @@ enum BuilderCmd {
         /// the builder's sha. (Not `--name`: that is the global rack name.)
         #[arg(long)]
         label: Option<String>,
+    },
+    /// Build omicron's commtest in a running builder and copy it to the
+    /// host, for `voxel commtest --builder` (`build` does this too).
+    Commtest {
+        /// The builder's omicron sha; optional if only one is up.
+        rev: Option<String>,
     },
     /// Snapshot a builder disk.
     Snap {
@@ -990,18 +1001,36 @@ async fn main() -> Result<(), Error> {
         Cmd::Status => {
             rack::cmd_status(&load_config(&config_path)?, &cli.name).await
         }
-        Cmd::Commtest { source, rack, api, traffic, no_build, args } => {
+        Cmd::Commtest {
+            source,
+            builder,
+            rack,
+            api,
+            traffic,
+            no_build,
+            args,
+        } => {
+            let cfg = load_config(&config_path)?;
+            let prebuilt = builder
+                .as_deref()
+                .map(|rev| {
+                    builder::Builder::new(cfg.clone(), rev)
+                        .map(|b| b.commtest_dir())
+                })
+                .transpose()?;
             commtest::run(
-                &load_config(&config_path)?,
+                &cfg,
                 &cli.name,
                 commtest::Options {
                     config_path: &config_path,
                     source: source.as_deref(),
+                    prebuilt: prebuilt.as_deref(),
                     rack: *rack,
                     api_override: api.as_deref(),
                     traffic: *traffic,
                     no_build: *no_build,
                     passthrough: args,
+                    hosts_entry: false,
                 },
             )
             .await
@@ -1103,6 +1132,7 @@ async fn main() -> Result<(), Error> {
                         label.clone().unwrap_or_else(|| b.key().to_string());
                     b.build(&label, false).await
                 }
+                BuilderCmd::Commtest { rev } => pick(rev)?.commtest(),
                 BuilderCmd::Snap { label, rev } => pick(rev)?.snap(label).await,
                 BuilderCmd::Restore { label, rev } => pick(rev)?.restore(label),
             }

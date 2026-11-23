@@ -11,7 +11,9 @@
 //! entry and no toolchain.
 //!
 //! `--source` instead builds and runs a local Omicron checkout's commtest, for
-//! versions the port does not have yet (the multicast phases).
+//! versions the port does not have yet (the multicast phases). `--builder`
+//! runs the commtest a builder compiled for its commit (`builder::COMMTEST`),
+//! for hosts without a toolchain.
 
 use anyhow::{Context, bail, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -22,6 +24,8 @@ use voxel_config::{Network, VoxelConfig};
 use crate::multicast;
 
 const DEFAULT_POOL_SIZE: u32 = 16;
+/// commtest's source in an omicron checkout.
+pub(crate) const COMMTEST_SRC: &str = "end-to-end-tests/src/bin/commtest.rs";
 /// Commtest's connectivity subcommand. Voxel only derives arguments and demands
 /// privileges for this one, so passthrough naming another subcommand is
 /// forwarded untouched.
@@ -72,11 +76,18 @@ pub(crate) struct Options<'a> {
     /// A local Omicron checkout whose commtest to build and run instead of
     /// the built-in one.
     pub source: Option<&'a Utf8Path>,
+    /// A builder's commtest dir (`commtest` and its `commtest.rs`), run
+    /// as-is instead of the built-in one.
+    pub prebuilt: Option<&'a Utf8Path>,
     pub rack: usize,
     pub api_override: Option<&'a str>,
     pub traffic: Traffic,
     pub no_build: bool,
     pub passthrough: &'a [String],
+    /// Add (or refresh) a marked `/etc/hosts` line for the API name when it
+    /// does not resolve, rather than failing. Upstream commtest only uses the
+    /// system resolver.
+    pub hosts_entry: bool,
 }
 
 /// Where and how to reach the rack's API.
@@ -97,11 +108,13 @@ pub(crate) async fn run(
     let Options {
         config_path,
         source,
+        prebuilt,
         rack,
         api_override,
         traffic,
         no_build,
         passthrough,
+        hosts_entry,
     } = options;
     if passthrough.is_empty()
         || passthrough.iter().any(|arg| arg == RUN_SUBCOMMAND)
@@ -119,6 +132,10 @@ pub(crate) async fn run(
             "--no-build applies to --source; the built-in commtest needs no build"
         );
     }
+    ensure!(
+        source.is_none() || prebuilt.is_none(),
+        "--source and --builder both name a commtest; pick one"
+    );
     ensure_default_recovery_silo(cfg)?;
     let rack_net = cfg.network.for_rack(rack - 1);
     let mut api = match api_override {
@@ -127,7 +144,7 @@ pub(crate) async fn run(
     };
     api.url.truncate(api.url.trim_end_matches('/').len());
 
-    let Some(source) = source else {
+    if source.is_none() && prebuilt.is_none() {
         let args = commtest_args_for(
             BUILTIN,
             &rack_net,
@@ -174,8 +191,69 @@ pub(crate) async fn run(
             bail!("commtest failed ({status})");
         }
         return Ok(());
-    };
+    }
 
+    let (bin, label, multicast) = match (source, prebuilt) {
+        (Some(source), _) => {
+            let (bin, multicast) = build_source(source, no_build)?;
+            (bin, source.to_string(), multicast)
+        }
+        (None, Some(dir)) => {
+            let bin = dir.join("commtest");
+            ensure!(
+                bin.is_file(),
+                "{bin} does not exist; build it with `voxel builder commtest`"
+            );
+            let multicast = prebuilt_has_multicast(dir)?;
+            (bin, format!("the commtest in {dir}"), multicast)
+        }
+        (None, None) => unreachable!("the built-in commtest returned above"),
+    };
+    // Upstream commtest has no resolver override: the name must resolve here.
+    if let Some((host, ip)) = &api.resolve {
+        use std::net::ToSocketAddrs;
+        if (host.as_str(), 443).to_socket_addrs().is_err() {
+            if hosts_entry {
+                set_hosts_entry(host, ip)?;
+            } else {
+                bail!(
+                    "{host} does not resolve on this host. Omicron's commtest \
+                     (from --source or --builder) uses the system resolver, and \
+                     the rack serves its API over TLS by name only. Add it to \
+                     /etc/hosts:\n\n  {ip} {host}\n\nor run without them \
+                     (the built-in commtest resolves it itself)"
+                );
+            }
+        }
+    }
+    let args = commtest_args_for(
+        &label,
+        &rack_net,
+        cfg.topology.sleds,
+        traffic,
+        passthrough,
+        multicast,
+    )?;
+    ensure_mcast_plumbing(cfg, name, &preflight_groups(traffic, &args), rack)
+        .await?;
+    let mut argv = vec![api.url.clone()];
+    argv.extend(args);
+    eprintln!("[voxel] running {} {}", bin, argv.join(" "));
+    publish_mode(traffic);
+    // Upstream commtest's rustls client takes extra roots from SSL_CERT_FILE.
+    let status = run_streamed(&bin, &argv, api.ca.as_deref())?;
+    if !status.success() {
+        bail!("commtest failed ({status})");
+    }
+    Ok(())
+}
+
+/// Build (unless `no_build`) a checkout's commtest: its binary and whether it
+/// has the multicast phases.
+fn build_source(
+    source: &Utf8Path,
+    no_build: bool,
+) -> anyhow::Result<(Utf8PathBuf, bool)> {
     let source = validate_source(source)?;
     let bin = target_dir(&source).join("debug/commtest");
     if !no_build {
@@ -198,39 +276,36 @@ pub(crate) async fn run(
             bin
         );
     }
-    // Upstream commtest has no resolver override: the name must resolve here.
-    if let Some((host, ip)) = &api.resolve {
-        use std::net::ToSocketAddrs;
-        if (host.as_str(), 443).to_socket_addrs().is_err() {
-            bail!(
-                "{host} does not resolve on this host. Omicron's commtest (from \
-                 --source) uses the system resolver, and the rack serves its \
-                 API over TLS by name only. Add it to /etc/hosts:\n\n  \
-                 {ip} {host}\n\nor run without --source (the built-in \
-                 commtest resolves it itself)"
-            );
-        }
-    }
-    let args = commtest_args_for(
-        source.as_str(),
-        &rack_net,
-        cfg.topology.sleds,
-        traffic,
-        passthrough,
-        supports_multicast(&source)?,
-    )?;
-    ensure_mcast_plumbing(cfg, name, &preflight_groups(traffic, &args), rack)
-        .await?;
-    let mut argv = vec![api.url.clone()];
-    argv.extend(args);
-    eprintln!("[voxel] running {} {}", bin, argv.join(" "));
-    publish_mode(traffic);
-    // Upstream commtest's rustls client takes extra roots from SSL_CERT_FILE.
-    let status = run_streamed(&bin, &argv, api.ca.as_deref())?;
-    if !status.success() {
-        bail!("commtest failed ({status})");
-    }
+    let multicast = source_has_multicast(&source.join(COMMTEST_SRC))?;
+    Ok((bin, multicast))
+}
+
+/// Upsert `/etc/hosts`'s voxel-marked line for `host`, so upstream commtest
+/// can reach a TLS rack by name. A relaunch moves the address; the old line
+/// is replaced, never duplicated.
+fn set_hosts_entry(host: &str, ip: &str) -> anyhow::Result<()> {
+    const HOSTS: &str = "/etc/hosts";
+    let text = std::fs::read_to_string(HOSTS)
+        .with_context(|| format!("read {HOSTS}"))?;
+    let updated = hosts_with_entry(&text, host, ip);
+    std::fs::write(HOSTS, updated).with_context(|| format!("write {HOSTS}"))?;
+    eprintln!("[voxel] added `{ip} {host}` to {HOSTS} for upstream commtest");
     Ok(())
+}
+
+const HOSTS_MARK: &str = "# voxel commtest";
+
+fn hosts_with_entry(text: &str, host: &str, ip: &str) -> String {
+    let mut out: String = text
+        .lines()
+        .filter(|l| {
+            !(l.ends_with(HOSTS_MARK)
+                && l.split_whitespace().nth(1) == Some(host))
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    out.push_str(&format!("{ip}\t{host}\t{HOSTS_MARK}\n"));
+    out
 }
 
 /// `voxel commtest-exec`: run omicron's commtest library with `args` (its own
@@ -360,7 +435,7 @@ fn validate_source(path: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
     let path = path
         .canonicalize_utf8()
         .with_context(|| format!("resolve Omicron source {}", path))?;
-    let commtest = path.join("end-to-end-tests/src/bin/commtest.rs");
+    let commtest = path.join(COMMTEST_SRC);
     if !path.join("Cargo.toml").is_file() || !commtest.is_file() {
         bail!("{} is not an Omicron checkout with {}", path, commtest);
     }
@@ -542,11 +617,15 @@ fn derive_api(
     })
 }
 
+/// Whether a builder's commtest (`--builder`) has the multicast phases.
+pub(crate) fn prebuilt_has_multicast(dir: &Utf8Path) -> anyhow::Result<bool> {
+    source_has_multicast(&dir.join("commtest.rs"))
+}
+
 /// Whether the checkout's commtest has the multicast phases, detected from its
 /// source so older unicast-only eras keep working without a probe run.
-fn supports_multicast(source: &Utf8Path) -> anyhow::Result<bool> {
-    let source_file = source.join("end-to-end-tests/src/bin/commtest.rs");
-    let text = std::fs::read_to_string(&source_file)
+fn source_has_multicast(source_file: &Utf8Path) -> anyhow::Result<bool> {
+    let text = std::fs::read_to_string(source_file)
         .with_context(|| format!("read {}", source_file))?;
     Ok(text.contains("skip_unicast") && text.contains("mcast_group"))
 }
@@ -882,6 +961,22 @@ fn derive_pool(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hosts_entry_replaces_its_own_line_only() {
+        let hosts = "127.0.0.1\tlocalhost\n\
+                     10.0.0.9\trecovery.sys.oxide.test\t# voxel commtest\n\
+                     10.0.0.7\trecovery.sys.oxide.test\n";
+        let out =
+            hosts_with_entry(hosts, "recovery.sys.oxide.test", "10.0.0.5");
+        assert_eq!(
+            out,
+            "127.0.0.1\tlocalhost\n\
+             10.0.0.7\trecovery.sys.oxide.test\n\
+             10.0.0.5\trecovery.sys.oxide.test\t# voxel commtest\n"
+        );
+    }
+
     use super::*;
 
     #[test]

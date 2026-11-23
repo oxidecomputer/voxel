@@ -198,6 +198,10 @@ voxel network multicast up
 # Run both phases from a local multicast-capable checkout, unmodified.
 voxel commtest --source /oxide/workspace/omicron --traffic both
 
+# Or, with no toolchain on the host, the commtest a builder compiled for
+# its commit (`voxel builder build` makes it; `voxel builder commtest` too).
+voxel commtest --builder <sha> --traffic both
+
 # Pass commtest arguments after `--` (the default multicast group is
 # 239.1.1.1 when no --mcast-group is supplied).
 voxel network multicast up --group 239.10.0.1
@@ -214,6 +218,13 @@ and because upstream commtest uses the system resolver, the silo name must
 resolve on the host (voxel prints the `/etc/hosts` line when it does not).
 `--no-build` reuses `<omicron>/target/debug/commtest`. The checkout is built in
 place, without fetching or changing its Git state.
+
+`--builder <sha>` runs the commtest that sha's builder compiled and copied to
+`<workdir>/builder/<sha>/commtest/`; it has the same resolver requirement.
+`voxel heading` uses it when present: if it has the multicast phases, heading
+runs `voxel network multicast up`, adds a `# voxel commtest`-marked
+`/etc/hosts` line for the silo name if needed, and runs `--traffic both`.
+Otherwise heading runs the built-in commtest, unicast only.
 
 `--traffic` accepts `unicast`/`uni`, `multicast`/`multi`, or `both`. The
 multicast modes need `--source` with a checkout that supports them; voxel

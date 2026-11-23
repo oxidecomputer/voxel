@@ -141,6 +141,28 @@ voxel_up() {
 	# falcon state, image builds and the omicron build root all stay under
 	# .voxel; images go in the pool's shared falcon dataset.
 	config="$root/voxel.toml"
+
+	# A config from another voxel version may no longer load (a field
+	# renamed or dropped). Offer to set it aside rather than fail below.
+	if [ -f "$config" ] &&
+		! err="$(VOXEL_CONFIG="$config" "$bin/voxel" config show 2>&1 >/dev/null)"; then
+		say "existing $config does not load with this voxel:"
+		printf '%s\n' "$err" | sed 's/^/    /' >&2
+		# stdin is the script itself under `curl | sh`; ask the terminal.
+		ans=
+		if { : </dev/tty; } 2>/dev/null; then
+			printf 'voxel-up: move it aside and write a fresh one? [y/N] ' >/dev/tty
+			read -r ans </dev/tty || ans=
+		fi
+		case "$ans" in
+		y | Y | yes | YES) ;;
+		*) die "fix or remove $config and rerun" ;;
+		esac
+		bak="$config.bak.$(date +%Y%m%d%H%M%S)"
+		mv "$config" "$bak"
+		say "moved the old config to $bak"
+	fi
+
 	set_cfg() { VOXEL_CONFIG="$config" "$bin/voxel" config set "$1" "$2" >/dev/null; }
 	set_cfg falcon.dataset "$pool/falcon"
 	set_cfg falcon.workdir "$root"

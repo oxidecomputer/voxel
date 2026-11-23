@@ -7,7 +7,10 @@
 //!
 //! The steps are the ones an operator would otherwise run by hand: the frr
 //! and builder images, a `voxel-cp-<rev>` image built in the builder,
-//! `image.cp` pointed at it, `launch --emu`, `status` and `commtest`. A step
+//! `image.cp` pointed at it, `launch --emu`, `status` and `commtest`. The
+//! builder also compiles the commit's own commtest; when that has the
+//! multicast phases, heading plumbs host multicast and runs unicast and
+//! multicast both, else it falls back to the built-in (unicast) one. A step
 //! whose result already exists is skipped, so `engage` resumes after a
 //! failure and a second heading reuses the frr and builder images. Each rev
 //! gets its own builder (see `builder`), copied from the most recently used
@@ -18,6 +21,7 @@
 use crate::builder::Builder;
 use crate::commtest;
 use crate::imagebuild;
+use crate::multicast;
 use crate::rack::{self, LaunchOpts};
 use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -199,18 +203,42 @@ pub(crate) async fn run(o: Opts<'_>) -> Result<()> {
     step("status");
     rack::cmd_status(&cfg, o.name).await?;
 
-    step("commtest");
+    // The commit's own commtest, when the builder made one: it matches the
+    // rack's API and may have the multicast phases the built-in one lacks.
+    let dir = Builder::new(cfg.clone(), rev)?.commtest_dir();
+    let prebuilt = dir.join("commtest").is_file().then_some(dir.as_path());
+    let traffic = match prebuilt {
+        Some(dir) if commtest::prebuilt_has_multicast(dir)? => {
+            step("multicast up");
+            let group = commtest::DEFAULT_MCAST_GROUP
+                .parse()
+                .map_err(|e| anyhow!("{e}"))?;
+            multicast::up(&cfg, o.name, &[group], &[], false).await?;
+            commtest::Traffic::Both
+        }
+        _ => commtest::Traffic::Unicast,
+    };
+    match prebuilt {
+        Some(dir) => step(&format!("commtest ({traffic}, from {dir})")),
+        None => step(&format!(
+            "commtest (unicast, built-in: no commtest in {dir}; \
+             `voxel builder commtest {}` makes one)",
+            &rev[..7]
+        )),
+    }
     commtest::run(
         &cfg,
         o.name,
         commtest::Options {
             config_path: o.config_path,
             source: None,
+            prebuilt,
             rack: 1,
             api_override: None,
-            traffic: commtest::Traffic::Unicast,
+            traffic,
             no_build: false,
             passthrough: &[],
+            hosts_entry: true,
         },
     )
     .await?;
