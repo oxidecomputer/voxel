@@ -48,6 +48,7 @@ pub(crate) struct CpBuild<'a> {
     pub num_gimlets: usize,
     pub dataset: &'a str,
     pub external: Option<&'a voxel_config::External>,
+    pub propolis_binary: Option<&'a str>,
 }
 
 /// The omicron sha voxel's own rack-init-config dependency is pinned to. Empty while
@@ -64,6 +65,7 @@ pub(crate) async fn create(
     sled_agent: Option<&Utf8Path>,
     dataset: &str,
     external: Option<&voxel_config::External>,
+    propolis_binary: Option<&str>,
 ) -> Result<()> {
     if let Some(repo) = from_tuf {
         if src.is_some() {
@@ -101,6 +103,7 @@ pub(crate) async fn create(
             num_gimlets,
             dataset,
             external,
+            propolis_binary,
         )
         .await;
     }
@@ -159,6 +162,7 @@ pub(crate) async fn create(
         num_gimlets,
         dataset,
         external,
+        propolis_binary,
     })
     .await
 }
@@ -291,8 +295,9 @@ pub(crate) async fn create_cp(b: CpBuild<'_>) -> Result<()> {
         image_name: &image_name,
         dataset: b.dataset,
         external: b.external,
-        schema_root: src,
+        checkout: src,
         stamp: &stamp,
+        propolis_binary: b.propolis_binary,
     })
     .await
 }
@@ -390,15 +395,31 @@ pub(crate) struct CpBake<'a> {
     pub image_name: &'a str,
     pub dataset: &'a str,
     pub external: Option<&'a voxel_config::External>,
-    /// A checkout, or a stub holding sled-agent/src/config.rs and
-    /// sled-hardware/src/lib.rs, for the sled schema stamp.
-    pub schema_root: &'a Utf8Path,
+    /// A checkout, or a stub shaped like one: the sled schema sources and
+    /// tools/permslip_staging.
+    pub checkout: &'a Utf8Path,
     pub stamp: &'a CpStamp,
+    pub propolis_binary: Option<&'a str>,
 }
 
 pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
     fetch_sidecar(b.root, &b.cargo_bay.join("sidecar"))?;
     stage_agent(&SLED_INIT, b.cargo_bay)?;
+    // The firmware omicron pins, for `launch --emu`. Without it the image
+    // still launches; an emulated fleet then needs --sp-firmware.
+    let firmware = match crate::permslip::fetch_firmware(
+        b.checkout,
+        &b.root.join(".permslip-fw"),
+    ) {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            eprintln!(
+                "[voxel] WARN: no emulated-fleet firmware for this image \
+                     ({e:#}); `launch --emu` will need --sp-firmware"
+            );
+            None
+        }
+    };
 
     let network = builder_network(b.external)?;
     bake(BakeOpts {
@@ -411,24 +432,29 @@ pub(crate) async fn bake_cp(b: CpBake<'_>) -> Result<()> {
         mem_gb: 16,
         cores: 8,
         network: &network,
+        propolis_binary: b.propolis_binary,
     })
     .await?;
 
     // Launch reads the sled schema and provenance from the image itself
     // instead of re-deriving them from a checkout.
-    let (data_links, disks) = crate::topo::schema_from_checkout(b.schema_root)
+    let (data_links, disks) = crate::topo::schema_from_checkout(b.checkout)
         .with_context(|| {
-            format!("read sled-agent config schema from {}", b.schema_root)
+            format!("read sled-agent config schema from {}", b.checkout)
         })?;
     let dirty = b.stamp.dirty.to_string();
+    let mut props = vec![
+        (crate::topo::PROP_DATA_LINKS, data_links.as_str()),
+        (crate::topo::PROP_DISKS, disks.as_str()),
+        (crate::topo::PROP_OMICRON_COMMIT, b.stamp.commit.as_str()),
+        (crate::topo::PROP_OMICRON_DIRTY, dirty.as_str()),
+    ];
+    if let Some(dir) = &firmware {
+        props.push((crate::topo::PROP_TUF_FW, dir.as_str()));
+    }
     zfs::set(
         &zfs::Dataset::new(format!("{}/img/{}", b.dataset, b.image_name))?,
-        &[
-            (crate::topo::PROP_DATA_LINKS, data_links.as_str()),
-            (crate::topo::PROP_DISKS, disks.as_str()),
-            (crate::topo::PROP_OMICRON_COMMIT, &b.stamp.commit),
-            (crate::topo::PROP_OMICRON_DIRTY, &dirty),
-        ],
+        &props,
     )?;
 
     println!("built image {}", b.image_name);
@@ -473,6 +499,7 @@ async fn create_cp_tuf(
     num_gimlets: usize,
     dataset: &str,
     external: Option<&voxel_config::External>,
+    propolis_binary: Option<&str>,
 ) -> Result<()> {
     let root = build_root()?;
     let cargo_bay = fresh_cargo_bay("vbuild")?;
@@ -594,6 +621,7 @@ async fn create_cp_tuf(
         mem_gb: 16,
         cores: 8,
         network: &network,
+        propolis_binary,
     })
     .await?;
 

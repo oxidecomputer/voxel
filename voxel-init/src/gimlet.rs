@@ -10,7 +10,7 @@
 
 use crate::sys::{
     capture, note, read_external_net, replace_in_file, run, run_env, run_quiet,
-    sync_authorized_keys, warn,
+    warn,
 };
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
@@ -29,7 +29,7 @@ const PATCHED_CFG: &str = "/tmp/sled-config.toml";
 const TUF_MARKER: &str = "/opt/oxide/.voxel-tuf";
 
 pub fn bring_up() -> Result<()> {
-    setup_ssh();
+    crate::sys::setup_ssh();
     crash_dump();
     maybe_load_sidecar();
 
@@ -392,23 +392,6 @@ fn activate_native() {
     }
     run_quiet("svcadm", &["enable", "svc:/oxide/sled-agent:default"]);
     note("sled-agent activated");
-}
-
-/// SSH convenience for `voxel host login` (was the sourced `setup_ssh`
-/// function). illumos sshd defaults differ from debian's, hence the explicit
-/// config edits.
-fn setup_ssh() {
-    sync_authorized_keys(&format!("{CARGO_BAY}/root_authorized_keys"));
-    run("ssh-keygen", &["-A"]);
-    replace_in_file(
-        "/etc/ssh/sshd_config",
-        &[
-            ("#PasswordAuthentication no", "PasswordAuthentication yes"),
-            ("#PermitEmptyPasswords no", "PermitEmptyPasswords yes"),
-            ("PermitRootLogin without-password", "PermitRootLogin yes"),
-        ],
-    );
-    run("svcadm", &["restart", "svc:/network/ssh:default"]);
 }
 
 fn crash_dump() {

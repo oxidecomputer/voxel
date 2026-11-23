@@ -12,7 +12,10 @@
 //! Same source builds for both guest OSes; the role picks the implementation at
 //! runtime, matching how `gimlet` / `router` already work.
 
-use crate::sys::{capture, note, replace_in_file, run, run_quiet, warn};
+use crate::sys::{
+    bring_up_network, builder_net, capture, note, replace_in_file, run,
+    run_quiet, sleep2, wait_for_dns, warn,
+};
 use anyhow::{Result, bail};
 use camino::Utf8Path;
 use indoc::indoc;
@@ -208,23 +211,6 @@ fn install_cp_tuf() -> Result<()> {
     Ok(())
 }
 
-/// The static address staged as `builder-net` when the host built this image on
-/// an isolated external segment (no DHCP server to lease from).
-struct BuilderNet {
-    cidr: String,
-    gateway: String,
-}
-
-/// Read `<cidr> <gateway>` from the cargo-bay. `None` when the host used the
-/// default LAN path and the builder just DHCPs.
-fn builder_net() -> Option<BuilderNet> {
-    let text = fs::read_to_string(format!("{CARGO_BAY}/builder-net")).ok()?;
-    let mut parts = text.split_whitespace();
-    let cidr = parts.next()?.to_string();
-    let gateway = parts.next()?.to_string();
-    Some(BuilderNet { cidr, gateway })
-}
-
 /// Copy the staged agent onto local disk and make it executable. The cargo-bay
 /// 9p mount drops the exec bit, so this cannot be a symlink or a direct run.
 /// Fatal: an image without the agent boots into nothing at launch.
@@ -287,62 +273,6 @@ const SWITCH_ENFORCER_MANIFEST: &str = r#"<?xml version="1.0"?>
 </service_bundle>
 "#;
 
-fn sleep2() {
-    std::thread::sleep(std::time::Duration::from_secs(2));
-}
-
-/// Address the external NIC and wait for DNS. Static in isolated mode, DHCP
-/// on a LAN.
-fn bring_up_network() -> Result<()> {
-    // The builder has a single external NIC; find a vioif and address it.
-    let ext_if = std::env::var("EXT_IF")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            capture("dladm", &["show-phys", "-o", "link", "-p"]).and_then(|o| {
-                o.lines().find(|l| l.starts_with("vioif")).map(str::to_string)
-            })
-        })
-        .unwrap_or_else(|| "vioif0".into());
-    note(format!("using external interface {ext_if}"));
-    fs::write("/etc/resolv.conf", "nameserver 1.1.1.1\n")
-        .map_err(|e| anyhow::anyhow!("write /etc/resolv.conf: {e}"))?;
-
-    let addrobj = format!("{ext_if}/v4");
-    match builder_net() {
-        // Isolated mode: no DHCP server on the segment, use the staged address.
-        Some(net) => {
-            note(format!(
-                "static builder net: {} via {}",
-                net.cidr, net.gateway
-            ));
-            run(
-                "ipadm",
-                &["create-addr", "-T", "static", "-a", &net.cidr, &addrobj],
-            );
-            run("route", &["add", "default", &net.gateway]);
-        }
-        None => {
-            run("ipadm", &["create-addr", "-T", "dhcp", &addrobj]);
-            note("waiting for DHCP lease...");
-            for _ in 0..30 {
-                let leased = capture(
-                    "ipadm",
-                    &["show-addr", &addrobj, "-p", "-o", "addr"],
-                )
-                .is_some_and(|a| a.contains('/'));
-                if leased {
-                    break;
-                }
-                sleep2();
-            }
-        }
-    }
-    wait_for_dns("pkg.oxide.computer");
-
-    Ok(())
-}
-
 /// Run a command, retrying `attempts` times `delay_secs` apart. The
 /// prerequisites scripts fail transiently on the pkg lock and on fetches.
 fn run_retrying(
@@ -364,17 +294,6 @@ fn run_retrying(
         std::thread::sleep(std::time::Duration::from_secs(delay_secs));
     }
     Ok(())
-}
-
-/// Poll until `host` resolves, up to 30s. Resolution lags the lease.
-fn wait_for_dns(host: &str) {
-    note("waiting for DNS...");
-    for _ in 0..15 {
-        if run_quiet("getent", &["hosts", host]) {
-            return;
-        }
-        sleep2();
-    }
 }
 
 /// pkg install, retried past the lock pkg holds after boot. Exit 4 means the
@@ -505,7 +424,7 @@ pub fn build_builder_image() -> Result<()> {
     }
 
     bring_up_network()?;
-    pkg_install(&["git"])?;
+    pkg_install(&["git", "rsync"])?;
 
     fs::create_dir_all(WORK)
         .map_err(|e| anyhow::anyhow!("mkdir {WORK}: {e}"))?;
@@ -584,6 +503,9 @@ pub fn build_builder_image() -> Result<()> {
         15,
     )?;
 
+    // The bake's cargo-bay copy stays on the disk. The rev request is
+    // removed from it.
+    let _ = fs::remove_file(&rev_file);
     let rustc = capture("sh", &["-c", ". /work/env.sh && rustc --version"])
         .unwrap_or_else(|| "?".into());
     mark_ready(&format!(

@@ -101,8 +101,20 @@ Runtime paths. Each unset value resolves via env then built-in default.
 | `dataset` | string | `$FALCON_DATASET`, else `rpool/falcon` | ZFS dataset. |
 | `workdir` | string | directory of `voxel.toml` | Root that `cargo-bay/`, `.falcon/` and `image-build/` (image builds: falcon dir, cargo-bays, download caches) live under. Absolute. |
 | `build_root` | string | `$BUILD_ROOT`, else `$HOME/voxel-builds` | Root for `voxel image create` (omicron checkouts). |
-| `propolis_binary` | string | unset | `propolis-server` the host runs each node under. Unset leaves falcon's own binary, which it downloads on demand. Set it to run a locally built propolis, e.g. for a device-model fix that has not reached a release. Rack nodes only, as the image-build VM keeps falcon's binary. |
+| `propolis_binary` | string | unset | `propolis-server` the host runs each node under. Unset leaves falcon's own binary, which it downloads on demand. Set it to run a locally built propolis, e.g. for a device-model fix that has not reached a release. Applies to rack nodes and the image-build VM. |
 | `ssh_pubkey` | string | first of `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` | SSH public key staged into every node's cargo-bay as `root_authorized_keys`; on each boot voxel-init rewrites a `# voxel-managed-begin` / `# voxel-managed-end` block into the root's `authorized_keys` from it, allowing `ssh root@<node>` authentication by key instead of via an empty password. Keys added manually outside the block will survive reboots. This is validated before staging (i.e., a private key is rejected). When unset and with no default key existing, an empty file is staged and the guest drops the block. Set it to `""` to turn this option off. |
+
+## [builder]
+
+`voxel builder`, the persistent Omicron build host. Omitted from `config show`
+while every value is the default.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `image` | string | `voxel-builder-<image.version>` | Builder image the first `up` clones the disk from. |
+| `memory_gb` | integer | `32` | Guest memory. Omicron release builds want 32. |
+| `cores` | integer | `8` | Guest vCPUs. |
+| `disk_gb` | integer | `80` | Disk size; the checkout, caches and target dir live on it. |
 
 ## [sp]
 
