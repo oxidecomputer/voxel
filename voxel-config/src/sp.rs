@@ -153,6 +153,22 @@ impl Sp {
             SpRole::Gimlet(i) => format!("g{i}"),
         }
     }
+
+    /// The port an emulated SP serves its host power bridge on, after the MGS
+    /// pair.
+    pub fn power_port(&self) -> u16 {
+        self.base_port + 2
+    }
+
+    /// This SP as one `SP_EMU_IGNITION` entry, so the emulated ignition
+    /// controller matches the MGS configuration.
+    pub fn ignition_entry(&self) -> String {
+        let kind = match self.role {
+            SpRole::Sidecar => "sidecar",
+            SpRole::Gimlet(_) => "gimlet",
+        };
+        format!("{}:{kind}", self.ignition_target)
+    }
 }
 
 /// Render one `[[simulated_sps.<key>]]` block (identity + the two per-instance
