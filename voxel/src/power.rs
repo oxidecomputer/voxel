@@ -22,6 +22,8 @@ const RECONNECT: Duration = Duration::from_secs(3);
 /// How often the sleds' propolis processes are checked for loss.
 const LOSS_CHECK: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const POWER_ON_ATTEMPTS: u32 = 6;
+const POWER_ON_RETRY: Duration = Duration::from_secs(5);
 
 /// The address an SP serves its host power bridge on.
 pub(crate) fn power_addr(rack: usize, sp: &Sp) -> String {
@@ -314,13 +316,114 @@ async fn follow(
     );
     if on {
         l.lost_told = false;
-        if !alive && let Err(e) = crate::node::on(cfg, name, &node).await {
-            eprintln!("[power] {node}: power on failed: {e:#}");
+        if !alive {
+            // The guest takes its boot M.2 from the slot the SP booted it on.
+            if let Some(slot) = &l.boot_slot {
+                let path = crate::topo::cargo_bay(&node).join("boot-slot");
+                if let Err(e) = std::fs::write(&path, slot) {
+                    eprintln!("[power] {node}: write {path}: {e}");
+                }
+                if let Err(e) = stage_host_os(name, &node, slot) {
+                    eprintln!("[power] {node}: host OS not staged: {e:#}");
+                }
+            }
+            // The host can refuse the guest's memory while its ZFS cache is
+            // still giving pages back; that passes within seconds.
+            for attempt in 1..=POWER_ON_ATTEMPTS {
+                match crate::node::on(cfg, name, &node).await {
+                    Ok(()) => break,
+                    Err(e) => eprintln!(
+                        "[power] {node}: power on failed \
+                         ({attempt}/{POWER_ON_ATTEMPTS}): {e:#}"
+                    ),
+                }
+                tokio::time::sleep(POWER_ON_RETRY).await;
+            }
         }
     } else if let Err(e) = crate::node::off(&node).await {
         // Runs for a sled already gone too; it clears the pid file and VM.
         eprintln!("[power] {node}: power off failed: {e:#}");
     }
+}
+
+/// Lift the global-zone software out of the phase 2 in a sled's boot M.2 slot
+/// into the sled's cargo-bay, where the guest's boot service restages it. A
+/// sled then runs what its boot slot holds, as a gimlet does. Sleds on
+/// file-backed disks have no such slot and are left alone.
+fn stage_host_os(name: &str, node: &str, slot: &str) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    /// The guest's sector size (`disks::BLOCK_SIZE`), which its GPT is in.
+    const SECTOR: u64 = 4096;
+    const BOOT_IMAGE_MAGIC: u32 = 0x1deb0075;
+    let index = if slot == "B" { 1 } else { 0 };
+    let zvol = format!(
+        "/dev/zvol/dsk/{}/topo/{name}/{node}-M2{index}",
+        crate::image::falcon_dataset()
+    );
+    if !Utf8Path::new(&zvol).exists() {
+        return Ok(());
+    }
+    let mut dev =
+        std::fs::File::open(&zvol).with_context(|| format!("open {zvol}"))?;
+    let u64_at = |b: &[u8], at: usize| {
+        u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    };
+    // GPT header at LBA 1: the partition entries' LBA at 72. The boot image
+    // is partition 0, whose first LBA is at 32 in its entry.
+    let mut sector = [0u8; SECTOR as usize];
+    dev.seek(SeekFrom::Start(SECTOR))?;
+    dev.read_exact(&mut sector)?;
+    if &sector[..8] != b"EFI PART" {
+        bail!("{zvol}: no GPT");
+    }
+    dev.seek(SeekFrom::Start(u64_at(&sector, 72) * SECTOR))?;
+    dev.read_exact(&mut sector)?;
+    let image = u64_at(&sector, 32) * SECTOR;
+    // BootImageHeader: magic at 0, data size at 16, sha256 of the data at 40.
+    dev.seek(SeekFrom::Start(image))?;
+    dev.read_exact(&mut sector)?;
+    if sector[..4] != BOOT_IMAGE_MAGIC.to_le_bytes() {
+        bail!("{zvol}: slot {slot} holds no boot image");
+    }
+    let data_size = u64_at(&sector, 16);
+    let sha: String =
+        sector[40..72].iter().map(|b| format!("{b:02x}")).collect();
+
+    let bay = crate::topo::cargo_bay(node);
+    let stamp = bay.join("gz.sha256");
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == sha) {
+        return Ok(());
+    }
+    let cache = crate::imagebuild::build_root()?.join(".tuf-host");
+    std::fs::create_dir_all(&cache)
+        .with_context(|| format!("mkdir {cache}"))?;
+    let payload = cache.join(format!("phase2-{}.img", &sha[..12]));
+    if !payload.exists() {
+        let part = cache.join(format!("phase2-{}.img.part", &sha[..12]));
+        let mut out = std::fs::File::create(&part)
+            .with_context(|| format!("create {part}"))?;
+        let copied = std::io::copy(&mut (&mut dev).take(data_size), &mut out)
+            .with_context(|| format!("read phase 2 from {zvol}"))?;
+        if copied != data_size {
+            bail!("{zvol}: phase 2 is {copied} bytes, header says {data_size}");
+        }
+        std::fs::rename(&part, &payload)
+            .with_context(|| format!("move {part} to {payload}"))?;
+    }
+    let gz = bay.join("gz");
+    let _ = std::fs::remove_dir_all(&gz);
+    crate::cpbuild::stage_gz_from_phase2(
+        &payload,
+        &cache.join(format!("mnt-{node}")),
+        &gz,
+    )?;
+    crate::cpbuild::recompose_lifted_gz(&gz)?;
+    std::fs::write(&stamp, &sha).with_context(|| format!("write {stamp}"))?;
+    eprintln!(
+        "[power] {node}: staged host OS from slot {slot} ({})",
+        &sha[..12]
+    );
+    Ok(())
 }
 
 /// An ignition request for a target port. Ignition cuts the whole sled: off

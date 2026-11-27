@@ -89,7 +89,10 @@ pub(crate) fn run(args: &[&str]) -> anyhow::Result<()> {
 /// binds `SP_EMU_BRIDGE` at the rack's fleet address: sp-emu serves the switch0
 /// view there and the switch1 view on the next port, which is exactly the pair
 /// `mgs::switch_config` emits for the two switch slots. The host power bridge
-/// follows on the port after that pair.
+/// follows on the port after that pair. `SP_EMU_WALL_TICK` paces the SP's
+/// clock by the wall clock: paced by instruction count, a busy SP's clock runs
+/// at about a tenth of real time and Nexus's update timeouts expire first.
+/// `SP_EMU_IDLE_MS=1` keeps an idle SP's ticks from arriving in 10ms bursts.
 fn manifest(
     rack: usize,
     dir: &Utf8Path,
@@ -125,7 +128,9 @@ fn manifest(
              \x20         <envvar name=\"SP_EMU_BRIDGE\" value=\"[{addr}]:{}\"/>\n\
              \x20         <envvar name=\"SP_EMU_VPD_SERIAL\" value=\"{}\"/>\n\
              \x20         <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n\
-             \x20         <envvar name=\"SP_EMU_HOST_POWER\" value=\"[{addr}]:{}\"/>\n",
+             \x20         <envvar name=\"SP_EMU_HOST_POWER\" value=\"[{addr}]:{}\"/>\n\
+             \x20         <envvar name=\"SP_EMU_IDLE_MS\" value=\"1\"/>\n\
+             \x20         <envvar name=\"SP_EMU_WALL_TICK\" value=\"400000\"/>\n",
             board,
             sp.base_port,
             sp.serial,
@@ -725,16 +730,19 @@ pub(crate) fn up(
         if !st.success() {
             bail!("sp-emu flash failed for port {} ({st})", sp.base_port);
         }
-        // Seed the gimlet's host-boot QSPI with the release's phase 1. The
-        // rom is exactly the 32 MiB array sp-emu persists, and sp-emu loads
-        // a pre-existing qspi-flash.bin at startup, so Hubris hashes real
-        // contents and host phase 1 identifies instead of reading as blank.
-        // Launch-time only: a fresh rack starts at the release baseline.
+        // A fresh rack starts at the release baseline: host flash chip 0
+        // (slot A) holds the release's phase 1, and sp-emu starts a missing
+        // chip 1 as a copy of it with slot A active. The state dir outlives a
+        // destroy, so a chip left from the last rack would keep that rack's
+        // active slot, and the SP would disagree with a sled booted from A.
+        let chip0 = state.join("qspi-flash.bin");
+        let _ = std::fs::remove_file(&chip0);
+        let _ = std::fs::remove_file(state.join("qspi-flash-1.bin"));
         let rom = dir.join("host-phase1.rom");
         if board_of(sp) == "gimlet" && rom.exists() {
-            std::fs::copy(&rom, state.join("qspi-flash.bin")).with_context(
-                || format!("seed host phase 1 for port {}", sp.base_port),
-            )?;
+            std::fs::copy(&rom, &chip0).with_context(|| {
+                format!("seed host phase 1 for port {}", sp.base_port)
+            })?;
         }
     }
 

@@ -44,6 +44,10 @@ enum Cmd {
         #[arg(long, value_enum)]
         role: InstallRole,
     },
+    /// Internal: the baked `svc:/oxide/voxel-boot` SMF method. Runs at every
+    /// boot before sled-agent and redoes the bring-up a reboot loses.
+    #[command(hide = true)]
+    GimletBoot,
     /// Internal: the detached switch-config enforcer for a scrimlet's slot
     /// (spawned by `gimlet`)—swaps the launch-count MGS + sp-sim configs in.
     #[command(hide = true)]
@@ -70,6 +74,14 @@ enum InstallRole {
 fn main() {
     let result = match Cli::parse().cmd {
         Cmd::Gimlet => gimlet::bring_up(),
+        Cmd::GimletBoot => {
+            // Never fail the service: sled-agent depends on it, and a sled
+            // that boots on its launch-time config beats one that does not.
+            if let Err(e) = gimlet::boot() {
+                eprintln!("[voxel-init] boot bring-up failed: {e:#}");
+            }
+            Ok(())
+        }
         Cmd::Router => router::bring_up(),
         Cmd::Builder => builder::bring_up(),
         Cmd::Install { role } => match role {

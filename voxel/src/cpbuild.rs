@@ -660,7 +660,7 @@ async fn create_cp_tuf(
 
 /// Mount the phase 2 pool read-only under `mnt` and copy its /opt/oxide plus
 /// the sled-agent SMF manifest into `dest`. Runs under pfexec.
-fn stage_gz_from_phase2(
+pub(crate) fn stage_gz_from_phase2(
     payload: &Utf8Path,
     mnt: &Utf8Path,
     dest: &Utf8Path,
@@ -765,6 +765,31 @@ fn stage_gz_from_phase2(
     let _ = Command::new("zpool").args(["export", POOL]).output();
     let _ = Command::new("lofiadm").args(["-d", &dev]).output();
     result
+}
+
+/// Make global-zone software lifted from a release's phase 2 (`gz`) usable on
+/// a voxel sled: its switch zone ships the tofino dendrite, so swap in the
+/// softnpu build that release pins, as the bake does. The release's commit
+/// comes from the sled-agent VERSION file (`<version>+git<sha>`).
+pub(crate) fn recompose_lifted_gz(gz: &Utf8Path) -> Result<()> {
+    let version = std::fs::read_to_string(gz.join("sled-agent/VERSION"))
+        .context("read the lifted sled-agent VERSION")?;
+    let commit = version
+        .trim()
+        .rsplit_once("+git")
+        .map(|(_, sha)| sha)
+        .with_context(|| format!("no commit in version {version:?}"))?;
+    let root = build_root()?;
+    let manifest = fetch_omicron_raw(&root, commit, "package-manifest.toml")?;
+    let dendrite = fetch_dendrite_softnpu(&root, &manifest)?;
+    // The baked default; the switch enforcer installs the launch's own.
+    let n = num_gimlets();
+    let mgs_config = voxel_config::mgs::switch_config(
+        0,
+        &voxel_config::sp::SpFleet::sim(n),
+        &[0, n.saturating_sub(1)],
+    );
+    recompose_switch_zone(&gz.join("switch.tar.gz"), &dendrite, &mgs_config)
 }
 
 const OMICRON_RAW_URL: &str =

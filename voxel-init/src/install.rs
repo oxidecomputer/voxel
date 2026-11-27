@@ -95,6 +95,55 @@ fn install_cp_omicron() -> Result<()> {
     Ok(())
 }
 
+/// Stage global-zone software lifted from a host phase 2 payload (`gz`: its
+/// /opt/oxide entries plus sled-agent.xml) into /opt/oxide. The bake does this
+/// once; `gimlet::boot` repeats it when the sled's active slot changes.
+pub fn stage_gz(gz: &str) -> Result<()> {
+    for e in Utf8Path::new(gz)
+        .read_dir_utf8()
+        .map_err(|e| anyhow::anyhow!("read {gz}: {e}"))?
+    {
+        let e = e.map_err(|e| anyhow::anyhow!("read {gz}: {e}"))?;
+        let name = e.file_name();
+        if name == "sled-agent.xml" {
+            continue;
+        }
+        if !run("cp", &["-r", e.path().as_str(), "/opt/oxide/"]) {
+            bail!("stage {name} into /opt/oxide failed");
+        }
+    }
+    // The 9p mount drops exec bits; these directories hold binaries.
+    for d in [
+        "sled-agent",
+        "mg-ddm",
+        "opte",
+        "oxlog",
+        "pumpkind",
+        "crucible_utils",
+        "bin",
+    ] {
+        run_quiet(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "find /opt/oxide/{d} -type f -exec chmod +x {{}} + \
+                     2>/dev/null"
+                ),
+            ],
+        );
+    }
+    // The SMF manifest is imported at LAUNCH, after config injection.
+    // Importing here would autostart sled-agent at first boot unconfigured.
+    fs::copy(
+        format!("{gz}/sled-agent.xml"),
+        "/opt/oxide/sled-agent/pkg/manifest.xml",
+    )
+    .map_err(|e| anyhow::anyhow!("stage sled-agent manifest: {e}"))?;
+    fs::remove_file("/opt/oxide/sled-agent/pkg/config-rss.toml").ok();
+    Ok(())
+}
+
 /// TUF image bake: zones and GZ software are prestaged repo files (cargo-bay
 /// zones/ + gz/); no omicron tooling exists or is baked. Launch detects
 /// /opt/oxide/.voxel-tuf and replaces `xtask virtual-hardware` and
@@ -144,48 +193,7 @@ fn install_cp_tuf() -> Result<()> {
     note(format!("staged {n} zone artifacts into /opt/oxide"));
 
     note("staging global-zone software from the host phase 2 payload ...");
-    let gz = format!("{CARGO_BAY}/gz");
-    for e in Utf8Path::new(&gz)
-        .read_dir_utf8()
-        .map_err(|e| anyhow::anyhow!("read {gz}: {e}"))?
-    {
-        let e = e.map_err(|e| anyhow::anyhow!("read {gz}: {e}"))?;
-        let name = e.file_name();
-        if name == "sled-agent.xml" {
-            continue;
-        }
-        if !run("cp", &["-r", e.path().as_str(), "/opt/oxide/"]) {
-            bail!("stage {name} into /opt/oxide failed");
-        }
-    }
-    // The 9p mount drops exec bits; these directories hold binaries.
-    for d in [
-        "sled-agent",
-        "mg-ddm",
-        "opte",
-        "oxlog",
-        "pumpkind",
-        "crucible_utils",
-        "bin",
-    ] {
-        run_quiet(
-            "sh",
-            &[
-                "-c",
-                &format!(
-                    "find /opt/oxide/{d} -type f -exec chmod +x {{}} + \
-                     2>/dev/null"
-                ),
-            ],
-        );
-    }
-    // The SMF manifest is imported at LAUNCH, after config injection.
-    // Importing here would autostart sled-agent at first boot unconfigured.
-    fs::copy(
-        format!("{gz}/sled-agent.xml"),
-        "/opt/oxide/sled-agent/pkg/manifest.xml",
-    )
-    .map_err(|e| anyhow::anyhow!("stage sled-agent manifest: {e}"))?;
+    stage_gz(&format!("{CARGO_BAY}/gz"))?;
 
     note("staging host boot image + phase 1 rom ...");
     let host = format!("{CARGO_BAY}/host");
@@ -205,7 +213,6 @@ fn install_cp_tuf() -> Result<()> {
     if n == 0 {
         bail!("no host artifacts staged in {host}");
     }
-    fs::remove_file("/opt/oxide/sled-agent/pkg/config-rss.toml").ok();
     fs::write("/opt/oxide/.voxel-tuf", "")
         .map_err(|e| anyhow::anyhow!("write /opt/oxide/.voxel-tuf: {e}"))?;
     Ok(())
@@ -268,6 +275,35 @@ const SWITCH_ENFORCER_MANIFEST: &str = r#"<?xml version="1.0"?>
     <stability value='Unstable'/>
     <template>
       <common_name><loctext xml:lang='C'>voxel switch-slot enforcer</loctext></common_name>
+    </template>
+  </service>
+</service_bundle>
+"#;
+
+/// Boot-time bring-up, ahead of sled-agent: see `gimlet::boot`. sled-agent's
+/// dependency on it is added at launch, when its manifest is imported.
+const BOOT_MANIFEST: &str = r#"<?xml version="1.0"?>
+<!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
+<service_bundle type='manifest' name='voxel-boot'>
+  <service name='oxide/voxel-boot' type='service' version='1'>
+    <create_default_instance enabled='true'/>
+    <single_instance/>
+    <dependency name='fs-local' grouping='require_all' restart_on='none' type='service'>
+      <service_fmri value='svc:/system/filesystem/local:default'/>
+    </dependency>
+    <dependency name='network' grouping='require_all' restart_on='none' type='service'>
+      <service_fmri value='svc:/milestone/network:default'/>
+    </dependency>
+    <exec_method type='method' name='start'
+      exec='/opt/oxide/voxel-init gimlet-boot'
+      timeout_seconds='900'/>
+    <exec_method type='method' name='stop' exec=':true' timeout_seconds='60'/>
+    <property_group name='startd' type='framework'>
+      <propval name='duration' type='astring' value='transient'/>
+    </property_group>
+    <stability value='Unstable'/>
+    <template>
+      <common_name><loctext xml:lang='C'>voxel boot-time bring-up</loctext></common_name>
     </template>
   </service>
 </service_bundle>
@@ -389,6 +425,16 @@ pub fn build_control_plane_image() -> Result<()> {
     } else {
         warn(
             "svccfg import voxel-switch-enforcer failed (manifest staged for boot-time import)",
+        );
+    }
+
+    note("baking voxel-boot SMF service");
+    let manifest = "/lib/svc/manifest/site/voxel-boot.xml";
+    fs::write(manifest, BOOT_MANIFEST)
+        .map_err(|e| anyhow::anyhow!("write {manifest}: {e}"))?;
+    if !run("svccfg", &["import", manifest]) {
+        warn(
+            "svccfg import voxel-boot failed (manifest staged for boot-time import)",
         );
     }
 

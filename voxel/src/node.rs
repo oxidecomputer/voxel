@@ -282,7 +282,11 @@ pub(crate) async fn on(
     let bootrom = dir.join("bin/OVMF_CODE.fd");
     let out = std::fs::File::create(node_file(node, "out"))?;
     let err = std::fs::File::create(node_file(node, "err"))?;
-    let child = Command::new("pfexec")
+    // ctrun gives propolis a process contract of its own. Left in the
+    // caller's, an SMF restart of the power loop kills every sled it had
+    // powered on.
+    let ctrun = Command::new("pfexec")
+        .args(["ctrun", "-l", "child"])
         .args([bin.as_str(), "run", bootrom.as_str(), "[::]:0"])
         .env("RUST_BACKTRACE", "FULL")
         .stdin(Stdio::null())
@@ -290,7 +294,20 @@ pub(crate) async fn on(
         .stderr(err)
         .spawn()
         .with_context(|| format!("start {bin} for {node}"))?;
-    std::fs::write(node_file(node, "pid"), child.id().to_string())?;
+    // The pidfile names propolis, ctrun's one child, not ctrun.
+    let parent = ctrun.id().to_string();
+    let deadline = Instant::now() + PORT_WAIT;
+    let pid = loop {
+        let out = Command::new("pgrep").args(["-P", &parent]).output()?;
+        match String::from_utf8_lossy(&out.stdout).split_whitespace().next() {
+            Some(pid) => break pid.to_string(),
+            None if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            None => bail!("{node}: {bin} did not start under ctrun"),
+        }
+    };
+    std::fs::write(node_file(node, "pid"), &pid)?;
     let port = wait_for_port(node).await?;
     std::fs::write(node_file(node, "port"), port.to_string())?;
     let p = Propolis::at(port)?;
@@ -315,7 +332,7 @@ pub(crate) async fn on(
         }
     }
     p.request("Run").await.with_context(|| format!("{node}: run"))?;
-    eprintln!("[voxel] {node}: on (propolis pid {}, port {port})", child.id());
+    eprintln!("[voxel] {node}: on (propolis pid {pid}, port {port})");
     Ok(())
 }
 
