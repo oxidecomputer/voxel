@@ -5,7 +5,7 @@
 [sp-emu]
 repo = "sp-emu"
 series = "illumos"
-rev = "2755b40a0fec9c90919c524d6cea9dcae3a173c3"
+rev = "f1404d799bb1583b7ca54efac08da0dbfed1ff8d"
 artifact = "sp-emu"
 
 [faux-mgs]

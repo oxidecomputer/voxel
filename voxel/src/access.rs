@@ -103,13 +103,25 @@ pub(crate) async fn cmd_host_ls(
     name: &str,
 ) -> anyhow::Result<()> {
     let topo = build_topo(cfg, name)?;
-    println!("{:<6}  {:<16}  ROLE", "NODE", "IP");
+    println!(
+        "{:<6}  {:<16}  {:<8}  {:<10}  SP",
+        "NODE", "IP", "ROLE", "PROPOLIS"
+    );
     for (s, n) in &topo.sleds {
-        let ip = resolve_external_ip(cfg, &topo.runner, &s.name, *n, false)
-            .await
-            .unwrap_or_else(|_| "(unknown)".into());
+        let state = crate::node::propolis_state(&s.name).await;
+        // No console on a powered off sled.
+        let ip = if state == "down" {
+            "-".to_string()
+        } else {
+            resolve_external_ip(cfg, &topo.runner, &s.name, *n, false)
+                .await
+                .unwrap_or_else(|_| "(unknown)".into())
+        };
         let role = if s.scrimlet { "scrimlet" } else { "gimlet" };
-        println!("{:<6}  {:<16}  {role}", s.name, ip);
+        // SP host power state, on an --emu rack.
+        let sp = crate::power::sp_state(cfg, s.rack, &s.name)
+            .unwrap_or_else(|| "-".into());
+        println!("{:<6}  {ip:<16}  {role:<8}  {state:<10}  {sp}", s.name);
     }
     Ok(())
 }

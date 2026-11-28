@@ -53,7 +53,7 @@ fn manifest_path(rack: usize) -> String {
 }
 
 /// Run a read-only probe (true when it exits 0).
-fn probe(cmd: &str, args: &[&str]) -> bool {
+pub(crate) fn probe(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
         .args(args)
         .stdout(Stdio::null())
@@ -73,7 +73,7 @@ fn probe_out(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Run a mutating host command under pfexec.
-fn run(args: &[&str]) -> anyhow::Result<()> {
+pub(crate) fn run(args: &[&str]) -> anyhow::Result<()> {
     let st = Command::new("pfexec")
         .args(args)
         .status()
@@ -88,7 +88,9 @@ fn run(args: &[&str]) -> anyhow::Result<()> {
 /// foreground so startd's contract owns it (restart on crash, reboot safe), and
 /// binds `SP_EMU_BRIDGE` at the rack's fleet address: sp-emu serves the switch0
 /// view there and the switch1 view on the next port, which is exactly the pair
-/// `mgs::switch_config` emits for the two switch slots.
+/// `mgs::switch_config` emits for the two switch slots. The host power bridge
+/// is on the port after that pair. `SP_EMU_WALL_TICK` paces the SP's clock by
+/// the wall clock. `SP_EMU_IDLE_MS` is the idle throttle period.
 fn manifest(
     rack: usize,
     dir: &Utf8Path,
@@ -105,6 +107,9 @@ fn manifest(
          \x20   <service_fmri value=\"svc:/milestone/multi-user:default\"/>\n\
          \x20 </dependency>\n"
     );
+    let ignition: Vec<String> =
+        fleet.iter().map(|sp| sp.ignition_entry()).collect();
+    let ignition = ignition.join(",");
     for sp in fleet {
         let inst = instance(rack, sp.base_port);
         let state = format!("{dir}/state/{}", sp.base_port);
@@ -120,9 +125,20 @@ fn manifest(
              \x20         <envvar name=\"SP_EMU_BOARD\" value=\"{}\"/>\n\
              \x20         <envvar name=\"SP_EMU_BRIDGE\" value=\"[{addr}]:{}\"/>\n\
              \x20         <envvar name=\"SP_EMU_VPD_SERIAL\" value=\"{}\"/>\n\
-             \x20         <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n",
-            board, sp.base_port, sp.serial
+             \x20         <envvar name=\"SP_EMU_NO_DEBUG\" value=\"1\"/>\n\
+             \x20         <envvar name=\"SP_EMU_HOST_POWER\" value=\"[{addr}]:{}\"/>\n\
+             \x20         <envvar name=\"SP_EMU_IDLE_MS\" value=\"1\"/>\n\
+             \x20         <envvar name=\"SP_EMU_WALL_TICK\" value=\"400000\"/>\n",
+            board,
+            sp.base_port,
+            sp.serial,
+            sp.power_port()
         ));
+        if sp.role == voxel_config::sp::SpRole::Sidecar {
+            s.push_str(&format!(
+                "            <envvar name=\"SP_EMU_IGNITION\" value=\"{ignition}\"/>\n"
+            ));
+        }
         if let Some(part) = &sp.part_number {
             s.push_str(&format!(
                 "            <envvar name=\"SP_EMU_VPD_PART\" value=\"{part}\"/>\n"
@@ -169,10 +185,25 @@ fn has_link_local(link: &str) -> bool {
     out.lines().any(|l| l.starts_with(&prefix) && l.contains("fe80"))
 }
 
-/// Whether the host has the SMF instance backing an SP. The import is only
-/// believable once every instance is really there.
-fn instance_exists(rack: usize, port: u16) -> bool {
-    probe("svcs", &["-H", &format!("{SVC}:{}", instance(rack, port))])
+/// Import a manifest until every instance it declares exists. svccfg can fail
+/// with "changed unexpectedly" after importing the service but no instances.
+pub(crate) fn import_manifest(
+    path: &str,
+    fmris: &[String],
+) -> anyhow::Result<()> {
+    let mut waited = 0;
+    loop {
+        let imported = run(&["svccfg", "import", path]).is_ok()
+            && fmris.iter().all(|f| probe("svcs", &["-H", f]));
+        if imported {
+            return Ok(());
+        }
+        if waited >= IMPORT_WAIT_S {
+            bail!("svccfg import {path}: instances missing after {waited}s");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        waited += 2;
+    }
 }
 
 // --- the running fleet, for the operator commands ---------------------------
@@ -532,6 +563,12 @@ pub(crate) fn restart(rack: usize, port: u16) -> bool {
     probe("pfexec", &["svcadm", "restart", &fmri(rack, port)])
 }
 
+/// Enable or disable one SP's SMF instance.
+pub(crate) fn set_enabled(rack: usize, port: u16, on: bool) -> bool {
+    let verb = if on { "enable" } else { "disable" };
+    probe("pfexec", &["svcadm", verb, "-s", &fmri(rack, port)])
+}
+
 /// Restart every SP in a rack's fleet, returning how many were restarted.
 pub(crate) fn restart_rack(rack: usize) -> usize {
     let prefix = format!("{SVC}:r{rack}sp");
@@ -690,16 +727,17 @@ pub(crate) fn up(
         if !st.success() {
             bail!("sp-emu flash failed for port {} ({st})", sp.base_port);
         }
-        // Seed the gimlet's host-boot QSPI with the release's phase 1. The
-        // rom is exactly the 32 MiB array sp-emu persists, and sp-emu loads
-        // a pre-existing qspi-flash.bin at startup, so Hubris hashes real
-        // contents and host phase 1 identifies instead of reading as blank.
-        // Launch-time only: a fresh rack starts at the release baseline.
+        // Remove host flash left by an earlier rack; the state dir outlives a
+        // destroy. Chip 0 (slot A) is seeded with the release's phase 1 and
+        // sp-emu creates chip 1 as a copy of it.
+        let chip0 = state.join("qspi-flash.bin");
+        let _ = std::fs::remove_file(&chip0);
+        let _ = std::fs::remove_file(state.join("qspi-flash-1.bin"));
         let rom = dir.join("host-phase1.rom");
         if board_of(sp) == "gimlet" && rom.exists() {
-            std::fs::copy(&rom, state.join("qspi-flash.bin")).with_context(
-                || format!("seed host phase 1 for port {}", sp.base_port),
-            )?;
+            std::fs::copy(&rom, &chip0).with_context(|| {
+                format!("seed host phase 1 for port {}", sp.base_port)
+            })?;
         }
     }
 
@@ -708,24 +746,13 @@ pub(crate) fn up(
     let tmp = dir.join("voxel-sp-emu.xml");
     std::fs::write(&tmp, body).with_context(|| format!("write {tmp}"))?;
     run(&["cp", tmp.as_str(), &path])?;
-    // svccfg loses races against svc.startd's own repository writes, failing
-    // with "changed unexpectedly" after importing the service but no instances.
-    let mut waited = 0;
-    loop {
-        let imported = run(&["svccfg", "import", &path]).is_ok()
-            && fleet.iter().all(|sp| instance_exists(rack, sp.base_port));
-        if imported {
-            break;
-        }
-        if waited >= IMPORT_WAIT_S {
-            bail!(
-                "sp-emu fleet NOT started: no SMF instances for rack {rack}; \
-                 MGS would find no SPs"
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        waited += 2;
-    }
+    let fmris: Vec<String> =
+        fleet.iter().map(|sp| fmri(rack, sp.base_port)).collect();
+    import_manifest(&path, &fmris).with_context(|| {
+        format!(
+            "sp-emu fleet NOT started for rack {rack}; MGS would find no SPs"
+        )
+    })?;
     let ports: Vec<u16> = fleet.iter().map(|sp| sp.base_port).collect();
     println!(
         "[voxel] rack {rack} SP fleet up on {addr} ({} SP(s): {ports:?})",

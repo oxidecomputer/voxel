@@ -191,7 +191,7 @@ pub(crate) const CARGO_BAY: &str = "./cargo-bay";
 /// Host-side staging root for the emulated SP fleet, one directory per rack.
 const SP_FLEET_DIR: &str = "./sp-fleet";
 
-fn cargo_bay(node: &str) -> Utf8PathBuf {
+pub(crate) fn cargo_bay(node: &str) -> Utf8PathBuf {
     Utf8Path::new(CARGO_BAY).join(node)
 }
 

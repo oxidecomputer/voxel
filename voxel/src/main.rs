@@ -36,7 +36,9 @@ mod isolated_external;
 mod multirack_join;
 mod net;
 mod network;
+mod node;
 mod permslip;
+mod power;
 mod rack;
 mod repocmd;
 mod rss;
@@ -538,6 +540,14 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
+    /// Internal: the `svc:/oxide/voxel-power` SMF method. Syncs sled power to
+    /// the SPs' host power bridges.
+    #[command(hide = true)]
+    Watch {
+        /// Follow one rack instead of all of them.
+        #[arg(long)]
+        rack: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -559,6 +569,12 @@ enum HostCmd {
         #[arg(default_value = "g0")]
         node: String,
     },
+    /// Power a node off at the hypervisor: `voxel host off g1`.
+    Off { node: String },
+    /// Power a node back on from its captured instance.
+    On { node: String },
+    /// Reset a node (a propolis reboot).
+    Reset { node: String },
 }
 
 #[derive(Subcommand)]
@@ -790,6 +806,7 @@ async fn main() -> Result<(), Error> {
                 emu: *emu,
                 init_rss: *init_rss,
                 sp_firmware: sp_firmware.as_deref(),
+                config_path: &config_path,
             };
             rack::cmd_launch(&load_config(&config_path)?, &cli.name, opts).await
         }
@@ -975,6 +992,21 @@ async fn main() -> Result<(), Error> {
                     command,
                 )
                 .await
+            }
+            HostCmd::Off { node } => {
+                let cfg = load_config(&config_path)?;
+                node::cmd_host_power(&cfg, &cli.name, node, node::Power::Off)
+                    .await
+            }
+            HostCmd::On { node } => {
+                let cfg = load_config(&config_path)?;
+                node::cmd_host_power(&cfg, &cli.name, node, node::Power::On)
+                    .await
+            }
+            HostCmd::Reset { node } => {
+                let cfg = load_config(&config_path)?;
+                node::cmd_host_power(&cfg, &cli.name, node, node::Power::Reset)
+                    .await
             }
         },
         Cmd::Tp { cmd } => match cmd {

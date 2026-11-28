@@ -153,6 +153,20 @@ impl Sp {
             SpRole::Gimlet(i) => format!("g{i}"),
         }
     }
+
+    /// Host power bridge port: the one after the MGS pair.
+    pub fn power_port(&self) -> u16 {
+        self.base_port + 2
+    }
+
+    /// This SP as an `SP_EMU_IGNITION` entry.
+    pub fn ignition_entry(&self) -> String {
+        let kind = match self.role {
+            SpRole::Sidecar => "sidecar",
+            SpRole::Gimlet(_) => "gimlet",
+        };
+        format!("{}:{kind}", self.ignition_target)
+    }
 }
 
 /// Render one `[[simulated_sps.<key>]]` block (identity + the two per-instance

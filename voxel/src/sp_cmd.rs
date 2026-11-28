@@ -72,6 +72,7 @@ pub(crate) async fn cmd_sp(
         SpCmd::Ipcc { target, cmd, switch } => {
             sp_ipcc(cfg, name, switch, target, cmd).await
         }
+        SpCmd::Watch { rack } => crate::power::watch(cfg, name, *rack).await,
     }
 }
 

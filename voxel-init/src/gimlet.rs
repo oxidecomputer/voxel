@@ -15,6 +15,7 @@ use crate::sys::{
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
 use std::fs;
+use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -24,9 +25,14 @@ const OMICRON: &str = "/opt/oxide/omicron";
 // `<CARGO_BAY>/sled-config.toml` (kept literal: `concat!` can't expand a const).
 const SLED_CFG: &str = "/opt/cargo-bay/sled-config.toml";
 const PATCHED_CFG: &str = "/tmp/sled-config.toml";
+const INSTALLED_CFG: &str = "/opt/oxide/sled-agent/pkg/config.toml";
 /// Written at bake by `image create --from-tuf`; selects the native (no
 /// omicron tooling) bring-up paths.
 const TUF_MARKER: &str = "/opt/oxide/.voxel-tuf";
+/// Written when launch bring-up finishes. `boot` is a no-op without it.
+const LAUNCHED_MARKER: &str = "/opt/oxide/.voxel-launched";
+/// sha256 of the phase 2 the installed global-zone software came from.
+const GZ_MARKER: &str = "/opt/oxide/.voxel-gz";
 
 pub fn bring_up() -> Result<()> {
     crate::sys::setup_ssh();
@@ -76,7 +82,50 @@ pub fn bring_up() -> Result<()> {
             warn("omicron-package activate failed");
         }
     }
+    if let Err(e) = fs::write(LAUNCHED_MARKER, "") {
+        warn(format!("write {LAUNCHED_MARKER}: {e}"));
+    }
     note("gimlet bring-up complete");
+    Ok(())
+}
+
+/// `svc:/oxide/voxel-boot` method. Runs at every boot after launch, before
+/// sled-agent. TUF images only.
+pub fn boot() -> Result<()> {
+    if !Utf8Path::new(LAUNCHED_MARKER).exists()
+        || !Utf8Path::new(TUF_MARKER).exists()
+    {
+        note("boot: not a launched TUF sled, nothing to do");
+        return Ok(());
+    }
+    // Pull the cargo-bay again; falcon copies it in only at launch.
+    std::env::set_current_dir(CARGO_BAY)
+        .with_context(|| format!("cd {CARGO_BAY}"))?;
+    if !run("p9kp", &["pull"]) {
+        warn("boot: cargo-bay pull failed; using the launch-time copy");
+    }
+    // Restage the global-zone software if the staged phase 2 differs from the
+    // installed one.
+    let staged = fs::read_to_string(format!("{CARGO_BAY}/gz.sha256"))
+        .unwrap_or_default();
+    let staged = staged.trim();
+    let current = fs::read_to_string(GZ_MARKER).unwrap_or_default();
+    if !staged.is_empty() && staged != current.trim() {
+        crate::install::stage_gz(&format!("{CARGO_BAY}/gz"))?;
+        run("svccfg", &["import", "/opt/oxide/sled-agent/pkg/manifest.xml"]);
+        fs::write(GZ_MARKER, staged)
+            .with_context(|| format!("write {GZ_MARKER}"))?;
+        note(format!("restaged global-zone software from phase 2 {staged}"));
+    }
+    maybe_load_sidecar();
+    let (underlay, other) = detect_underlay();
+    patch_sled_config(&underlay, true)?;
+    setup_external_networking(&other);
+    setup_sp_net(&other);
+    setup_virtual_hardware_native()?;
+    inject_runtime_configs()?;
+    unplumb_softnpu_source();
+    note("boot bring-up complete");
     Ok(())
 }
 
@@ -182,20 +231,15 @@ impl SledDisk {
         if self.m2 { 0x11 + self.index as i64 } else { self.index as i64 }
     }
 
-    /// Which M.2 the sled booted from. A voxel guest still boots off falcon's
-    /// own disk, so for now this is an assertion rather than an observation.
-    /// Taking it from the SP's active host-boot-flash slot is what an update's
-    /// PostUpdateWait needs, and is the next increment.
-    fn is_boot_disk(&self) -> bool {
-        self.m2 && self.index == 0
-    }
-
     /// This disk as sled-agent's `UnparsedDisk`. `next_active_slot` is left
-    /// out: it is an `Option`, and TOML has no null.
-    fn config_entry(&self) -> String {
+    /// out: it is an `Option`, and TOML has no null. `boot_m2` is the index of
+    /// the boot M.2. The bay is written as both `slot` and `pcie_slot`
+    /// (renamed in omicron #11279).
+    fn config_entry(&self, boot_m2: usize) -> String {
         format!(
             "{{ paths = {{ devfs_path = \"{devfs}\", \
              dev_path = \"/dev/dsk/{disk}\" }}, slot = {slot}, \
+             pcie_slot = {slot}, \
              variant = \"{variant}\", identity = {{ vendor = \"Oxide\", \
              model = \"propolis-nvme\", serial = \"{serial}\" }}, \
              is_boot_disk = {boot}, firmware = {{ active_slot = 1, \
@@ -206,7 +250,7 @@ impl SledDisk {
             slot = self.slot(),
             variant = if self.m2 { "M2" } else { "U2" },
             serial = self.serial,
-            boot = self.is_boot_disk(),
+            boot = self.m2 && self.index == boot_m2,
         )
     }
 }
@@ -344,12 +388,25 @@ fn ensure_u2_label(d: &SledDisk) -> Result<()> {
 /// Write the image's host phase 2 into the M.2's boot image partition, so the
 /// slot inventories at the image's own repo version instead of erroring. On a
 /// real block device this runs at device speed.
+///
+/// A slot that already holds a boot image is left alone.
 fn seed_boot_image(d: &SledDisk) -> Result<()> {
     const HOST_BOOT_IMAGE: &str = "/opt/voxel/host/boot-image.img";
+    /// `BootImageHeader` magic (nexus_sled_agent_shared), little endian at 0.
+    const BOOT_IMAGE_MAGIC: u32 = 0x1deb0075;
+    let slot = format!("/dev/rdsk/{}s0", d.disk);
+    // Raw device: read a whole block.
+    let mut header = [0u8; 4096];
+    if fs::File::open(&slot).and_then(|mut f| f.read_exact(&mut header)).is_ok()
+        && header[..4] == BOOT_IMAGE_MAGIC.to_le_bytes()
+    {
+        note(format!("{}: boot image already present", d.disk));
+        return Ok(());
+    }
     if !Utf8Path::new(HOST_BOOT_IMAGE).exists() {
         bail!("{HOST_BOOT_IMAGE} missing from the image");
     }
-    let of = format!("of=/dev/rdsk/{}s0", d.disk);
+    let of = format!("of={slot}");
     if !run("dd", &[&format!("if={HOST_BOOT_IMAGE}"), &of, "bs=1048576"]) {
         bail!("{}: seeding the host phase 2 failed", d.disk);
     }
@@ -363,8 +420,16 @@ fn seed_boot_image(d: &SledDisk) -> Result<()> {
 /// injects during device polling on any platform that is not an Oxide sled -
 /// which is the path a voxel guest takes. They arrive as REAL disks, with no
 /// omicron change of any kind. `vdevs` goes empty: nothing is file-backed now.
+///
+/// The boot M.2 is the slot in the cargo-bay's `boot-slot` (A or B), which the
+/// power loop writes from the SP's active host phase 1 slot. Default A.
 fn write_disk_config(disks: &[SledDisk]) -> Result<()> {
-    let items: Vec<String> = disks.iter().map(SledDisk::config_entry).collect();
+    let boot_m2 = match fs::read_to_string(format!("{CARGO_BAY}/boot-slot")) {
+        Ok(s) if s.trim() == "B" => 1,
+        _ => 0,
+    };
+    let items: Vec<String> =
+        disks.iter().map(|d| d.config_entry(boot_m2)).collect();
     let rendered = format!(
         "external_disks = {{ kind = \"hardcoded\", vdevs = [], \
          disks = [{}] }}",
@@ -391,6 +456,34 @@ fn activate_native() {
         return;
     }
     run_quiet("svcadm", &["enable", "svc:/oxide/sled-agent:default"]);
+    // Add a voxel-boot dependency to sled-agent's manifest.
+    let dep = "voxel-boot";
+    let ok =
+        run("svccfg", &["-s", "oxide/sled-agent", "addpg", dep, "dependency"])
+            && [
+                ("grouping", "astring: require_all"),
+                ("restart_on", "astring: none"),
+                ("type", "astring: service"),
+                ("entities", "fmri: svc:/oxide/voxel-boot:default"),
+            ]
+            .iter()
+            .all(|(prop, value)| {
+                run(
+                    "svccfg",
+                    &[
+                        "-s",
+                        "oxide/sled-agent",
+                        "setprop",
+                        &format!("{dep}/{prop}"),
+                        "=",
+                        value,
+                    ],
+                )
+            })
+            && run("svcadm", &["refresh", "svc:/oxide/sled-agent:default"]);
+    if !ok {
+        warn("sled-agent does not depend on voxel-boot; a reboot may race it");
+    }
     note("sled-agent activated");
 }
 
@@ -465,6 +558,14 @@ fn patch_sled_config(underlay: &[String], tuf: bool) -> Result<()> {
         } else {
             *dl = toml_edit::value(devices);
         }
+    }
+    // Copy the support shell section from the installed config, if present.
+    // A sled-agent without the field rejects it.
+    if let Ok(installed) = fs::read_to_string(INSTALLED_CFG)
+        && let Ok(installed) = installed.parse::<toml_edit::DocumentMut>()
+        && let Some(sush) = installed.get("sush")
+    {
+        doc["sush"] = sush.clone();
     }
     fs::write(PATCHED_CFG, doc.to_string())
         .with_context(|| format!("write {PATCHED_CFG}"))?;
@@ -835,7 +936,7 @@ fn wipe_vdevs() {
 /// Inject the (data-link-patched) sled config + the generated RSS config (the
 /// latter present only on the RSS node) as the runtime sled-agent configs.
 fn inject_runtime_configs() -> Result<()> {
-    fs::copy(PATCHED_CFG, "/opt/oxide/sled-agent/pkg/config.toml")
+    fs::copy(PATCHED_CFG, INSTALLED_CFG)
         .context("inject sled-agent config.toml")?;
     let rss = format!("{CARGO_BAY}/config-rss.toml");
     if Utf8Path::new(&rss).exists() {
