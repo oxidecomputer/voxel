@@ -109,7 +109,7 @@ pub(crate) async fn cmd_host_ls(
     );
     for (s, n) in &topo.sleds {
         let state = crate::node::propolis_state(&s.name).await;
-        // A powered off sled has no console to ask.
+        // No console on a powered off sled.
         let ip = if state == "down" {
             "-".to_string()
         } else {
@@ -118,7 +118,7 @@ pub(crate) async fn cmd_host_ls(
                 .unwrap_or_else(|_| "(unknown)".into())
         };
         let role = if s.scrimlet { "scrimlet" } else { "gimlet" };
-        // The SP's host power, where an emulated fleet serves this sled.
+        // SP host power state, on an --emu rack.
         let sp = crate::power::sp_state(cfg, s.rack, &s.name)
             .unwrap_or_else(|| "-".into());
         println!("{:<6}  {ip:<16}  {role:<8}  {state:<10}  {sp}", s.name);

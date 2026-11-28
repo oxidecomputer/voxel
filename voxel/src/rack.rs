@@ -36,7 +36,7 @@ pub(crate) struct LaunchOpts<'a> {
     pub(crate) init_rss: bool,
     /// Firmware directory for the emulated fleet, overriding the image's own.
     pub(crate) sp_firmware: Option<&'a Utf8Path>,
-    /// Config the power loop service inherits.
+    /// Config path passed to the power service.
     pub(crate) config_path: &'a Utf8Path,
 }
 
@@ -282,9 +282,7 @@ pub(crate) async fn cmd_launch(
         }
     };
 
-    // Capture each sled's instance so its SP can bring it back as launched,
-    // then start the loop that lets the SPs own the sleds' power. --emu
-    // depends on it: an SP reset must restart its sled.
+    // Capture each sled's instance and start the power service.
     if opts.emu {
         let nodes: Vec<String> =
             topo.sleds.iter().map(|(s, _)| s.name.clone()).collect();
@@ -473,8 +471,7 @@ fn teardown(runner: &Runner, name: &str) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_destroy(cfg: &VoxelConfig, name: &str) -> anyhow::Result<()> {
-    // The power loop first, so it does not act on the sleds vanishing, then the
-    // fleet. Both before teardown, so they go away if falcon's destroy errors.
+    // Stop the power loop, then the fleet, before falcon's teardown.
     power::down_all(cfg);
     sp_host::down_all(cfg);
     let topo = build_topo(cfg, name)?;

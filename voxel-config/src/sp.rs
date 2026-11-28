@@ -154,14 +154,12 @@ impl Sp {
         }
     }
 
-    /// The port an emulated SP serves its host power bridge on, after the MGS
-    /// pair.
+    /// Host power bridge port: the one after the MGS pair.
     pub fn power_port(&self) -> u16 {
         self.base_port + 2
     }
 
-    /// This SP as one `SP_EMU_IGNITION` entry, so the emulated ignition
-    /// controller matches the MGS configuration.
+    /// This SP as an `SP_EMU_IGNITION` entry.
     pub fn ignition_entry(&self) -> String {
         let kind = match self.role {
             SpRole::Sidecar => "sidecar",

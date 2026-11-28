@@ -29,10 +29,9 @@ const INSTALLED_CFG: &str = "/opt/oxide/sled-agent/pkg/config.toml";
 /// Written at bake by `image create --from-tuf`; selects the native (no
 /// omicron tooling) bring-up paths.
 const TUF_MARKER: &str = "/opt/oxide/.voxel-tuf";
-/// Written when launch-time bring-up finishes. The boot service acts only once
-/// it exists: the first boot belongs to `voxel launch`.
+/// Written when launch bring-up finishes. `boot` is a no-op without it.
 const LAUNCHED_MARKER: &str = "/opt/oxide/.voxel-launched";
-/// The phase 2 hash whose global-zone software this root last restaged.
+/// sha256 of the phase 2 the installed global-zone software came from.
 const GZ_MARKER: &str = "/opt/oxide/.voxel-gz";
 
 pub fn bring_up() -> Result<()> {
@@ -90,8 +89,8 @@ pub fn bring_up() -> Result<()> {
     Ok(())
 }
 
-/// The baked `svc:/oxide/voxel-boot`: every boot after launch, before
-/// sled-agent starts, redo the bring-up a reboot loses. TUF images only.
+/// `svc:/oxide/voxel-boot` method. Runs at every boot after launch, before
+/// sled-agent. TUF images only.
 pub fn boot() -> Result<()> {
     if !Utf8Path::new(LAUNCHED_MARKER).exists()
         || !Utf8Path::new(TUF_MARKER).exists()
@@ -99,16 +98,14 @@ pub fn boot() -> Result<()> {
         note("boot: not a launched TUF sled, nothing to do");
         return Ok(());
     }
-    // falcon copies the cargo-bay in once, at launch. Pull again for what the
-    // host has staged since: the SP's boot slot.
+    // Pull the cargo-bay again; falcon copies it in only at launch.
     std::env::set_current_dir(CARGO_BAY)
         .with_context(|| format!("cd {CARGO_BAY}"))?;
     if !run("p9kp", &["pull"]) {
         warn("boot: cargo-bay pull failed; using the launch-time copy");
     }
-    // The host lifts the global-zone software out of the phase 2 in the boot
-    // slot. Restage it unless this root already runs it, so an updated sled
-    // comes up on the new release.
+    // Restage the global-zone software if the staged phase 2 differs from the
+    // installed one.
     let staged = fs::read_to_string(format!("{CARGO_BAY}/gz.sha256"))
         .unwrap_or_default();
     let staged = staged.trim();
@@ -236,9 +233,8 @@ impl SledDisk {
 
     /// This disk as sled-agent's `UnparsedDisk`. `next_active_slot` is left
     /// out: it is an `Option`, and TOML has no null. `boot_m2` is the index of
-    /// the M.2 the sled is taken to have booted from. The bay goes out as both
-    /// `slot` and `pcie_slot`: omicron renamed the field (#11279) and ignores
-    /// the one it does not know.
+    /// the boot M.2. The bay is written as both `slot` and `pcie_slot`
+    /// (renamed in omicron #11279).
     fn config_entry(&self, boot_m2: usize) -> String {
         format!(
             "{{ paths = {{ devfs_path = \"{devfs}\", \
@@ -393,14 +389,13 @@ fn ensure_u2_label(d: &SledDisk) -> Result<()> {
 /// slot inventories at the image's own repo version instead of erroring. On a
 /// real block device this runs at device speed.
 ///
-/// A slot that already holds a boot image is left alone: after first launch
-/// the slots belong to the control plane, and a host OS update writes here.
+/// A slot that already holds a boot image is left alone.
 fn seed_boot_image(d: &SledDisk) -> Result<()> {
     const HOST_BOOT_IMAGE: &str = "/opt/voxel/host/boot-image.img";
     /// `BootImageHeader` magic (nexus_sled_agent_shared), little endian at 0.
     const BOOT_IMAGE_MAGIC: u32 = 0x1deb0075;
     let slot = format!("/dev/rdsk/{}s0", d.disk);
-    // A raw device wants whole-block reads.
+    // Raw device: read a whole block.
     let mut header = [0u8; 4096];
     if fs::File::open(&slot).and_then(|mut f| f.read_exact(&mut header)).is_ok()
         && header[..4] == BOOT_IMAGE_MAGIC.to_le_bytes()
@@ -426,10 +421,8 @@ fn seed_boot_image(d: &SledDisk) -> Result<()> {
 /// which is the path a voxel guest takes. They arrive as REAL disks, with no
 /// omicron change of any kind. `vdevs` goes empty: nothing is file-backed now.
 ///
-/// A voxel guest boots off falcon's own disk, so the boot M.2 is asserted, not
-/// observed: it is the host phase 1 slot the SP was on when it powered the
-/// host, which the host's power loop stages as `boot-slot` (A or B). Absent
-/// that, slot A. An update's boot disk check needs the two to agree.
+/// The boot M.2 is the slot in the cargo-bay's `boot-slot` (A or B), which the
+/// power loop writes from the SP's active host phase 1 slot. Default A.
 fn write_disk_config(disks: &[SledDisk]) -> Result<()> {
     let boot_m2 = match fs::read_to_string(format!("{CARGO_BAY}/boot-slot")) {
         Ok(s) if s.trim() == "B" => 1,
@@ -463,8 +456,7 @@ fn activate_native() {
         return;
     }
     run_quiet("svcadm", &["enable", "svc:/oxide/sled-agent:default"]);
-    // From the next boot on, sled-agent waits for voxel-boot to rewrite its
-    // config. The manifest is omicron's, so the dependency is added here.
+    // Add a voxel-boot dependency to sled-agent's manifest.
     let dep = "voxel-boot";
     let ok =
         run("svccfg", &["-s", "oxide/sled-agent", "addpg", dep, "dependency"])
@@ -567,9 +559,8 @@ fn patch_sled_config(underlay: &[String], tuf: bool) -> Result<()> {
             *dl = toml_edit::value(devices);
         }
     }
-    // The generated config has no support shell section. Carry over the one
-    // the installed release ships: a sled-agent older than the section
-    // rejects it as an unknown field, so it cannot be generated blind.
+    // Copy the support shell section from the installed config, if present.
+    // A sled-agent without the field rejects it.
     if let Ok(installed) = fs::read_to_string(INSTALLED_CFG)
         && let Ok(installed) = installed.parse::<toml_edit::DocumentMut>()
         && let Some(sush) = installed.get("sush")

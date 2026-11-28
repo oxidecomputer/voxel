@@ -16,7 +16,7 @@ use voxel_config::sp::{Sp, SpRole};
 /// SMF service running the loop, one instance per rack.
 const SVC: &str = "svc:/oxide/voxel-power";
 const MANIFEST_DIR: &str = "/var/svc/manifest/site";
-/// Loop tick, and how long a dead SP socket waits before a reconnect.
+/// Loop tick and SP reconnect interval.
 const TICK: Duration = Duration::from_millis(500);
 const RECONNECT: Duration = Duration::from_secs(3);
 /// How often the sleds' propolis processes are checked for loss.
@@ -57,7 +57,7 @@ struct Link {
     host_on: Option<bool>,
     /// The host phase 1 slot the SP reported with its last A0.
     boot_slot: Option<String>,
-    /// A host-lost was sent for the current A0 and is not repeated.
+    /// host-lost was sent for the current A0.
     lost_told: bool,
     next_connect: Instant,
 }
@@ -157,7 +157,7 @@ pub(crate) fn sp_state(
     line.trim().strip_prefix("state ").map(str::to_string)
 }
 
-/// Follow the fleet of one rack, or every rack, and keep its sleds in step.
+/// Sync sled power to the SPs of one rack, or every rack.
 pub(crate) async fn watch(
     cfg: &VoxelConfig,
     name: &str,
@@ -187,10 +187,10 @@ pub(crate) async fn watch(
     if links.is_empty() {
         bail!("no emulated SPs in rack(s) {racks:?}; nothing to follow");
     }
-    // One loop per rack: two would race each other's relaunches.
+    // One loop per rack.
     let _locks: Vec<std::fs::File> =
         racks.iter().map(|&r| lock(r)).collect::<anyhow::Result<_>>()?;
-    // Every running sled needs a captured instance before an SP can cycle it.
+    // Capture every running sled's instance.
     let nodes: Vec<String> =
         links.iter().filter_map(|l| l.node.clone()).collect();
     crate::node::capture_missing(&nodes).await;
@@ -231,8 +231,8 @@ pub(crate) async fn watch(
     }
 }
 
-/// Hold a rack's loop lock for as long as the file lives. A second loop for
-/// the same rack fails here.
+/// Take a rack's loop lock, held while the file lives. Fails if another loop
+/// holds it.
 fn lock(rack: usize) -> anyhow::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     let path =
@@ -262,7 +262,7 @@ async fn handle(
     i: usize,
     line: &str,
 ) {
-    // A gimlet's A0 lines carry the host phase 1 slot it boots from.
+    // A gimlet's A0 line carries its host phase 1 slot.
     let words: Vec<&str> = line.split_whitespace().collect();
     match words.as_slice() {
         ["state", s, slot @ ..] if slot.len() <= 1 => {
@@ -287,7 +287,7 @@ async fn handle(
     }
 }
 
-/// Bring a gimlet's sled in line with what its SP supplies.
+/// Power a gimlet's sled on or off to match its SP.
 async fn follow(
     cfg: &VoxelConfig,
     name: &str,
@@ -296,7 +296,7 @@ async fn follow(
     how: &str,
 ) {
     let Some(node) = l.node.clone() else {
-        // Nothing sits behind the sidecar's Tofino. Note it once on connect.
+        // Sidecar: no sled. Log its state once, on connect.
         if how == "reports" {
             eprintln!(
                 "[power] {}: {how} {}",
@@ -317,7 +317,7 @@ async fn follow(
     if on {
         l.lost_told = false;
         if !alive {
-            // The guest takes its boot M.2 from the slot the SP booted it on.
+            // Write the SP's boot slot for the guest.
             if let Some(slot) = &l.boot_slot {
                 let path = crate::topo::cargo_bay(&node).join("boot-slot");
                 if let Err(e) = std::fs::write(&path, slot) {
@@ -327,8 +327,7 @@ async fn follow(
                     eprintln!("[power] {node}: host OS not staged: {e:#}");
                 }
             }
-            // The host can refuse the guest's memory while its ZFS cache is
-            // still giving pages back; that passes within seconds.
+            // propolis can refuse an instance create with a 500. Retry.
             for attempt in 1..=POWER_ON_ATTEMPTS {
                 match crate::node::on(cfg, name, &node).await {
                     Ok(()) => break,
@@ -341,15 +340,14 @@ async fn follow(
             }
         }
     } else if let Err(e) = crate::node::off(&node).await {
-        // Runs for a sled already gone too; it clears the pid file and VM.
+        // Also runs for a sled already gone: clears its pid file and VM.
         eprintln!("[power] {node}: power off failed: {e:#}");
     }
 }
 
-/// Lift the global-zone software out of the phase 2 in a sled's boot M.2 slot
-/// into the sled's cargo-bay, where the guest's boot service restages it. A
-/// sled then runs what its boot slot holds, as a gimlet does. Sleds on
-/// file-backed disks have no such slot and are left alone.
+/// Copy the global-zone software from the phase 2 in a sled's boot M.2 slot
+/// into the sled's cargo-bay, for `voxel-boot` to restage. No-op for sleds on
+/// file-backed disks.
 fn stage_host_os(name: &str, node: &str, slot: &str) -> anyhow::Result<()> {
     use std::io::{Seek, SeekFrom};
     /// The guest's sector size (`disks::BLOCK_SIZE`), which its GPT is in.
@@ -426,8 +424,8 @@ fn stage_host_os(name: &str, node: &str, slot: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An ignition request for a target port. Ignition cuts the whole sled: off
-/// takes the SP down with the host, on brings the SP up to power the host.
+/// Handle an ignition request for a target port. Off disables the target's
+/// SP and powers its sled off. On enables the SP. Reset does both.
 async fn ignition(links: &mut [Link], from: usize, port: u8, op: &str) {
     let rack = links[from].rack;
     let Some(t) = links.iter().position(|l| {
@@ -480,8 +478,7 @@ pub(crate) fn fmri(rack: usize) -> String {
     format!("{SVC}:{}", instance(rack))
 }
 
-/// The SMF manifest for one rack's loop: this voxel binary on the config and
-/// workdir the launch used.
+/// SMF manifest for one rack's loop, run with the launch's config and workdir.
 fn manifest(
     rack: usize,
     exe: &Utf8Path,
@@ -556,8 +553,7 @@ pub(crate) fn up_all(
     Ok(())
 }
 
-/// Stop and remove every rack's loop. Best effort. Runs first in a destroy so
-/// the loop does not act on the sleds vanishing.
+/// Stop and remove every rack's loop. Best effort. Called first in destroy.
 pub(crate) fn down_all(cfg: &VoxelConfig) {
     for rack in 0..cfg.topology.racks() {
         let f = fmri(rack);

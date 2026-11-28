@@ -89,10 +89,8 @@ pub(crate) fn run(args: &[&str]) -> anyhow::Result<()> {
 /// binds `SP_EMU_BRIDGE` at the rack's fleet address: sp-emu serves the switch0
 /// view there and the switch1 view on the next port, which is exactly the pair
 /// `mgs::switch_config` emits for the two switch slots. The host power bridge
-/// follows on the port after that pair. `SP_EMU_WALL_TICK` paces the SP's
-/// clock by the wall clock: paced by instruction count, a busy SP's clock runs
-/// at about a tenth of real time and Nexus's update timeouts expire first.
-/// `SP_EMU_IDLE_MS=1` keeps an idle SP's ticks from arriving in 10ms bursts.
+/// is on the port after that pair. `SP_EMU_WALL_TICK` paces the SP's clock by
+/// the wall clock. `SP_EMU_IDLE_MS` is the idle throttle period.
 fn manifest(
     rack: usize,
     dir: &Utf8Path,
@@ -187,9 +185,8 @@ fn has_link_local(link: &str) -> bool {
     out.lines().any(|l| l.starts_with(&prefix) && l.contains("fe80"))
 }
 
-/// Import a manifest until every instance it declares exists. svccfg loses
-/// races against svc.startd's own repository writes, failing with "changed
-/// unexpectedly" after importing the service but no instances.
+/// Import a manifest until every instance it declares exists. svccfg can fail
+/// with "changed unexpectedly" after importing the service but no instances.
 pub(crate) fn import_manifest(
     path: &str,
     fmris: &[String],
@@ -566,7 +563,7 @@ pub(crate) fn restart(rack: usize, port: u16) -> bool {
     probe("pfexec", &["svcadm", "restart", &fmri(rack, port)])
 }
 
-/// Enable or disable one SP, as ignition powering its sled on or off would.
+/// Enable or disable one SP's SMF instance.
 pub(crate) fn set_enabled(rack: usize, port: u16, on: bool) -> bool {
     let verb = if on { "enable" } else { "disable" };
     probe("pfexec", &["svcadm", verb, "-s", &fmri(rack, port)])
@@ -730,11 +727,9 @@ pub(crate) fn up(
         if !st.success() {
             bail!("sp-emu flash failed for port {} ({st})", sp.base_port);
         }
-        // A fresh rack starts at the release baseline: host flash chip 0
-        // (slot A) holds the release's phase 1, and sp-emu starts a missing
-        // chip 1 as a copy of it with slot A active. The state dir outlives a
-        // destroy, so a chip left from the last rack would keep that rack's
-        // active slot, and the SP would disagree with a sled booted from A.
+        // Remove host flash left by an earlier rack; the state dir outlives a
+        // destroy. Chip 0 (slot A) is seeded with the release's phase 1 and
+        // sp-emu creates chip 1 as a copy of it.
         let chip0 = state.join("qspi-flash.bin");
         let _ = std::fs::remove_file(&chip0);
         let _ = std::fs::remove_file(state.join("qspi-flash-1.bin"));

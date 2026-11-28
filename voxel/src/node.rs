@@ -14,8 +14,8 @@ use voxel_config::VoxelConfig;
 use crate::imagebuild;
 use crate::topo::build_topo;
 
-/// The propolis API version voxel speaks, the one falcon's client was generated
-/// from. Older versions leave the SMBIOS table out of the spec.
+/// propolis API version, matching falcon's client. Older versions omit the
+/// SMBIOS table from the spec.
 const API_VERSION: &str = "2.0.0";
 /// How long propolis gets to stop the VM before it is killed.
 const STOP_WAIT: Duration = Duration::from_secs(5);
@@ -172,8 +172,8 @@ impl Propolis {
         if status.get("type").and_then(|t| t.as_str()) != Some("Present") {
             bail!("propolis has no spec for this instance yet");
         }
-        // API 2.0.0 returns the spec under value; 1.0.0 wrapped it in a
-        // versioned envelope, which an older capture may carry.
+        // API 2.0.0 returns the spec under `value`; 1.0.0 wraps it in a
+        // versioned envelope.
         let value = status
             .get("value")
             .ok_or_else(|| anyhow!("no spec value in the reply"))?;
@@ -197,8 +197,7 @@ pub(crate) async fn capture(node: &str) -> anyhow::Result<Utf8PathBuf> {
     Ok(path)
 }
 
-/// Capture every running node that has no capture yet. Best effort; a failure
-/// is reported, not fatal.
+/// Capture every running node that has no capture. Failures are logged.
 pub(crate) async fn capture_missing(nodes: &[String]) {
     for n in nodes {
         if node_file(n, "ensure.json").exists() || !alive(n) {
@@ -211,8 +210,8 @@ pub(crate) async fn capture_missing(nodes: &[String]) {
     }
 }
 
-/// Power a node off: a bounded propolis stop, then the process and the bhyve
-/// VM. The instance is captured first if it never was.
+/// Power a node off: propolis stop, bounded by STOP_WAIT, then kill the
+/// process and destroy the bhyve VM. Captures the instance first if missing.
 pub(crate) async fn off(node: &str) -> anyhow::Result<()> {
     if alive(node) {
         if !node_file(node, "ensure.json").exists() {
@@ -240,8 +239,8 @@ pub(crate) async fn off(node: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Power a node on: a fresh propolis on a kernel assigned port, the captured
-/// instance ensured, then run. Pid and port are recorded where falcon does.
+/// Power a node on: start propolis on a kernel assigned port, ensure the
+/// captured instance, run. Records pid and port in falcon's files.
 pub(crate) async fn on(
     cfg: &VoxelConfig,
     name: &str,
@@ -261,8 +260,7 @@ pub(crate) async fn on(
         })?,
     )
     .with_context(|| format!("decode {ensure}"))?;
-    // propolis omits the SMBIOS table from its spec. The sled's baseboard
-    // identity comes from it, so restore it from the topology.
+    // Restore the SMBIOS table, which propolis omits from its spec.
     if let Some(smbios) = smbios_of(cfg, name, node)? {
         match body.pointer_mut("/init/value/spec") {
             Some(spec) => {
@@ -271,7 +269,7 @@ pub(crate) async fn on(
             None => bail!("{ensure}: no spec to carry the SMBIOS table"),
         }
     }
-    // Clear the last run; a stale bhyve VM keeps the uuid busy.
+    // Remove any stale bhyve VM; it holds the uuid.
     hyperstop(node);
     let dir = falcon_dir();
     let bin = cfg
@@ -282,9 +280,7 @@ pub(crate) async fn on(
     let bootrom = dir.join("bin/OVMF_CODE.fd");
     let out = std::fs::File::create(node_file(node, "out"))?;
     let err = std::fs::File::create(node_file(node, "err"))?;
-    // ctrun gives propolis a process contract of its own. Left in the
-    // caller's, an SMF restart of the power loop kills every sled it had
-    // powered on.
+    // Run propolis in its own process contract, outside the caller's.
     let ctrun = Command::new("pfexec")
         .args(["ctrun", "-l", "child"])
         .args([bin.as_str(), "run", bootrom.as_str(), "[::]:0"])
@@ -294,7 +290,7 @@ pub(crate) async fn on(
         .stderr(err)
         .spawn()
         .with_context(|| format!("start {bin} for {node}"))?;
-    // The pidfile names propolis, ctrun's one child, not ctrun.
+    // Record the pid of propolis (ctrun's child), not ctrun.
     let parent = ctrun.id().to_string();
     let deadline = Instant::now() + PORT_WAIT;
     let pid = loop {
@@ -311,8 +307,8 @@ pub(crate) async fn on(
     let port = wait_for_port(node).await?;
     std::fs::write(node_file(node, "port"), port.to_string())?;
     let p = Propolis::at(port)?;
-    // Ensure once the server accepts a connection. Only a transport failure
-    // is retried; any answer from propolis is final.
+    // Ensure once the server accepts a connection. Retry transport failures
+    // only.
     let deadline = Instant::now() + READY_WAIT;
     loop {
         match p.put("/instance", &body).await {
@@ -336,8 +332,7 @@ pub(crate) async fn on(
     Ok(())
 }
 
-/// The SMBIOS Type 1 table voxel gave a node at launch, as the topology builds
-/// it. None for a router.
+/// The SMBIOS Type 1 table the topology builds for a node. None for a router.
 fn smbios_of(
     cfg: &VoxelConfig,
     name: &str,

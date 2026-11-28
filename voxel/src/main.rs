@@ -540,8 +540,8 @@ enum SpCmd {
         #[arg(long, default_value = "switch0")]
         switch: String,
     },
-    /// Internal: the `svc:/oxide/voxel-power` SMF method. Follows the fleet's
-    /// host power bridges and keeps the sleds in step with their SPs.
+    /// Internal: the `svc:/oxide/voxel-power` SMF method. Syncs sled power to
+    /// the SPs' host power bridges.
     #[command(hide = true)]
     Watch {
         /// Follow one rack instead of all of them.

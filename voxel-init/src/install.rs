@@ -96,8 +96,8 @@ fn install_cp_omicron() -> Result<()> {
 }
 
 /// Stage global-zone software lifted from a host phase 2 payload (`gz`: its
-/// /opt/oxide entries plus sled-agent.xml) into /opt/oxide. The bake does this
-/// once; `gimlet::boot` repeats it when the sled's active slot changes.
+/// /opt/oxide entries plus sled-agent.xml) into /opt/oxide. Called by the bake
+/// and by `gimlet::boot`.
 pub fn stage_gz(gz: &str) -> Result<()> {
     for e in Utf8Path::new(gz)
         .read_dir_utf8()
@@ -280,8 +280,8 @@ const SWITCH_ENFORCER_MANIFEST: &str = r#"<?xml version="1.0"?>
 </service_bundle>
 "#;
 
-/// Boot-time bring-up, ahead of sled-agent: see `gimlet::boot`. sled-agent's
-/// dependency on it is added at launch, when its manifest is imported.
+/// SMF manifest for `gimlet::boot`. sled-agent's dependency on it is added at
+/// launch.
 const BOOT_MANIFEST: &str = r#"<?xml version="1.0"?>
 <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
 <service_bundle type='manifest' name='voxel-boot'>

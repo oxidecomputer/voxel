@@ -767,10 +767,10 @@ pub(crate) fn stage_gz_from_phase2(
     result
 }
 
-/// Make global-zone software lifted from a release's phase 2 (`gz`) usable on
-/// a voxel sled: its switch zone ships the tofino dendrite, so swap in the
-/// softnpu build that release pins, as the bake does. The release's commit
-/// comes from the sled-agent VERSION file (`<version>+git<sha>`).
+/// Replace the tofino dendrite in the switch zone of global-zone software
+/// lifted from a phase 2 (`gz`) with the softnpu build that release pins. The
+/// release commit is read from the sled-agent VERSION file
+/// (`<version>+git<sha>`).
 pub(crate) fn recompose_lifted_gz(gz: &Utf8Path) -> Result<()> {
     let version = std::fs::read_to_string(gz.join("sled-agent/VERSION"))
         .context("read the lifted sled-agent VERSION")?;
@@ -782,7 +782,7 @@ pub(crate) fn recompose_lifted_gz(gz: &Utf8Path) -> Result<()> {
     let root = build_root()?;
     let manifest = fetch_omicron_raw(&root, commit, "package-manifest.toml")?;
     let dendrite = fetch_dendrite_softnpu(&root, &manifest)?;
-    // The baked default; the switch enforcer installs the launch's own.
+    // Baked default. The switch enforcer installs the launch's config.
     let n = num_gimlets();
     let mgs_config = voxel_config::mgs::switch_config(
         0,
